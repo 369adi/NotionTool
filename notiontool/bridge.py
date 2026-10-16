@@ -49,7 +49,9 @@ REA_TOOLS = {
     'rea_tools': ('Discover REA (Reverse Engineer Anything) tools and their argument schemas', {}),
     'rea_call': ('Call a discovered REA tool', {'name':{'type':'string'},'arguments':{'type':'object'}}),
 }
+from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled
 READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewer')
+from .screen_capture import SCREEN_TOOLS, SCREEN_OPERATOR_TOOLS, SCREEN_OPERATOR_NAMES, ScreenCapture
 
 
 def shell_command(command):
@@ -76,9 +78,15 @@ OPERATOR_TOOLS = [
     {'name':'nt_notion_stream','description':'Operator: send a full runInferenceTranscript body and return the streamed NDJSON lines (capped).',
      'annotations':{'readOnlyHint':False,'destructiveHint':True},
      'inputSchema':{'type':'object','properties':{'body':{'type':'object'},'account_id':{'type':'string'},'timeout':{'type':'number'},'max_lines':{'type':'integer'}},'required':['body']}},
+    {'name':'nt_local_mcp','description':'Operator: list the local MCP servers (REA, Roblox, Blender, ...) and their current tools. refresh=true restarts the enabled servers and rediscovers their tools, so new tools work without reconnecting this MCP.',
+     'annotations':{'readOnlyHint':True,'destructiveHint':False},
+     'inputSchema':{'type':'object','properties':{'server':{'type':'string'},'refresh':{'type':'boolean'}}}},
+    {'name':'nt_local_mcp_call','description':'Operator: call a tool of an enabled local MCP server (server = rea, roblox, blender). Use nt_local_mcp to see tools and schemas.',
+     'annotations':{'readOnlyHint':False,'destructiveHint':True},
+     'inputSchema':{'type':'object','properties':{'server':{'type':'string'},'name':{'type':'string'},'arguments':{'type':'object'}},'required':['server','name']}},
 ]
 from .devtools import TOOLS as DEV_TOOLS, NAMES as DEV_NAMES, call as dev_call
-OPERATOR_TOOLS = OPERATOR_TOOLS + DEV_TOOLS
+OPERATOR_TOOLS = OPERATOR_TOOLS + DEV_TOOLS + SCREEN_OPERATOR_TOOLS
 OPERATOR_NAMES = {t['name'] for t in OPERATOR_TOOLS}
 
 class Bridge:
@@ -94,13 +102,66 @@ class Bridge:
     def browser_access(self):
         return bool(self.store.settings().get('mcp_browser_access', False))
 
+    def screen_access(self):
+        # Window capture is read-only and on by default; Settings can switch it off.
+        return bool(self.store.settings().get('screen_capture', True))
+
+    def screen(self):
+        if getattr(self, '_screen', None) is None:
+            self._screen = ScreenCapture(self.store)
+        return self._screen
+
     def tools(self):
         tools = dict(TOOLS)
         if self.browser_access():
             tools.update(BROWSER_TOOLS)
-        if self.store.settings().get('rea_enabled', False):
-            tools.update(REA_TOOLS)
+        if self.screen_access():
+            tools.update(SCREEN_TOOLS)
+        settings = self.store.settings()
+        for server in LOCAL_SERVERS:
+            if local_enabled(settings, server):
+                tools.update(tool_specs(server))
         return tools
+
+    def local_client(self, key):
+        lock = self.__dict__.setdefault('_local_lock', threading.Lock())
+        with lock:
+            clients = self.__dict__.setdefault('_local_mcp', {})
+            if key not in clients:
+                from .rea import Rea
+                server = LOCAL_BY_KEY[key]
+                clients[key] = Rea(command=server['command'](), label=server['label'], prefix=key)
+            return clients[key]
+
+    def local_refresh(self, key=None, restart=True, schemas=False):
+        settings = self.store.settings()
+        out = []
+        for server in LOCAL_SERVERS:
+            if key and server['key'] != key:
+                continue
+            entry = {'server': server['key'], 'name': server['name'], 'enabled': local_enabled(settings, server)}
+            if entry['enabled']:
+                if restart:
+                    self.close_local([server['key']])
+                try:
+                    tools = self.local_client(server['key']).tools()
+                    entry.update(ok=True, count=len(tools),
+                                 tools=tools if schemas else [{'name': t.get('name'), 'description': str(t.get('description', ''))[:200]} for t in tools])
+                except Exception as exc:
+                    entry.update(ok=False, error=str(exc)[:300])
+            out.append(entry)
+        return out
+
+    def close_local(self, keys=None):
+        lock = self.__dict__.setdefault('_local_lock', threading.Lock())
+        with lock:
+            clients = self.__dict__.setdefault('_local_mcp', {})
+            closing = [clients.pop(k) for k in list(clients) if keys is None or k in keys]
+        for client in closing:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     @property
     def browser(self):
@@ -162,16 +223,15 @@ class Bridge:
         with self.engine.lock:
             task,run = self.assignment(token)
             if name not in self.tools():
-                raise ValueError('Unknown or disabled tool' + (' (enable browser access in Settings)' if name in BROWSER_TOOLS else ' (enable REA in Settings)' if name in REA_TOOLS else ''))
-            if name in REA_TOOLS:
-                if getattr(self, '_rea', None) is None:
-                    from .rea import Rea
-                    self._rea = Rea()
-                rea = self._rea
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message='REA: '+str(args.get('name','discover'))[:100])
+                raise ValueError('Unknown or disabled tool' + (' (enable browser access in Settings)' if name in BROWSER_TOOLS else ' (enable '+LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+' in Settings)' if name in TOOL_SERVER else ''))
+            if name in TOOL_SERVER:
+                rea = self.local_client(TOOL_SERVER[name])
+                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message=LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+': '+str(args.get('name','discover'))[:100])
             if task['role'] in READ_ONLY_ROLES and (name in ('write_file','run_shell') or name in BROWSER_ACTIONS):
                 raise ValueError('This planning/review role has read-only PC access')
-            if name in REA_TOOLS:
+            if name in TOOL_SERVER:
+                pass
+            elif name in SCREEN_TOOLS:
                 pass
             elif name in BROWSER_TOOLS:
                 if name in BROWSER_ACTIONS:
@@ -248,8 +308,11 @@ class Bridge:
                     path.parent.mkdir(parents=True,exist_ok=True)
                     path.write_text(text,encoding='utf-8')
                     return {'written':str(path),'bytes':len(text.encode())}
-        if name in REA_TOOLS:
-            return rea.tools() if name=='rea_tools' else rea.call(str(args.get('name','')), args.get('arguments') or {})
+        if name in TOOL_SERVER:
+            return rea.tools() if name.endswith('_tools') else rea.call(str(args.get('name','')), args.get('arguments') or {})
+        if name in SCREEN_TOOLS:
+            # Window capture is read-only and runs outside the coordinator lock.
+            return self.screen().call(name, args, task_id=task['id'], run_id=run['id'], role=task.get('role', ''))
         if name in BROWSER_TOOLS:
             # Slow browser work runs outside the coordinator lock.
             return self.browser.call(name, args)
@@ -283,7 +346,15 @@ class Bridge:
     def operator_call(self, app, name, args):
         import re, urllib.request, urllib.error
         from .harness_account import selected_account
+        if name in SCREEN_OPERATOR_NAMES: return self.screen().call(name[3:], args, role='operator')
         if name in DEV_NAMES: return dev_call(name, args)
+        if name=='nt_local_mcp':
+            return self.local_refresh(str(args.get('server') or '') or None, bool(args.get('refresh')), schemas=bool(args.get('server')))
+        if name=='nt_local_mcp_call':
+            server=LOCAL_BY_KEY.get(str(args.get('server','')))
+            if server is None: raise ValueError('Unknown local MCP server; use nt_local_mcp')
+            if not local_enabled(self.store.settings(), server): raise ValueError('Switch on '+server['label']+' in MCP servers first')
+            return self.local_client(server['key']).call(str(args.get('name','')), args.get('arguments') or {})
         if name=='nt_api':
             path=str(args.get('path',''))
             if not path.startswith('/api/'): raise ValueError('path must start with /api/')
@@ -360,8 +431,12 @@ class Bridge:
                     value = [{'id':'NotionTool','tools':list(TOOLS),'full_pc_access':self.full_access()}]
                     if self.browser_access():
                         value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
-                    if self.store.settings().get('rea_enabled', False):
-                        value.append({'id':'REA','tools':list(REA_TOOLS)})
+                    if self.screen_access():
+                        value.append({'id':'Screen','tools':list(SCREEN_TOOLS)})
+                    settings = self.store.settings()
+                    for server in LOCAL_SERVERS:
+                        if local_enabled(settings, server):
+                            value.append({'id':server['label'],'tools':list(tool_specs(server))})
                 elif name=='mcp_list_tools':
                     value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
                              if not args.get('tool_name') or n==args['tool_name']]
@@ -369,7 +444,10 @@ class Bridge:
                     value = self.call(args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token',''))
                 else:
                     raise ValueError('Unknown MCP tool')
+                image = value.pop('_image', None) if isinstance(value, dict) else None
                 result = {'content':[{'type':'text','text':json.dumps(value,ensure_ascii=False)}]}
+                if image:
+                    result['content'].append({'type':'image','data':image['data'],'mimeType':image['mimeType']})
             else:
                 return {'jsonrpc':'2.0','id':ident,'error':{'code':-32601,'message':'Method not found'}}
             return {'jsonrpc':'2.0','id':ident,'result':result}

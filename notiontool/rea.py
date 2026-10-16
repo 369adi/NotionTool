@@ -1,7 +1,7 @@
-"""Optional REA (Reverse Engineer Anything, npm rea-agents) stdio MCP.
+"""Generic local stdio MCP client (used for REA, Roblox Studio MCP, Blender MCP).
 
-Started only when enabled in Settings; runs locally through npx. The owned
-process speaks JSON-RPC over stdio; an unconfirmed call is never repeated.
+Started only when enabled in Settings. The owned process speaks JSON-RPC over
+stdio; an unconfirmed call is never repeated.
 """
 import json
 import os
@@ -20,8 +20,10 @@ def node_available():
 
 
 class Rea:
-    def __init__(self, launch=subprocess.Popen, timeout=180):
+    def __init__(self, launch=subprocess.Popen, timeout=180, command=None, label='REA', prefix='rea'):
         self.launch, self.timeout = launch, timeout
+        self.command = list(command) if command else COMMAND
+        self.label, self.prefix = label, prefix
         self.lock = threading.RLock()
         self.process = None
         self.messages = queue.Queue()
@@ -42,23 +44,24 @@ class Rea:
                 message = self.messages.get(timeout=max(0.01, deadline - time.monotonic()))
             except queue.Empty:
                 self.close()
-                raise RuntimeError('REA response is unconfirmed; the call was not repeated') from None
+                raise RuntimeError(self.label + ' response is unconfirmed; the call was not repeated') from None
             if message is None:
                 self.close()
-                raise RuntimeError('REA disconnected; the call was not repeated')
+                raise RuntimeError(self.label + ' disconnected; the call was not repeated')
             if message.get('id') == ident:
                 if 'error' in message:
-                    raise ValueError('REA rejected this request')
+                    detail = message['error'].get('message', '') if isinstance(message['error'], dict) else ''
+                    raise ValueError(self.label + ' rejected this request' + (': ' + str(detail)[:300] if detail else ''))
                 return message.get('result', {})
             if deadline <= time.monotonic():
                 self.close()
-                raise RuntimeError('REA response is unconfirmed; the call was not repeated')
+                raise RuntimeError(self.label + ' response is unconfirmed; the call was not repeated')
 
     def _ensure(self):
         if self.process is not None and self.process.poll() is None:
             return
         self.messages = queue.Queue()
-        self.process = self.launch(COMMAND, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.process = self.launch(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         process, messages = self.process, self.messages
@@ -74,7 +77,7 @@ class Rea:
                         messages.put(value)
             finally:
                 messages.put(None)
-        threading.Thread(target=read, daemon=True, name='rea-mcp').start()
+        threading.Thread(target=read, daemon=True, name=self.prefix + '-mcp').start()
         try:
             self._request('initialize', {'protocolVersion': '2024-11-05', 'capabilities': {},
                 'clientInfo': {'name': 'NotionTool', 'version': '0.3.0'}})
@@ -100,7 +103,7 @@ class Rea:
         with self.lock:
             self._ensure()
             if name not in self.schemas:
-                raise ValueError('Unknown REA tool; use rea_tools first')
+                raise ValueError('Unknown ' + self.label + ' tool; use ' + self.prefix + '_tools first')
             return self._request('tools/call', {'name': name, 'arguments': arguments})
 
     def close(self):

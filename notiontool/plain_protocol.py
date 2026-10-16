@@ -120,12 +120,24 @@ Use T1, T2, etc.; list dependencies or none, and relative files separated by sem
 One line per task, no vertical bars inside a cell.'''
 
 
+# Visual work (desktop apps, UI, renders) needs the screen tools even without a project folder.
+VISUAL=re.compile(r'\b(roblox|blender|screens?|screenshots?|capture|viewport|gui|ui|layout|render(ing)?|visual(ly)?|bildschirm|fenster|aussehen)\b',re.I)
+SCREEN_HINT=(' For visual work in desktop apps such as Roblox Studio or Blender, call the screen_capture tool through mcp_call'
+             ' (target "roblox" or "blender") as often as needed to see the current state before and after changes.')
+
+
+def visual(task,run):
+    text=' '.join(str(value or '') for value in (run.get('goal'),task.get('title'),task.get('prompt'),task.get('acceptance')))
+    return bool(VISUAL.search(text))
+
+
 def prompt(task,run,context,token,tools_available):
     goal=run['goal']
     reference=('\nFor reference, the work already completed:\n'+context+'\n') if context.strip() else ''
     memory=('\nFor reference, our completed earlier work:\n'+run['context']+'\n') if run.get('context','').strip() else ''
     project=('\nThe project folder is '+run['project_path']+'.\n') if run.get('project_path') else ''
-    tools=('\nThe connected NotionTool project tools require assignment_token '+token+' for this request.\n') if tools_available and (run.get('project_path') or task.get('files')) else ''
+    screen=bool(tools_available) and visual(task,run)
+    tools=('\nThe connected NotionTool project tools require assignment_token '+token+' for this request.'+(SCREEN_HINT if screen else '')+'\n') if tools_available and (run.get('project_path') or task.get('files') or screen) else ''
     if run.get('allocation',{}).get('mode')=='direct':
         return goal+memory+'\nReply naturally in my language.'
     if task['role'] in ('architect','researcher','quality_planner'):

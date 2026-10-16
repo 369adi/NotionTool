@@ -158,6 +158,11 @@ class Application:
                             page = app.store.message_page(ident, query.get('limit',['100'])[0])
                             return self.response(200,dict(page,
                                 tasks=[app.safe_task(t) for t in app.store.all('tasks') if app.store.get('runs',t['run_id'],{}).get('chat_id')==ident][-200:]))
+                        if method=='GET' and path=='/api/metrics':
+                            from .telemetry import task_metrics
+                            return self.response(200,{'tasks':task_metrics(app.store,query.get('run_id',[''])[0] or None)})
+                        if method=='GET' and path=='/api/coordination':
+                            return self.response(200,app.engine.coordination())
                         if method=='GET' and path=='/api/report':
                             task = app.store.get('tasks',query.get('id',[''])[0])
                             return self.response(200,{'task':app.safe_task(task),'result':task['result'],'partial':task.get('raw_response') or task.get('partial','')})
@@ -227,9 +232,13 @@ class Application:
         settings = self.store.settings()
         now = time.time()
         cooling = [a for a in self.store.all('accounts') if a.get('cooldown_until', 0) > now]
+        coordination = self.engine.coordination()
+        pause = coordination.get('pause') or {}
+        paused = ('Remote calls paused: Notion account blocked (' + str(pause.get('reason') or 'sign-in required')
+                  + '). Sign in again, then use Retry on the blocked run to resume.') if coordination.get('paused') else ''
         return dict(confirmed='No published concurrency or message limit exists for internal Notion AI chats.',
             observed=(f'Rate limited: cooldown until {time.strftime("%H:%M:%S", time.localtime(max(a["cooldown_until"] for a in cooling)))} (temporary, not a chat limit)'
-                      if cooling else 'No active rate limit observed.'),
+                      if cooling else 'No active rate limit observed.') if not paused else paused,
             configured=f"Local limits: max {settings.get('max_workers')} parallel chats, {settings.get('per_account')} per account (local setting, not a Notion guarantee).")
 
     def health(self):
@@ -308,9 +317,7 @@ class Application:
         return None
 
     def close(self):
-        rea = getattr(self.bridge, '_rea', None)
-        if rea is not None:
-            rea.close()
+        self.bridge.close_local()
         if self.bridge._browser is not None:
             self.bridge._browser.close()
         self.account_pages.close()
@@ -365,8 +372,16 @@ class Application:
                         if fresh and fresh['thread_id'] == worker['thread_id']:
                             fresh.update(context_usage=usage, context_checked=time.time())
                             self.store.put('workers', fresh)
-            except Exception:
-                self.store.event('context_scan_waiting', message='Native context scan deferred; check the selected account and Edge tab')
+                if getattr(self, 'context_scan_blocked', False):
+                    self.context_scan_blocked = False
+                    self.store.event('context_scan_resumed', message='Native context scan works again')
+            except Exception as exc:
+                # Record the waiting state once per change instead of on every pass.
+                if not getattr(self, 'context_scan_blocked', False):
+                    self.context_scan_blocked = True
+                    from .telemetry import classify
+                    self.store.event('context_scan_waiting', error=type(exc).__name__, error_class=classify(exc),
+                                     message='Native context scan deferred; check the selected account and Edge tab')
 
     def snapshot(self):
         from .harness_account import selected_account, main_chat
@@ -520,6 +535,8 @@ class Application:
             if path=='/api/run/pause':
                 self.engine.pause(body['id'],bool(body.get('paused',True)))
                 return {'ok':True}
+            if path=='/api/coordination/resume':
+                return self.engine.resume_remote()
             if path=='/api/run/retry':
                 self.engine.retry_blocked(body['id'])
                 return {'ok':True}
@@ -571,7 +588,8 @@ class Application:
                 for key in ('public_mcp_url','theme'):
                     if key in body:
                         settings[key] = str(body[key])[:1000]
-                for key in ('harness_enabled', 'mcp_full_access', 'mcp_browser_access', 'rea_enabled'):
+                from .local_mcp import SERVERS as LOCAL_SERVERS, SETTINGS as LOCAL_SETTINGS
+                for key in ('harness_enabled', 'mcp_full_access', 'mcp_browser_access') + LOCAL_SETTINGS:
                     if key in body:
                         settings[key] = str(body[key]).lower() in ('true', '1', 'on', 'yes')
                 if 'browser_path' in body:
@@ -581,8 +599,12 @@ class Application:
                         raise ValueError('Choose Edge or native API transport')
                     settings['notion_transport'] = body['notion_transport']
                 self.store.put('settings',settings)
+                off = [s['key'] for s in LOCAL_SERVERS if not settings.get(s['setting'])]
+                threading.Thread(target=self.bridge.close_local, args=(off,), daemon=True, name='local-mcp-close').start()
                 return {'ok':True}
         # Slow network calls run outside the coordinator lock.
+        if path=='/api/mcp/refresh':
+            return {'ok':True,'servers':[{k:v for k,v in e.items() if k!='tools'} for e in self.bridge.local_refresh()]}
         account_id = body.get('account_id','')
         if path=='/api/account/select':
             from .harness_account import select_account

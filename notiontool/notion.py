@@ -15,8 +15,9 @@ import hashlib
 from .engine import PendingRemote, RateLimited, ResetNotAccepted
 from .vendor.sessions import SessionStore
 from .vendor.transport import NativeNotionTransport, NotionHttpError
-from .network_budget import NetworkBudget
+from .network_budget import NetworkBudget, request_priority
 from .model_verification import verify_execution,ModelVerificationError,turn_status
+from .telemetry import http_class
 
 
 def unwrap(value):
@@ -89,6 +90,25 @@ def not_accepted(task, transcript, fresh, grace=30):
     return any(e.get('kind') == 'assistant_message' and stamp(e) > sent for e in fresh)
 
 
+MODEL_CATALOG_TTL = 600  # seconds; a cached model catalog is read again after this or on a miss
+
+
+def own_turn_steps(records, ids, step_id, chunk=20):
+    # Read thread messages newest first until our own user step is loaded. Only the
+    # own turn is checked, so older history is skipped; without a match all is read.
+    steps, start, read = [], len(ids), 0
+    while start > 0:
+        part = ids[max(0, start - chunk):start]
+        messages = records('thread_message', part)
+        steps = [dict((messages[ident] or {}).get('step', {})) for ident in part if ident in messages] + steps
+        read += len(part)
+        start -= len(part)
+        if step_id and any(s.get('type') == 'user' and s.get('id') == step_id for s in steps):
+            break
+        chunk = min(chunk * 5, 100)
+    return steps, read
+
+
 class VerifiedReply(str):
     """Own committed turn; proof flags cannot be supplied by model JSON."""
     def __new__(cls,text,tool_activity):
@@ -142,9 +162,25 @@ class NotionClient:
     def model(self, selected='opus'):
         from .model_routing import MODELS, choice
         label = MODELS[choice(selected)]
-        models = self.call('getAvailableModels',{'spaceId':self.info['space_id'],'surface':'workspace_model_settings'}).get('models',[])
-        model = next((m for m in models if m.get('modelProvider')=='anthropic' and not m.get('isDisabled')
-                      and re.sub(r'\s+',' ',m.get('modelMessage','')).strip().lower()==label.lower()), None)
+        def pick(models):
+            return next((m for m in models if m.get('modelProvider')=='anthropic' and not m.get('isDisabled')
+                         and re.sub(r'\s+',' ',m.get('modelMessage','')).strip().lower()==label.lower()), None)
+        # The catalog is cached per workspace on the long-lived transport of the account.
+        space = self.info['space_id']
+        cache = getattr(self.transport, 'model_catalog', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            try:
+                self.transport.model_catalog = cache
+            except AttributeError:
+                pass
+        entry = cache.get(space)
+        model = pick(entry[1]) if entry and time.monotonic() - entry[0] < MODEL_CATALOG_TTL else None
+        if not model or not model.get('model'):
+            # Missing, expired or label not in the cached list: read the catalog once.
+            models = self.call('getAvailableModels',{'spaceId':space,'surface':'workspace_model_settings'}).get('models',[])
+            cache[space] = (time.monotonic(), models)
+            model = pick(models)
         if not model or not model.get('model'):
             raise ValueError(label+' is not available for this account. No model substitution was made.')
         return model['model']
@@ -174,6 +210,7 @@ class NotionAdapter:
         self.template = json.loads((Path(__file__).parent / 'template.json').read_text(encoding='utf-8'))
         self.welcome = json.loads((Path(__file__).parent / 'welcome.json').read_text(encoding='utf-8'))
         self.network_budget = NetworkBudget(store)
+        self.confirmed_configs = {}  # thread_id -> (thread_id, generation, model) after a confirmed config check
 
     def client(self, account_id, anonymous=False):
         with self.lock:
@@ -206,8 +243,6 @@ class NotionAdapter:
             existing = next((a for a in self.store.all('accounts') if a['email']==email),None)
             if existing:
                 return existing
-            if self.store.all('accounts'):
-                raise ValueError('NotionTool uses one account slot. Select an existing harness account.')
             used = {int(a['slot']) for a in self.store.all('accounts')}
             slot = slot or next(n for n in range(1,1001) if n not in used)
             account = dict(id=uuid.uuid4().hex,slot=slot,email=email,label=f'Slot {slot}',
@@ -332,8 +367,7 @@ class NotionAdapter:
         info=NotionClient(NativeNotionTransport(session)).identity()
         email=info['email'].lower()
         existing=next((a for a in self.store.all('accounts') if a['email'].lower()==email),None)
-        if not existing and self.store.all('accounts'):
-            raise ValueError('Another account is connected. Remove it first; NotionTool uses one account.')
+        had_accounts=bool(self.store.all('accounts'))
         account=existing or self.create_account(email)
         self.sessions.save(account['id'],session)
         self.transports.pop(account['id'],None)
@@ -344,8 +378,9 @@ class NotionAdapter:
         except Exception as exc:
             account=self.store.get('accounts',account['id']);account['error']=str(exc)[:200];self.store.put('accounts',account)
         from .harness_account import select_account
-        try:select_account(self.store,account['id'])
-        except Exception:pass
+        if not had_accounts or existing:
+            try:select_account(self.store,account['id'])
+            except Exception:pass
         return {'account_id':account['id'],'email':email,'state':self.store.get('accounts',account['id']).get('state')}
 
     def remove_account(self, account_id):
@@ -372,12 +407,14 @@ class NotionAdapter:
                 settings['harness_account_id']='';self.store.put('settings',settings)
         return {'removed':account_id,'email':account['email']}
 
-    def body(self, client, thread_id, step_id, prompt, model, create=False):
+    def body(self, client, thread_id, step_id, prompt, model, create=False, computer=False):
         body = copy.deepcopy(self.template)
         info = client.info
         config = body['transcript'][0]
         config['id'] = self.new_id(info['space_id'],'00aa')
-        config['value'].update(model=model,modelFromUser=True,enableComputer=False,
+        # Notion AI reaches MCP connections (NotionTool, Screen, Roblox, Blender) only with the
+        # tool environment enabled; plain text turns stay without it to keep latency low.
+        config['value'].update(model=model,modelFromUser=True,enableComputer=bool(computer),
                               agentMemorySettings={'useMemories':True,'excludeChatFromMemories':True})
         # Only the real Welcome chat creation (welcome_body) may start onboarding.
         config['value'].pop('agentMessageKey', None)
@@ -605,7 +642,11 @@ class NotionAdapter:
             prompt = worker['handoff'] + note + '\n\nCurrent assignment (continue from the checkpoint):\n' + prompt
         selected = 'opus' if worker.get('purpose') == 'main' else task.get('model', 'opus')
         model = client.model(selected)
-        self.ensure_thread_model(client, worker['thread_id'], model)
+        # The saved chat config changes only through our own confirmed write: check once per chat generation.
+        config_key = (worker['thread_id'], worker.get('generation', 0), model)
+        if getattr(self, 'confirmed_configs', {}).get(worker['thread_id']) != config_key:
+            self.ensure_thread_model(client, worker['thread_id'], model)
+            self.__dict__.setdefault('confirmed_configs', {})[worker['thread_id']] = config_key
         with self.store.lock:
             saved = self.store.get('tasks',task['id'])
             saved['before_seq'] = session.get('sequence',0)
@@ -621,7 +662,8 @@ class NotionAdapter:
             task = saved
         if cancel.is_set():
             raise ValueError('Assignment cancelled before submission')
-        body = self.body(client,worker['thread_id'],task['step_id'],prompt,model)
+        # The assignment token is only offered when tools are needed (project, files, visual work).
+        body = self.body(client,worker['thread_id'],task['step_id'],prompt,model,computer='assignment_token' in prompt)
         if worker.get('context_reset'):
             body['isPartialTranscript'] = False  # replace the context inside the same chat
             with self.store.lock:
@@ -631,33 +673,63 @@ class NotionAdapter:
                 task = saved
         steps = []
         started,last_update = time.monotonic(),0
+        trace = dict(task_id=task['id'], worker_id=worker.get('id', ''), attempt=task.get('attempts', 0))
+        run_id = task.get('run_id', '')
+        self.store.event('remote_sent', run_id, prompt_chars=len(prompt), **trace)
+        seen_output, lines, reported = False, 0, []
+        def remote_done(outcome, error_class=''):
+            if not reported:
+                reported.append(outcome)
+                self.store.event('remote_done', run_id, outcome=outcome, error_class=error_class, lines=lines,
+                                 seconds=round(time.monotonic()-started, 3), **trace)
         try:
             for line in client.transport.stream('runInferenceTranscript',body,client.headers(),timeout=60,cancel=cancel):
                 if cancel.is_set() or time.monotonic()-started>self.store.settings()['task_timeout']:
                     raise PendingRemote()
                 event = json.loads(line)
+                lines += 1
                 if event.get('type') in ('patch-start','patch-sync'):
                     steps = (event.get('data') or {}).get('s') or steps
                 elif event.get('type')=='patch':
                     steps = apply_patch(steps,event.get('v'))
+                if not seen_output and stream_text(steps).strip():
+                    seen_output = True
+                    self.mark_task(task['id'], first_output_at=time.time())
+                    self.store.event('first_output', run_id, seconds=round(time.monotonic()-started, 3), **trace)
                 if time.monotonic()-last_update>0.6:
                     update(stream_text(steps))
                     last_update = time.monotonic()
             errors = [s for s in steps if isinstance(s,dict) and s.get('type')=='error']
             text = stream_text(steps)
+            self.mark_task(task['id'], remote_done_at=time.time())
+            remote_done('stream_end')
             # Streaming steps can contain stale text or provider placeholders.
             # Only the committed answer to our own turn can finish an assignment.
             return self.recover(worker,task,cancel)
         except NotionHttpError as exc:
+            remote_done('http_'+str(exc.status), http_class(exc.status))
             if exc.status==429:
                 raise RateLimited(exc.retry_after) from None
             raise ValueError(f'Notion inference: HTTP {exc.status}') from None
         except (OSError,TimeoutError,json.JSONDecodeError):
+            remote_done('unknown', 'REMOTE_UNKNOWN')
             raise PendingRemote() from None
+        except PendingRemote:
+            remote_done('unconfirmed', 'REMOTE_UNKNOWN')
+            raise
+
+    def mark_task(self, task_id, **fields):
+        # Persist telemetry timestamps on the task without touching its state.
+        with self.store.lock:
+            saved = self.store.get('tasks', task_id)
+            if saved:
+                saved.update(fields)
+                self.store.put('tasks', saved)
 
     def recover(self, worker, task, cancel):
         try:
-            transcript = self.client(worker['account_id']).transcript(task.get('thread_id') or worker['thread_id'])
+            with request_priority('verify'):
+                transcript = self.client(worker['account_id']).transcript(task.get('thread_id') or worker['thread_id'])
         except Exception:
             raise PendingRemote() from None
         from .chat_context import ChatContext
@@ -684,7 +756,8 @@ class NotionAdapter:
         text = '\n'.join(text_content(e.get('content',[])) for e in sorted(own_turn,key=lambda e:e.get('sequence',0))
                          if e.get('kind')=='assistant_message')
         if completed and text:
-            self.verify_response_model(worker,task)
+            with request_priority('verify'):
+                self.verify_response_model(worker,task)
             if (task.get('handoff_included') or task.get('context_reset')) and worker.get('id'):
                 with self.store.lock:
                     fresh_worker = self.store.get('workers', worker['id'])
@@ -710,7 +783,10 @@ class NotionAdapter:
         saved.update(model_verification='turn_error', reported_model_ids=[], remote_error=sub_type)
         self.store.put('tasks', saved)
         self.store.event('remote_turn_failed', task.get('run_id', ''), task_id=task['id'],
-                         trace_id=error.get('traceId', ''), sub_type=sub_type, message=message)
+                         trace_id=error.get('traceId', ''), sub_type=sub_type, error_class='TRANSIENT', message=message)
+        budget = getattr(self, 'network_budget', None)
+        if isinstance(budget, NetworkBudget):
+            budget.turn_failed(source='inference', sub_type=sub_type)
         raise RateLimited(20, message, confirmed=True)
 
     def confirm_turn_error(self, worker, task):
@@ -723,11 +799,7 @@ class NotionAdapter:
             return {ident: unwrap(value) for ident, value in result.get('recordMap', {}).get(table, {}).items()}
         try:
             thread = records('thread', [thread_id]).get(thread_id) or {}
-            ids = thread.get('messages', [])
-            messages = {}
-            for start in range(0, len(ids), 100):
-                messages.update(records('thread_message', ids[start:start + 100]))
-            steps = [dict((messages[ident] or {}).get('step', {})) for ident in ids if ident in messages]
+            steps, _ = own_turn_steps(records, thread.get('messages', []), task.get('step_id'))
             state, error = turn_status(steps, task.get('step_id'), list(((thread.get('data') or {}).get('turn_outcomes') or {}).values()))
         except Exception:
             return
@@ -749,6 +821,26 @@ class NotionAdapter:
         return latest > done and time.time() * 1000 - latest < self.store.settings()['task_timeout'] * 1000
 
     def verify_response_model(self,worker,task):
+        # Check the committed own turn, framed by verify_started / verify_done events.
+        trace=dict(task_id=task['id'],worker_id=worker.get('id',''),attempt=task.get('attempts',0))
+        began=time.monotonic();outcome='error'
+        self.store.event('verify_started',task.get('run_id',''),**trace)
+        try:
+            result=self.check_response_model(worker,task)
+            outcome=(self.store.get('tasks',task['id']) or {}).get('model_verification') or 'verified'
+            return result
+        except PendingRemote:
+            outcome='pending';raise
+        except RateLimited:
+            outcome='turn_error';raise
+        except ModelVerificationError:
+            outcome='unverified';raise
+        finally:
+            read=(self.store.get('tasks',task['id']) or {}).get('verify_messages_read',0)
+            self.store.event('verify_done',task.get('run_id',''),outcome=outcome,seconds=round(time.monotonic()-began,3),
+                             messages_read=read,**trace)
+
+    def check_response_model(self,worker,task):
         client=self.client(worker['account_id'])
         def records(table,ids):
             result=client.call('syncRecordValuesSpaceInitial',{'requests':[
@@ -759,10 +851,8 @@ class NotionAdapter:
             thread=records('thread',[worker['thread_id']]).get(worker['thread_id'],{})
             if thread.get('space_id')!=client.info['space_id'] or thread.get('alive') is False:
                 raise ModelVerificationError(task.get('assigned_model_id'),[],'missing')
-            ids=thread.get('messages',[])
-            messages={}
-            for start in range(0,len(ids),100):messages.update(records('thread_message',ids[start:start+100]))
-            steps=[dict(messages[ident].get('step',{})) for ident in ids if ident in messages]
+            steps,read=own_turn_steps(records,thread.get('messages',[]),task.get('step_id'))
+            self.mark_task(task['id'],verify_messages_read=read)
             reported=verify_execution(steps,task.get('step_id'),task.get('assigned_model_id'))
         except ModelVerificationError as exc:
             saved=self.store.get('tasks',task['id'],dict(task))

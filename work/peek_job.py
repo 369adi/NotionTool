@@ -4,7 +4,7 @@ import sqlite3
 import sys
 import time
 
-DB = 'file:' + __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))), 'data', 'notiontool.db') + '?mode=ro'
+DB = r'file:C:\Users\liket\Downloads\NotionTool-harness\NotionTool\data\notiontool.db?mode=ro'
 TIME_KEYS = {'created', 'updated', 'started', 'finished', 'ts', 'at'}
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')

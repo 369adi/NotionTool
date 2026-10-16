@@ -21,6 +21,7 @@ The public Notion Integrations API is NOT used.
 | `/api/request?id=<request_id>` | idempotency lookup: what happened to a client request (use after reconnect) |
 | `/api/operations` / `/api/operation?id=<op>` | durable operations (create_main) with step log |
 | `/api/stream?since=<seq>` | Server-Sent Events: `event: probe`, state/status/answer deltas; reconnect with the last seq |
+| `/api/metrics?run_id=<run>` | per-task metrics from the event chain: total, queue/ready wait, time to first output, remote, after stream, verify messages read, errors, fallbacks, attempt log (see docs/TELEMETRY.md) |
 
 ## Write routes (POST, JSON)
 | Route | Body | Notes |

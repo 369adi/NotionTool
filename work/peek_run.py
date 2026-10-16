@@ -8,7 +8,7 @@ import sqlite3
 import sys
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-DB = __import__('os').path.join(__import__('os').path.dirname(__import__('os').path.dirname(__import__('os').path.abspath(__file__))), 'data', 'notiontool.db')
+DB = r'C:\Users\liket\Downloads\NotionTool-harness\NotionTool\data\notiontool.db'
 db = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
 TITLE = 'Maintain Tailscale MCP and account connections'
 

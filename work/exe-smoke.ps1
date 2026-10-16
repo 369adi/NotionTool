@@ -3,7 +3,7 @@
 # Stops only dist\NotionTool.exe, its descendants and the harness Edge profile; other NotionTool.exe installs stay untouched.
 param([int]$LiveSeconds = 150)
 $ErrorActionPreference = 'Continue'
-$root = (Split-Path -Parent $PSScriptRoot)
+$root = 'C:\Users\liket\Downloads\NotionTool-harness\NotionTool'
 $exe = "$root\dist\NotionTool.exe"
 $log = "$root\work\exe-smoke.log"
 function L([string]$m) { Add-Content -Path $log -Value ('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $m) }

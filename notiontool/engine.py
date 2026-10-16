@@ -14,6 +14,7 @@ from . import plain_protocol
 from .allocation import allocation, parallel_width, validate_allocation
 from .model_routing import validate_models
 from .model_verification import ModelVerificationError
+from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, run_with_priority
 
 ACTIVE = {'approach', 'planning', 'executing', 'reviewing', 'fixing', 'integrating'}
 TERMINAL = {'done', 'failed', 'blocked', 'cancelled'}
@@ -110,7 +111,8 @@ class Engine:
                     state='queued', attempts=0, created=time.time(), next_at=0, result='', error='',
                     worker_id='', lease='', step_id='', started=0, finished=0, specialty=specialty,
                     model=model, model_reason=model_reason, use_main=use_main)
-        self.store.put('tasks', task)
+        self.store.event('task_queued', run['id'], commit=False, task_id=task['id'], role=role, message=task['title'])
+        self.store.put('tasks', task)  # also commits task_queued
         return task
 
     @staticmethod
@@ -236,6 +238,43 @@ class Engine:
                 run['state'] = run.pop('resume_state', 'executing')
             self.store.put('runs', run)
 
+    def _budget(self):
+        # The process-wide request coordinator, when the adapter has one (Phase 3).
+        budget = getattr(self.adapter, 'network_budget', None)
+        return budget if isinstance(budget, NetworkBudget) else None
+
+    def _parallel_cap(self, configured):
+        budget = self._budget()
+        return budget.parallel_limit(configured) if budget is not None else configured
+
+    def coordination(self):
+        budget = self._budget()
+        return budget.status() if budget is not None else dict(paused=False)
+
+    def resume_remote(self):
+        # Manual resume after ACCOUNT_BLOCKED: lift the pause and requeue only the tasks it stopped.
+        with self.lock:
+            budget = self._budget()
+            resumed = budget.resume() if budget is not None else False
+            requeued, runs = 0, set()
+            for task in self.store.all('tasks'):
+                if task.get('paused_by') and task['state'] == 'blocked' and not task.get('remote_unknown'):
+                    task.pop('paused_by', None)
+                    task.update(state='queued', error='', next_at=0)
+                    self.store.put('tasks', task)
+                    requeued += 1
+                    runs.add(task['run_id'])
+            resumed_runs = 0
+            for run_id in runs:
+                run = self.store.get('runs', run_id)
+                if run and run['state'] == 'blocked' and not any(
+                        t['state'] in ('failed', 'blocked') or t.get('remote_unknown') for t in self.tasks(run_id)):
+                    run.update(state=run.get('blocked_stage', 'executing'), error='')
+                    self.store.put('runs', run)
+                    self.store.event('stage_changed', run['id'], message=run['state'])
+                    resumed_runs += 1
+            return dict(resumed=resumed, requeued_tasks=requeued, resumed_runs=resumed_runs)
+
     def retry_blocked(self, run_id):
         with self.lock:
             run = self.store.get('runs', run_id)
@@ -243,11 +282,15 @@ class Engine:
                 raise ValueError('Only a blocked or failed run can be resumed')
             if any(t['state'] == 'uncertain' or t.get('remote_unknown') for t in self.tasks(run_id)):
                 raise ValueError('Wait for reconciliation before retrying')
+            budget = self._budget()
+            if budget is not None:
+                budget.resume()  # Retry on a blocked run doubles as the manual resume after ACCOUNT_BLOCKED.
             run['state'] = run.get('blocked_stage', 'executing')
             run['error'] = ''
             for task in self.tasks(run_id):
                 if task['state'] in ('blocked', 'failed'):
                     task.update(state='queued', attempts=0, error='', next_at=0)
+                    task.pop('paused_by', None)
                     self.store.put('tasks', task)
             self.store.put('runs', run)
 
@@ -350,11 +393,18 @@ class Engine:
                             continue
                         if any(d['state'] != 'done' for d in deps) or self._conflicts(task, run):
                             continue
+                        first_ready = not task.get('ready_at')
+                        if first_ready:
+                            # Committed with the next task write, so the dispatch path gets no extra disk sync.
+                            task['ready_at'] = time.time()
+                            self.store.event('task_ready', run['id'], commit=False, task_id=task['id'], deps=len(task['deps']))
                         worker = self._choose_worker(task, run, settings)
                         if worker:
                             self._dispatch(task, run, worker)
                             assigned = True
                             break
+                        if first_ready:
+                            self.store.put('tasks', task)
                 if not assigned:
                     break
 
@@ -384,7 +434,7 @@ class Engine:
                 counts[worker['account_id']] = counts.get(worker['account_id'], 0) + 1
         accounts = {a['id']:a for a in self.store.all('accounts')}
         choices = [w for w in choices if accounts.get(w['account_id'], {}).get('state')=='ready'
-                   and counts.get(w['account_id'], 0) - int(w['id'] in checkpoint_workers) < settings['per_account']
+                   and counts.get(w['account_id'], 0) - int(w['id'] in checkpoint_workers) < self._parallel_cap(settings['per_account'])
                    and accounts.get(w['account_id'], {}).get('cooldown_until', 0) <= time.time()]
         if task['role'] == 'reviewer':
             executors = {t.get('worker_id') for t in self.tasks(run['id']) if t['role']=='executor'}
@@ -398,7 +448,7 @@ class Engine:
                     and accounts.get(main['account_id'],{}).get('state')=='ready'
                     and main.get('cooldown_until',0)<=time.time()
                     and accounts.get(main['account_id'],{}).get('cooldown_until',0)<=time.time()
-                    and counts.get(main['account_id'],0)-int(main['id'] in checkpoint_workers)<settings['per_account']):
+                    and counts.get(main['account_id'],0)-int(main['id'] in checkpoint_workers)<self._parallel_cap(settings['per_account'])):
                     choices=[main]  # The planner did not execute any of the parts.
         choices = [w for w in choices if not pending_rotations.get(w['id'], {}).get('task_id') or
                    pending_rotations[w['id']]['task_id'] == task['id'] or
@@ -415,10 +465,14 @@ class Engine:
         task.update(state='running', worker_id=worker['id'], lease=secrets.token_urlsafe(32),
                     step_id=uid(), started=time.time(), attempts=task['attempts']+1, error='', partial='',
                     thread_id=worker['thread_id'], submission_phase='preparing')
+        # Every attempt keeps its own timing record for the metrics.
+        task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
+            dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
         self.store.put('tasks', task)  # Commit the submission marker BEFORE the API can accept it.
         worker.update(state='busy', lease=task['lease'], last_used=time.time(),
                       prev_task_id=worker.get('last_task_id', ''), last_task_id=task['id'])
-        self.store.put('workers', worker)
+        self.store.event('lease_acquired', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'], attempt=task['attempts'])
+        self.store.put('workers', worker)  # also commits lease_acquired
         context_tasks = [self.store.get('tasks', dep) for dep in task['deps']]
         completed = [t for t in self.tasks(run['id']) if t['state']=='done']
         if task['role']=='planner':
@@ -433,8 +487,11 @@ class Engine:
         account = self.store.get('accounts', worker['account_id'], {})
         make_prompt=plain_protocol.prompt if getattr(self.adapter,'response_mode','json')=='plain' else prompt_for
         prompt = make_prompt(task, run, context, task['lease'], bool(account.get('bridge_connected')))
+        # Committed together with task_started right after the submit.
+        self.store.event('context_built', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'], attempt=task['attempts'],
+                         context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt))
         cancel = threading.Event()
-        future = self.pool.submit(self.adapter.run, worker, task, prompt, cancel,
+        future = self.pool.submit(run_with_priority, 'critical', self.adapter.run, worker, task, prompt, cancel,
                                   lambda text: self._partial(task['id'], task['lease'], text))
         self.inflight[future] = dict(task_id=task['id'], lease=task['lease'], worker_id=worker['id'],
                                     run_id=run['id'], cancel=cancel, recovery=False)
@@ -479,6 +536,7 @@ class Engine:
             return  # An old report must not complete a newer attempt.
         run = self.store.get('runs', task['run_id'])
         text=''
+        failure=None
         try:
             text = future.result()
             task.pop('remote_unknown',None)
@@ -511,6 +569,7 @@ class Engine:
             task['finished'] = time.time()
             self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'])
         except ModelVerificationError as exc:
+            failure=exc
             self._release(info['worker_id'],info['lease'])
             task.update(state='blocked',error=str(exc),finished=time.time(),
                         model_verification='unverified' if exc.reason=='missing' else 'mismatch',reported_model_ids=exc.reported)
@@ -518,6 +577,7 @@ class Engine:
             self.store.event('model_verification_failed',task['run_id'],task_id=task['id'],
                              expected_model_id=exc.expected,reported_model_ids=exc.reported,message=str(exc))
         except RateLimited as exc:
+            failure=exc
             self._release(info['worker_id'], info['lease'])
             account = self.store.get('accounts', self.store.get('workers', info['worker_id'])['account_id'])
             account['cooldown_until'] = time.time() + exc.seconds
@@ -533,15 +593,18 @@ class Engine:
                                'retry' if exc.free or task['attempts']<self.store.settings()['max_attempts'] else 'blocked'),
                         next_at=time.time()+exc.seconds, error=exc.message or 'Notion rate limit; account cooldown applied')
         except TransientInference as exc:
+            failure=exc
             self._release(info['worker_id'],info['lease'])
             task.update(state='retry' if task['attempts']<self.store.settings()['max_attempts'] else 'blocked',
-                        next_at=time.time()+2**task['attempts'],error=str(exc)[:300])
-        except ContextCheckpointPending:
+                        next_at=time.time()+backoff(task['attempts'], base=1, cap=60),error=str(exc)[:300])
+        except ContextCheckpointPending as exc:
+            failure=exc
             self._release(info['worker_id'], info['lease'])
             task.update(state='cancelled' if run['state']=='cancelled' else 'retry',
                         attempts=max(0, task['attempts']-1), next_at=time.time()+10,
                         error='Waiting for a verified context checkpoint; assignment has not been submitted')
-        except ResetNotAccepted:
+        except ResetNotAccepted as exc:
+            failure=exc
             # Verified: Notion finished without committing the reset step. Continue once as a
             # normal message in the same chat; the checkpoint stays in front of the assignment.
             self._release(info['worker_id'], info['lease'])
@@ -560,7 +623,30 @@ class Engine:
             self.store.event('context_reset_fallback', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
                              message='Context replacement not accepted; continuing in the same Welcome chat with the checkpoint')
             info['verified_fallback'] = True
-        except PendingRemote:
+        except (CircuitOpen, RemotePaused) as exc:
+            failure=exc
+            if task.get('submission_phase') == 'inference':
+                # Phase 3 / I5: the inference may already have left; never resend, reconcile instead.
+                overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
+                checks=task.get('reconcile_checks',0)+1
+                task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue, reconcile_checks=checks,
+                            reconcile_at=time.time()+(300 if overdue else max(min(60,5*2**min(checks-1,4)), getattr(exc,'seconds',0))),
+                            error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                worker = self.store.get('workers', info['worker_id'])
+                worker['state'] = 'recovering'
+                self.store.put('workers', worker)
+            elif isinstance(exc, CircuitOpen):
+                # Refused locally before anything was sent: no attempt used, nothing to reconcile.
+                self._release(info['worker_id'], info['lease'])
+                task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry',
+                            attempts=max(0, task['attempts']-1), next_at=time.time()+exc.seconds, error=str(exc)[:300])
+            else:
+                # ACCOUNT_BLOCKED pause: nothing was sent; the task waits for a manual resume.
+                self._release(info['worker_id'], info['lease'])
+                task.update(state='cancelled' if run['state'] == 'cancelled' else 'blocked',
+                            attempts=max(0, task['attempts']-1), paused_by='account_blocked', error=str(exc)[:400])
+        except PendingRemote as exc:
+            failure=exc
             overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
             checks=task.get('reconcile_checks',0)+1
             task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
@@ -569,13 +655,14 @@ class Engine:
             worker['state'] = 'recovering'
             self.store.put('workers', worker)
         except ContractError as exc:
+            failure=exc
             self._release(info['worker_id'], info['lease'])
             declined = plain_protocol.declined(task.get('raw_response',''))
             provider_failed=isinstance(exc,plain_protocol.ProviderReplyError)
             safe_provider_retry=(provider_failed and not task.get('files') and
                               getattr(text,'verified_terminal_reply',False) and not getattr(text,'tool_activity',True))
             task.update(state='retry' if not declined and (not provider_failed or safe_provider_retry) and task['attempts']<self.store.settings()['max_attempts'] else 'blocked',
-                        next_at=time.time()+(2**task['attempts'] if provider_failed else 2), error=str(exc))
+                        next_at=time.time()+(backoff(task['attempts'], base=1, cap=60) if provider_failed else 2), error=str(exc))
             if declined:
                 task['error'] = 'Notion declined the request; see the saved response. No automatic repetition.'
             elif provider_failed:
@@ -583,11 +670,34 @@ class Engine:
             else:
                 task['prompt'] += '\nPlease correct this problem in the response: '+str(exc)
         except Exception as exc:
+            failure=exc
             self._release(info['worker_id'], info['lease'], 'error')
             task.update(state='blocked', error=str(exc)[:400])
+        from .telemetry import classify
+        error_class = classify(failure) or ('TASK_FAILED' if task['state'] in ('failed', 'blocked') else '')
+        if error_class == 'ACCOUNT_BLOCKED' and task['state'] == 'blocked' and not task.get('remote_unknown'):
+            # Phase 3: an account block pauses every remote call (no probes) until a manual resume.
+            budget = self._budget()
+            blocked_worker = self.store.get('workers', info['worker_id']) or {}
+            if budget is not None:
+                budget.pause(str(failure)[:300], account_id=blocked_worker.get('account_id', ''),
+                             status=getattr(failure, 'status', 0) or 0)
+            task['paused_by'] = 'account_blocked'
+            if blocked_worker.get('state') == 'error' and not blocked_worker.get('lease'):
+                blocked_worker['state'] = 'ready'  # the account was blocked, not this chat thread
+                self.store.put('workers', blocked_worker)
+        log = task.get('attempt_log') or []
+        if log and (not log[-1].get('finished') or log[-1].get('state') == 'uncertain'):
+            # Close this attempt; remote timestamps count only when written during it.
+            entry, now = log[-1], time.time()
+            begun = entry.get('started') or now
+            stamp = lambda name: task.get(name) if (task.get(name) or 0) >= begun else 0
+            entry.update(finished=now, duration=round(now - begun, 3), state=task['state'], error_class=error_class,
+                         sent=stamp('sent_at'), first_output=stamp('first_output_at'), remote_done=stamp('remote_done_at'))
         self.store.put('tasks', task)
         self.store.event('task_attempt_finished',task['run_id'],task_id=task['id'],
-                         worker_id=info['worker_id'],attempt=task['attempts'],state=task['state'])
+                         worker_id=info['worker_id'],attempt=task['attempts'],state=task['state'],
+                         error_class=error_class,duration=log[-1].get('duration') if log else None)
         parked = self.store.get('runs', task['run_id'])
         if (parked and parked['state'] == 'blocked' and (task['state'] == 'done' or info.get('verified_fallback') or info.get('verified_retry'))
                 and not any(t['state'] in ('failed', 'blocked') or t.get('remote_unknown') for t in self.tasks(parked['id']))):

@@ -1,5 +1,5 @@
 # Local EXE build without push. Log: work\build.log; one line per build in work\build-history.log.
-param([string]$Python = 'python.exe')
+param([string]$Python = 'C:\Users\liket\AppData\Local\Programs\Python\Python312\python.exe')
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 $p = Start-Process cmd.exe -ArgumentList "/c `"$Python`" -m PyInstaller --noconfirm NotionTool.spec > work\build.log 2>&1" -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru

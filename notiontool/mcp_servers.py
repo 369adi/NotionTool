@@ -10,9 +10,8 @@ class McpServers:
         self.store=adapter.store
 
     def public(self):
-        return [{'id':'builtin_rea','name':'REA (Reverse Engineer Anything)','url':'Local stdio: npx rea-agents@6.5.0 mcp',
-                 'builtin':True,'installed':self._node(),'enabled':bool(self.store.settings().get('rea_enabled',False)),
-                 'toggle':'rea_enabled','read_auto':True,'write_auto':False}]+self.store.all('mcp_servers')
+        from .local_mcp import public as local_public
+        return local_public(self.store.settings())+self.store.all('mcp_servers')
 
     @staticmethod
     def _node():

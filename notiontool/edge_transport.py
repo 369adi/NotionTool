@@ -107,7 +107,7 @@ class EdgeTransport:
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', path):
             raise ValueError('Invalid Notion endpoint')
         target = self.prepare()
-        self.budget.acquire(cancel)
+        ticket = self.budget.acquire(cancel, source=path)
         key = uuid.uuid4().hex
         # Forbidden browser headers are supplied by Edge itself.
         headers = {k: v for k, v in (headers or {}).items()
@@ -139,11 +139,13 @@ class EdgeTransport:
         })'''
         args = json.dumps([key, path, body, headers, timeout], ensure_ascii=True)
         self.browser.evaluate(target, script + '(...' + args + ')')
-        return target, key
+        return target, key, ticket
 
     def _chunks(self, path, body, headers, timeout, cancel=None):
-        target, key = self._start(path, body, headers, timeout, cancel)
+        target, key, ticket = self._start(path, body, headers, timeout, cancel)
         deadline = time.monotonic() + timeout + 5
+        # Phase 3: every started request reports its outcome to the shared coordinator.
+        begun, status, latency, outcome = time.monotonic(), 0, None, 'neutral'
         try:
             while time.monotonic() < deadline:
                 if cancel is not None and cancel.is_set():
@@ -155,22 +157,34 @@ class EdgeTransport:
                           text:q.chunks.splice(0, 128).join(''), remaining:q.chunks.length};
                 })(''' + json.dumps(key) + ')')
                 if not result:
+                    outcome = 'failed'
                     raise NotionStreamError('Edge request state lost; reconcile before reuse')
+                if result.get('status') and latency is None:
+                    status, latency = result['status'], time.monotonic() - begun
                 if result.get('status') == 429:
+                    outcome = 'rate_limited'
                     self.local.retry_after = self.budget.limited(result.get('retry'))
                     raise NotionHttpError(429, retry_after=self.retry_after)
                 if result.get('status', 0) >= 400:
-                    raise NotionHttpError(result['status'])
+                    code = result['status']
+                    outcome = 'blocked' if code in (401, 403) else 'failed' if code >= 500 else 'invalid'
+                    raise NotionHttpError(code)
                 if result.get('error'):
+                    outcome = 'failed'
                     raise NotionStreamError('Edge request interrupted; reconcile before reuse')
                 if result.get('text'):
                     yield result['text']
                 if result.get('done') and not result.get('remaining'):
+                    outcome = 'ok'
                     self._save_cookies(target)
                     return
                 time.sleep(.1)
+            outcome = 'failed'
             raise NotionStreamError('Edge request timed out; reconcile before reuse')
         finally:
+            release = getattr(self.budget, 'release', None)
+            if release is not None:
+                release(ticket, outcome, status=status, latency=latency, account_id=self.account_id)
             try:
                 self.browser.evaluate(target, '''(key => {
                   const q = window.__notiontoolRequests?.[key];

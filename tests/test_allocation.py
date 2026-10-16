@@ -35,7 +35,7 @@ class AllocationTests(unittest.TestCase):
 class BudgetTests(unittest.TestCase):
     def setUp(self):
         self.now=1000
-        self.budget=NetworkBudget(clock=lambda:self.now,sleep=self.sleep)
+        self.budget=NetworkBudget(clock=lambda:self.now,sleep=self.sleep,rng=lambda:0)
     def sleep(self,seconds):self.now+=seconds
     def test_all_accounts_share_start_pacing_but_streams_need_no_serial_completion(self):
         starts=[]

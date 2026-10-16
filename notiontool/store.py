@@ -47,7 +47,11 @@ class Store:
         self.db.execute("CREATE INDEX IF NOT EXISTS message_chat ON objects(kind, json_extract(doc, '$.chat_id'))")
         self.db.execute('CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, value INTEGER NOT NULL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)')
+        # Daily counts per kind of events removed by the 2000-event retention window.
+        self.db.execute('CREATE TABLE IF NOT EXISTS event_rollup(day TEXT, kind TEXT, total INTEGER NOT NULL, PRIMARY KEY(day,kind))')
+        self.db.execute("CREATE INDEX IF NOT EXISTS event_task ON events(json_extract(doc, '$.task_id'))")
         self.db.commit()
+        self.projects = {}
 
     SCHEMA_VERSION = 2
 
@@ -116,13 +120,38 @@ class Store:
             for kind, ident in deletes:
                 self.db.execute('DELETE FROM objects WHERE kind=? AND id=?', (kind, str(ident)))
 
-    def event(self, kind, run_id='', **fields):
+    def event(self, kind, run_id='', *, commit=True, **fields):
+        # commit=False leaves the row to the next write on this connection: one disk sync instead of two.
+        from .telemetry import EVENT_SCHEMA, IDENTIFIERS
         fields = redact(fields)
+        for name in IDENTIFIERS:
+            fields.setdefault(name, '')
+        if run_id and not fields['project_id']:
+            fields['project_id'] = self.project_of(run_id)
+        fields['v'] = EVENT_SCHEMA
         with self.lock:
-            self.db.execute('INSERT INTO events(ts,run_id,kind,doc) VALUES(?,?,?,?)',
-                            (time.time(), run_id, kind, json.dumps(fields, ensure_ascii=False)))
-            self.db.execute('DELETE FROM events WHERE seq < (SELECT COALESCE(MAX(seq),0)-2000 FROM events)')
-            self.db.commit()
+            seq = self.db.execute('INSERT INTO events(ts,run_id,kind,doc) VALUES(?,?,?,?)',
+                                  (time.time(), run_id, kind, json.dumps(fields, ensure_ascii=False))).lastrowid
+            cutoff = seq - 2000
+            if self.db.execute('SELECT 1 FROM events WHERE seq < ? LIMIT 1', (cutoff,)).fetchone():
+                # Count the oldest events per day and kind before retention removes them.
+                self.db.execute("INSERT INTO event_rollup(day,kind,total) SELECT date(ts,'unixepoch','localtime'),kind,COUNT(*) "
+                                "FROM events WHERE seq < ? GROUP BY 1,2 "
+                                "ON CONFLICT(day,kind) DO UPDATE SET total=total+excluded.total", (cutoff,))
+                self.db.execute('DELETE FROM events WHERE seq < ?', (cutoff,))
+            if commit:
+                self.db.commit()
+        return seq
+
+    def project_of(self, run_id):
+        # Project of a run for event attribution; the chat folder until projects exist.
+        projects = self.__dict__.setdefault('projects', {})
+        if run_id not in projects:
+            run = self.get('runs', run_id)
+            if not run:
+                return ''
+            projects[run_id] = run.get('project_id') or run.get('folder_id') or ''
+        return projects[run_id]
 
     def events(self, after=0, limit=150):
         with self.lock:
