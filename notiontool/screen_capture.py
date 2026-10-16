@@ -1,15 +1,15 @@
-"""Window-limited screen capture for desktop apps such as Roblox Studio and Blender.
+"""Screen capture for desktop work such as Roblox Studio and Blender (Windows only).
 
-Windows only. One top-level window is captured with PrintWindow and
-PW_RENDERFULLCONTENT, which also renders DirectX/OpenGL content and works while
-the window is covered by other windows. If that yields a blank image, the
-window area is copied from the screen instead. The whole desktop is never
-captured.
+Default: the whole screen (every monitor, the virtual desktop) is copied with BitBlt.
+With target or hwnd one top-level window is captured with PrintWindow and
+PW_RENDERFULLCONTENT, which also renders DirectX/OpenGL content and works while the
+window is covered; a blank result falls back to copying that screen area.
 
-Every stored capture is a full-resolution PNG under <data>/captures/<day>/ and
-is logged as a capture_taken event (time, reason, task, hashes; never pixels).
-A 64-bit difference hash marks captures that did not change since the previous
-capture of the same window, so frequent checks stay cheap.
+Images are never written to disk: a capture exists only in memory until its image
+data has been encoded into the tool response, then it is gone. Only a 64-bit
+difference hash per target stays in memory, so only_if_changed can skip unchanged
+images. A capture_taken event logs time, reason, task and hashes (never pixels).
+Captures stored on disk by older versions are deleted on first use.
 """
 import base64
 import contextlib
@@ -18,6 +18,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -33,25 +34,23 @@ MAX_SIDE = 3840
 MIN_SIDE = 64
 MAX_PER_TASK = 500        # runaway-loop guard only; normal work never gets near it
 SAME_DISTANCE = 3         # dHash bits; at most this many differing bits = unchanged
-RETENTION_DAYS = 7
-MAX_FILES = 2000
-PRUNE_EVERY = 600
 LIST_LIMIT = 80
 
 _PROPS = {
-    'target': {'type': 'string', 'description': 'App or window title, for example "roblox", "blender" or part of a window title'},
-    'hwnd': {'type': 'integer', 'description': 'Exact window handle from screen_windows'},
-    'region': {'type': 'object', 'description': 'Optional crop in window pixels {x, y, width, height}; use it to zoom into details'},
+    'target': {'type': 'string', 'description': 'Optional: app or window title ("roblox", "blender" or part of a title) to capture only that window. Leave target and hwnd empty to capture the whole screen'},
+    'hwnd': {'type': 'integer', 'description': 'Optional: exact window handle from screen_windows'},
+    'region': {'type': 'object', 'description': 'Optional crop in captured pixels {x, y, width, height}; use it to zoom into details'},
     'max_side': {'type': 'integer', 'description': f'Longest side of the returned image, default {DEFAULT_SIDE}, at most {MAX_SIDE}'},
     'format': {'type': 'string', 'enum': ['jpeg', 'png'], 'description': 'jpeg (default, small) or png (sharp text and UI)'},
-    'only_if_changed': {'type': 'boolean', 'description': 'Leave out the image when nothing changed since the previous capture of this window'},
+    'only_if_changed': {'type': 'boolean', 'description': 'Leave out the image when nothing changed since the previous capture of the same screen or window'},
     'restore': {'type': 'boolean', 'description': 'Restore the window first if it is minimized'},
     'reason': {'type': 'string', 'description': 'Short reason, written to the activity log'},
 }
 SCREEN_TOOLS = {
-    'screen_windows': ('List open desktop app windows (hwnd, title, process, size) that screen_capture can target', {}),
-    'screen_capture': ('Capture one desktop app window (for example Roblox Studio or Blender) and return the image. '
-                       'Use it as often as needed to check what you are building. Never captures the whole screen.', _PROPS),
+    'screen_windows': ('List open desktop app windows (hwnd, title, process, size); screen_capture can target one of them', {}),
+    'screen_capture': ('Capture the whole screen (all monitors) and return the image; pass target or hwnd to capture only '
+                       'one app window (for example Roblox Studio or Blender). No assignment token or code is needed. '
+                       'Use it as often as needed to check what you are building. Images are never stored.', _PROPS),
 }
 _RO = {'readOnlyHint': True, 'destructiveHint': False}
 SCREEN_OPERATOR_TOOLS = [
@@ -107,6 +106,7 @@ def _win():
     sig(u.GetWindowRect, w.BOOL, w.HWND, ctypes.POINTER(w.RECT))
     sig(u.GetWindowLongW, ctypes.c_long, w.HWND, ctypes.c_int)
     sig(u.GetForegroundWindow, w.HWND)
+    sig(u.GetSystemMetrics, ctypes.c_int, ctypes.c_int)
     sig(u.GetDC, w.HDC, w.HWND)
     sig(u.ReleaseDC, ctypes.c_int, w.HWND, w.HDC)
     sig(u.PrintWindow, w.BOOL, w.HWND, w.HDC, w.UINT)
@@ -274,6 +274,29 @@ def grab(hwnd, restore=False):
     return image, method
 
 
+def grab_screen():
+    """Return (PIL image, 'screen') of the whole virtual desktop (all monitors)."""
+    W = _win()
+    with _dpi_aware(W):
+        left, top = W.u.GetSystemMetrics(76), W.u.GetSystemMetrics(77)      # SM_X/YVIRTUALSCREEN
+        width, height = W.u.GetSystemMetrics(78), W.u.GetSystemMetrics(79)  # SM_CX/CYVIRTUALSCREEN
+        if width < 2 or height < 2:
+            raise CaptureError('The screen size is unavailable')
+        screen = W.u.GetDC(None)
+        memory = W.g.CreateCompatibleDC(screen)
+        bitmap = W.g.CreateCompatibleBitmap(screen, width, height)
+        try:
+            old = W.g.SelectObject(memory, bitmap)
+            W.g.BitBlt(memory, 0, 0, width, height, screen, left, top, 0x00CC0020 | 0x40000000)  # SRCCOPY|CAPTUREBLT
+            W.g.SelectObject(memory, old)
+            image = _read(W, screen, bitmap, width, height)
+        finally:
+            W.g.DeleteObject(bitmap)
+            W.g.DeleteDC(memory)
+            W.u.ReleaseDC(None, screen)
+    return image, 'screen'
+
+
 # ---- pure helpers (tested without Win32) --------------------------------------
 def pick(windows, target='', hwnd=0):
     if hwnd:
@@ -283,7 +306,7 @@ def pick(windows, target='', hwnd=0):
         raise CaptureError('No open window has this hwnd; call screen_windows')
     query = str(target or '').strip().lower()
     if not query:
-        raise CaptureError('Pass target (app name or window title) or hwnd; the whole screen is never captured')
+        return None  # no target: the caller captures the whole screen
     names = ALIASES.get(query, (query.removesuffix('.exe'),))
 
     def score(window):
@@ -347,16 +370,17 @@ def _encode(image, max_side=None, fmt=None):
 
 
 class ScreenCapture:
-    def __init__(self, store=None, folder=None, lister=None, grabber=None):
+    def __init__(self, store=None, folder=None, lister=None, grabber=None, screen_grabber=None):
         self.store = store
         base = getattr(store, 'directory', None)
         self.folder = Path(folder) if folder else (Path(base) / 'captures' if base else Path('data') / 'captures')
         self.lister = lister or list_windows
         self.grabber = grabber or grab
+        self.screen_grabber = screen_grabber or grab_screen
+        self.purged = False
         self.lock = threading.Lock()
         self.last = {}
         self.counts = {}
-        self.pruned = 0.0
 
     def call(self, name, args, task_id='', run_id='', role=''):
         args = args or {}
@@ -374,8 +398,13 @@ class ScreenCapture:
             with self.lock:
                 if self.counts.get(task_id, 0) >= MAX_PER_TASK:
                     raise CaptureError(f'Capture limit of {MAX_PER_TASK} per task reached')
-        window = pick(self.lister(), args.get('target', ''), args.get('hwnd') or 0)
-        image, method = self.grabber(window['hwnd'], bool(args.get('restore')))
+        self._purge()
+        window = pick(self.lister(), args.get('target', ''), args.get('hwnd') or 0) if (args.get('target') or args.get('hwnd')) else None
+        if window is None:
+            window = dict(hwnd=0, title='Whole screen', process='screen')
+            image, method = self.screen_grabber()
+        else:
+            image, method = self.grabber(window['hwnd'], bool(args.get('restore')))
         size = image.size
         region = _region(args.get('region'), size)
         if region:
@@ -385,41 +414,29 @@ class ScreenCapture:
         with self.lock:
             previous = self.last.get(key)
         distance = bin(digest ^ previous['hash']).count('1') if previous else None
-        changed = previous is None or distance > SAME_DISTANCE or not Path(previous['path']).is_file()
-        path, sha = self._save(image, window) if changed else (previous['path'], previous['sha256'])
+        changed = previous is None or distance > SAME_DISTANCE
+        sha = hashlib.sha256(image.tobytes()).hexdigest()  # identity only; the pixels are not kept
         with self.lock:
-            self.last[key] = dict(hash=digest, path=path, sha256=sha, ts=time.time())
+            self.last[key] = dict(hash=digest, sha256=sha, ts=time.time())
             if len(self.last) > 256:
                 del self.last[min(self.last, key=lambda k: self.last[k]['ts'])]
             if task_id:
                 self.counts[task_id] = self.counts.get(task_id, 0) + 1
         info = dict(window=dict(hwnd=window['hwnd'], title=window['title'], process=window['process']),
                     width=image.width, height=image.height, window_size=list(size),
-                    region=list(region) if region else None, method=method, changed=changed,
-                    distance=distance, phash=f'{digest:016x}', sha256=sha, path=path)
+                    region=list(region) if region else None, scope='window' if window['hwnd'] else 'screen', method=method, changed=changed,
+                    distance=distance, phash=f'{digest:016x}', sha256=sha, stored=False)
         part = None
         if changed or not args.get('only_if_changed'):
             part = _encode(image, args.get('max_side'), args.get('format'))
             info['image'] = {k: part[k] for k in ('mimeType', 'width', 'height', 'bytes')}
         else:
-            info['note'] = 'Unchanged since the previous capture of this window; no image attached'
+            info['note'] = 'Unchanged since the previous capture of the same screen or window; no image attached'
         info['ms'] = round((time.monotonic() - started) * 1000)
         self._log(info, args.get('reason', ''), task_id, run_id, role)
-        self._prune()
         if part:
             info['_image'] = {'data': part['data'], 'mimeType': part['mimeType']}
         return info
-
-    def _save(self, image, window):
-        folder = self.folder / time.strftime('%Y-%m-%d')
-        folder.mkdir(parents=True, exist_ok=True)
-        stem = re.sub(r'[^A-Za-z0-9_-]+', '-', (window['process'] or 'window').removesuffix('.exe'))[:40] or 'window'
-        path = folder / f"{time.strftime('%H%M%S')}-{time.time_ns() % 10**9:09d}-{stem}.png"
-        buf = io.BytesIO()
-        image.save(buf, 'PNG', compress_level=1)
-        data = buf.getvalue()
-        path.write_bytes(data)
-        return str(path), hashlib.sha256(data).hexdigest()
 
     def _log(self, info, reason, task_id, run_id, role):
         if self.store is None:
@@ -430,27 +447,18 @@ class ScreenCapture:
                              reason=str(reason or '')[:200], process=window['process'], title=window['title'][:120],
                              hwnd=window['hwnd'], width=info['width'], height=info['height'], method=info['method'],
                              changed=info['changed'], distance=info['distance'], phash=info['phash'],
-                             sha256=info['sha256'], path=info['path'], image_bytes=(info.get('image') or {}).get('bytes', 0),
+                             sha256=info['sha256'], image_bytes=(info.get('image') or {}).get('bytes', 0),
                              ms=info['ms'], message='Screen capture: ' + (window['process'] or window['title'][:60]))
         except Exception:
             pass
 
-    def _prune(self):
-        now = time.time()
-        with self.lock:
-            if now - self.pruned < PRUNE_EVERY:
-                return
-            self.pruned = now
+    def _purge(self):
+        """Delete captures stored by older versions (they kept PNG files for 7 days)."""
+        if self.purged:
+            return
+        self.purged = True
         try:
-            files = sorted(self.folder.glob('*/*.png'), key=lambda p: p.stat().st_mtime)
-            extra, cutoff = len(files) - MAX_FILES, now - RETENTION_DAYS * 86400
-            for index, file in enumerate(files):
-                if index < extra or file.stat().st_mtime < cutoff:
-                    file.unlink(missing_ok=True)
-                else:
-                    break
-            for folder in self.folder.iterdir():
-                if folder.is_dir() and not any(folder.iterdir()):
-                    folder.rmdir()
+            if self.folder.is_dir():
+                shutil.rmtree(self.folder, ignore_errors=True)
         except OSError:
             pass

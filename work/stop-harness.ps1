@@ -12,7 +12,7 @@ function L($m) { Add-Content $log ("[" + (Get-Date) + "] stop-harness: " + $m) }
 function Harness {
     $owners = @(Get-NetTCPConnection -State Listen -LocalPort $ports -ErrorAction SilentlyContinue | ForEach-Object { $_.OwningProcess })
     @(Get-CimInstance Win32_Process | Where-Object {
-        $_.ProcessId -ne $PID -and (
+        $_.ProcessId -ne $PID -and -not ($_.CommandLine -and $_.CommandLine.Contains('--gateway')) -and (
             ($_.Name -ieq 'NotionTool.exe' -and $_.ExecutablePath -and $_.ExecutablePath.ToLower() -eq $exe) -or
             ($_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -match 'main\.py' -and (
                 $_.CommandLine.ToLower().Contains($root.ToLower()) -or ($owners -contains $_.ProcessId)))

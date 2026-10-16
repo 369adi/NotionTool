@@ -171,6 +171,9 @@ class Bridge:
         return self._browser
 
     # ---- capability -------------------------------------------------------
+    def has_assignment(self, token):
+        return bool(token) and any(t.get('lease')==token and t.get('state')=='running' for t in self.store.all('tasks'))
+
     def assignment(self, token):
         # Capability is revoked as soon as an attempt ends or is superseded.
         task = next((t for t in self.store.all('tasks') if t.get('lease')==token and t['state']=='running'),None)
@@ -210,6 +213,9 @@ class Bridge:
 
     # ---- tools ------------------------------------------------------------
     def call(self, name, args, token):
+        if name in SCREEN_TOOLS and self.screen_access() and not self.has_assignment(token):
+            # Read-only screen tools also work in the user's own chats (Main), which have no assignment token.
+            return self.screen().call(name, args, role='chat')
         cwd = None
         verifier=getattr(getattr(self.engine,'adapter',None),'verify_response_model',None)
         if verifier is not None:
@@ -416,10 +422,10 @@ class Bridge:
                     {'name':'mcp_list_tools','description':'Get schemas for a NotionTool tool by name',
                      'annotations':{'readOnlyHint':True,'destructiveHint':False},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'}}}},
-                    {'name':'mcp_call','description':'Execute a scoped tool using the assignment token from your current prompt',
+                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty)',
                      'annotations':{'readOnlyHint':False,'destructiveHint':True},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'},'assignment_token':{'type':'string'},
-                                   'arguments':{'type':'object'}},'required':['tool_name','assignment_token']}}]}
+                                   'arguments':{'type':'object'}},'required':['tool_name']}}]}
                 if operator is not None:
                     result['tools'] += OPERATOR_TOOLS
             elif method=='tools/call':
@@ -432,7 +438,7 @@ class Bridge:
                     if self.browser_access():
                         value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
                     if self.screen_access():
-                        value.append({'id':'Screen','tools':list(SCREEN_TOOLS)})
+                        value.append({'id':'Screen','tools':list(SCREEN_TOOLS),'assignment_token':'not needed'})
                     settings = self.store.settings()
                     for server in LOCAL_SERVERS:
                         if local_enabled(settings, server):
@@ -453,3 +459,21 @@ class Bridge:
             return {'jsonrpc':'2.0','id':ident,'result':result}
         except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
             return {'jsonrpc':'2.0','id':ident,'result':{'isError':True,'content':[{'type':'text','text':str(exc)[:400]}]}}
+        except Exception as exc:  # noqa: BLE001 - an MCP call must always get an answer
+            self.log_failure(method, params, exc)
+            return {'jsonrpc':'2.0','id':ident,'result':{'isError':True,'content':[{'type':'text','text':'Internal NotionTool error ('+type(exc).__name__+'): '+str(exc)[:300]}]}}
+
+    def log_failure(self, method, params, exc):
+        import time
+        import traceback
+        try:
+            folder = Path(getattr(self.store,'directory','.'))/'runtime'
+            folder.mkdir(parents=True, exist_ok=True)
+            tool = (params or {}).get('name','')
+            inner = ((params or {}).get('arguments') or {}).get('tool_name','') if tool=='mcp_call' else ''
+            stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            text = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-4000:]
+            with open(folder/'mcp-errors.log','a',encoding='utf-8') as handle:
+                handle.write(f'[{stamp}] {method} {tool} {inner}\n{text}\n')
+        except Exception:  # noqa: BLE001 - logging must never break the answer
+            pass

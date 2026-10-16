@@ -7,6 +7,10 @@ $pyw = 'C:\Users\liket\AppData\Local\Programs\Python\Python312\pythonw.exe'
 $log = "$root\work\restart.log"
 function L($m) { Add-Content $log ("[" + (Get-Date) + "] restart-harness: " + $m) }
 Set-Location $root
+# This script is usually started from inside the running app. Never let the new EXE inherit that app's
+# PyInstaller state: it would reuse an old, stale _MEI folder (e.g. without newly bundled libraries).
+Get-ChildItem env: | Where-Object { $_.Name -like '_PYI*' -or $_.Name -eq '_MEIPASS2' } | ForEach-Object { Remove-Item "env:$($_.Name)" }
+$env:PYINSTALLER_RESET_ENVIRONMENT = '1'
 L "begin mode=$Mode rebuild=$Rebuild"
 if ($Rebuild -and $Mode -eq 'exe') {
     Remove-Item "$root\work\newdist\NotionTool.exe" -Force -ErrorAction SilentlyContinue

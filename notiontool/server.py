@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 
+from .updater import Updater
 from .bridge import Bridge
 from .engine import Engine, ACTIVE
 from .notion import NotionAdapter
@@ -37,6 +38,8 @@ class Application:
 
     def __init__(self, directory, adapter_factory=NotionAdapter):
         self.store = Store(directory)
+        self.data_dir = str(directory)
+        self.gateway_port = 0
         stale = []
         for job in self.store.all('jobs'):
             if job.get('title')==self.BRIDGE_JOB_TITLE and job['id']!=self.BRIDGE_JOB_ID:
@@ -119,6 +122,9 @@ class Application:
                         return self.response(200,result) if result is not None else self.response(202,{})
                     except (ValueError,TypeError,AttributeError):
                         return self.response(400,{'error':'Invalid MCP request'})
+                    except Exception as exc:  # noqa: BLE001 - never drop the connection (the gateway would report a restart)
+                        app.bridge.log_failure('http', {}, exc)
+                        return self.response(500,{'error':'Internal MCP error ('+type(exc).__name__+')'})
                 if path.startswith('/api/'):
                     bearer = hmac.compare_digest(self.headers.get('Authorization',''),'Bearer '+app.host_api_key)
                     ui = hmac.compare_digest(self.headers.get('X-NotionTool-Token',''),app.token)
@@ -215,6 +221,8 @@ class Application:
         self.port = self.http.server_port
         self.adapter.sessions.save('runtime',{'port':self.port,'token':self.token})
         threading.Thread(target=self.http.serve_forever,daemon=True,name='local-http').start()
+        try:self.ensure_mcp_listener()  # MCP is reachable right after a restart, before the first maintenance run
+        except Exception as exc:self.store.event('mcp_listener_failed',message=str(exc)[:200])
         self.engine.start()
         threading.Thread(target=self.maintain_bridge,daemon=True,name='bridge-maintenance').start()
         # Resume durable operations; reconciliation never resends an accepted creation.
@@ -223,6 +231,8 @@ class Application:
                 self.store.event('operation_resume', message='Resuming '+op['kind']+' after restart', operation_id=op['id'])
                 self.job('Resume '+op['kind'].replace('_',' '), lambda ident=op['id']: self.mains.resume(ident), 'op:'+op['id'])
         threading.Thread(target=self.maintain_context,daemon=True,name='chat-context').start()
+        self.updater = Updater(self)
+        self.updater.start()
         return f'http://127.0.0.1:{self.port}/#'+self.token
 
     def origins(self):
@@ -332,7 +342,7 @@ class Application:
             self.http.server_close()
         if self.mcp_http:
             self.mcp_http.shutdown();self.mcp_http.server_close()
-        if self.tailscale:
+        if self.tailscale and not self.gateway_port:  # with the gateway the route stays; process 2 bridges the restart
             try:self.tailscale.stop()
             except Exception:pass
 
@@ -433,6 +443,29 @@ class Application:
             if 'already running' in str(exc):
                 return {}
             raise
+
+    def prepare_account(self, account_id):
+        """After sign-in or an account switch: load the Main and set up the Tailscale MCP bridge automatically."""
+        result = {'account_id': account_id}
+        try:
+            result['main'] = self.adapter.ensure_main(account_id)
+        except Exception as exc:
+            result['main_error'] = str(exc)[:250]
+            self.store.event('main_load_failed', message=str(exc)[:250])
+        try:
+            bridge = self.start_tunnel()
+            result['bridge'] = bridge
+            account = self.store.get('accounts', account_id, {})
+            self.store.event('mcp_auto_setup', message=('NotionTool MCP connected via Tailscale' if account.get('bridge_connected')
+                             else 'Tailscale ready; MCP connection pending: ' + str(account.get('bridge_error', ''))[:200]))
+        except Exception as exc:
+            result['bridge_error'] = str(exc)[:250]
+            account = self.store.get('accounts', account_id)
+            if account:
+                account['bridge_error'] = str(exc)[:250]
+                self.store.put('accounts', account)
+            self.store.event('mcp_auto_setup_failed', message=str(exc)[:250])
+        return result
 
     def finish_account_result(self, result):
         ident = result.get('account_id')
@@ -609,7 +642,10 @@ class Application:
         if path=='/api/account/select':
             from .harness_account import select_account
             with self.engine.lock:
-                return select_account(self.store, account_id)
+                result = select_account(self.store, account_id)
+            # The chosen account's Main is loaded (created once if missing); nothing is deleted.
+            self.job_once('Load Main chat and MCP', lambda: self.prepare_account(account_id), 'main:'+account_id)
+            return result
         if path=='/api/main/create':
             from .harness_account import selected_account
             op, new = self.mains.request_create(selected_account(self.store), body.get('request_id'),
@@ -655,7 +691,13 @@ class Application:
                 raise ValueError('Select this account for the harness first')
             return self.job('Open signed-in Notion in Edge', lambda:self.adapter.edge_transport(account_id).open_app(), account_id)
         if path=='/api/account/browser-login':
-            return self.job('Sign in to Notion in the browser window',self.adapter.browser_login,'login')
+            def login():
+                from .harness_account import selected_account
+                result = self.adapter.browser_login()
+                if result.get('account_id') and result['account_id'] == selected_account(self.store):
+                    result.update(self.prepare_account(result['account_id']))
+                return result
+            return self.job('Sign in to Notion in the browser window',login,'login')
         if path=='/api/account/remove':
             from .harness_account import selected_account
             ident=account_id or selected_account(self.store)
@@ -686,27 +728,127 @@ class Application:
             return {'path':result[0] if result else ''}
         raise ValueError('Unknown action')
 
-    def start_tunnel(self):
-        from .tailscale_bridge import TailscaleBridge
+    def ensure_mcp_listener(self):
         if not self.mcp_http:
             try:self.mcp_http=ExclusiveHTTPServer(('127.0.0.1',int(self.store.settings().get('public_mcp_port',8873))),self.handler)
             except OSError:self.mcp_http=ExclusiveHTTPServer(('127.0.0.1',0),self.handler);_s=self.store.settings();_s['public_mcp_port']=self.mcp_http.server_port;self.store.put('settings',_s)  # port taken (e.g. another NotionTool): any free local port; Funnel targets it
             self.mcp_http.mcp_only=True
             self.mcp_http.daemon_threads=True
             threading.Thread(target=self.mcp_http.serve_forever,daemon=True,name='public-mcp').start()
+        from .gateway import publish_core
+        publish_core(self.data_dir,self.mcp_http.server_port)
+        return self.mcp_http.server_port
+
+    @staticmethod
+    def gateway_health(port):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/__gateway',timeout=2) as response:
+                data=json.loads(response.read())
+            return data if data.get('service')=='notiontool-gateway' else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def port_busy(port):
+        import socket
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            return probe.connect_ex(('127.0.0.1',port))==0
+
+    def ensure_gateway(self):
+        """Process 2: the stable MCP gateway Tailscale points to. It survives every restart of this app,
+        holds MCP requests while the app is down and answers as backup MCP if the restart takes longer."""
+        from . import gateway as gw
+        import sys
+        settings=self.store.settings()
+        if settings.get('mcp_gateway') is False:return 0
+        port=int(settings.get('mcp_gateway_port') or gw.DEFAULT_PORT)
+        health=self.gateway_health(port)
+        if health and health.get('version')==gw.VERSION:return port
+        if health:  # an older gateway version: replace it once
+            import urllib.request
+            control=gw.read_json(gw.runtime_dir(self.data_dir)/'gateway.json').get('control','')
+            try:urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/__gateway/stop',data=b'{}',method='POST',headers={'X-Gateway-Control':control}),timeout=5).read()
+            except Exception:pass
+            for _ in range(20):
+                if not self.gateway_health(port):break
+                time.sleep(0.5)
+        elif self.port_busy(port):
+            self.store.event('mcp_gateway_port_busy',message=f'Port {port} belongs to another program; the MCP runs without gateway')
+            return 0
+        breakaway=0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+        flags=(subprocess.DETACHED_PROCESS|subprocess.CREATE_NEW_PROCESS_GROUP|breakaway) if os.name=='nt' else 0
+        if getattr(sys,'frozen',False):
+            exe=gw.runtime_dir(self.data_dir)/f'NotionTool-gateway-v{gw.VERSION}.exe'
+            if not exe.is_file():shutil.copy2(sys.executable,exe)  # own file: the app EXE stays replaceable
+            command=[str(exe),'--gateway','--data-dir',self.data_dir,'--gateway-port',str(port)]
+        else:
+            python=Path(sys.executable);pythonw=python.with_name('pythonw.exe')
+            command=[str(pythonw if pythonw.is_file() else python),str(Path(__file__).resolve().parent.parent/'main.py'),
+                     '--gateway','--data-dir',self.data_dir,'--gateway-port',str(port)]
+        env={k:v for k,v in os.environ.items() if not k.startswith('_PYI') and k!='_MEIPASS2'}
+        env['PYINSTALLER_RESET_ENVIRONMENT']='1'  # the gateway EXE unpacks its own copy, independent of this process
+        options=dict(stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,cwd=str(gw.runtime_dir(self.data_dir)),env=env)
+        try:subprocess.Popen(command,creationflags=flags,**options)
+        except OSError:subprocess.Popen(command,creationflags=flags&~breakaway,**options)
+        for _ in range(60):
+            health=self.gateway_health(port)
+            if health and health.get('version')==gw.VERSION:
+                self.store.event('mcp_gateway_started',message=f'MCP gateway (process 2) running on port {port}')
+                return port
+            time.sleep(0.5)
+        self.store.event('mcp_gateway_failed',message='MCP gateway did not start; Tailscale points to the app directly')
+        return 0
+
+    def start_tunnel(self):
+        from .tailscale_bridge import TailscaleBridge
+        self.ensure_mcp_listener()
+        self.gateway_port=self.ensure_gateway()
         self.tailscale=self.tailscale or TailscaleBridge(self.store)
-        result=self.tailscale.start(self.mcp_http.server_port)
+        result=self.tailscale.start(self.gateway_port or self.mcp_http.server_port)
         connected=0;errors=[]
         for account in self.store.all('accounts'):
             from .harness_account import selected_account
             if account['id'] != selected_account(self.store):
                 continue
+            if account['state']=='ready' and time.time()-account.get('pool_checked_at',0)>120 and any(
+                    w['account_id']==account['id'] and w.get('join_state')=='pending' and w.get('state')!='missing'
+                    for w in self.store.all('workers')):
+                fresh=self.store.get('accounts',account['id']);fresh['pool_checked_at']=time.time();self.store.put('accounts',fresh)
+                try:self.adapter.refresh(account['id'])  # renames Coworkers whose join is now confirmed
+                except Exception:pass
+                account=self.store.get('accounts',account['id'])
             if account['state']!='ready' or account.get('bridge_blocked') or account.get('bridge_next_at',0)>time.time():continue
             if account.get('bridge_connected') and account.get('bridge_url')==result['url']:
-                connected+=1;continue
+                if time.time()-account.get('bridge_checked_at',0)<300:
+                    connected+=1;continue
+                try:alive=self.adapter.bridge_alive(account['id'],result['url'])
+                except Exception:alive=True  # a failed check never tears down a working bridge
+                fresh=self.store.get('accounts',account['id']);fresh['bridge_checked_at']=time.time();self.store.put('accounts',fresh)
+                fresh=self.store.get('accounts',account['id'])
+                if alive:
+                    if fresh.get('bridge_misses'):
+                        fresh.update(bridge_misses=0,bridge_missing_since=0);self.store.put('accounts',fresh)
+                    connected+=1;continue
+                # Reconnect only when the module is confirmed missing twice, and not while Coworkers of this
+                # account are working (max. 10 minutes) - a confirmed-missing MCP is broken for them anyway.
+                misses=fresh.get('bridge_misses',0)+1
+                fresh.update(bridge_misses=misses,bridge_missing_since=fresh.get('bridge_missing_since') or time.time())
+                if misses<2:fresh['bridge_checked_at']=time.time()-240  # confirm in about a minute
+                self.store.put('accounts',fresh)
+                busy=any(w['account_id']==account['id'] and w.get('state') in ('busy','recovering') for w in self.store.all('workers'))
+                if misses<2 or (busy and time.time()-fresh['bridge_missing_since']<600):
+                    if misses>=2:
+                        self.store.event('mcp_reconnect_deferred',message='NotionTool MCP missing; reconnect waits until the Coworkers are idle',slot=account.get('slot'))
+                    connected+=1;continue
+                self.store.event('mcp_missing',message='NotionTool MCP is no longer active in the account; reconnecting',slot=account.get('slot'))
             try:
                 self.adapter.connect_bridge(account['id'],result['url'],self.bridge_token)
                 connected+=1
+                if account.get('bridge_url'):
+                    self.store.event('mcp_reconnected',message='NotionTool MCP reconnected automatically',slot=account.get('slot'))
+                fresh=self.store.get('accounts',account['id']);fresh.update(bridge_checked_at=time.time(),bridge_misses=0,bridge_missing_since=0);self.store.put('accounts',fresh)
             except Exception as exc:
                 fresh=self.store.get('accounts',account['id'])
                 fresh.update(bridge_connected=False,bridge_error=str(exc)[:250],

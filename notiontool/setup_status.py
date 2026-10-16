@@ -1,7 +1,7 @@
 """Separate usable chats from a fully verified account configuration."""
 
 def account_setup(account, workers):
-    own=[w for w in workers if w.get('account_id')==account.get('id') and w.get('welcome')]
+    own=[w for w in workers if w.get('account_id')==account.get('id') and w.get('welcome') and w.get('enabled')]
     chats=(sum(w.get('purpose')=='worker' for w in own)>=5 and
            any(w.get('purpose')=='main' for w in own))
     authenticated=account.get('state')=='ready'

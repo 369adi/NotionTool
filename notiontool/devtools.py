@@ -95,7 +95,9 @@ def call(name, args):
         else:
             cmd, flags = ['sh', '-c', str(args['command'])], 0
         try:
-            r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, timeout=timeout, creationflags=flags)
+            env = {k: v for k, v in os.environ.items() if not k.startswith('_PYI') and k != '_MEIPASS2'}
+            env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'  # started programs get their own, fresh bundle state
+            r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, timeout=timeout, creationflags=flags, env=env)
         except subprocess.TimeoutExpired as e:
             out, _ = _cap((e.stdout or b'').decode('utf-8', 'replace'))
             return {'exit_code': None, 'timed_out': True, 'stdout': out, 'stderr': ''}

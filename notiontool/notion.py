@@ -326,7 +326,12 @@ class NotionAdapter:
             if tid not in seen and worker['state'] not in ('busy','recovering'):
                 worker.update(state='missing',enabled=False)
                 self.store.put('workers',worker)
-        return dict(account_id=account_id,threads=len(seen),state=account['state'])
+        try:
+            pool = self.apply_chat_pool(account_id, client)
+        except Exception as exc:
+            pool = {}
+            self.store.event('chat_pool_error', message=str(exc)[:200])
+        return dict(account_id=account_id,threads=len(seen),state=account['state'],coworkers=pool.get('coworkers',0))
 
     NOTION_COOKIE_DOMAINS=('notion.so','notion.com')
 
@@ -446,6 +451,165 @@ class NotionAdapter:
         parts = str(space).split('-')
         return f'{day:03x}{parts[0][3:]}-{parts[1]}-80{secrets.token_hex(1)}-{secrets.choice("89ab")}{secrets.token_hex(2)[:3]}-{tail}{secrets.token_hex(4)}'
 
+    @staticmethod
+    def thread_key(thread):
+        tid = thread.get('id') or thread.get('thread_id') or thread.get('threadId')
+        return str(uuid.UUID(tid)) if tid else ''
+
+    def thread_records(self, client, ids):
+        out = {}
+        ids = list(dict.fromkeys(ids))
+        for i in range(0, len(ids), 50):
+            result = client.call('syncRecordValuesSpaceInitial', {'requests': [
+                {'pointer': {'table': 'thread', 'id': t, 'spaceId': client.info['space_id']}, 'version': -1} for t in ids[i:i+50]]})
+            out.update({k: unwrap(v) for k, v in result.get('recordMap', {}).get('thread', {}).items()})
+        return out
+
+    def apply_chat_pool(self, account_id, client):
+        """Register the Main and apply the Coworker rule; marker renames happen only after a confirmed join."""
+        from .chat_pool import COWORK_TITLE, MAIN_TITLES, pool_decision, pick_main
+        account = self.store.get('accounts', account_id)
+        workers = [w for w in self.store.all('workers') if w['account_id'] == account_id and w.get('state') != 'missing']
+        ledger = account.get('team_threads') or {}
+        main = pick_main(workers, (ledger.get('main') or {}).get('id', ''))
+        if main and (main.get('purpose') != 'main' or not main.get('enabled')):
+            main.update(purpose='main', enabled=True, welcome=True)
+            self.store.put('workers', main)
+            self.store.event('main_registered', message='Main chat registered: ' + main.get('label', ''), slot=account.get('slot'))
+        if main and not (ledger.get('main') or {}).get('id'):
+            ledger['main'] = {'id': main['thread_id'], 'pending': False}
+            account['team_threads'] = ledger
+            self.store.put('accounts', account)
+        pool = [w for w in workers if w.get('purpose', 'worker') == 'worker' and (not main or w['id'] != main['id'])]
+        records = self.thread_records(client, [w['thread_id'] for w in pool
+            if w.get('label') == COWORK_TITLE or w.get('join_state') in ('pending', 'joined')])
+        usable = 0
+        for worker in pool:
+            if worker.get('label') in MAIN_TITLES:
+                changes, rename, event = dict(enabled=False), None, None
+            else:
+                changes, rename, event = pool_decision(worker, records.get(worker['thread_id']))
+            if rename:
+                try:
+                    self.rename_thread(client, worker['thread_id'], rename)
+                    changes['label'] = rename
+                except Exception:
+                    changes.update(enabled=False, join_state=worker.get('join_state') or 'pending')
+                    event = 'coworker_rename_failed'
+            if any(worker.get(k) != v for k, v in changes.items()):
+                worker.update(changes)
+                self.store.put('workers', worker)
+                if event:
+                    self.store.event(event, message=worker.get('label', '') + ' ' + worker['thread_id'], slot=account.get('slot'))
+            usable += bool(worker.get('enabled') and worker.get('join_state') == 'joined')
+        return {'main': main['id'] if main else '', 'coworkers': usable}
+
+    def ensure_main_chat(self, account_id):
+        """Local chat record for the account's Main; existing history is kept, never deleted."""
+        from .chat_pool import pick_main
+        from .store import uid
+        account = self.store.get('accounts', account_id)
+        workers = [w for w in self.store.all('workers') if w['account_id'] == account_id]
+        main = pick_main(workers, ((account.get('team_threads') or {}).get('main') or {}).get('id', ''))
+        if not main or main.get('purpose') != 'main':
+            return None
+        chat = next((c for c in self.store.all('chats') if c.get('main_worker') == main['id']), None)
+        if not chat:
+            chat = dict(id=uid('c'), title=account.get('label', account.get('email', '')) + ' · Main', main_worker=main['id'],
+                        folder_id='', project_path='', created=time.time())
+            self.store.put('chats', chat)
+            self.store.event('main_chat_registered', message=chat['title'], slot=account.get('slot'))
+        return chat
+
+    def create_welcome(self, client, tid, model):
+        """Create one Welcome chat. Returns (listed, clean). No retry: a timeout may still have created it."""
+        steps, failed = [], False
+        try:
+            for line in client.transport.stream('runInferenceTranscript', self.welcome_body(client, tid, model), client.headers(), timeout=180):
+                event = json.loads(line)
+                if event.get('type') in ('patch-start', 'patch-sync'):
+                    steps = (event.get('data') or {}).get('s') or steps
+                elif event.get('type') == 'patch':
+                    steps = apply_patch(steps, event.get('v'))
+        except (OSError, json.JSONDecodeError):
+            failed = True
+        # HTTP 200 does not confirm a persisted chat; only Notion's chat list does.
+        listed = any(self.thread_key(t) == str(uuid.UUID(tid)) for t in client.threads())
+        clean = not failed and not any(isinstance(s, dict) and s.get('type') == 'error' for s in steps)
+        return listed, clean
+
+    def ensure_main(self, account_id):
+        """Load the account's Main (title Main or Main Chat); create one Welcome chat named Main only if none exists."""
+        from .chat_pool import MAIN_TITLE
+        self.refresh(account_id)
+        chat = self.ensure_main_chat(account_id)
+        if chat:
+            return {'account_id': account_id, 'chat_id': chat['id'], 'created': False}
+        account = self.store.get('accounts', account_id)
+        if account.get('state') != 'ready':
+            raise ValueError('Sign in to this account again before loading its Main chat')
+        client = self.client(account_id)
+        self.require_workspace_ai(account_id, client.identity())
+        ledger = account.get('team_threads') or {}
+        item = ledger.get('main') or {}
+        known = {w['thread_id'] for w in self.store.all('workers') if w['account_id'] == account_id and w.get('state') != 'missing'}
+        if item.get('pending') and item.get('id') in known:
+            tid = item['id']
+        elif item.get('pending'):
+            raise ValueError('A previous Main creation is unconfirmed. Refresh the account before creating again.')
+        else:
+            model = client.model()
+            tid = self.new_id(client.info['space_id'], '00a9')
+            ledger['main'] = {'id': tid, 'pending': True}
+            account['team_threads'] = ledger
+            self.store.put('accounts', account)
+            listed, clean = self.create_welcome(client, tid, model)
+            if not listed:
+                raise ValueError('Main creation is unconfirmed; refresh to reconcile before creating again')
+            if not clean:
+                self.store.event('welcome_warning', message='Main exists, but its greeting returned an upstream error', slot=account.get('slot'))
+        self.rename_thread(client, tid, MAIN_TITLE)
+        account = self.store.get('accounts', account_id)
+        account['team_threads']['main'] = {'id': tid, 'pending': False}
+        self.store.put('accounts', account)
+        self.transaction(client, 'newUserHomeActions.savePostOnboardingAgentConfig', [{
+            'pointer': {'table': 'user_settings', 'id': client.info['user_id']}, 'path': ['settings'], 'command': 'update',
+            'args': {'post_onboarding_agent_config': {'thread_id': tid, 'has_clicked_all_set': False, 'space_id': client.info['space_id']}}}])
+        self.refresh(account_id)
+        chat = self.ensure_main_chat(account_id)
+        if not chat:
+            raise ValueError('Created Main chat is absent from the Notion chat list')
+        self.store.event('team_setup', message='Main Welcome chat created', slot=account.get('slot'))
+        return {'account_id': account_id, 'chat_id': chat['id'], 'created': True}
+
+    def bridge_alive(self, account_id, url):
+        """True while the account still has an enabled, live NotionTool MCP module for this URL."""
+        client = self.client(account_id)
+        client.identity()
+        view = next((unwrap(v) for v in client.info.get('records', {}).get('space_view', {}).values()
+                     if unwrap(v).get('space_id') == client.info['space_id']), None)
+        if not view:
+            return False
+        ids = [m['pointer']['id'] for m in ((view.get('settings') or {}).get('agent_chat_modules') or [])
+               if (m.get('pointer') or {}).get('table') == 'workflow_module' and m.get('defaultEnabled') is not False]
+        if not ids:
+            return False
+        synced = client.call('syncRecordValuesSpaceInitial', {'requests': [
+            {'pointer': {'table': 'workflow_module', 'id': i, 'spaceId': client.info['space_id']}, 'version': -1} for i in ids]})
+        return any(value.get('alive', True) and ((value.get('data') or {}).get('serverUrl') or value.get('server_url')) == url
+                   for value in (unwrap(v) for v in synced.get('recordMap', {}).get('workflow_module', {}).values()))
+
+    def note_worker_mcp_failure(self, worker):
+        """A worker chat could not use the MCP. Never reconnect from here: a reconnect could disturb the
+        other Coworkers. Only schedule a read-only check of the account's MCP module for the next minute."""
+        account = self.store.get('accounts', worker['account_id'])
+        if not account:
+            return
+        account.update(bridge_checked_at=0, bridge_suspect_at=time.time())
+        self.store.put('accounts', account)
+        self.store.event('worker_mcp_unavailable', message='NotionTool MCP was unavailable in ' + str(worker.get('label') or 'a worker chat')
+                         + '; checking the account connection without interrupting other Coworkers', slot=account.get('slot'))
+
     def provision(self, account_id, count):
         count = int(count)
         if not 1<=count<=40:
@@ -453,22 +617,28 @@ class NotionAdapter:
         client = self.client(account_id)
         self.require_workspace_ai(account_id, client.identity())
         model = client.model()
-        created = 0
+        created, new_ids = 0, []
         for _ in range(count):
-            tid,step = self.new_id(client.info['space_id'],'00a9'), self.new_id(client.info['space_id'])
-            body = self.welcome_body(client,tid,model)
+            tid = self.new_id(client.info['space_id'],'00a9')
             # No automatic retry: a creation timeout could still have created the thread.
-            for _line in client.transport.stream('runInferenceTranscript',body,client.headers(),timeout=120):
-                pass
+            listed, clean = self.create_welcome(client, tid, model)
+            if not listed:
+                self.store.event('welcome_warning', message='Coworker creation is unconfirmed; refresh before creating again')
+                break
+            if not clean:
+                self.store.event('welcome_warning', message='Coworker exists, but its greeting returned an upstream error')
             created += 1
-            self.rename_thread(client,tid,'Cowork joined')
+            new_ids.append(str(uuid.UUID(tid)))
         self.refresh(account_id)
-        # Newly created Welcome chats are immediately usable workers.
+        # New Welcome chats keep their name and stay unused until Notion confirms the join.
         for worker in self.store.all('workers'):
-            if worker['account_id'] == account_id and worker.get('label') == 'Cowork joined' and worker.get('purpose') == 'worker':
-                worker.update(enabled=True, welcome=True)
+            if worker['account_id'] == account_id and worker['thread_id'] in new_ids:
+                worker.update(join_state='pending', enabled=False, welcome=True, purpose='worker')
                 self.store.put('workers', worker)
-        return {'created':created}
+        self.apply_chat_pool(account_id, client)
+        joined = sum(1 for w in self.store.all('workers') if w['account_id'] == account_id
+                     and w['thread_id'] in new_ids and w.get('join_state') == 'joined')
+        return {'created': created, 'joined': joined, 'pending': created - joined}
 
     def welcome_body(self,client,tid,model):
         """Exactly the captured Refresher Welcome protocol; no browser onboarding clicks."""
@@ -539,73 +709,62 @@ class NotionAdapter:
         return {'model': model, 'explicit': True, 'corrected': len(changed)}
 
     def ensure_team(self,account_id):
-        """Idempotent desired team: five Welcome workers and one dedicated Welcome main."""
+        """Idempotent desired team: one Main and five Welcome Coworkers; Coworkers are renamed only after joining."""
+        self.ensure_main(account_id)
         client=self.client(account_id)
-        self.require_workspace_ai(account_id, client.identity())
         model=client.model()
         account=self.store.get('accounts',account_id)
         ledger=account.get('team_threads') or {}
-        known={str(uuid.UUID(t.get('id') or t.get('thread_id') or t.get('threadId'))) for t in client.threads()
-               if t.get('id') or t.get('thread_id') or t.get('threadId')}
-        for role in ['main','worker1','worker2','worker3','worker4','worker5']:
+        known={self.thread_key(t) for t in client.threads() if self.thread_key(t)}
+        roles=['worker1','worker2','worker3','worker4','worker5']
+        # Existing pool chats fill empty slots first; nothing is created twice.
+        taken={(item or {}).get('id') for item in ledger.values()}
+        spare=[w for w in self.store.all('workers') if w['account_id']==account_id and w.get('purpose','worker')=='worker'
+               and w.get('state')!='missing' and w.get('join_state') in ('joined','pending') and w['thread_id'] not in taken]
+        for role in roles:
+            if not ledger.get(role) and spare:
+                ledger[role]={'id':spare.pop(0)['thread_id'],'pending':False}
+        account['team_threads']=ledger
+        self.store.put('accounts',account)
+        new_ids=[]
+        for role in roles:
             item=ledger.get(role)
             if item and item['id'] not in known:
                 if item.get('pending'):
                     raise ValueError('A previous Welcome creation is unconfirmed. Refresh the account before creating again.')
                 raise ValueError('A managed Welcome chat is missing; existing chats were preserved')
-            if not item:
-                tid=self.new_id(client.info['space_id'],'00a9')
-                item={'id':tid,'pending':True}
-                ledger[role]=item
-                account['team_threads']=ledger
-                self.store.put('accounts',account)
-                steps=[]
-                stream_failed=False
-                try:
-                    for line in client.transport.stream('runInferenceTranscript',self.welcome_body(client,tid,model),client.headers(),timeout=180):
-                        event=json.loads(line)
-                        if event.get('type') in ('patch-start','patch-sync'):steps=(event.get('data') or {}).get('s') or steps
-                        elif event.get('type')=='patch':steps=apply_patch(steps,event.get('v'))
-                except (OSError, json.JSONDecodeError):
-                    stream_failed=True
-                # HTTP 200 and even a well-formed empty frame do not confirm a
-                # persisted chat. Keep the reserved ID pending on every failure.
-                actual=client.threads()
-                if not any((t.get('id') or t.get('thread_id') or t.get('threadId'))==tid for t in actual):
-                    raise ValueError('Welcome creation is unconfirmed; refresh to reconcile before creating again')
-                if stream_failed or any(s.get('type')=='error' for s in steps if isinstance(s,dict)):
-                    self.store.event('welcome_warning',message=role+' exists, but its initial greeting returned an upstream error',slot=account['slot'])
-                known.add(tid)
-            # The chat keeps the account's default model.
-            self.rename_thread(client,item['id'],'Main Chat' if role=='main' else 'Cowork joined')
+            if item:
+                continue
+            tid=self.new_id(client.info['space_id'],'00a9')
+            item={'id':tid,'pending':True}
+            ledger[role]=item
+            account['team_threads']=ledger
+            self.store.put('accounts',account)
+            listed,clean=self.create_welcome(client,tid,model)
+            if not listed:
+                raise ValueError('Welcome creation is unconfirmed; refresh to reconcile before creating again')
+            if not clean:
+                self.store.event('welcome_warning',message=role+' exists, but its initial greeting returned an upstream error',slot=account['slot'])
             item['pending']=False
             account['team_threads']=ledger
             self.store.put('accounts',account)
-            self.store.event('team_setup',message=role+' Welcome chat verified',slot=account['slot'])
-        # The main thread is the registered onboarding chat, like Refresher.
-        self.transaction(client,'newUserHomeActions.savePostOnboardingAgentConfig',[{
-            'pointer':{'table':'user_settings','id':client.info['user_id']},'path':['settings'],'command':'update',
-            'args':{'post_onboarding_agent_config':{'thread_id':ledger['main']['id'],'has_clicked_all_set':False,'space_id':client.info['space_id']}}}])
+            new_ids.append(str(uuid.UUID(tid)))
+            self.store.event('team_setup',message=role+' Welcome chat created; waiting for its join',slot=account['slot'])
         self.refresh(account_id)
-        for role,item in ledger.items():
-            worker=next((w for w in self.store.all('workers') if w['account_id']==account_id and w['thread_id']==item['id']), None)
-            if not worker:
-                raise ValueError('Created Welcome chat is absent from the Notion chat list')
-            expected='Main Chat' if role=='main' else 'Cowork joined'
-            if worker['label']!=expected:
-                raise ValueError('Welcome chat rename was not confirmed by Notion')
-            worker.update(enabled=True,purpose='main' if role=='main' else 'worker',welcome=True)
-            self.store.put('workers',worker)
-        main_worker=next(w['id'] for w in self.store.all('workers') if w['account_id']==account_id and w['thread_id']==ledger['main']['id'])
-        existing=next((c for c in self.store.all('chats') if c['main_worker']==main_worker),None)
-        if not existing:
-            from .store import uid
-            self.store.put('chats',dict(id=uid('c'),title=account['label']+' · Main Chat',main_worker=main_worker,
-                folder_id='',project_path='',created=time.time()))
+        for worker in self.store.all('workers'):
+            if worker['account_id']==account_id and worker['thread_id'] in new_ids:
+                worker.update(join_state='pending',enabled=False,welcome=True,purpose='worker')
+                self.store.put('workers',worker)
+        self.apply_chat_pool(account_id,client)
+        managed={ledger[r]['id'] for r in roles}
+        team=[w for w in self.store.all('workers') if w['account_id']==account_id and w['thread_id'] in managed]
+        if len(team)<len(managed):
+            raise ValueError('Created Welcome chat is absent from the Notion chat list')
+        joined=sum(1 for w in team if w.get('join_state')=='joined' and w.get('enabled'))
         from .setup_status import account_setup
         status=account_setup(self.store.get('accounts',account_id),self.store.all('workers'))
-        return {'account_id':account_id,'welcome_chats':6,'workers':5,'main_chats':1,
-                'verified':status['complete'],'chat_verified':True,'setup':status}
+        return {'account_id':account_id,'welcome_chats':len(managed)+1,'workers':joined,'pending_workers':len(managed)-joined,
+                'main_chats':1,'verified':status['complete'],'chat_verified':True,'setup':status}
 
     def run(self, worker, task, prompt, cancel, update):
         account = self.store.get('accounts',worker['account_id'])
@@ -701,6 +860,9 @@ class NotionAdapter:
                     last_update = time.monotonic()
             errors = [s for s in steps if isinstance(s,dict) and s.get('type')=='error']
             text = stream_text(steps)
+            from .chat_pool import script_mode_failure
+            if script_mode_failure(steps):
+                self.note_worker_mcp_failure(worker)
             self.mark_task(task['id'], remote_done_at=time.time())
             remote_done('stream_end')
             # Streaming steps can contain stale text or provider placeholders.
@@ -918,15 +1080,22 @@ class NotionAdapter:
             if not result.get('success'):
                 raise ValueError('Notion refused the MCP connection')
             modules.append({'pointer':{'table':'workflow_module','id':integration,'spaceId':client.info['space_id']},'defaultEnabled':True})
+        # Idempotent: an existing, enabled module with the right permissions is left untouched, so a
+        # reconnect never rewrites the account's chat modules while Coworkers are working.
+        changed = integration not in records
         for module in modules:
-            if (module.get('pointer') or {}).get('id')==integration:module['defaultEnabled']=True
-        self.transaction(client,'agentPersistenceHelpers.addAgentChatModule',[
-            {'pointer':{'table':'space_view','id':view['id'],'spaceId':client.info['space_id']},'path':['settings'],
-             'command':'update','args':{'agent_chat_modules':modules}}])
-        self.transaction(client,'mcpServerSettings.updateToolPermissions',[
-            {'pointer':{'table':'workflow_module','id':integration,'spaceId':client.info['space_id']},
-             'path':['data',key],'command':'set','args':value} for key,value in
-             (('runReadToolsAutomatically',read_auto),('runWriteToolsAutomatically',write_auto))])
+            if (module.get('pointer') or {}).get('id')==integration and module.get('defaultEnabled') is not True:
+                module['defaultEnabled']=True;changed=True
+        if changed:
+            self.transaction(client,'agentPersistenceHelpers.addAgentChatModule',[
+                {'pointer':{'table':'space_view','id':view['id'],'spaceId':client.info['space_id']},'path':['settings'],
+                 'command':'update','args':{'agent_chat_modules':modules}}])
+        current=(records.get(integration) or {}).get('data') or {}
+        if integration not in records or current.get('runReadToolsAutomatically')!=read_auto or current.get('runWriteToolsAutomatically')!=write_auto:
+            self.transaction(client,'mcpServerSettings.updateToolPermissions',[
+                {'pointer':{'table':'workflow_module','id':integration,'spaceId':client.info['space_id']},
+                 'path':['data',key],'command':'set','args':value} for key,value in
+                 (('runReadToolsAutomatically',read_auto),('runWriteToolsAutomatically',write_auto))])
         account = self.store.get('accounts',account_id)
         if registry_id:
             connections=account.setdefault('mcp_connections',{})

@@ -45,9 +45,8 @@ class PickTests(unittest.TestCase):
         self.assertEqual(pick(WINDOWS, 'output')['hwnd'], 23)
         self.assertEqual(pick(WINDOWS, hwnd=23)['hwnd'], 23)
 
-    def test_missing_target_never_falls_back_to_the_whole_screen(self):
-        with self.assertRaises(CaptureError):
-            pick(WINDOWS, '')
+    def test_missing_target_means_the_whole_screen(self):
+        self.assertIsNone(pick(WINDOWS, ''))
         with self.assertRaisesRegex(CaptureError, 'Open apps'):
             pick(WINDOWS, 'maya')
 
@@ -67,23 +66,42 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(image['mimeType'], 'image/jpeg')
         self.assertEqual(Image.open(io.BytesIO(base64.b64decode(image['data']))).size, (800, 600))
         self.assertTrue(result['changed'])
-        self.assertTrue(Path(result['path']).is_file())
+        self.assertNotIn('path', result)
+        self.assertFalse(result['stored'])
+        self.assertEqual(list(Path(self.store.directory).rglob('*.png')), [])
         kind, run_id, fields = self.store.events[-1]
         self.assertEqual((kind, run_id, fields['task_id'], fields['reason'], fields['process']),
                          ('capture_taken', 'r1', 't1', 'check build', 'RobloxStudioBeta.exe'))
         self.assertLess(len(str(fields)), 2000)
 
-    def test_unchanged_window_reuses_the_file_and_can_skip_the_image(self):
+    def test_unchanged_window_can_skip_the_image(self):
         first = self.screen.call('screen_capture', {'target': 'blender'})
         second = self.screen.call('screen_capture', {'target': 'blender', 'only_if_changed': True})
         self.assertFalse(second['changed'])
-        self.assertEqual(second['path'], first['path'])
+        self.assertEqual(second['sha256'], first['sha256'])
         self.assertNotIn('_image', second)
         self.frames.append(picture(bright_left=True))
         third = self.screen.call('screen_capture', {'target': 'blender', 'only_if_changed': True})
         self.assertTrue(third['changed'])
         self.assertIn('_image', third)
-        self.assertNotEqual(third['path'], first['path'])
+        self.assertNotEqual(third['sha256'], first['sha256'])
+
+    def test_without_target_the_whole_screen_is_captured(self):
+        def no_lister():
+            raise AssertionError('window list must not be needed for a screen capture')
+        screen = ScreenCapture(self.store, lister=no_lister, grabber=None,
+                               screen_grabber=lambda: (picture(size=(2560, 1440)), 'screen'))
+        result = screen.call('screen_capture', {})
+        self.assertEqual((result['scope'], result['window']['process'], result['window_size']), ('screen', 'screen', [2560, 1440]))
+        self.assertIn('_image', result)
+
+    def test_old_stored_captures_are_deleted_and_nothing_new_is_written(self):
+        old = Path(self.store.directory) / 'captures' / '2026-10-10'
+        old.mkdir(parents=True)
+        (old / 'x.png').write_bytes(b'png')
+        self.screen.call('screen_capture', {'target': 'blender'})
+        self.assertFalse((Path(self.store.directory) / 'captures').exists())
+        self.assertEqual(list(Path(self.store.directory).rglob('*.png')), [])
 
     def test_region_and_max_side_shape_the_returned_image(self):
         self.frames.append(picture(size=(3000, 2000)))

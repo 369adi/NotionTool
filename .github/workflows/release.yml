@@ -1,0 +1,36 @@
+# Every push to main builds NotionTool.exe and publishes it as the latest release.
+# Installed EXEs poll this release and update themselves (notiontool/updater.py).
+name: Build and release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: python -m pip install -r requirements.txt pillow
+      - name: Stamp build
+        shell: pwsh
+        run: |
+          "BUILD = ${{ github.run_number }}`nCOMMIT = '${{ github.sha }}'`nREPO = '${{ github.repository }}'`n" | Set-Content -Encoding utf8 notiontool/_build.py
+      - name: Build EXE
+        run: python -m PyInstaller --noconfirm NotionTool.spec
+      - name: Checksum
+        shell: pwsh
+        run: (Get-FileHash dist/NotionTool.exe -Algorithm SHA256).Hash.ToLower() | Set-Content -NoNewline dist/NotionTool.exe.sha256
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "build-${{ github.run_number }}" dist/NotionTool.exe dist/NotionTool.exe.sha256 --title "NotionTool build ${{ github.run_number }}" --notes "Automatic build of ${{ github.sha }}" --latest

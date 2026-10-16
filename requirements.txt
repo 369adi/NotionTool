@@ -1,3 +1,4 @@
 pywebview>=5.0
 pyinstaller>=6.0
 websocket-client>=1.9
+pillow>=10.0

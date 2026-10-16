@@ -22,6 +22,11 @@ def instance_lock(directory):
 
 
 def main():
+    if '--gateway' in sys.argv:  # process 2: MCP gateway / backup MCP, no window, no instance lock
+        from notiontool.gateway import main as gateway_main
+        sys.exit(gateway_main(sys.argv))
+    from notiontool.updater import handoff
+    sys.argv = handoff(sys.argv)  # waits for the previous instance; installs a downloaded update
     parser = argparse.ArgumentParser()
     parser.add_argument('--serve',action='store_true')
     parser.add_argument('--data-dir',default=str(Path(sys.executable).parent/'data' if getattr(sys,'frozen',False) else Path(__file__).parent/'data'))

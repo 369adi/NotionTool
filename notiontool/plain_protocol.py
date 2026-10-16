@@ -123,7 +123,8 @@ One line per task, no vertical bars inside a cell.'''
 # Visual work (desktop apps, UI, renders) needs the screen tools even without a project folder.
 VISUAL=re.compile(r'\b(roblox|blender|screens?|screenshots?|capture|viewport|gui|ui|layout|render(ing)?|visual(ly)?|bildschirm|fenster|aussehen)\b',re.I)
 SCREEN_HINT=(' For visual work in desktop apps such as Roblox Studio or Blender, call the screen_capture tool through mcp_call'
-             ' (target "roblox" or "blender") as often as needed to see the current state before and after changes.')
+             ' (no target = the whole screen; target "roblox" or "blender" = only that window) as often as needed to see the current state'
+             ' before and after changes. Screen tools need no assignment token or code.')
 
 
 def visual(task,run):
