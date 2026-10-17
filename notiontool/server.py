@@ -172,6 +172,8 @@ class Application:
                         if method=='GET' and path=='/api/report':
                             task = app.store.get('tasks',query.get('id',[''])[0])
                             return self.response(200,{'task':app.safe_task(task),'result':task['result'],'partial':task.get('raw_response') or task.get('partial','')})
+                        if method=='POST' and path=='/api/run/confirm':
+                            return self.response(*app.confirm_run_request(self.read_body()))
                         if method=='POST':
                             return self.response(200,app.action(path,self.read_body()))
                         return self.response(404,{'error':'Unknown API route'})
@@ -231,6 +233,10 @@ class Application:
                 self.store.event('operation_resume', message='Resuming '+op['kind']+' after restart', operation_id=op['id'])
                 self.job('Resume '+op['kind'].replace('_',' '), lambda ident=op['id']: self.mains.resume(ident), 'op:'+op['id'])
         threading.Thread(target=self.maintain_context,daemon=True,name='chat-context').start()
+        from .turn_watch import TurnWatch
+        self.turn_watch=TurnWatch(self.store,self.adapter,self.engine)
+        threading.Thread(target=self.turn_watch.loop,daemon=True,name='turn-watch').start()
+        threading.Thread(target=self.sweep_main_archives,daemon=True,name='main-archive-sweep').start()
         self.updater = Updater(self)
         self.updater.start()
         return f'http://127.0.0.1:{self.port}/#'+self.token
@@ -274,15 +280,16 @@ class Application:
             chats.append(dict(chat, state=chat.get('state', 'active'), worker_state=worker.get('state', 'missing'),
                 generation=int(worker.get('generation', 0)) + 1, context_usage=worker.get('context_usage', {}),
                 active_run=next((r['id'] for r in reversed(runs) if r['state'] not in ('done', 'failed', 'blocked', 'cancelled')), ''),
+                awaiting_main=[r['id'] for r in runs if r.get('state') == 'awaiting_main'],
                 message_marker=marker))
         return sorted(chats, key=lambda c: c.get('main_number') or 0)
 
     def stream(self, handler, query):
         """Server-sent events: durable events (id = event sequence) plus task partial text.
-        Reconnect with Last-Event-ID or ?after=; state is re-read, nothing is resent upstream."""
+        Reconnect with Last-Event-ID, ?since= or ?after=; state is re-read, nothing is resent upstream."""
         run_filter = query.get('run_id', [''])[0]
         try:
-            last = int(handler.headers.get('Last-Event-ID') or query.get('after', ['0'])[0] or 0)
+            last = max(0, int(handler.headers.get('Last-Event-ID') or query.get('since', query.get('after', ['0']))[0] or 0))
         except ValueError:
             last = 0
         duration = max(5, min(900, int(query.get('timeout', ['300'])[0] or 300)))
@@ -360,11 +367,14 @@ class Application:
     def maintain_context(self):
         from .harness_account import selected_account
         from .chat_context import ChatContext
+        from .network_budget import set_thread_priority
+        set_thread_priority('background')  # scan failures must never throttle task parallelism
         while not self.engine.stop_event.wait(30):
             account_id = selected_account(self.store)
             if not account_id or self.store.get('accounts', account_id, {}).get('state') != 'ready':
                 continue
             try:
+                failed = None
                 for worker in self.store.all('workers'):
                     if self.engine.stop_event.is_set():
                         return
@@ -372,16 +382,28 @@ class Application:
                         continue
                     if time.time() - worker.get('context_checked', 0) < 120:
                         continue
-                    transcript = self.adapter.client(account_id).transcript(worker['thread_id'])
-                    archive = self.store.get('thread_context', account_id + ':' + worker['thread_id'], {})
-                    if not archive.get('native_archived_at'):
-                        ChatContext(self.store).archive_native(self.adapter.client(account_id), worker)
-                    usage = ChatContext(self.store).usage(worker, transcript)
+                    try:
+                        transcript = self.adapter.client(account_id).transcript(worker['thread_id'], limit=30)
+                        archive = self.store.get('thread_context', account_id + ':' + worker['thread_id'], {})
+                        if not archive.get('native_archived_at'):
+                            ChatContext(self.store).archive_native(self.adapter.client(account_id), worker)
+                        usage = ChatContext(self.store).usage(worker, transcript)
+                    except Exception as exc:
+                        # One unreadable chat (e.g. a very long one) must not stop the scan of the others.
+                        failed = failed or exc
+                        with self.engine.lock:
+                            fresh = self.store.get('workers', worker['id'])
+                            if fresh and fresh['thread_id'] == worker['thread_id']:
+                                fresh.update(context_checked=time.time())
+                                self.store.put('workers', fresh)
+                        continue
                     with self.engine.lock:
                         fresh = self.store.get('workers', worker['id'])
                         if fresh and fresh['thread_id'] == worker['thread_id']:
                             fresh.update(context_usage=usage, context_checked=time.time())
                             self.store.put('workers', fresh)
+                if failed:
+                    raise failed
                 if getattr(self, 'context_scan_blocked', False):
                     self.context_scan_blocked = False
                     self.store.event('context_scan_resumed', message='Native context scan works again')
@@ -405,10 +427,32 @@ class Application:
         runs = [{k:v for k,v in r.items() if k!='context'} for r in self.store.all('runs')]
         return dict(name='NotionTool',mcp_servers=self.mcp_servers.public(),accounts=accounts,workers=workers,folders=self.store.all('folders'),
             chats=self.chat_list(),operations=[self.mains.public(o) for o in self.store.all('operations')][-30:],host_api=dict(port=self.port,bind=getattr(self,'bind','127.0.0.1')),limits=self.limits(),runs=runs,tasks=[self.safe_task(t) for t in self.store.all('tasks')],
+            awaiting_main=[r['id'] for r in runs if r.get('state') == 'awaiting_main'],
             harness_account_id=selected,settings=self.store.settings(),jobs=self.store.all('jobs')[-30:],events=self.store.events(),
             bridge=dict(local_url=f'http://127.0.0.1:{self.port}/mcp',public_url=self.store.settings().get('public_mcp_url','')),
             stats=dict(running=sum(w['state']=='busy' for w in workers),ready=sum(w.get('enabled') and w['state']=='ready' and w['purpose']=='worker' and w.get('account_id') in ready_accounts for w in workers),
                        recovering=sum(w['state']=='recovering' for w in workers)))
+
+    MAIN_ROTATE_LOCK = threading.Lock()
+    MAIN_ROTATE_JOBS = {}  # account_id -> job id of the last /api/main/rotate job
+
+    def sweep_main_archives(self):
+        """Phase 5b: every 60 s let main_handoff_ops delete archived Main chats past DELETE_DELAY. Never raises."""
+        last = ''
+        while True:
+            time.sleep(60)
+            try:
+                from . import main_handoff_ops
+                main_handoff_ops.sweep_archives(self.store, self.adapter)
+                last = ''
+            except Exception as exc:
+                text = (type(exc).__name__ + ': ' + str(exc))[:250]
+                if text != last:  # log each distinct error once, not every minute
+                    last = text
+                    try:
+                        self.store.event('main_archive_sweep_failed', message=text)
+                    except Exception:
+                        pass
 
     def job(self, title, fn, account_id='', key=''):
         """Run fn on the admin pool. A key keeps one record for a periodic job; its event is logged only when the outcome changes."""
@@ -467,6 +511,15 @@ class Application:
             self.store.event('mcp_auto_setup_failed', message=str(exc)[:250])
         return result
 
+    def resume_after_sign_in(self, account_id):
+        """Lift an auth pause once the account that caused it signed in successfully."""
+        coordination = self.engine.coordination()
+        pause = coordination.get('pause') or {}
+        blocked_account = str(pause.get('account_id') or '')
+        if not coordination.get('paused') or (blocked_account and blocked_account != account_id):
+            return None
+        return self.engine.resume_remote()
+
     def finish_account_result(self, result):
         ident = result.get('account_id')
         account = self.store.get('accounts', ident, {})
@@ -506,6 +559,22 @@ class Application:
             raise ValueError('Sign in to Notion again (Settings > Sign in) before preparing chats.')
         # Setup uses the account's existing paid plan; nothing is activated.
         return self.finish_account_result(self.adapter.ensure_team(account_id))
+
+    def confirm_run_request(self, body):
+        """POST /api/run/confirm {id}: the Main confirms a run in awaiting_main. Returns (status, payload)."""
+        confirm = getattr(self.engine, 'confirm_run', None)
+        if not callable(confirm):
+            return 501, {'error': 'Run confirmation is not available: the engine has no confirm_run yet'}
+        run_id = str((body or {}).get('id') or '').strip()
+        run = self.store.get('runs', run_id) if run_id else None
+        if not run:
+            return 404, {'error': 'Run not found'}
+        if run.get('state') != 'awaiting_main':
+            return 409, {'error': 'Run is not awaiting Main confirmation (state: %s)' % run.get('state', '')}
+        result = confirm(run_id)
+        saved = self.store.get('runs', run_id) or {}
+        return 200, {'ok': True, 'id': run_id, 'state': saved.get('state', ''),
+                     'result': result if isinstance(result, dict) else None}
 
     def action(self,path,body):
         with self.engine.lock:
@@ -552,6 +621,14 @@ class Application:
                 chat = self.store.get('chats',body['id'])
                 if not chat:
                     raise ValueError('Chat not found')
+                if body.get('main_worker'):
+                    # Re-point a chat whose Main thread vanished to a ready Main worker.
+                    target = self.store.get('workers', str(body['main_worker']))
+                    if not target or target.get('state') != 'ready' or target.get('purpose') != 'main':
+                        raise ValueError('Choose a ready Notion main chat')
+                    if any(c['id'] != chat['id'] and c.get('main_worker') == target['id'] for c in self.store.all('chats')):
+                        raise ValueError('This Notion thread already belongs to a main chat')
+                    chat['main_worker'] = target['id']
                 for key in ('title','folder_id','project_path','harness'):
                     if key in body:
                         chat[key] = str(body[key])[:500]
@@ -600,8 +677,8 @@ class Application:
             if path=='/api/settings':
                 settings = self.store.settings()
                 for key,lo,hi in [('max_workers',1,40),('per_account',1,40),('max_attempts',1,5),
-                                 ('task_timeout',60,3600),('max_fix_rounds',0,4),('context_token_limit',8000,200000),
-                                 ('context_turn_limit',5,200),('context_handoff_chars',8000,40000)]:
+                                 ('task_timeout',60,3600),('max_fix_rounds',0,4),('context_token_limit',8000,2000000),
+                                 ('context_turn_limit',5,2000),('context_handoff_chars',8000,40000),('max_runs_per_chat',1,6)]:
                     if key in body:
                         settings[key] = max(lo,min(hi,int(body[key])))
                 if 'host_api_port' in body:
@@ -664,8 +741,24 @@ class Application:
                 usage = worker.get('context_usage') or {}
                 tokens, limit = int(usage.get('estimated_tokens', 0)), int(usage.get('token_limit', 0) or self.store.settings().get('context_token_limit', 60000))
                 reason = str(body.get('reason') or '').strip()[:300] or ('Context at about %d of %d tokens' % (tokens, limit))
-                worker.update(compress_requested=True, compress_reason=reason)
-                self.store.put('workers', worker)
+                native = (worker.get('purpose') == 'main' and self.store.settings().get('main_context_policy', 'hint') != 'auto')
+                if native:
+                    # Fix Q: the operator Main is compacted by Notion itself. Never inject a checkpoint turn there;
+                    # clear the request and drop a rotation whose task is no longer running.
+                    pending = self.store.get('rotations', worker['id'])
+                    task = self.store.get('tasks', (pending or {}).get('task_id', '')) or {}
+                    stale = bool(pending) and task.get('state') not in ('running', 'cancelling', 'uncertain', 'checkpoint', 'preparing')
+                    worker.update(compress_requested=False, compress_reason='', context_hint=None)
+                    self.store.put('workers', worker)
+                    if stale:
+                        self.store.batch([], [('rotations', worker['id'])])
+                else:
+                    worker.update(compress_requested=True, compress_reason=reason)
+                    self.store.put('workers', worker)
+            if native:
+                self.store.event('main_compress_native', '', worker_id=worker['id'], stale_rotation=stale,
+                                 message='Operator Main is compacted by Notion; no checkpoint turn was sent. ' + reason)
+                return dict(ok=True, chat_id=chat['id'], reason=reason, same_chat=True, native=True, stale_rotation_removed=stale)
             self.store.event('compress_requested', '', worker_id=worker['id'], message=reason)
             return dict(ok=True, chat_id=chat['id'], reason=reason, same_chat=True)
         if path=='/api/operation/resume':
@@ -694,6 +787,9 @@ class Application:
             def login():
                 from .harness_account import selected_account
                 result = self.adapter.browser_login()
+                resumed = self.resume_after_sign_in(result.get('account_id', ''))
+                if resumed is not None:
+                    result['coordination'] = resumed
                 if result.get('account_id') and result['account_id'] == selected_account(self.store):
                     result.update(self.prepare_account(result['account_id']))
                 return result
@@ -707,6 +803,66 @@ class Application:
             result=self.adapter.remove_account(ident)
             self.store.event('account_removed',message='Account removed: '+result['email'])
             return result
+        if path=='/api/account/reset-coworkers':
+            # Fix Z: delete every unnamed Coworker chat (Welcome/Cowork titles), drop missing entries, create a fresh pool.
+            # Named chats and the Main are never touched; a worker with an active task is skipped.
+            from .harness_account import selected_account
+            ident = account_id or selected_account(self.store)
+            def reset():
+                titles = ('Welcome to Notion', 'Cowork joined', 'Cowork (retired)')
+                active = ('running', 'preparing', 'uncertain', 'checkpoint', 'cancelling')
+                busy = {t.get('worker_id') for t in self.store.all('tasks') if t.get('state') in active or t.get('remote_unknown')}
+                client = self.adapter.client(ident)
+                deleted, dropped, skipped, failed = [], [], [], []
+                for w in list(self.store.all('workers')):
+                    if w.get('account_id') != ident or w.get('purpose', 'worker') != 'worker':
+                        continue
+                    if w.get('state') == 'missing':
+                        if w.get('label') in titles:
+                            self.store.delete('workers', w['id']); dropped.append(w['thread_id'])
+                        continue
+                    if w.get('label') not in titles:
+                        continue
+                    if w['id'] in busy:
+                        skipped.append(w['thread_id']); continue
+                    try:
+                        self.adapter.delete_thread(client, w['thread_id'])
+                        self.store.delete('workers', w['id']); deleted.append(w['thread_id'])
+                    except Exception as exc:
+                        failed.append(w['thread_id'] + ': ' + str(exc)[:120])
+                account = self.store.get('accounts', ident)
+                ledger = account.get('team_threads') or {}
+                for role in ('worker1', 'worker2', 'worker3', 'worker4', 'worker5'):
+                    ledger.pop(role, None)
+                account['team_threads'] = ledger
+                self.store.put('accounts', account)
+                self.store.event('coworkers_reset', message='Coworker chats deleted: %d, stale entries dropped: %d, skipped busy: %d, failed: %d'
+                                 % (len(deleted), len(dropped), len(skipped), len(failed)))
+                team = self.adapter.ensure_team(ident)
+                return dict(deleted=deleted, dropped=dropped, skipped=skipped, failed=failed, team=team)
+            return self.job('Reset Coworker chats', reset, ident)
+        if path=='/api/main/rotate':
+            # Phase 5b: move the Main into a fresh Welcome chat through the file handoff.
+            # Runs as a job like reset-coworkers; a second request for the same account while
+            # a rotation runs returns the running job and starts nothing new.
+            from .harness_account import selected_account
+            ident = account_id or selected_account(self.store)
+            if not ident:
+                raise ValueError('account_id is required')
+            def rotate():
+                from . import main_handoff_ops  # imported here so server.py loads without the module
+                def emit(kind, message='', **fields):
+                    fields.setdefault('account_id', ident)
+                    self.store.event(kind, message=message, **fields)
+                return main_handoff_ops.run_rotation(self.store, self.adapter, ident, emit)
+            with Application.MAIN_ROTATE_LOCK:
+                jobs = Application.MAIN_ROTATE_JOBS
+                existing = self.store.get('jobs', jobs[ident], None) if ident in jobs else None
+                if existing and existing.get('state') == 'running':
+                    return {'job_id': existing['id'], 'already_running': True}
+                started = self.job('Rotate Main into a fresh chat', rotate, ident)
+                jobs[ident] = started['job_id']
+                return started
         if path=='/api/account/team':
             return self.job('Prepare five Welcome workers and one main',lambda:self.adapter.ensure_team(account_id),account_id)
         if path=='/api/account/setup':

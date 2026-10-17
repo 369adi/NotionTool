@@ -80,3 +80,12 @@ Alle Notion-Requests eines Prozesses laufen durch genau eine `NetworkBudget`-Ins
 - Scheitert `_start` nach `acquire`, wird das Ticket nicht freigegeben. Eine hängende Probe gibt sich nach 120 s selbst frei.
 - `remote_sent` kann geloggt werden, obwohl `CircuitOpen` erst beim Stream-Acquire greift. Das ist kosmetisch, gesendet wird nichts.
 - Turn-Fehler im Stream zählen nicht für den Breaker, weil der Endpunkt geantwortet hat. Sie senken nur die Parallelität. Die Engine kühlt den Task über `RateLimited(20)` ab (live beobachtet: etwa 20 s zwischen den Versuchen). Ein eigener Breaker für gehäufte `temporarily-unavailable`-Fehler ist nicht umgesetzt.
+
+## 11. Nachweise
+
+Stand: 16.10.2026. Die Punkte stammen aus dem Live-Betrieb des Operators vom 16.10.2026.
+
+- Eingefrorener Tab, vor Fix K: `setTimeout(0)` im versteckten Transport-Tab bekam keine Antwort. 5 bereits beendete Streams blieben offen, bis der Timeout von 900 s griff.
+- Nach dem Wecken über `Page.setWebLifecycleState` (`notiontool/edge_transport.py:52-56`): `setTimeout(0)` antwortete in 0 ms.
+- Nach dem Neustart mit dem Fix: 3 Tasks im Zustand `uncertain` wurden in jeweils etwa 2 s geprüft.
+- Fix L: Der Review ging vom busy Main an einen Coworker (Event `reviewer_fallback`, `notiontool/engine.py:494`).

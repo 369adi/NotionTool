@@ -65,3 +65,11 @@ Hypothese (UNBEKANNT): Welcome-/Onboarding-Threads (`welcome.json`: `modelFromUs
 2. Verifikation auf die Messages des eigenen Turns begrenzen statt alle Thread-Messages zu laden.
 3. Router/UI ehrlich machen: effektives Modell (Sonnet 4.6 low) anzeigen; Haiku-Routing bringt keinen Speed-Gewinn.
 4. Health: Account-Anzeige nach dem Start beobachten (einmal 971f).
+
+## 7. Phase 4 - Fix K und Fix L (Code-Stand 16.10.2026)
+| Fähigkeit | Befund | Stelle | Beleg |
+|---|---|---|---|
+| Edge-Tab-Wake (Fix K) | Der versteckte Transport-Tab wird ohne Navigation und ohne Notion-Request aus dem Edge-Zustand frozen geholt: `browser.wake(target)`, sonst DevTools `Page.setWebLifecycleState` mit `{state: active}`. Normal höchstens alle 15 s; erzwungen, wenn ein Stream länger als `stall_wake_after` keine neuen Bytes liefert, dann vorher Test mit `setTimeout(0)` (2 s). Liegt außerhalb des Request-Budgets (I11). Event `edge_tab_woken` mit `frozen=true` höchstens einmal pro 60 s | edge_transport.py:34-66, :219-222 | LOKAL GEPRÜFT (Code) |
+| Reviewer-Fallback bei belegtem Main (Fix L) | Wurde der Main kürzlich als belegt erkannt (`main_busy_at` innerhalb von `MAIN_BUSY_FALLBACK_S`) und haben alle freien Coworker an diesem Run mitgearbeitet, wartet das Review nicht bis `BUSY_WAIT_LIMIT`: Der Coworker mit dem kleinsten eigenen Executor-Anteil prüft. Event `reviewer_fallback` einmal pro Task | engine.py:475-495 | LOKAL GEPRÜFT (Code) |
+
+Live-Belege: siehe docs/REQUEST_COORDINATION.md (Abschnitt Nachweise); in diesem Dokument NICHT GEPRÜFT.

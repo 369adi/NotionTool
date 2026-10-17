@@ -12,6 +12,10 @@ Set-Location $root
 Get-ChildItem env: | Where-Object { $_.Name -like '_PYI*' -or $_.Name -eq '_MEIPASS2' } | ForEach-Object { Remove-Item "env:$($_.Name)" }
 $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
 L "begin mode=$Mode rebuild=$Rebuild"
+# Exactly one restart at a time: a second, overlapping call aborts before it builds or stops anything.
+$mutex = New-Object System.Threading.Mutex($false, 'Global\NotionToolHarnessRestart')
+try { $own = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $own = $true }
+if (-not $own) { L 'abort: another restart is already running'; exit 2 }
 if ($Rebuild -and $Mode -eq 'exe') {
     Remove-Item "$root\work\newdist\NotionTool.exe" -Force -ErrorAction SilentlyContinue
     & $py -m PyInstaller --noconfirm --distpath "$root\work\newdist" --workpath "$root\work\pyibuild" NotionTool.spec *> "$root\work\pyinstaller.log"

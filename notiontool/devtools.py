@@ -2,7 +2,18 @@
 import ast, fnmatch, hashlib, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
-ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent.parent
+def _root():
+    # Frozen EXE built into <project>/dist: use the project folder so backups and memory stay out of dist.
+    if not getattr(sys, 'frozen', False):
+        return Path(__file__).resolve().parent.parent
+    exe = Path(sys.executable).resolve().parent
+    parent = exe.parent
+    if exe.name.lower() == 'dist' and (parent / 'notiontool').is_dir() and (parent / 'project-memory').is_dir():
+        return parent
+    return exe
+
+
+ROOT = _root()
 SKIP = {'.git', 'node_modules', '__pycache__', 'build', 'dist', '.venv', 'venv', '.test-data', 'data', 'browser-profiles', '.pytest_cache', 'backups'}
 MEMORY = ROOT / 'project-memory'
 LIMIT = 60000

@@ -189,7 +189,7 @@ class Store:
         defaults = dict(id='app', max_workers=40, per_account=8,
                        max_attempts=3, task_timeout=900, max_fix_rounds=2, tool_parallelism=4,
                        public_mcp_url='', theme='dark', notion_transport='edge',
-                       context_token_limit=60000, context_turn_limit=80, context_handoff_chars=24000,
+                       context_token_limit=1200000, context_turn_limit=600, context_handoff_chars=24000,
                        host_api_port=8790, host_api_allow_network=False, host_api_bind='127.0.0.1',
                        coworker_fresh_context='threshold', context_replace_mode='soft')
         return dict(defaults, **self.get('settings', 'app', {}))

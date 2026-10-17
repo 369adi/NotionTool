@@ -44,10 +44,15 @@ def declined(text):
                "i can't fulfill this request",'no files or pc tools are configured'))
 
 
+def unmark(cell):
+    """Drop the Markdown escapes Notion adds inside table cells (SCREEN\\_CAPTURE.md -> SCREEN_CAPTURE.md)."""
+    return re.sub(r'\\([\\`*_~#])', r'\1', cell)
+
+
 def table_plan(text):
     rows=[]
     for line in plain(text).splitlines():
-        cells=[c.strip().strip('`') for c in line.strip().strip('|').split('|')]
+        cells=[unmark(c.strip().strip('`')) for c in line.strip().strip('|').split('|')]
         if len(cells)<6 or not re.fullmatch(r'T\d+',cells[0],re.I):continue
         ident,title,work,deps,files,check=cells[:6]
         dependencies=re.findall(r'T\d+',deps.upper())
@@ -105,7 +110,7 @@ def normalize(task,text):
 TABLE='''| ID | Title | Work to do | Depends on | Files | How to check |
 | T1 | short title | specific instructions | none | none | observable check |
 Use T1, T2, etc. as identifiers. For dependencies, name earlier IDs or none.
-For files, use paths relative to the project folder separated by semicolons, or none.
+For files, use paths relative to the project folder with forward slashes (docs/README.md), separated by semicolons, or none.
 Use one line per task; do not put vertical bars inside a cell.'''
 
 MODEL_TABLE='''| ID | Title | Work to do | Depends on | Files | How to check | Model | Model reason | Route |
@@ -116,7 +121,7 @@ Prioritize answer quality and latency; cheap models are useful only when capable
 Choose afresh for every task, including repairs; never inherit the previous worker model.
 Route is worker for delegation. If you can solve the request efficiently alone, return exactly
 one independent task with Route main and Model Opus 5.5. Include its complete checks.
-Use T1, T2, etc.; list dependencies or none, and relative files separated by semicolons or none.
+Use T1, T2, etc.; list dependencies or none, and relative files with forward slashes (docs/README.md) separated by semicolons or none.
 One line per task, no vertical bars inside a cell.'''
 
 
@@ -125,11 +130,73 @@ VISUAL=re.compile(r'\b(roblox|blender|screens?|screenshots?|capture|viewport|gui
 SCREEN_HINT=(' For visual work in desktop apps such as Roblox Studio or Blender, call the screen_capture tool through mcp_call'
              ' (no target = the whole screen; target "roblox" or "blender" = only that window) as often as needed to see the current state'
              ' before and after changes. Screen tools need no assignment token or code.')
+# Every coworker role may look at the screen; advisers and planners still only look.
+SCREEN_TOOLS_LINE=('\nScreen tools: screen_windows and screen_capture are available through mcp_call with no assignment token,'
+                   ' to check the current state when needed.')
+ADVISER_TOOLS_NOTE=' Use them only to look; this planning role has no write or shell rights.'
+
+
+# Capture policy per task_class (docs/SCREEN_CAPTURE.md): code and docs never get the hint,
+# visual and ui always do; missing or other classes keep the keyword match.
+NO_SCREEN_CLASSES=('code','docs')
+SCREEN_CLASSES=('visual','ui')
 
 
 def visual(task,run):
+    task_class=str(task.get('task_class') or '').strip().lower()
+    if task_class in NO_SCREEN_CLASSES:
+        return False
+    if task_class in SCREEN_CLASSES:
+        return True
     text=' '.join(str(value or '') for value in (run.get('goal'),task.get('title'),task.get('prompt'),task.get('acceptance')))
     return bool(VISUAL.search(text))
+
+
+# Worker capture gate (Phase 7): a worker screen capture is checked against
+# capture_policy.capture_allowed before it is taken. Explicit operator captures
+# (operator or chat path without a worker task) are never gated here.
+try:
+    from . import capture_policy
+except ImportError:  # Part A not available yet: workers are refused, operators are unaffected
+    capture_policy = None
+
+CAPTURE_REFUSAL = 'Screen capture refused for this task: {detail}. No capture was taken.'
+FALLBACK_DETAILS = {'capture_policy_unavailable': 'the capture policy is not available'}
+
+
+def refusal_text(why):
+    """Readable English refusal text; uses capture_policy.reason_text(code) when it exists."""
+    describe = getattr(capture_policy, 'reason_text', None)
+    text = describe(why) if callable(describe) else None
+    if isinstance(text, str) and text.strip():
+        return text.strip() + ' No capture was taken.'
+    return CAPTURE_REFUSAL.format(detail=FALLBACK_DETAILS.get(why, why))
+
+
+def capture_gate(task, project_settings=None, already_taken=0, operator=False):
+    """Return None when the capture may go ahead, else a refusal with an English text and an event reason."""
+    if operator or not task:
+        return None
+    task_class = str(task.get('task_class') or '').strip().lower()
+    # A bad count is passed through unchanged so the policy can refuse it (invalid_count).
+    taken = 0 if already_taken is None else already_taken
+    if capture_policy is None:
+        allowed, why = False, 'capture_policy_unavailable'
+    else:
+        allowed, why = capture_policy.capture_allowed(task_class, dict(project_settings or {}), taken)
+    if allowed:
+        return None
+    event_taken = taken if isinstance(taken, (int, float, str)) else repr(taken)
+    reason = dict(reason=str(why or 'refused'), task_class=task_class, already_taken=event_taken)
+    return dict(refused=True, text=refusal_text(reason['reason']), reason=reason)
+
+
+def guarded_capture(capture, args, task=None, project_settings=None, already_taken=0, operator=False):
+    """Call capture(args) only when capture_gate allows it; otherwise return the refusal and take no capture."""
+    refusal = capture_gate(task, project_settings, already_taken, operator)
+    if refusal is not None:
+        return refusal
+    return capture(args)
 
 
 def prompt(task,run,context,token,tools_available):
@@ -139,19 +206,21 @@ def prompt(task,run,context,token,tools_available):
     project=('\nThe project folder is '+run['project_path']+'.\n') if run.get('project_path') else ''
     screen=bool(tools_available) and visual(task,run)
     tools=('\nThe connected NotionTool project tools require assignment_token '+token+' for this request.'+(SCREEN_HINT if screen else '')+'\n') if tools_available and (run.get('project_path') or task.get('files') or screen) else ''
+    screen_tools=(SCREEN_TOOLS_LINE+'\n') if tools_available else ''
+    adviser_tools=(SCREEN_TOOLS_LINE+ADVISER_TOOLS_NOTE+'\n') if tools_available else ''
     if run.get('allocation',{}).get('mode')=='direct':
         return goal+memory+'\nReply naturally in my language.'
     if task['role'] in ('architect','researcher','quality_planner'):
         angle={'architect':'a clear method and useful independent parts','researcher':'facts, calculations and practical constraints',
                'quality_planner':'specific checks and possible mistakes'}[task['role']]
-        return 'I would like help planning this request:\n'+goal+'\nPlease suggest '+angle+'. I only need suggestions for now, not execution.'+memory+project
+        return 'I would like help planning this request:\n'+goal+'\nPlease suggest '+angle+'. I only need suggestions for now, not execution.'+memory+project+adviser_tools
     if task['role']=='planner':
         correction='\n'+task['prompt'] if task.get('attempts',0)>1 else ''
         explicit=run.get('allocation',{}).get('requested_parts')
         independence=f'\nI requested exactly {explicit} independent execution contributions. Give exactly {explicit} rows with no dependencies; each part must compute and check its own result without relying on another row. Do not add a review or combine row.' if explicit else ''
-        return 'You are the Architect of my request. Decide whether to work alone or delegate, and assign the explicit model of every task. Please make an execution task list:\n'+goal+memory+reference+project+f'\nUp to {run.get("worker_budget",run["capacity"])} people can contribute independent parts. Choose the smallest useful task list that preserves answer quality and speed. Do not invent work to fill available people. Separate independent work only when it saves time or improves quality; avoid duplicate research and merging overhead. Respect any explicit contribution count in my request. Use dependencies where needed. Delegated work will be reviewed and combined separately.'+independence+correction+'\nPlease present the task list as this readable table:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
+        return 'You are the Architect of my request. Decide whether to work alone or delegate, and assign the explicit model of every task. Please make an execution task list:\n'+goal+memory+reference+project+run.get('file_claims','')+adviser_tools+f'\nUp to {run.get("worker_budget",run["capacity"])} people can contribute independent parts. Choose the smallest useful task list that preserves answer quality and speed. Do not invent work to fill available people. Separate independent work only when it saves time or improves quality; avoid duplicate research and merging overhead. Respect any explicit contribution count in my request. Use dependencies where needed. Delegated work will be reviewed and combined separately.'+independence+correction+'\nPlease present the task list as this readable table:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='reviewer':
-        return 'Please check these completed results against my request:\n'+goal+reference+project+tools+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
+        return 'Please check these completed results against my request:\n'+goal+reference+project+tools+screen_tools+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='integrator':
-        return 'Please combine these checked results into a complete answer to my request:\n'+goal+reference+memory+'\nUse my language. State what was actually checked and any remaining limitations.'
-    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+tools+reference+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'
+        return 'Please combine these checked results into a complete answer to my request:\n'+goal+reference+memory+screen_tools+'\nUse my language. State what was actually checked and any remaining limitations.'
+    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'

@@ -38,6 +38,17 @@ The public Notion Integrations API is NOT used.
 
 All previously existing routes (account, settings, tools/MCP, files, recover) are unchanged. `POST /api/settings` accepts partial bodies, for example `{"coworker_fresh_context":"threshold"}` or `{"context_replace_mode":"soft"}`.
 
+## Run and worker control routes (detail)
+Source: `notiontool/server.py` (CRLF, read only). Every POST body must be a JSON object of 1 byte to 2 MiB (server.py:191-198). A route result is returned with 200 (server.py:175-176). `ValueError`, `KeyError`, `TypeError` and `OSError` become 400 with `{error: <message>}` (server.py:178-179); any other exception becomes 500 `Operation failed; see the activity log` (server.py:180-182). A missing required field such as `id` raises `KeyError`, so it also returns 400, with the quoted field name as the message (server.py:178-179).
+
+| Route | Body | Response | Error cases and behavior | Source |
+|---|---|---|---|---|
+| `/api/run/pause` | `{id, paused?}`; `paused` defaults to true | `{ok:true}` | 400 `Run not found` (engine.py:247-248). `paused:true` only pauses an active run and keeps its state for resume; `paused:false` only resumes a paused run; any other state is stored unchanged and still returns `{ok:true}` (engine.py:249-254) | server.py:586-588 |
+| `/api/run/retry` | `{id}` | `{ok:true}` | 400 `Only a blocked or failed run can be resumed` (engine.py:296-297); 400 `Wait for reconciliation before retrying` while any task is `uncertain` or `remote_unknown` (engine.py:298-299). On success it also lifts the coordination pause and requeues blocked and failed tasks with `attempts=0`; finished tasks are kept (engine.py:300-310) | server.py:591-593 |
+| `/api/coordination/resume` | `{}` (no field is read, but the body must still be a JSON object) | `{resumed, requeued_tasks, resumed_runs}` | No route-specific error. Manual resume after `ACCOUNT_BLOCKED`: lifts the pause, requeues only blocked tasks with `paused_by` and without `remote_unknown`, and resumes a blocked run only if none of its tasks is failed, blocked or `remote_unknown` (engine.py:269-291) | server.py:589-590 |
+| `/api/task/reconcile` | `{id}` | `{ok:true}` | 400 `This task does not need manual reconciliation` when the task does not exist or has no `remote_unknown` (server.py:596-597). On success the task becomes `uncertain` with `remote_unknown=false`, `reconcile_at=0` and a new `started` time, so the remote state is checked again instead of resending (server.py:598-600; the later check itself is NOT VERIFIED here) | server.py:594-600 |
+| `/api/worker` | `{id, enabled}`; `enabled` is read with `bool()`, a missing value disables the worker | `{ok:true}` | 400 `Worker not found` (server.py:603-604); 400 `Main threads are reserved for their chat` (server.py:605-606) | server.py:601-609 |
+
 ## Operation states
 `reserved -> submitted -> (unconfirmed) -> done | failed`.
 `unconfirmed` = the remote request may have been accepted (timeout). The host checks the real remote state (thread lookup / message marker) before any further action.

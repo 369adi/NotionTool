@@ -26,6 +26,8 @@ class ContextTests(unittest.TestCase):
         self.task = dict(id='t', run_id='r', worker_id='logical-main', state='running')
         self.store.put('tasks', self.task)
         self.store.put('runs', dict(id='r', chat_id='c', goal='Keep every constraint', project_path='C:/project'))
+        settings = self.store.settings(); settings['main_context_policy'] = 'auto'  # legacy inline Main rotation
+        self.store.put('settings', settings)
         self.context = ChatContext(self.store)
         self.client = SimpleNamespace(info={'space_id': 'space'}, model=lambda:'opus', threads=lambda:[],
             transport=SimpleNamespace(stream=Mock(return_value=iter([]))), headers=lambda:{})

@@ -29,6 +29,9 @@ class FakeClient:
             for op in body['transactions'][0]['operations']:
                 if op['pointer']['table']=='thread':self.titles[op['pointer']['id']]=op['args']
             return {}
+        if path=='syncRecordValuesSpaceInitial':
+            done={'alive':True,'data':{'turn_outcomes':{'t':{'status':'completed'}}}}
+            return {'recordMap':{'thread':{r['pointer']['id']:{'value':{'value':done}} for r in body['requests']}}}
         raise AssertionError(path)
 
 
@@ -45,6 +48,21 @@ class NativeTests(unittest.TestCase):
         adapter.client=lambda *args,**kwargs:self.client
         self.store.put('accounts',dict(id='a',slot=1,email='test@example.test',label='Slot 1',state='ready'))
         return adapter
+
+    def test_orphaned_account_pause_is_cleared_on_restart(self):
+        from notiontool.network_budget import NetworkBudget
+        budget = NetworkBudget(self.store)
+        budget.pause('HTTP 403', account_id='removed', status=403)
+        adapter = NotionAdapter(self.store)
+        self.assertFalse(adapter.network_budget.status()['paused'])
+
+    def test_existing_account_pause_requires_matching_new_login(self):
+        adapter = self.adapter()
+        adapter.network_budget.pause('HTTP 403', account_id='a', status=403)
+        self.assertFalse(adapter.clear_account_pause('different'))
+        self.assertTrue(adapter.network_budget.status()['paused'])
+        self.assertTrue(adapter.clear_account_pause('a'))
+        self.assertFalse(adapter.network_budget.status()['paused'])
     def test_exactly_five_welcome_workers_and_one_welcome_main(self):
         adapter=self.adapter();result=adapter.ensure_team('a')
         self.assertEqual(result['welcome_chats'],6)
@@ -53,7 +71,7 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(all(b['transcript'][0]['value']['oracleThreadType']=='onboarding' for b in self.client.created))
         self.assertTrue(all(b['transcript'][2]['value']=='Welcome to Notion' for b in self.client.created))
         workers=self.store.all('workers')
-        self.assertEqual(sum(w['purpose']=='worker' and w['label']=='Cowork joined' for w in workers),5)
+        self.assertEqual(sum(w['purpose']=='worker' and w['label']=='Welcome to Notion' and w.get('join_state')=='joined' for w in workers),5)
         self.assertEqual(sum(w['purpose']=='main' and w['label']=='Main Chat' for w in workers),1)
         self.assertEqual(len(self.store.all('chats')),1)
     def test_team_setup_is_idempotent(self):

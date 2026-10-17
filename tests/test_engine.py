@@ -51,6 +51,14 @@ class FakeAdapter:
         raise PendingRemote()
 
 
+class FakeClock:
+    """Injectable engine clock. It starts far ahead of real time, so retry times stored with time.time() are already due."""
+    def __init__(self, now=4_000_000_000.0):
+        self.now = now
+    def __call__(self):
+        return self.now
+
+
 class EngineTests(unittest.TestCase):
     def test_wrong_model_cannot_use_tools_before_final_response_check(self):
         from unittest.mock import Mock
@@ -216,8 +224,16 @@ class EngineTests(unittest.TestCase):
         def call(worker,task,prompt,cancel,update):
             if task['role']=='integrator':return VerifiedReply(json.dumps({'status':'done','summary':'Something went wrong. Please try again later.'}),False)
             return original(worker,task,prompt,cancel,update)
+        from concurrent.futures import wait
+        clock=FakeClock();self.engine.clock=clock
         self.adapter.run=call;run=self.engine.submit('c','bounded final outage')
-        self.pump(lambda:self.store.get('runs',run['id'])['state']=='blocked',timeout=10)
+        for _ in range(500):
+            self.engine.tick()
+            if self.store.get('runs',run['id'])['state']=='blocked':break
+            with self.engine.lock:running=list(self.engine.inflight)
+            if running:wait(running,timeout=10)
+            else:clock.now+=61
+        self.assertEqual(self.store.get('runs',run['id'])['state'],'blocked')
         self.assertEqual(next(t for t in self.engine.tasks(run['id']) if t['role']=='integrator')['attempts'],3)
         self.assertFalse(any(m['role']=='assistant' for m in self.store.all('messages')))
     def test_verified_tool_free_execution_failure_recovers_without_repeating_other_parts(self):
@@ -252,6 +268,7 @@ class EngineTests(unittest.TestCase):
         self.pump(lambda:all(self.store.get('runs',r['id'])['state']=='done' for r in [first,second]))
         self.assertEqual({m['chat_id'] for m in self.store.all('messages') if m['role']=='assistant'},{'c','c2'})
     def test_same_chat_queues_next_message(self):
+        settings=self.store.settings();settings['max_runs_per_chat']=1;self.store.put('settings',settings)
         self.adapter.hold=True
         first=self.engine.submit('c','first');second=self.engine.submit('c','second')
         self.assertEqual(second['state'],'queued')
@@ -259,6 +276,19 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.store.get('runs',second['id'])['state'],'queued')
         self.adapter.gate.set()
         self.pump(lambda:self.store.get('runs',second['id'])['state']=='done')
+    def test_same_chat_runs_in_parallel_up_to_limit(self):
+        settings=self.store.settings();settings['max_runs_per_chat']=2;self.store.put('settings',settings)
+        self.adapter.hold=True
+        a=self.engine.submit('c','first');b=self.engine.submit('c','second');c=self.engine.submit('c','third')
+        self.assertNotEqual(b['state'],'queued')
+        self.assertEqual(c['state'],'queued')
+        self.adapter.gate.set()
+        self.pump(lambda:all(self.store.get('runs',r['id'])['state']=='done' for r in [a,b,c]))
+    def test_runs_per_chat_setting_is_clamped(self):
+        settings=self.store.settings();settings['max_runs_per_chat']='bad';self.store.put('settings',settings)
+        self.assertEqual(self.engine._runs_per_chat(),1)
+        settings['max_runs_per_chat']=99;self.store.put('settings',settings)
+        self.assertEqual(self.engine._runs_per_chat(),6)
     def test_ambiguous_submit_is_not_resent(self):
         self.adapter.count=1;self.adapter.ambiguous=True
         run=self.engine.submit('c','one part')

@@ -22,10 +22,49 @@ class EdgeTransport:
         self.ready_process = None
         self.target = None
         self.local = threading.local()
+        # Phase 4 Fix K: wake bookkeeping of the hidden transport tab.
+        self.woken_at = 0.0
+        self.wake_logged_at = 0.0
+        self.stall_wake_after = 8.0
 
     @property
     def retry_after(self):
         return getattr(self.local, 'retry_after', 30)
+
+    def wake(self, target, force=False, reason='periodic'):
+        # Phase 4 Fix K: keep the hidden transport tab out of Edge's frozen lifecycle state.
+        # A frozen tab still answers DevTools evaluations, but its fetch readers and timers stop:
+        # a Notion stream that already ended is never read to its end and the task waits until
+        # task_timeout, while every other request through the tab times out. Waking needs no
+        # navigation and no Notion request, so it stays outside the request budget (I11).
+        now = time.monotonic()
+        if now - self.woken_at < (self.stall_wake_after if force else 15):
+            return False
+        self.woken_at = now
+        frozen = None
+        if force:
+            try:
+                self.browser.evaluate(target, 'new Promise(r => setTimeout(() => r(1), 0))', 2)
+                frozen = False
+            except Exception:
+                frozen = True
+        try:
+            wake = getattr(self.browser, 'wake', None)
+            if wake is not None:
+                wake(target)
+            else:
+                self.browser.send(target, 'Page.setWebLifecycleState', {'state': 'active'}, 5)
+        except Exception:
+            return False
+        if frozen and now - self.wake_logged_at >= 60:
+            self.wake_logged_at = now
+            event = getattr(self.store, 'event', None)
+            if event is not None:
+                try:
+                    event('edge_tab_woken', account_id=self.account_id, reason=str(reason)[:80], frozen=True)
+                except Exception:
+                    pass
+        return True
 
     def prepare(self):
         with self.lock:
@@ -61,6 +100,7 @@ class EdgeTransport:
             # Navigation of the transport tab must never forward a request to another origin.
             if self.browser.evaluate(self.target, 'location.origin') != self._base:
                 raise OSError('Restore the Notion robots.txt transport tab before continuing')
+            self.wake(self.target)
             return self.target
 
     def open(self):
@@ -146,6 +186,7 @@ class EdgeTransport:
         deadline = time.monotonic() + timeout + 5
         # Phase 3: every started request reports its outcome to the shared coordinator.
         begun, status, latency, outcome = time.monotonic(), 0, None, 'neutral'
+        progress_at, last_seen = begun, None
         try:
             while time.monotonic() < deadline:
                 if cancel is not None and cancel.is_set():
@@ -172,6 +213,13 @@ class EdgeTransport:
                 if result.get('error'):
                     outcome = 'failed'
                     raise NotionStreamError('Edge request interrupted; reconcile before reuse')
+                seen_now = (result.get('status'), result.get('remaining'), result.get('done'))
+                if result.get('text') or seen_now != last_seen:
+                    progress_at, last_seen = time.monotonic(), seen_now
+                elif time.monotonic() - progress_at > self.stall_wake_after:
+                    # Phase 4 Fix K: no new bytes for a while; a frozen tab would hold them back.
+                    self.wake(target, force=True, reason='stalled ' + path)
+                    progress_at = time.monotonic()
                 if result.get('text'):
                     yield result['text']
                 if result.get('done') and not result.get('remaining'):

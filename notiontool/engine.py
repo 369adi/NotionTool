@@ -11,8 +11,9 @@ import time
 from .protocol import ContractError, json_object, validate_plan, prompt_for
 from .store import uid
 from . import plain_protocol
+from . import file_registry
 from .allocation import allocation, parallel_width, validate_allocation
-from .model_routing import validate_models
+from .model_routing import validate_models, with_reason
 from .model_verification import ModelVerificationError
 from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, run_with_priority
 
@@ -23,6 +24,10 @@ def harness_enabled(chat, settings):
     override = str((chat or {}).get('harness', '')).lower()
     return override == 'on' if override in ('on', 'off') else bool(settings.get('harness_enabled', True))
 
+
+# Fix V2: like bridge.LIVE_TASK_STATES. An uncertain task may still be working in Notion
+# (the stream ended, the turn goes on), so its lease stays valid for writes.
+LIVE_TASK_STATES = ('running', 'uncertain')
 
 class PendingRemote(Exception):
     """Upstream acceptance/completion is unknown. Never automatically resend."""
@@ -38,16 +43,34 @@ class ContextCheckpointPending(Exception):
 
 class RateLimited(Exception):
     """confirmed: Notion recorded the turn as failed without a reply; free: nothing was submitted."""
-    def __init__(self, seconds=30, message='', confirmed=False, free=False):
+    # scope: 'account' cools the whole account down (a real 429); 'thread' means only this chat was busy
+    # (e.g. the operator's own turn), so the account and its other chats keep working (Phase 4 fix).
+    def __init__(self, seconds=30, message='', confirmed=False, free=False, scope='account'):
         super().__init__(message or 'Notion rate limit')
         self.seconds = seconds
         self.message = message
         self.confirmed = confirmed
         self.free = free
+        self.scope = scope
+
+
+# Free waits for a busy chat use no attempt; this bound keeps a stuck remote session from parking a task forever.
+BUSY_WAIT_LIMIT = 120
+# How long a busy Main stays handed over to free coworkers before the harness tries the Main again.
+MAIN_BUSY_FALLBACK_S = 120
 
 
 class TransientInference(Exception):
     pass
+
+
+CANCELLED_BEFORE_SUBMISSION = 'Assignment cancelled before submission'
+HEAL_BASE, HEAL_CAP = 60, 600  # seconds: 60, 120, 240, 480, 600, 600, ...
+
+
+def cancelled_before_submission(exc):
+    # notion.py:826 and network_budget.py:182 raise a plain ValueError with exactly this text.
+    return type(exc) is ValueError and str(exc) == CANCELLED_BEFORE_SUBMISSION
 
 
 class Engine:
@@ -59,6 +82,7 @@ class Engine:
         self.stop_event = threading.Event()
         self.round_robin = 0
         self.thread = None
+        self.clock = time.time  # injectable for the worker heal backoff
         self._restore()
 
     def _restore(self):
@@ -105,12 +129,14 @@ class Engine:
     def tasks(self, run_id):
         return [t for t in self.store.all('tasks') if t['run_id'] == run_id]
 
-    def add_task(self, run, role, prompt, title='', deps=(), files=(), acceptance='', ident=None, specialty='', model='opus', model_reason='', use_main=False):
+    def add_task(self, run, role, prompt, title='', deps=(), files=(), acceptance='', ident=None, specialty='', model='opus', model_reason='', use_main=False, task_class=''):
         task = dict(id=ident or uid('t'), run_id=run['id'], role=role, title=title or role.title(),
                     prompt=prompt, deps=list(deps), files=list(files), acceptance=acceptance,
                     state='queued', attempts=0, created=time.time(), next_at=0, result='', error='',
                     worker_id='', lease='', step_id='', started=0, finished=0, specialty=specialty,
-                    model=model, model_reason=model_reason, use_main=use_main)
+                    model=model, model_reason=model_reason, use_main=use_main,
+                    task_class=str(task_class or '').strip().lower())
+        with_reason(task)  # every role stores a non-empty model_reason; task['model'] is unchanged
         self.store.event('task_queued', run['id'], commit=False, task_id=task['id'], role=role, message=task['title'])
         self.store.put('tasks', task)  # also commits task_queued
         return task
@@ -152,13 +178,13 @@ class Engine:
             prior = [m for m in self.store.all('messages') if m['chat_id'] == chat_id and m.get('run_id') in completed
                      and not (m['role']=='assistant' and plain_protocol.provider_error(m['text']))][-10:]
             memory = self.store.get('memory', chat.get('folder_id') or chat_id, {})
-            context = '\n'.join(f"{m['role']}: {m['text']}" for m in prior)[-18000:]
-            # Final answers are also remembered; quote each one only once.
-            findings = self._unquoted_memory(memory.get('text', ''), context, prior)
-            if findings:
-                context = (context + '\nProject memory:\n' + findings[-12000:]).lstrip('\n')
+            # Context lives on the operator's PC (handoff files, project memory); never inject old reports.
+            context = ''
             # A chat queues its next run, while independent main chats share the pool.
-            existing = any(r['chat_id'] == chat_id and r['state'] in ACTIVE | {'queued', 'paused'} for r in self.store.all('runs'))
+            # Up to max_runs_per_chat runs of one chat work at once (file claims keep them apart); the rest queue in order.
+            same = [r for r in self.store.all('runs') if r['chat_id'] == chat_id]
+            existing = (any(r['state'] == 'queued' for r in same)
+                        or sum(r['state'] in ACTIVE | {'paused'} for r in same) >= self._runs_per_chat())
             ready_accounts={a['id'] for a in self.store.all('accounts') if a.get('state')=='ready'}
             workers = [w for w in self.store.all('workers') if w.get('purpose') == 'worker' and w.get('enabled') and w['account_id'] in ready_accounts
                        and (not getattr(self.adapter, 'single_account_harness', False) or w['account_id'] == main['account_id'])]
@@ -181,6 +207,38 @@ class Engine:
                 self._approach(run)
             return run
 
+    def _empty_remote_reply(self, task, info, run):
+        """Hang fix: Notion finished the turn but no text reached the harness. After 3 checks and 60 s, retry."""
+        done_at = float(task.get('remote_done_at') or 0)
+        if not done_at or str(task.get('result') or '').strip() or str(task.get('partial') or '').strip():
+            return False
+        if int(task.get('reconcile_checks') or 0) < 3 or time.time() - done_at < 60:
+            return False
+        self._release(info['worker_id'], info['lease'])
+        task.pop('remote_unknown', None)
+        task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry', next_at=time.time() + 5,
+                    reconcile_checks=0, remote_done_at=0, partial='',
+                    error='Notion finished with an empty reply; retrying on a free coworker')
+        self.store.event('empty_reply_retry', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
+                         message='Notion finished with an empty reply; the task is retried')
+        return True
+
+    def _main_compressing(self, run):
+        # Phase 4 Fix P: a Main with a requested compress waits for its rotation; its tasks go to coworkers.
+        return bool(self.store.get('workers', run.get('main_worker'), {}).get('compress_requested'))
+
+    def _runs_per_chat(self):
+        try:
+            return max(1, min(int(self.store.settings().get('max_runs_per_chat', 3)), 6))
+        except (TypeError, ValueError):
+            return 1
+
+    def _run_slot_free(self, run, runs):
+        same = [r for r in runs if r['chat_id'] == run['chat_id'] and r['id'] != run['id']]
+        if any(r['state'] == 'queued' and r['created'] < run['created'] for r in same):
+            return False  # queued runs of one chat still start in their order
+        return sum(r['state'] in ACTIVE | {'paused'} for r in same) < self._runs_per_chat()
+
     def _approach(self, run):
         # Allocate only useful approach roles. Reserve the main chat for the final plan.
         policy = run.get('allocation', allocation(run['goal'], run['capacity']))
@@ -190,13 +248,18 @@ class Engine:
             if policy.get('reason') == 'Conversational message' or not run.get('harness', True):
                 self.add_task(run, 'integrator', 'Respond naturally to the conversational message.')
             else:
-                self.add_task(run, 'integrator', 'Answer this focused question directly and completely yourself. '
-                              'No coworker is assigned. State what you checked and what is an assumption.')
+                # Phase 4 DIRECT: exactly one turn on the Main, no planner or separate integration stage.
+                self.add_task(run, 'integrator', 'Answer this request directly and completely yourself in one turn. '
+                              'No coworker is assigned. Follow any requested output format exactly; '
+                              'otherwise briefly name what is an assumption.')
             return
         if run.get('model_routing'):
             run['state'] = 'planning'
             self.store.put('runs', run)
-            self.add_task(run, 'planner', 'Choose whether to work alone or delegate, and choose each task model explicitly.')
+            hint = 'Choose whether to work alone or delegate, and choose each task model explicitly.'
+            if policy.get('planner_mode') == 'deep':
+                hint += ' DEEP mode: analyse or review first; every change task depends on that analysis.'
+            self.add_task(run, 'planner', hint)
             return
         roles = ['architect', 'researcher', 'quality_planner'][:policy['advisers']]
         if not roles:
@@ -294,17 +357,16 @@ class Engine:
                     self.store.put('tasks', task)
             self.store.put('runs', run)
 
+    def _project_root(self, run):
+        return Path(run.get('project_path') or Path(self.store.directory) / 'artifacts' / run['id']).resolve()
+
     def _resource_keys(self, run, files):
         if not files:
             return []
-        root = Path(run.get('project_path') or self.store.directory / 'artifacts' / run['id']).resolve()
-        result = []
-        for path in files:
-            resolved = (root / path).resolve()
-            if not resolved.is_relative_to(root):
-                raise ContractError('A planned file is outside the project folder')
-            result.append(str(resolved).casefold())
-        return result
+        try:
+            return file_registry.resource_keys(self._project_root(run), files)
+        except ValueError as exc:
+            raise ContractError('A planned file is outside the project folder: ' + str(exc)) from exc
 
     @staticmethod
     def _overlap(a, b):
@@ -326,22 +388,37 @@ class Engine:
     def claim_file(self, task_id, lease, relative):
         with self.lock:
             task = self.store.get('tasks', task_id)
-            if not task or task['state'] != 'running' or task['lease'] != lease:
+            if not task or task['state'] not in LIVE_TASK_STATES or task['lease'] != lease:
                 raise ValueError('Assignment is no longer active')
             run = self.store.get('runs', task['run_id'])
+            root = self._project_root(run)
+            relative = file_registry.normalize(root, relative)
+            held = {file_registry.path_key(root / f) for f in file_registry.normalize_files(root, task['files'], strict=False)}
+            if file_registry.path_key(root / relative) in held:
+                return  # this task already holds the file under another spelling
             trial = dict(task, files=task['files'] + [relative])
+            if file_registry.operator_owner(self.store, self._resource_keys(run, [relative])):
+                raise ValueError('The operator is editing this file right now; describe the needed change in your result instead')
             if self._conflicts(trial, run):
                 raise ValueError('Another active task owns this file; request a dependency instead')
             task['files'] = trial['files']
             self.store.put('tasks', task)
 
+    def check_lease(self, task_id, lease):
+        with self.lock:
+            task = self.store.get('tasks', task_id)
+            if not task or task['state'] not in LIVE_TASK_STATES or task['lease'] != lease:
+                raise ValueError('Assignment is no longer active')
+
     def claim_absolute(self, task_id, lease, path):
         """Serialize explicit full-PC writes using the same cross-chat ownership."""
         with self.lock:
             task=self.store.get('tasks',task_id)
-            if not task or task['state']!='running' or task['lease']!=lease:
+            if not task or task['state'] not in LIVE_TASK_STATES or task['lease']!=lease:
                 raise ValueError('Assignment is no longer active')
             resource=str(Path(path).resolve()).casefold()
+            if file_registry.operator_owner(self.store,[resource]):
+                raise ValueError('The operator is editing this PC path right now; describe the needed change in your result instead')
             trial=dict(task,absolute_resources=list(set(task.get('absolute_resources',[])+[resource])))
             if self._conflicts(trial,self.store.get('runs',task['run_id'])):
                 raise ValueError('Another active task owns this PC path; request a dependency instead')
@@ -354,6 +431,7 @@ class Engine:
                     del self.inflight[future]
                     self._complete(future, info)
             self._reconcile()
+            self._heal_workers()
             runs = self.store.all('runs')
             if getattr(self.adapter, 'single_account_harness', False):
                 from .harness_account import selected_account, main_chat
@@ -361,8 +439,7 @@ class Engine:
                 # Every Main of the selected harness account may run; each chat stays strictly ordered.
                 runs = [r for r in runs if selected and self.store.get('workers', r.get('main_worker'), {}).get('account_id') == selected]
             for run in runs:
-                if run['state'] == 'queued' and not any(
-                    r['chat_id'] == run['chat_id'] and r['created'] < run['created'] and r['state'] in ACTIVE | {'paused', 'queued'} for r in runs):
+                if run['state'] == 'queued' and self._run_slot_free(run, runs):
                     run['state'] = 'approach'
                     self.store.put('runs', run)
                     self._approach(run)
@@ -384,7 +461,7 @@ class Engine:
                     if sum(info['run_id']==run['id'] for info in self.inflight.values()) >= run.get('worker_budget', max(1,run['capacity'])):
                         continue
                     for task in self.tasks(run['id']):
-                        if task['state'] not in ('queued', 'retry') or task['next_at'] > time.time():
+                        if task['state'] not in ('queued', 'retry') or task['next_at'] > self.clock():
                             continue
                         deps = [self.store.get('tasks', d) for d in task['deps']]
                         if any(not d or d['state'] in ('failed', 'blocked', 'cancelled') for d in deps):
@@ -415,9 +492,14 @@ class Engine:
             selected = selected_account(self.store)
             workers = [w for w in workers if w['account_id'] == selected]
         main_role = task['role'] in ('planner', 'integrator') or task.get('use_main', False)
+        # A Main that was just found busy (usually the operator's own chat) hands Main tasks to a free joined coworker.
+        main_busy = main_role and (task.get('main_busy_at', 0) > time.time() - MAIN_BUSY_FALLBACK_S
+                                   or self._main_compressing(run))
+        main_account = self.store.get('workers', run['main_worker'], {}).get('account_id')
         choices = [w for w in workers if w.get('enabled') and w['state'] == 'ready'
                    and w.get('cooldown_until', 0) <= time.time()
-                   and (w['id'] == run['main_worker'] if main_role else w.get('purpose') == 'worker')]
+                   and (w['id'] == run['main_worker'] if main_role and not main_busy else
+                        w.get('purpose') == 'worker' and (not main_busy or w['account_id'] == main_account))]
         pending_rotations = {r['id']:r for r in self.store.all('rotations')}
         choices = [w for w in choices if not pending_rotations.get(w['id'], {}).get('task_id') or
                    pending_rotations[w['id']]['task_id'] == task['id'] or
@@ -442,14 +524,29 @@ class Engine:
             if independent:
                 choices = independent
             else:
-                choices=[]  # An executor must not review its own contribution.
+                candidates, choices = choices, []  # An executor must not review its own contribution.
+                # Phase 4 Fix L: a Main that was just found busy (usually the operator's own chat) must not
+                # hold the review until BUSY_WAIT_LIMIT; the coworker with the smallest own share reviews.
+                review_main_busy = (task.get('main_busy_at', 0) > time.time() - MAIN_BUSY_FALLBACK_S
+                                    or self._main_compressing(run))
                 main=self.store.get('workers',run['main_worker'])
-                if (main and main.get('enabled') and main['state']=='ready'
+                if (not review_main_busy and main and main.get('enabled') and main['state']=='ready'
                     and accounts.get(main['account_id'],{}).get('state')=='ready'
                     and main.get('cooldown_until',0)<=time.time()
                     and accounts.get(main['account_id'],{}).get('cooldown_until',0)<=time.time()
                     and counts.get(main['account_id'],0)-int(main['id'] in checkpoint_workers)<self._parallel_cap(settings['per_account'])):
                     choices=[main]  # The planner did not execute any of the parts.
+                elif review_main_busy and candidates:
+                    shares = {}
+                    for done in self.tasks(run['id']):
+                        if done['role'] == 'executor':
+                            shares[done.get('worker_id')] = shares.get(done.get('worker_id'), 0) + 1
+                    least = min(shares.get(w['id'], 0) for w in candidates)
+                    choices = [w for w in candidates if shares.get(w['id'], 0) == least]
+                    if not task.get('review_fallback'):
+                        task['review_fallback'] = True
+                        self.store.event('reviewer_fallback', task['run_id'], task_id=task['id'],
+                                         message='The Main chat is busy; the coworker with the smallest own share reviews')
         choices = [w for w in choices if not pending_rotations.get(w['id'], {}).get('task_id') or
                    pending_rotations[w['id']]['task_id'] == task['id'] or
                    self.store.get('tasks', pending_rotations[w['id']]['task_id'], {}).get('state') in TERMINAL]
@@ -486,7 +583,9 @@ class Engine:
         context = self._context(context_tasks)
         account = self.store.get('accounts', worker['account_id'], {})
         make_prompt=plain_protocol.prompt if getattr(self.adapter,'response_mode','json')=='plain' else prompt_for
-        prompt = make_prompt(task, run, context, task['lease'], bool(account.get('bridge_connected')))
+        # Every chat sees which files other chats (coworker tasks or the operator) are editing right now.
+        claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id']) if task['role'] in ('planner', 'executor') else ''
+        prompt = make_prompt(task, dict(run, file_claims=claims) if claims else run, context, task['lease'], bool(account.get('bridge_connected')))
         # Committed together with task_started right after the submit.
         self.store.event('context_built', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'], attempt=task['attempts'],
                          context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt))
@@ -528,6 +627,10 @@ class Engine:
         worker = self.store.get('workers', worker_id)
         if worker and worker.get('lease') == lease:
             worker.update(state=state, lease='')
+            # A new failure schedules its own heal time; a clean release ends the backoff series.
+            worker.pop('heal_at', None)
+            if state == 'ready':
+                worker.pop('heal_step', None)
             self.store.put('workers', worker)
 
     def _complete(self, future, info):
@@ -579,9 +682,21 @@ class Engine:
         except RateLimited as exc:
             failure=exc
             self._release(info['worker_id'], info['lease'])
-            account = self.store.get('accounts', self.store.get('workers', info['worker_id'])['account_id'])
-            account['cooldown_until'] = time.time() + exc.seconds
-            self.store.put('accounts', account)
+            busy_over = False
+            if getattr(exc, 'scope', 'account') == 'thread':
+                # Only this chat was busy: no account cooldown, so the other chats keep working.
+                task['busy_waits'] = task.get('busy_waits', 0) + 1
+                busy_over = task['busy_waits'] > BUSY_WAIT_LIMIT
+                if info['worker_id'] == (run or {}).get('main_worker') and not task.get('main_busy_at'):
+                    # The Main is often the operator's own chat: Main tasks move to a free joined coworker.
+                    self.store.event('main_busy_fallback', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
+                                     message='The Main chat is busy; this Main task moves to a free coworker')
+                if info['worker_id'] == (run or {}).get('main_worker'):
+                    task['main_busy_at'] = time.time()
+            else:
+                account = self.store.get('accounts', self.store.get('workers', info['worker_id'])['account_id'])
+                account['cooldown_until'] = time.time() + exc.seconds
+                self.store.put('accounts', account)
             if exc.free:
                 # Nothing was submitted: waiting for the chat does not use up an attempt.
                 task['attempts'] = max(0, task['attempts'] - 1)
@@ -590,8 +705,11 @@ class Engine:
                 task.pop('remote_unknown', None)
                 info['verified_retry'] = True
             task.update(state=('cancelled' if exc.free and (run or {}).get('state') == 'cancelled' else
+                               'blocked' if busy_over else
                                'retry' if exc.free or task['attempts']<self.store.settings()['max_attempts'] else 'blocked'),
-                        next_at=time.time()+exc.seconds, error=exc.message or 'Notion rate limit; account cooldown applied')
+                        next_at=time.time()+exc.seconds,
+                        error=(('The chat stayed busy for %d checks; nothing was sent' % task['busy_waits']) if busy_over else
+                               exc.message or 'Notion rate limit; account cooldown applied'))
         except TransientInference as exc:
             failure=exc
             self._release(info['worker_id'],info['lease'])
@@ -625,7 +743,9 @@ class Engine:
             info['verified_fallback'] = True
         except (CircuitOpen, RemotePaused) as exc:
             failure=exc
-            if task.get('submission_phase') == 'inference':
+            if task.get('submission_phase') == 'inference' and self._empty_remote_reply(task, info, run):
+                pass
+            elif task.get('submission_phase') == 'inference':
                 # Phase 3 / I5: the inference may already have left; never resend, reconcile instead.
                 overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
                 checks=task.get('reconcile_checks',0)+1
@@ -647,13 +767,16 @@ class Engine:
                             attempts=max(0, task['attempts']-1), paused_by='account_blocked', error=str(exc)[:400])
         except PendingRemote as exc:
             failure=exc
-            overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
-            checks=task.get('reconcile_checks',0)+1
-            task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
-                        reconcile_checks=checks,reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))), error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
-            worker = self.store.get('workers', info['worker_id'])
-            worker['state'] = 'recovering'
-            self.store.put('workers', worker)
+            if self._empty_remote_reply(task, info, run):
+                pass
+            else:
+                overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
+                checks=task.get('reconcile_checks',0)+1
+                task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
+                            reconcile_checks=checks,reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))), error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                worker = self.store.get('workers', info['worker_id'])
+                worker['state'] = 'recovering'
+                self.store.put('workers', worker)
         except ContractError as exc:
             failure=exc
             self._release(info['worker_id'], info['lease'])
@@ -662,7 +785,7 @@ class Engine:
             safe_provider_retry=(provider_failed and not task.get('files') and
                               getattr(text,'verified_terminal_reply',False) and not getattr(text,'tool_activity',True))
             task.update(state='retry' if not declined and (not provider_failed or safe_provider_retry) and task['attempts']<self.store.settings()['max_attempts'] else 'blocked',
-                        next_at=time.time()+(backoff(task['attempts'], base=1, cap=60) if provider_failed else 2), error=str(exc))
+                        next_at=self.clock()+(backoff(task['attempts'], base=1, cap=60) if provider_failed else 2), error=str(exc))
             if declined:
                 task['error'] = 'Notion declined the request; see the saved response. No automatic repetition.'
             elif provider_failed:
@@ -671,8 +794,15 @@ class Engine:
                 task['prompt'] += '\nPlease correct this problem in the response: '+str(exc)
         except Exception as exc:
             failure=exc
-            self._release(info['worker_id'], info['lease'], 'error')
-            task.update(state='blocked', error=str(exc)[:400])
+            if cancelled_before_submission(exc):
+                # Fix M: a cancel that won the race is not a chat failure; nothing was sent.
+                failure=None
+                self._release(info['worker_id'], info['lease'])
+                task.update(state='cancelled' if (run or {}).get('state') == 'cancelled' else 'retry',
+                            attempts=max(0, task['attempts']-1), next_at=time.time(), error='')
+            else:
+                self._release(info['worker_id'], info['lease'], 'error')
+                task.update(state='blocked', error=str(exc)[:400])
         from .telemetry import classify
         error_class = classify(failure) or ('TASK_FAILED' if task['state'] in ('failed', 'blocked') else '')
         if error_class == 'ACCOUNT_BLOCKED' and task['state'] == 'blocked' and not task.get('remote_unknown'):
@@ -706,6 +836,25 @@ class Engine:
             self.store.put('runs', parked)
             self.store.event('stage_changed', parked['id'], message=parked['state'])
 
+    def _heal_workers(self):
+        # An error state is not permanent: an idle errored worker returns after a doubling backoff.
+        now = self.clock()
+        for worker in self.store.all('workers'):
+            if worker.get('state') != 'error' or worker.get('lease'):
+                continue  # a worker holding a lease is never touched
+            step = int(worker.get('heal_step') or 0)
+            delay = min(HEAL_CAP, HEAL_BASE * 2 ** min(step, 4))
+            if not worker.get('heal_at'):
+                worker.update(heal_at=now + delay, heal_backoff=delay)
+                self.store.put('workers', worker)
+            elif now >= worker['heal_at']:
+                delay = worker.get('heal_backoff') or delay
+                worker.update(state='ready', heal_step=step + 1)
+                worker.pop('heal_at', None)
+                self.store.put('workers', worker)
+                self.store.event('worker_recovered', worker_id=worker['id'], backoff=delay,
+                                 message='Worker returned to ready after %ds in error' % delay)
+
     def _reconcile(self):
         assigned = {v['task_id'] for v in self.inflight.values()}
         for task in self.store.all('tasks'):
@@ -738,7 +887,8 @@ class Engine:
             self.add_task(run, 'executor', task['prompt'], prefix+task['title'],
                           deps=[ids[d] for d in task.get('depends_on',[])], files=task.get('files',[]),
                           acceptance=task['acceptance'], ident=ids[task['id']],specialty=str(task.get('role','executor'))[:60],
-                          model=task.get('model', 'opus'), model_reason=task.get('model_reason', ''), use_main=task.get('use_main', False))
+                          model=task.get('model', 'opus'), model_reason=task.get('model_reason', ''), use_main=task.get('use_main', False),
+                          task_class=task.get('task_class', ''))
 
     def _advance(self, run):
         tasks = self.tasks(run['id'])

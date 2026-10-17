@@ -8,6 +8,7 @@ from pathlib import Path
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -25,6 +26,13 @@ CANDIDATES = [
     r'%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe',
     r'%LocalAppData%\Google\Chrome\Application\chrome.exe',
 ]
+
+# Phase 4 Fix K: an owned hidden or occluded tab must keep running its fetch readers and
+# timers. Without these flags Edge throttles or freezes it, and a finished Notion stream is
+# never read to its end.
+NO_THROTTLE_FLAGS = ('--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+                     '--disable-backgrounding-occluded-windows',
+                     '--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling')
 
 SNAPSHOT_JS = r'''(() => {
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -87,15 +95,110 @@ class Browser:
         except ValueError:
             return body
 
+    def probe(self, port):
+        """Return /json/version of a DevTools endpoint on 127.0.0.1, or None if it does not answer."""
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            return None
+        try:
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=2) as response:
+                data = json.loads(response.read().decode('utf-8', errors='replace'))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or '/devtools/browser/' not in str(data.get('webSocketDebuggerUrl', '')):
+            return None
+        return data
+
+    @staticmethod
+    def file_endpoint(profile):
+        """Port and browser path from DevToolsActivePort, or (0, '') if missing or invalid."""
+        try:
+            lines = (Path(profile) / 'DevToolsActivePort').read_text().splitlines()
+            port = int(lines[0])
+        except (OSError, ValueError, IndexError):
+            return 0, ''
+        if not 1 <= port <= 65535 or len(lines) < 2 or not lines[1].startswith('/devtools/browser/'):
+            return 0, ''
+        return port, lines[1]
+
+    def list_processes(self):
+        """Main browser processes with a --user-data-dir: [{'pid', 'cmd', 'ports'}]. Windows only, read-only."""
+        if os.name != 'nt':
+            return []
+        script = ("$ErrorActionPreference='SilentlyContinue'; ConvertTo-Json -Depth 3 -Compress -InputObject @("
+                  "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | "
+                  "Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' -and $_.CommandLine -match '--user-data-dir' } | "
+                  "ForEach-Object { [pscustomobject]@{ pid=$_.ProcessId; cmd=$_.CommandLine; ports=@(Get-NetTCPConnection -State Listen "
+                  "-OwningProcess $_.ProcessId -LocalAddress 127.0.0.1 | Select-Object -ExpandProperty LocalPort) } })")
+        try:
+            result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
+                                    capture_output=True, text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+            data = json.loads(result.stdout or '[]')
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return []
+        return [item for item in (data if isinstance(data, list) else [data]) if isinstance(item, dict)]
+
+    @staticmethod
+    def same_dir(left, right):
+        try:
+            return os.path.normcase(os.path.abspath(str(left)).rstrip('\\/')) == os.path.normcase(os.path.abspath(str(right)).rstrip('\\/'))
+        except (TypeError, ValueError):
+            return False
+
+    def running_ports(self, profile):
+        """Candidate DevTools ports of running browser processes that use exactly this profile."""
+        ports = []
+        for item in self.list_processes():
+            cmd = str(item.get('cmd') or '')
+            match = (re.search(r'"--user-data-dir=([^"]+)"', cmd) or re.search(r'--user-data-dir="([^"]+)"', cmd)
+                     or re.search(r'--user-data-dir=(\S+)', cmd))
+            if not match or not self.same_dir(match.group(1), profile):
+                continue
+            explicit = re.search(r'--remote-debugging-port=(\d+)', cmd)
+            found = [int(explicit.group(1))] if explicit and int(explicit.group(1)) > 0 else []
+            raw = item.get('ports') or []
+            for port in (raw if isinstance(raw, list) else [raw]):
+                try:
+                    found.append(int(port))
+                except (TypeError, ValueError):
+                    pass
+            ports.extend(port for port in found if port not in ports)
+        return ports
+
+    def reuse(self, profile):
+        """Attach to a healthy running browser for this profile; never stops or kills anything."""
+        port, browser_path = self.file_endpoint(profile)
+        if port:
+            version = self.probe(port)
+            if version is not None and str(version.get('webSocketDebuggerUrl', '')).endswith(browser_path):
+                self.port = port
+                return version
+        if not self.profile_name:
+            return None
+        for candidate in self.running_ports(profile):
+            version = self.probe(candidate)
+            if version is not None:
+                self.port = candidate
+                return version
+        return None
+
     def ensure(self):
         if self.process is not None and self.process.poll() is None and self.port:
             return self.http('/json/version')
+        if self.process is None and self.port:
+            version = self.probe(self.port)
+            if version is not None:
+                return version
+            self.port = 0
         profile = Path(self.store.directory) / 'browser-profiles' / (self.profile_name or uuid.uuid4().hex)
         self.profile = profile.resolve()
         profile.mkdir(parents=True, exist_ok=True)
+        reused = self.reuse(profile)
+        if reused is not None:
+            return reused
         (profile / 'DevToolsActivePort').unlink(missing_ok=True)
         args = [self.executable(), '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
-                f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check', self.start_url]
+                f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check',
+                *NO_THROTTLE_FLAGS, self.start_url]
         flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
         deadline = time.time() + 20
@@ -161,6 +264,11 @@ class Browser:
             raise RuntimeError('DevTools call timed out')
         finally:
             ws.close()
+
+    def wake(self, tab, timeout=5):
+        # Phase 4 Fix K: return a frozen or background-throttled tab to the active lifecycle state.
+        # No navigation and no page request; only the page's task queues run again.
+        return self.send(tab, 'Page.setWebLifecycleState', {'state': 'active'}, timeout)
 
     def evaluate(self, tab, expression, timeout=30):
         result = self.send(tab, 'Runtime.evaluate', dict(expression=expression, returnByValue=True, awaitPromise=True), timeout)

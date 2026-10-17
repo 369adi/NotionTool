@@ -33,7 +33,9 @@ def retry_seconds(value, now=None):
             return 0
 
 
-PRIORITIES = {'critical': 0, 'verify': 1, 'rest': 2}
+# background: helper scans (context usage, archives). They wait behind task traffic and their
+# transient failures feed only their endpoint breaker, never the per-account task parallelism.
+PRIORITIES = {'critical': 0, 'verify': 1, 'rest': 2, 'background': 3}
 BASE_INTERVAL = .25            # at most four request starts per second
 MAX_INTERVAL = 2.0
 BREAKER_FAILURES = 5           # consecutive transient failures of one endpoint open its circuit
@@ -73,6 +75,11 @@ def current_priority():
 def run_with_priority(level, fn, *args, **kwargs):
     with request_priority(level):
         return fn(*args, **kwargs)
+
+
+def set_thread_priority(level):
+    """Long-lived helper threads (e.g. the context scan): every later request of this thread uses the level."""
+    _local.priority = level if level in PRIORITIES else 'rest'
 
 
 class RemotePaused(Exception):
@@ -161,6 +168,9 @@ class NetworkBudget:
         # FIFO inside a level). A pause or an open circuit refuses before any
         # request leaves; such refusals use no window slot.
         level = PRIORITIES.get(priority or current_priority(), PRIORITIES['rest'])
+        if level == PRIORITIES['background'] and source:
+            # Background scans keep their own circuit: their failures never block tasks or operator calls.
+            source = source + '@background'
         held_since = None
         with self.lock:
             self._refuse(source, self.clock())
@@ -308,7 +318,9 @@ class NetworkBudget:
                         open_seconds=round(now - breaker['opened_at'], 3))))
                 events += self._succeeded(now, breaker, latency)
             elif outcome in ('failed', 'rate_limited'):
-                events += self._lower_parallel('transient_error' if outcome == 'failed' else 'rate_limited')
+                if outcome == 'rate_limited' or ticket.level < PRIORITIES['background']:
+                    # A failing background scan must not halve the task parallelism (seen live: 8 -> 1).
+                    events += self._lower_parallel('transient_error' if outcome == 'failed' else 'rate_limited')
                 trip = False
                 if outcome == 'failed' and breaker['state'] == 'closed':
                     breaker['failures'] += 1

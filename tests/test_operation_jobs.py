@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from notiontool.server import Application
 from notiontool.store import Store
@@ -69,6 +70,23 @@ class OperationJobTests(unittest.TestCase):
         self.assertEqual(set(jobs), {'jlogin'})
         self.assertEqual(jobs['jlogin']['state'], 'interrupted')
         self.assertEqual(self.finished(app), [(title, 'failed', 'tunnel down'), ('Sign in', 'done', '')])
+
+    def test_successful_sign_in_resumes_pause_for_same_account(self):
+        calls = []
+        app = SimpleNamespace(engine=SimpleNamespace(
+            coordination=lambda: {'paused': True, 'pause': {'account_id': 'acct'}},
+            resume_remote=lambda: calls.append('resume') or {'resumed': True}))
+        result = Application.resume_after_sign_in(app, 'acct')
+        self.assertEqual(result, {'resumed': True})
+        self.assertEqual(calls, ['resume'])
+
+    def test_successful_sign_in_does_not_resume_another_account(self):
+        calls = []
+        app = SimpleNamespace(engine=SimpleNamespace(
+            coordination=lambda: {'paused': True, 'pause': {'account_id': 'other'}},
+            resume_remote=lambda: calls.append('resume')))
+        self.assertIsNone(Application.resume_after_sign_in(app, 'acct'))
+        self.assertEqual(calls, [])
 
 
 if __name__ == '__main__':

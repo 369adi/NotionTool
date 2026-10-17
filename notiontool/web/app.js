@@ -92,13 +92,20 @@ function render(){
     return `<div class="pipeline-row ${complete?'complete':current?'current':''}"><span class="pipeline-dot">${complete?'✓':current?'•':displayIndex+1}</span>${({approach:'Explore approaches',planning:'Main chat plans',executing:'Execute in parallel',reviewing:'Check the results',fixing:'Repair remaining issues',integrating:'Bring it together'})[s]}${current?'<span class="stage-detail">Active</span>':''}</div>`;
   }).join('');
   $('worker-grid').innerHTML=state.workers.filter(w=>w.enabled||w.state==='recovering').map(w=>`<button class="worker-cell ${escape(w.state)}" data-worker-report="${escape(w.id)}" title="${escape(w.label)} · ${escape(w.state)}"></button>`).join('')||'<p class="help">No workers connected yet.</p>';
+  renderWorkerDashboard();
   const tasks=state.tasks.filter(t=>t.run_id===run?.id);
-  $('task-list').innerHTML=tasks.slice(-24).map(t=>`<button class="task-row ${escape(t.state)}" data-report="${escape(t.id)}"><strong>${escape(t.title)}</strong><small><span class="task-state">${escape(t.state==='done'&&t.role==='executor'&&run?.state!=='done'?'Reported':titleCase(t.state))}</span> · ${escape(titleCase(t.specialty||t.role))} · ${escape(titleCase(t.model||'opus'))} 5.5 ${({verified:'verified',mismatch:'mismatch',fallback:'fallback model',turn_error:'turn error'})[t.model_verification]||'requested'}${t.remote_error?' · <span class=warn>Notion error: '+escape(t.remote_error)+(t.state==='done'?' (retried)':'')+'</span>':''}${t.worker_id?' · '+escape(state.accounts.find(a=>a.id===state.workers.find(w=>w.id===t.worker_id)?.account_id)?.label||''):''}</small></button>`).join('');
+  $('task-list').innerHTML=tasks.slice(-24).map(t=>taskRow(t,run)).join('');
+  const runList=$('run-list');
+  if(runList){
+    const chatRuns=chat?state.runs.filter(r=>r.chat_id===chat.id).slice(-8).reverse():[];
+    runList.classList.toggle('hidden',chatRuns.length<2);
+    runList.innerHTML=chatRuns.length<2?'':'<div class="run-list-title">Runs in this chat</div>'+chatRuns.map(r=>`<div class="run-item ${escape(r.state)}"><span class="run-goal" title="${escape(r.goal||'')}">${escape(String(r.goal||r.id).slice(0,80))}</span><span class="run-item-state">${escape(titleCase(r.state))}</span><span class="run-controls">${runControls(r)}</span></div>`).join('');
+  }
   $('run-bar').classList.toggle('hidden',!run);
   if(run){
     const done=tasks.filter(t=>t.state==='done').length;
     const active=stages.includes(run.state);
-    $('run-bar').innerHTML=`<div><strong class="run-state">${escape(titleCase(run.state))}</strong> <span>· ${done}/${tasks.length} assignments finished</span><small>${escape(run.error||run.summary||'Your team is preparing the approach.')}</small></div><div>${active?`<button data-run-pause="${escape(run.id)}">Pause</button><button data-run-stop="${escape(run.id)}">Stop</button>`:run.state==='paused'?`<button data-run-resume="${escape(run.id)}">Resume</button>`:['blocked','failed'].includes(run.state)?`<button data-run-retry="${escape(run.id)}">Retry resolved tasks</button>`:''}</div>`;
+    $('run-bar').innerHTML=`<div><strong class="run-state">${escape(titleCase(run.state))}</strong> <span>\u00b7 ${done}/${tasks.length} assignments finished</span><small>${escape(run.error||run.summary||'Your team is preparing the approach.')}</small></div><div class="run-controls">${runControls(run)}</div>`;
   }
   if(chat){
       const key=JSON.stringify([details.messages.map(m=>[m.id,m.text]),details.has_more,run?.id,run?.state]);
@@ -113,7 +120,45 @@ function render(){
   if(view==='settings')renderSettings();
   if(view==='mcp')renderMcp();
 }
-function workerHints(w){const h=[];if(w.compress_requested)h.push('Compress queued'+(w.compress_reason?': '+w.compress_reason:''));if(w.context_fallback)h.push(w.context_fallback);if(String(w.cleanup_state||'').startsWith('deferred'))h.push('Cleanup waits: '+String(w.cleanup_state).slice(9).trim());return h.map(x=>'<small class=warn>'+escape(x)+'</small>').join('');}
+function modelLabel(model){return titleCase(model||'opus')+' 5.5';}
+function taskRow(t,run){
+  const sep=' \u00b7 ';
+  const stateText=t.state==='done'&&t.role==='executor'&&run?.state!=='done'?'Reported':titleCase(t.state);
+  const check=({verified:'verified',mismatch:'mismatch',turn_error:'turn error'})[t.model_verification]||'';
+  const fallback=t.model_verification==='fallback'?' <span class="warn model-fallback" title="Notion answered with another model than the requested one">fallback model</span>':'';
+  const account=t.worker_id?(state.accounts.find(a=>a.id===state.workers.find(w=>w.id===t.worker_id)?.account_id)?.label||''):'';
+  const error=t.remote_error?sep+'<span class=warn>Notion error: '+escape(t.remote_error)+(t.state==='done'?' (retried)':'')+'</span>':'';
+  const reconcile=t.remote_unknown?`<button type="button" class="task-action" data-task-reconcile="${escape(t.id)}" title="Check upstream completion again; nothing is resent">Reconcile</button>`:'';
+  return `<div class="task-item"><button class="task-row ${escape(t.state)}" data-report="${escape(t.id)}"><strong>${escape(t.title)}</strong><small><span class="task-state">${escape(stateText)}</span>${sep}${escape(titleCase(t.specialty||t.role))}${sep}<span class="task-model">Requested: ${escape(modelLabel(t.model))}</span>${check?' '+escape(check):''}${fallback}${error}${account?sep+escape(account):''}</small></button>${reconcile}</div>`;
+}
+function runControls(run){
+  const id=escape(run.id),buttons=[];
+  const waiting=state.tasks.some(t=>t.run_id===run.id&&(t.state==='uncertain'||t.remote_unknown));
+  if(stages.includes(run.state))buttons.push(`<button type="button" data-run-pause="${id}">Pause</button>`);
+  if(run.state==='paused')buttons.push(`<button type="button" data-run-resume="${id}">Resume</button>`);
+  if(['blocked','failed'].includes(run.state))buttons.push(waiting?'<button type="button" disabled title="Wait for reconciliation before retrying">Retry</button>':`<button type="button" data-run-retry="${id}" title="Retry resolved tasks">Retry</button>`);
+  if(!['done','failed','cancelled'].includes(run.state))buttons.push(`<button type="button" data-run-stop="${id}">Cancel</button>`);
+  return buttons.join('');
+}
+function workerHints(w){const h=[];if(w.compress_requested)h.push('Compress queued'+(w.compress_reason?': '+w.compress_reason:''));if(w.context_hint)h.push(w.context_hint);if(w.context_fallback)h.push(w.context_fallback);if(String(w.cleanup_state||'').startsWith('deferred'))h.push('Cleanup waits: '+String(w.cleanup_state).slice(9).trim());return h.map(x=>'<small class=warn>'+escape(x)+'</small>').join('');}
+function formatDuration(seconds){if(!Number.isFinite(seconds)||seconds<0)return 'unknown';const s=Math.floor(seconds),h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m?m+'m '+(s%60)+'s':s+'s';}
+function renderWorkerDashboard(){
+  // One row per worker (Main first, then coworkers); refreshed with every state update, no extra polling.
+  let box=$('worker-dashboard');
+  if(!box){const grid=$('worker-grid');if(!grid)return;box=document.createElement('div');box.id='worker-dashboard';box.className='worker-dashboard';grid.insertAdjacentElement('afterend',box);}
+  const live=['running','cancelling','uncertain'],now=Date.now()/1000;
+  const workers=state.workers.filter(w=>w.enabled||w.state==='recovering').sort((a,b)=>(a.purpose==='main'?0:1)-(b.purpose==='main'?0:1)||(a.main_number||0)-(b.main_number||0));
+  box.innerHTML=workers.map(w=>{
+    const own=state.tasks.filter(t=>t.worker_id===w.id),task=own.filter(t=>live.includes(t.state)).at(-1),last=own.at(-1);
+    const name=w.purpose==='main'?(w.main_number?'Main '+w.main_number:'Main'):'Coworker · '+String(w.id).slice(-6);
+    const model=(task||last)?.model?titleCase((task||last).model)+' 5.5':'unknown';
+    const runtime=task?(task.started?formatDuration(now-task.started):'unknown'):'idle';
+    const error=w.error||last?.error||'';
+    const usage=w.context_usage?'~'+Number(w.context_usage.estimated_tokens||0).toLocaleString()+' tokens · '+Number(w.context_usage.turns||0)+' turns':'unknown';
+    const cell=(label,value,cls='')=>`<span class="dash-cell ${cls}"><em>${label}</em>${escape(value)}</span>`;
+    return `<div class="dash-row ${escape(w.state||'unknown')}" data-worker-row="${escape(w.id)}"><strong class="dash-name">${escape(name)}</strong>${cell('Task',task?task.title||'unknown':'none')}${cell('Model',model)}${cell('State',w.state?titleCase(w.state):'unknown')}${cell('Runtime',runtime)}${cell('Last error',error||'none',error?'warn':'')}${cell('Context',usage)}${workerHints(w)}</div>`;
+  }).join('')||'<p class="help">No workers connected yet.</p>';
+}
 function renderAccounts(){
   $('accounts-summary').textContent='1 account slot · '+state.workers.filter(w=>w.purpose==='worker'&&w.enabled).length+' enabled Coworkers';
   const choices=state.accounts.length>1?`<div class="settings-card"><h3>Harness account</h3><p>Existing accounts are preserved. Only the selected account runs this harness.</p>${state.accounts.map(a=>`<button data-select-account="${escape(a.id)}" ${a.id===state.harness_account_id?'disabled':''}>${escape(a.email)}${a.id===state.harness_account_id?' · Selected':''}</button>`).join('')}</div>`:'';
@@ -264,13 +309,48 @@ document.addEventListener('click',async event=>{
     if(d.provision)modal('Create Welcome worker chats','<label>Number of chats<input type="number" name="count" min="1" max="40" value="5" required></label><p class="help">These use the Welcome to Notion protocol and are renamed Cowork joined. Account limits apply.</p>',async data=>action('account/provision',{account_id:d.provision,count:Number(data.count)}),'Create chats');
     if(d.runPause)await action('run/pause',{id:d.runPause,paused:true},'Paused new assignments');
     if(d.runResume)await action('run/pause',{id:d.runResume,paused:false},'Resumed');
-    if(d.runStop)await action('run/cancel',{id:d.runStop},'Stopped locally; upstream requests are reconciled before reuse');
+    if(d.runStop){if(!confirm('Cancel this run? Local work stops; upstream requests are reconciled before the chats are reused.'))return;await action('run/cancel',{id:d.runStop},'Cancelled locally; upstream requests are reconciled before reuse');}
     if(d.runRetry)await action('run/retry',{id:d.runRetry});
-    if(d.taskReconcile){await action('task/reconcile',{id:d.taskReconcile},'Checking upstream completion');$('modal').close();}
+    if(d.taskReconcile){await action('task/reconcile',{id:d.taskReconcile},'Checking upstream completion; nothing is resent');if($('modal').open)$('modal').close();}
     if('pickFolder' in d){const result=await api('project/pick',{});if(result.path)$('modal-fields').querySelector('[name=project_path]').value=result.path;}
   }catch(error){if(!error.message.includes('Request failed'))toast(error.message,true);}
 });
-refresh();setInterval(()=>{if(!document.hidden)refresh();},1500);
+// Live updates come only from /api/stream (server-sent events, id = event seq). EventSource cannot send the
+// X-NotionTool-Token header, so the stream is read with fetch. Each event triggers one state read; a new
+// connection starts only after the server ends the stream (its timeout) or the host was unreachable.
+let streamSeq=0,streamTimer=null,streamRetry=2000;
+function streamChanged(){
+  clearTimeout(streamTimer);
+  streamTimer=setTimeout(function apply(){if(pollBusy){streamTimer=setTimeout(apply,250);return;}if(!document.hidden)refresh();},250);
+}
+function streamBlock(block){
+  let changed=false;
+  for(const row of block.split('\n')){
+    if(row.startsWith('id:')){const n=Number(row.slice(3).trim());if(Number.isFinite(n)&&n>streamSeq)streamSeq=n;}
+    else if(row.startsWith('retry:')){const n=Number(row.slice(6).trim());if(Number.isFinite(n)&&n>0)streamRetry=n;}
+    else if(row.startsWith('data:'))changed=true;
+  }
+  if(changed)streamChanged();
+}
+async function startStream(){
+  if(!streamSeq)streamSeq=Math.max(0,...((state&&state.events)||[]).map(e=>Number(e.seq)||0));
+  for(;;){
+    try{
+      const response=await fetch('/api/stream?since='+streamSeq,{headers:{'X-NotionTool-Token':token},cache:'no-store'});
+      if(!response.ok||!response.body)throw new Error('Live updates are unavailable');
+      setHostBanner(false);streamChanged();
+      const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
+      for(;;){
+        const {value,done}=await reader.read();if(done)break;
+        buffer+=decoder.decode(value,{stream:true}).replace(/\r\n/g,'\n');
+        let cut;
+        while((cut=buffer.indexOf('\n\n'))>=0){streamBlock(buffer.slice(0,cut));buffer=buffer.slice(cut+2);}
+      }
+    }catch(error){setHostBanner(true);}
+    await new Promise(resolve=>setTimeout(resolve,streamRetry));
+  }
+}
+refresh().catch(()=>{}).finally(startStream);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
 
 function renderMcp(){
@@ -287,3 +367,63 @@ function fillRemote(){try{const u=$('remote-mcp-url');const url=(typeof state!==
 setInterval(fillRemote,1500);
 // Keep Settings readable: remote access first, everything else under Advanced settings.
 (function tidySettings(){const card=$('remote-mcp-card');if(!card||card.dataset.tidy)return;card.dataset.tidy='1';const view=card.parentElement;const d=document.createElement('details');d.className='settings-card advanced-settings';const s=document.createElement('summary');s.textContent='Advanced settings';d.appendChild(s);[...view.children].filter(el=>el!==card&&!el.classList.contains('page-heading')).forEach(el=>d.appendChild(el));view.appendChild(d);})();
+// Account settings: 'Create own chat' (belongs to the user, never a Coworker or Main) and 'Add coworker chat'.
+// ownChatError mirrors own_chats.validate_name; the host checks again and its answer wins.
+const OWN_CHAT_RESERVED=['welcome to notion','cowork joined','cowork (retired)'];
+function ownChatError(raw){
+  if(typeof raw!=='string')return 'Chat name must be text.';
+  const name=raw.trim();
+  if(!name)return 'Chat name must not be empty.';
+  if([...name].length>80)return 'Chat name must be 80 characters or fewer.';
+  if(/[\u0000-\u001f\u007f-\u009f]/.test(name))return 'Chat name must not contain control characters (such as tabs or line breaks).';
+  if(name.startsWith('Main'))return "Chat name must not start with 'Main'; Main chats are reserved for NotionTool.";
+  if(/^Cowork \d+$/.test(name))return "Chat name must not look like 'Cowork N'; those names are reserved for coworker chats.";
+  if(OWN_CHAT_RESERVED.includes(name.toLowerCase()))return "'"+name+"' is reserved for NotionTool worker chats; choose another name.";
+  const account=state&&state.harness_account_id;
+  const titles=[...((state&&state.chats)||[]).map(c=>c.title),...((state&&state.workers)||[]).filter(w=>!account||w.account_id===account).map(w=>w.label)];
+  if(titles.some(t=>typeof t==='string'&&t.trim().toLowerCase()===name.toLowerCase()))return "A chat named '"+name+"' already exists; choose another name.";
+  return '';
+}
+function busyButton(button,label){const idle=button.textContent;button.disabled=true;button.textContent=label;return()=>{button.disabled=false;button.textContent=idle;};}
+function harnessAccount(){return state&&(state.accounts||[]).find(a=>a.id===state.harness_account_id);}
+async function createOwnChat(event){
+  if(event)event.preventDefault();
+  const input=$('own-chat-name'),button=$('own-chat-create'),error=$('own-chat-error'),result=$('own-chat-result');
+  if(!input||!button||button.disabled)return;
+  const problem=ownChatError(input.value);
+  error.textContent=problem;
+  if(problem){input.focus();return;}
+  const account=harnessAccount();
+  if(!account){error.textContent='Sign in to Notion and select an account first.';return;}
+  const name=input.value.trim();
+  // One request_id per click; a retry after a failed or lost request reuses it, so the host creates one chat at most.
+  const key='create-own-chat:'+account.id+':'+name.toLowerCase();
+  const done=busyButton(button,'Creating...');
+  result.textContent='';
+  try{
+    const r=await api('account/create-chat',{account_id:account.id,name,request_id:requestId(key)});
+    sessionStorage.removeItem(key);
+    input.value='';
+    result.textContent=(r&&r.duplicate?'Already requested: ':'Creating your chat: ')+name+'. It stays yours and is never used as a Coworker or Main.';
+    await refresh();
+  }catch(e){
+    error.textContent=e.message;
+    result.textContent='Not created: '+e.message+' Click again to retry the same request.';
+  }finally{done();}
+}
+async function addCoworkerChat(){
+  const button=$('add-coworker-chat'),result=$('add-coworker-result');
+  if(!button||button.disabled)return;
+  const account=harnessAccount();
+  if(!account){$('sign-in-notion').click();return;}
+  const done=busyButton(button,'Adding...');
+  result.textContent='';
+  try{
+    const r=await action('account/add-worker',{account_id:account.id},'Adding Coworker chat');
+    result.textContent=r&&r.job_id?'Coworker chat requested. Progress appears in the job list.':'Coworker chat requested.';
+  }catch(e){result.textContent='Not added: '+e.message;}
+  finally{done();}
+}
+if($('own-chat-form'))$('own-chat-form').onsubmit=createOwnChat;
+if($('own-chat-name'))$('own-chat-name').oninput=()=>{$('own-chat-error').textContent='';};
+if($('add-coworker-chat'))$('add-coworker-chat').onclick=addCoworkerChat;

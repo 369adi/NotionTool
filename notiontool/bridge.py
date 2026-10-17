@@ -14,8 +14,10 @@ action is written to the activity log.
 from pathlib import Path
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import threading
 
 
@@ -63,6 +65,32 @@ def shell_command(command):
     return ['sh','-c',command]
 
 
+TEST_COMMAND = re.compile(r'python -m unittest((?: tests[.][A-Za-z0-9_]+){1,20})', re.ASCII)
+
+
+def read_only_test_modules(command):
+    # The one shell form read-only roles may run: python -m unittest followed by
+    # 1 to 20 tests.<module> names, single spaces. Returns the module names, or
+    # None for anything else (flags, quotes, pipes, redirection, separators,
+    # variables, newlines, non-ASCII text, non-strings).
+    if not isinstance(command, str) or not command.isascii():
+        return None
+    match = TEST_COMMAND.fullmatch(command)
+    if not match:
+        return None
+    return match.group(1).split()
+
+
+def unittest_python():
+    # Interpreter for read-only test runs; the frozen EXE is not a Python.
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    found = shutil.which('python') or shutil.which('py')
+    if not found:
+        raise ValueError('No Python interpreter found for read-only test runs')
+    return found
+
+
 
 # Operator scope: only with the owner Host API key (never the worker bridge token).
 OPERATOR_TOOLS = [
@@ -71,7 +99,7 @@ OPERATOR_TOOLS = [
      'inputSchema':{'type':'object','properties':{'method':{'type':'string','enum':['GET','POST']},'path':{'type':'string'},'body':{'type':'object'},'timeout':{'type':'number'}},'required':['path']}},
     {'name':'nt_notion_call','description':'Operator: raw internal Notion API call (POST /api/v3/<method>) as the selected harness account. For verified reverse-engineering tests.',
      'annotations':{'readOnlyHint':False,'destructiveHint':True},
-     'inputSchema':{'type':'object','properties':{'method':{'type':'string'},'body':{'type':'object'},'account_id':{'type':'string'}},'required':['method','body']}},
+     'inputSchema':{'type':'object','properties':{'method':{'type':'string'},'body':{'type':'object'},'account_id':{'type':'string'},'save_to':{'type':'string','description':'Optional relative path below work/ (e.g. work/notion/page.json). The full JSON response is written to that file and only path, bytes, sha256 and the top-level keys are returned.'}},'required':['method','body']}},
     {'name':'nt_inference_body','description':'Operator: build (not send) the standard NotionTool runInferenceTranscript body for a thread and prompt. Edit it, then send with nt_notion_stream.',
      'annotations':{'readOnlyHint':True,'destructiveHint':False},
      'inputSchema':{'type':'object','properties':{'thread_id':{'type':'string'},'prompt':{'type':'string'},'model':{'type':'string'},'create':{'type':'boolean'},'account_id':{'type':'string'}},'required':['thread_id','prompt']}},
@@ -86,8 +114,14 @@ OPERATOR_TOOLS = [
      'inputSchema':{'type':'object','properties':{'server':{'type':'string'},'name':{'type':'string'},'arguments':{'type':'object'}},'required':['server','name']}},
 ]
 from .devtools import TOOLS as DEV_TOOLS, NAMES as DEV_NAMES, call as dev_call
+from .devtools import _path as dev_path
+from . import file_registry
 OPERATOR_TOOLS = OPERATOR_TOOLS + DEV_TOOLS + SCREEN_OPERATOR_TOOLS
 OPERATOR_NAMES = {t['name'] for t in OPERATOR_TOOLS}
+
+# Fix V: an uncertain task may still be working in Notion (the stream ended but the
+# turn goes on). Keep its capability alive so its tool calls are not rejected.
+LIVE_TASK_STATES = ('running', 'uncertain')
 
 class Bridge:
     def __init__(self, store, engine, browser=None):
@@ -172,11 +206,11 @@ class Bridge:
 
     # ---- capability -------------------------------------------------------
     def has_assignment(self, token):
-        return bool(token) and any(t.get('lease')==token and t.get('state')=='running' for t in self.store.all('tasks'))
+        return bool(token) and any(t.get('lease')==token and t.get('state') in LIVE_TASK_STATES for t in self.store.all('tasks'))
 
     def assignment(self, token):
         # Capability is revoked as soon as an attempt ends or is superseded.
-        task = next((t for t in self.store.all('tasks') if t.get('lease')==token and t['state']=='running'),None)
+        task = next((t for t in self.store.all('tasks') if t.get('lease')==token and t['state'] in LIVE_TASK_STATES),None)
         if not task:
             raise ValueError('Assignment expired or invalid; do not join again')
         run = self.store.get('runs',task['run_id'])
@@ -233,7 +267,8 @@ class Bridge:
             if name in TOOL_SERVER:
                 rea = self.local_client(TOOL_SERVER[name])
                 self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message=LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+': '+str(args.get('name','discover'))[:100])
-            if task['role'] in READ_ONLY_ROLES and (name in ('write_file','run_shell') or name in BROWSER_ACTIONS):
+            if task['role'] in READ_ONLY_ROLES and (name=='write_file' or name in BROWSER_ACTIONS
+                    or (name=='run_shell' and read_only_test_modules(args.get('command')) is None)):
                 raise ValueError('This planning/review role has read-only PC access')
             if name in TOOL_SERVER:
                 pass
@@ -265,7 +300,8 @@ class Bridge:
                             memory=self.store.get('memory', memory_id, {}),
                             memory_baseline=self.store.get('memory_baselines', memory_id, {}),
                             memory_entries=[m for m in self.store.all('memory_entries') if m['memory_id']==memory_id],
-                            reports=[dict(id=t['id'],title=t['title'],state=t['state'],result=t['result']) for t in records])
+                            reports=[dict(id=t['id'],title=t['title'],state=t['state'],result=t['result']) for t in records],
+                            files_in_use=file_registry.in_use(self.store, exclude_task=task['id']))
                 text = json.dumps(payload, ensure_ascii=False)
                 if len(text) > 16000 or args.get('offset'):
                     offset = max(0, int(args.get('offset', 0)))
@@ -275,16 +311,27 @@ class Bridge:
                 ident = run.get('folder_id') or run['chat_id']
                 self.store.remember(ident, str(args.get('text','')), task['id'])
                 return {'saved':True}
+            elif name=='run_shell' and task['role'] in READ_ONLY_ROLES:
+                # Read-only test run: fixed project root (a cwd argument is ignored),
+                # no folder claim, only the lease check.
+                cwd = self.project(run)
+                if cwd is None:
+                    raise ValueError('Read-only test runs need a project folder')
+                self.engine.check_lease(task['id'],token)
+                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,
+                                 message='Tests in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             elif name=='run_shell':
                 cwd = self.path(run,str(args.get('cwd') or '.'))
                 if not cwd.is_dir():
                     raise ValueError('Shell folder does not exist')
-                # Shell is a powerful tool, not a filesystem sandbox. Serialize it
-                # against ALL edits in the project root, even across main chats.
+                # Shell is a powerful tool, not a filesystem sandbox. With full PC access it is still
+                # serialized against every edit. In a project folder it no longer holds the whole folder
+                # for the rest of the task, which blocked every parallel coworker (tests, builds). Writes
+                # stay owned per file, and the slots in shell() limit concurrent commands.
                 if self.full_access():
                     self.engine.claim_absolute(task['id'],token,Path(cwd).anchor)
-                elif self.project(run):
-                    self.engine.claim_file(task['id'],token,'.')
+                else:
+                    self.engine.check_lease(task['id'],token)
                 self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,
                                  message='Shell in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             else:
@@ -312,10 +359,13 @@ class Bridge:
                         raise ValueError('Write is too large')
                     self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message='Write: '+str(path)[:300])
                     path.parent.mkdir(parents=True,exist_ok=True)
-                    path.write_text(text,encoding='utf-8')
+                    path.write_text(text,encoding='utf-8',newline='')
                     return {'written':str(path),'bytes':len(text.encode())}
         if name in TOOL_SERVER:
             return rea.tools() if name.endswith('_tools') else rea.call(str(args.get('name','')), args.get('arguments') or {})
+        if name == 'screen_capture':
+            # Worker capture: checked against the shared capture gate first (Phase 7).
+            return self.worker_capture(args, task, run)
         if name in SCREEN_TOOLS:
             # Window capture is read-only and runs outside the coordinator lock.
             return self.screen().call(name, args, task_id=task['id'], run_id=run['id'], role=task.get('role', ''))
@@ -323,6 +373,54 @@ class Bridge:
             # Slow browser work runs outside the coordinator lock.
             return self.browser.call(name, args)
         return self.shell(name, args, task, run, cwd)
+
+    # ---- worker capture gate (Phase 7) ------------------------------------
+    def capture_settings(self, run):
+        """Project settings for the capture policy: the app settings, overlaid by the run's project_settings."""
+        settings = dict(self.store.settings() or {})
+        extra = (run or {}).get('project_settings')
+        if isinstance(extra, dict):
+            settings.update(extra)
+        return settings
+
+    def _capture_counts(self):
+        lock = self.__dict__.setdefault('_capture_lock', threading.Lock())
+        return lock, self.__dict__.setdefault('_capture_count_map', {})
+
+    def captures_taken(self, task_id):
+        """Number of worker captures that actually happened for this task."""
+        lock, counts = self._capture_counts()
+        with lock:
+            return counts.get(task_id, 0)
+
+    def worker_capture(self, args, task, run):
+        """Take a worker screen capture only when plain_protocol.capture_gate allows it.
+
+        A refusal takes no capture, emits capture_refused and returns a readable
+        English text. Only captures that actually happen are counted per task.
+        Operator and chat captures never come through here.
+        """
+        from . import plain_protocol
+        refusal = plain_protocol.capture_gate(task, self.capture_settings(run), self.captures_taken(task['id']))
+        if refusal is not None:
+            reason = refusal.get('reason') or {}
+            code = str(reason.get('reason') or 'refused')
+            self.store.event('capture_refused', run['id'], task_id=task['id'], task_class=reason.get('task_class', ''),
+                             reason=code, already_taken=reason.get('already_taken', 0), message=refusal.get('text', ''))
+            return {'refused': True, 'reason': code, 'text': refusal.get('text') or 'Screen capture refused for this task. No capture was taken.'}
+        result = self.screen().call('screen_capture', args, task_id=task['id'], run_id=run['id'], role=task.get('role', ''))
+        lock, counts = self._capture_counts()
+        with lock:
+            counts[task['id']] = counts.get(task['id'], 0) + 1
+        return result
+
+    def local_call(self, name, args):
+        """Local MCP tool (Roblox, Blender, REA) for the owner connection, without a worker assignment."""
+        server = LOCAL_BY_KEY[TOOL_SERVER[name]]
+        if not local_enabled(self.store.settings(), server):
+            raise ValueError('Switch on '+server['label']+' in MCP servers first')
+        client = self.local_client(server['key'])
+        return client.tools() if name.endswith('_tools') else client.call(str(args.get('name','')), args.get('arguments') or {})
 
     def shell(self, name, args, task, run, cwd):
         if not self.shell_gate.acquire(timeout=1):
@@ -333,8 +431,20 @@ class Bridge:
             if not command:
                 raise ValueError('Command is empty')
             creationflags = subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
-            process = subprocess.Popen(shell_command(command),
-                cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=creationflags)
+            if task.get('role') in READ_ONLY_ROLES:
+                # The one read-only shell form: unittest modules as an argument list,
+                # no shell, the project root as working folder, at most 120 s.
+                modules = read_only_test_modules(command)
+                if modules is None:
+                    raise ValueError('This planning/review role has read-only PC access')
+                timeout = max(1,min(120,int(args.get('timeout',60))))
+                root = Path(cwd)
+                env = dict(os.environ,PYTHONPATH=os.pathsep.join([str(root),str(root/'tests')]))
+                process = subprocess.Popen([unittest_python(),'-m','unittest',*modules],shell=False,
+                    cwd=str(root),env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=creationflags)
+            else:
+                process = subprocess.Popen(shell_command(command),
+                    cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=creationflags)
             try:
                 output,_ = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -349,11 +459,52 @@ class Bridge:
         finally:
             self.shell_gate.release()
 
+    def save_root(self):
+        """Folder for nt_notion_call save_to files (work/ next to the operator tools)."""
+        return dev_path('work')
+
+    def save_target(self, save_to):
+        """Resolve save_to to a file below work/; None when not given."""
+        from pathlib import PureWindowsPath
+        if save_to is None or save_to=='': return None
+        if not isinstance(save_to,str): raise ValueError('save_to must be a string')
+        raw=save_to.replace('\\','/')
+        windows=PureWindowsPath(save_to)
+        if raw.startswith('/') or windows.drive or windows.root or Path(save_to).is_absolute():
+            raise ValueError('save_to must be a relative path below work/, not an absolute path')
+        parts=raw.split('/')
+        if '..' in parts: raise ValueError("save_to must not contain '..'")
+        parts=[part for part in parts if part not in ('','.')]
+        if parts and parts[0]=='work': parts=parts[1:]
+        if not parts: raise ValueError('save_to must name a file below work/')
+        root=Path(self.save_root()).resolve()
+        target=root.joinpath(*parts).resolve()
+        if target==root or not target.is_relative_to(root):
+            raise ValueError('save_to resolves outside work/')
+        return target
+
+    def save_response(self, target, result):
+        """Write the full JSON response to target and return only a short summary."""
+        import hashlib
+        data=json.dumps(result,ensure_ascii=False,indent=2).encode('utf-8')
+        target.parent.mkdir(parents=True,exist_ok=True)
+        temp=target.with_name(target.name+'.tmp')
+        temp.write_bytes(data)
+        os.replace(temp,target)
+        root=Path(self.save_root()).resolve()
+        return {'path':'work/'+target.relative_to(root).as_posix(),'bytes':len(data),
+                'sha256':hashlib.sha256(data).hexdigest(),'keys':list(result) if isinstance(result,dict) else []}
+
     def operator_call(self, app, name, args):
         import re, urllib.request, urllib.error
         from .harness_account import selected_account
         if name in SCREEN_OPERATOR_NAMES: return self.screen().call(name[3:], args, role='operator')
-        if name in DEV_NAMES: return dev_call(name, args)
+        if name in DEV_NAMES:
+            if name in ('nt_write_file','nt_edit_file'):
+                # Register the operator edit so coworker chats see it and leave the file alone.
+                with self.engine.lock:
+                    file_registry.claim_operator(self.store, dev_path(args.get('path')))
+            return dev_call(name, args)
         if name=='nt_local_mcp':
             return self.local_refresh(str(args.get('server') or '') or None, bool(args.get('refresh')), schemas=bool(args.get('server')))
         if name=='nt_local_mcp_call':
@@ -382,7 +533,10 @@ class Bridge:
         if name=='nt_notion_call':
             method=str(args.get('method',''))
             if not re.fullmatch(r'[A-Za-z]{3,64}',method): raise ValueError('Invalid Notion method name')
-            return client.call(method,args.get('body') or {})
+            # Validate save_to before calling Notion, so a rejected path has no side effects.
+            target=self.save_target(args.get('save_to'))
+            result=client.call(method,args.get('body') or {})
+            return result if target is None else self.save_response(target,result)
         if name=='nt_inference_body':
             info=client.info
             model=args.get('model') or app.adapter.template['transcript'][0]['value'].get('model')
@@ -422,7 +576,7 @@ class Bridge:
                     {'name':'mcp_list_tools','description':'Get schemas for a NotionTool tool by name',
                      'annotations':{'readOnlyHint':True,'destructiveHint':False},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'}}}},
-                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty)',
+                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty); in the owner connection the local MCP tools (roblox_*, blender_*, rea_*) need no token either',
                      'annotations':{'readOnlyHint':False,'destructiveHint':True},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'},'assignment_token':{'type':'string'},
                                    'arguments':{'type':'object'}},'required':['tool_name']}}]}
@@ -447,7 +601,9 @@ class Bridge:
                     value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
                              if not args.get('tool_name') or n==args['tool_name']]
                 elif name=='mcp_call':
-                    value = self.call(args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token',''))
+                    inner,inner_args,token = args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token','')
+                    # Owner connection (operator scope already has shell access): local MCP tools need no assignment token.
+                    value = self.local_call(inner,inner_args) if operator is not None and inner in TOOL_SERVER and not self.has_assignment(token) else self.call(inner,inner_args,token)
                 else:
                     raise ValueError('Unknown MCP tool')
                 image = value.pop('_image', None) if isinstance(value, dict) else None

@@ -20,6 +20,19 @@ from .model_verification import verify_execution,ModelVerificationError,turn_sta
 from .telemetry import http_class
 
 
+class ThreadMissing(ValueError):
+    """Notion answered HTTP 404 for a worker thread (the chat was deleted)."""
+    def __init__(self, thread_id, path=''):
+        self.thread_id = str(thread_id or '')
+        self.path = str(path or '')
+        where = (' on ' + self.path) if self.path else ''
+        super().__init__('Notion thread %s is missing (HTTP 404%s)' % (self.thread_id, where))
+
+
+# Calls that address one worker thread; HTTP 404 there means the thread is gone.
+THREAD_PATHS = ('getInferenceTranscriptInferences', 'runInferenceTranscript', 'stopInferenceTranscript', 'stopInference')
+
+
 def unwrap(value):
     while isinstance(value, dict) and isinstance(value.get('value'), dict):
         value = value['value']
@@ -129,7 +142,7 @@ class NotionClient:
         # can override it without changing the adapter.
         origin = getattr(self.transport,'_base','https://app.notion.com')
         result = {'notion-audit-log-platform':'web','Origin':origin,'Referer':origin+'/login',
-                  'notion-client-version':self.info.get('client_version') or '23.13.20261011.1430'}
+                  'notion-client-version':self.info.get('client_version') or '23.13.20261017.0942'}
         for key, header in (('space_id','x-notion-space-id'),('user_id','x-notion-active-user-header'),('client_version','notion-client-version')):
             if self.info.get(key):
                 result[header] = self.info[key]
@@ -139,6 +152,8 @@ class NotionClient:
         status, text = self.transport.request(path,body,headers=self.headers(),timeout=timeout)
         if status == 429:
             raise RateLimited(getattr(self.transport, 'retry_after', 30))
+        if status == 404 and path in THREAD_PATHS and isinstance(body, dict) and body.get('threadId'):
+            raise ThreadMissing(body['threadId'], path)
         if status != 200:
             raise ValueError(f'Notion {path}: {text}')
         return json.loads(text)
@@ -154,7 +169,7 @@ class NotionClient:
         spaces = [dict(id=ident, name=unwrap(value).get('name','Workspace'))
                   for ident,value in records.get('space',{}).items() if unwrap(value).get('alive',True)]
         self.info = dict(user_id=user_id, email=user.get('email',''), user_name=user.get('name',''),
-                         client_version=self.info.get('client_version') or '23.13.20261011.1430',
+                         client_version=self.info.get('client_version') or '23.13.20261017.0942',
                          space_id=self.info.get('space_id') or (spaces[0]['id'] if spaces else ''),
                          spaces=spaces, onboarded=user.get('onboarding_completed'), records=records)
         return self.info
@@ -186,13 +201,55 @@ class NotionClient:
         return model['model']
 
     def threads(self):
-        return self.call('getInferenceTranscriptsForUser',{'threadParentPointer':{
-            'table':'space','id':self.info['space_id'],'spaceId':self.info['space_id']},
-            'includeWorkflowThreads':True,'includeWriterChats':False}).get('transcripts',[])
+        # getInferenceTranscriptsForUser was removed in Notion v23.13.20261017.
+        # includeWorkflowThreads / includeWriterChats params also gone.
+        # Fallback: call old endpoint (may still work server-side), else return empty list.
+        # TODO: find confirmed replacement endpoint for thread listing.
+        try:
+            return self.call('getInferenceTranscriptsForUser', {'threadParentPointer': {
+                'table': 'space', 'id': self.info['space_id'], 'spaceId': self.info['space_id']}
+            }).get('transcripts', [])
+        except ValueError:
+            # Server removed endpoint: load thread list from space record
+            try:
+                result = self.call('syncRecordValuesSpaceInitial', {'requests': [
+                    {'pointer': {'table': 'space', 'id': self.info['space_id'],
+                                 'spaceId': self.info['space_id']}, 'version': -1}]})
+                space = {}
+                for v in result.get('recordMap', {}).get('space', {}).values():
+                    while isinstance(v, dict) and isinstance(v.get('value'), dict):
+                        v = v['value']
+                    space = v
+                    break
+                thread_ids = list((space.get('data') or {}).get('thread_ids') or [])
+                if not thread_ids:
+                    return []
+                # Return minimal thread objects so refresh() can register workers
+                return [{'id': tid} for tid in thread_ids]
+            except Exception:
+                return []
 
-    def transcript(self, thread):
-        return self.call('getThreadTranscript',{'spaceId':self.info['space_id'],'threadId':thread,
-                                             'direction':'backward','limit':100})
+    def transcript(self, thread, limit=100):
+        # getThreadTranscript was removed in Notion v23.13.20261017.
+        # getInferenceTranscriptInferences replaces it; response shape differs.
+        # We normalize to the old shape so callers (run/recover/continue_turn) keep working.
+        try:
+            raw = self.call('getInferenceTranscriptInferences',
+                            {'spaceId': self.info['space_id'], 'threadId': thread})
+        except Exception:
+            raw = {}
+        # The new endpoint returns {inferences:[...], session:{...}} or similar.
+        # Map to the old {session:{}, patches:[], session_pending:False} shape.
+        session = raw.get('session') or {}
+        patches = raw.get('patches') or []
+        # Inferences are the new unit; convert to patch-entity format if patches absent
+        if not patches:
+            for inf in (raw.get('inferences') or []):
+                for entity in (inf.get('entities') or []):
+                    patches.append({'op': 'put', 'entity': entity})
+        return {'session': session, 'patches': patches,
+                'session_pending': raw.get('session_pending', False),
+                '_raw': raw}
 
 
 class NotionAdapter:
@@ -210,7 +267,16 @@ class NotionAdapter:
         self.template = json.loads((Path(__file__).parent / 'template.json').read_text(encoding='utf-8'))
         self.welcome = json.loads((Path(__file__).parent / 'welcome.json').read_text(encoding='utf-8'))
         self.network_budget = NetworkBudget(store)
+        self.clear_account_pause()
         self.confirmed_configs = {}  # thread_id -> (thread_id, generation, model) after a confirmed config check
+
+    def clear_account_pause(self, authenticated_account_id=''):
+        """Release only an orphaned pause or the freshly authenticated account's pause."""
+        pause = self.network_budget.status().get('pause') or {}
+        blocked = pause.get('account_id')
+        if blocked and (blocked == authenticated_account_id or not self.store.get('accounts', blocked)):
+            return self.network_budget.resume()
+        return False
 
     def client(self, account_id, anonymous=False):
         with self.lock:
@@ -306,7 +372,9 @@ class NotionAdapter:
                 account.update(state='model_unavailable',error=str(exc),model='')
         self.store.put('accounts',account)
         existing = {w['thread_id']:w for w in self.store.all('workers') if w['account_id']==account_id}
-        archived = {g['id'] for g in self.store.all('thread_generations') if g.get('account_id') == account_id}
+        gens = [g for g in self.store.all('thread_generations') if g.get('account_id') == account_id]
+        # Fix S: chats retired by a new-Welcome context switch never re-enter the pool.
+        archived = {g['id'] for g in gens} | {g['thread_id'] for g in gens if g.get('mode') == 'new_welcome'}
         seen = set()
         for thread in client.threads():
             tid = thread.get('id') or thread.get('thread_id') or thread.get('threadId')
@@ -376,9 +444,14 @@ class NotionAdapter:
         account=existing or self.create_account(email)
         self.sessions.save(account['id'],session)
         self.transports.pop(account['id'],None)
+        edge = self.edge_transports.get(account['id'])
+        if edge is not None:
+            # Reinstall the new cookies before the next request on an existing Edge process.
+            edge.ready_process = None
         account=self.store.get('accounts',account['id'])
         account.update(identity=info,state='signed_in',error='')
         self.store.put('accounts',account)
+        self.clear_account_pause(account['id'])
         try:self.refresh(account['id'])
         except Exception as exc:
             account=self.store.get('accounts',account['id']);account['error']=str(exc)[:200];self.store.put('accounts',account)
@@ -407,6 +480,7 @@ class NotionAdapter:
                 try:self.sessions.delete(key)
                 except Exception:pass
             self.store.delete('accounts',account_id)
+            self.clear_account_pause()
             settings=self.store.settings()
             if settings.get('harness_account_id')==account_id:
                 settings['harness_account_id']='';self.store.put('settings',settings)
@@ -466,8 +540,9 @@ class NotionAdapter:
         return out
 
     def apply_chat_pool(self, account_id, client):
-        """Register the Main and apply the Coworker rule; marker renames happen only after a confirmed join."""
-        from .chat_pool import COWORK_TITLE, MAIN_TITLES, pool_decision, pick_main
+        """Register the Main and apply the Coworker rule; Welcome chats stay unnamed, joined ones become Coworkers."""
+        from .chat_pool import COWORK_TITLE, MAIN_TITLES, WELCOME_TITLE, pool_decision, pick_main
+        from .cowork_names import is_pool_title
         account = self.store.get('accounts', account_id)
         workers = [w for w in self.store.all('workers') if w['account_id'] == account_id and w.get('state') != 'missing']
         ledger = account.get('team_threads') or {}
@@ -480,13 +555,20 @@ class NotionAdapter:
             ledger['main'] = {'id': main['thread_id'], 'pending': False}
             account['team_threads'] = ledger
             self.store.put('accounts', account)
+        if main:
+            from .main_repoint import repoint
+            try:
+                repoint(self.store, account_id, main)
+            except Exception as exc:
+                self.store.event('main_repoint_failed', message=str(exc)[:200], slot=account.get('slot'))
         pool = [w for w in workers if w.get('purpose', 'worker') == 'worker' and (not main or w['id'] != main['id'])]
         records = self.thread_records(client, [w['thread_id'] for w in pool
-            if w.get('label') == COWORK_TITLE or w.get('join_state') in ('pending', 'joined')])
+            if w.get('label') in (COWORK_TITLE, WELCOME_TITLE) or w.get('join_state') in ('pending', 'joined')])
         usable = 0
         for worker in pool:
-            if worker.get('label') in MAIN_TITLES:
-                changes, rename, event = dict(enabled=False), None, None
+            if worker.get('label') in MAIN_TITLES or not is_pool_title(worker.get('label') or ''):
+                # Named chats (anything not titled like the Welcome chat) are never coworkers.
+                changes, rename, event = dict(enabled=False, named=True), None, None
             else:
                 changes, rename, event = pool_decision(worker, records.get(worker['thread_id']))
             if rename:
@@ -672,6 +754,15 @@ class NotionAdapter:
         self.transaction(client,'agentThreads.rename',[{'pointer':{'table':'thread','id':tid,'spaceId':client.info['space_id']},
             'path':['data','title'],'command':'set','args':title}])
 
+    def delete_thread(self, client, tid):
+        """Same as the chat menu ... > Delete (verified on hg 2026-10-16): thread alive=false, then gone from the list."""
+        self.transaction(client, 'agentThreads.delete', [{'pointer': {'table': 'thread', 'id': tid, 'spaceId': client.info['space_id']},
+            'path': [], 'command': 'update', 'args': {'alive': False}}])
+        record = self.thread_records(client, [tid]).get(tid) or {}
+        if record.get('alive') is not False:
+            raise ValueError('Notion did not confirm the deletion of chat ' + tid)
+        return True
+
     def ensure_thread_model(self, client, thread_id, model):
         """Verify persisted legacy config; a request's new config can be ignored."""
         space = client.info['space_id']
@@ -774,13 +865,14 @@ class NotionAdapter:
         # Fetch head before sending so recovery cannot mistake old responses for this attempt.
         transcript = client.transcript(worker['thread_id'])
         session = transcript.get('session') or {}
-        if session.get('status') not in (None,'idle','completed'):
-            # Nothing was submitted. Treat an externally busy thread as safe backoff.
-            raise RateLimited(10)
-        if transcript.get('session_pending'):
-            raise RateLimited(10)
+        if session.get('status') not in (None,'idle','completed') or transcript.get('session_pending'):
+            # Nothing was submitted. An externally busy thread (e.g. the operator's own turn in this chat) is not a
+            # rate limit: no attempt is used and the account is not cooled down (Phase 4 fix).
+            raise RateLimited(10, 'This chat is busy with another turn (session ' + str(session.get('status') or 'pending') +
+                              '); nothing was sent yet', free=True, scope='thread')
         if self.thread_busy(client, worker['thread_id']):
-            raise RateLimited(5, 'Notion is still finishing the previous turn in this chat; nothing was sent yet', free=True)
+            raise RateLimited(5, 'Notion is still finishing the previous turn in this chat; nothing was sent yet',
+                              free=True, scope='thread')
         from .chat_context import ChatContext
         original_thread, original_generation = worker['thread_id'], worker.get('generation', 0)
         if worker.get('id'):
@@ -790,11 +882,42 @@ class NotionAdapter:
             transcript = client.transcript(worker['thread_id'])
             session = transcript.get('session') or {}
             if transcript.get('session_pending') or session.get('status') not in (None, 'idle', 'completed'):
-                raise RateLimited(10)
+                raise RateLimited(10, 'This chat is busy after the context checkpoint; the assignment was not sent yet',
+                                  free=True, scope='thread')
             if self.thread_busy(client, worker['thread_id']):
-                raise RateLimited(5, 'Notion is still finishing the context checkpoint in this chat; the assignment was not sent yet', free=True)
+                raise RateLimited(5, 'Notion is still finishing the context checkpoint in this chat; the assignment was not sent yet',
+                                  free=True, scope='thread')
         handoff_included = bool(worker.get('handoff') and not worker.get('handoff_delivered'))
-        if handoff_included:
+        handoff_token = ''
+        if handoff_included and worker.get('purpose') == 'worker' and self.store.settings().get('handoff_mode', 'file') == 'file':
+            # Phase 5b: the checkpoint goes to a local file; the chat reads it with read_file and acks with a token.
+            try:
+                import os as _os
+                from . import handoff_files
+                folder = str(self.store.directory / 'handoffs')
+                handoff_files.gc(folder, time.time())
+                path = handoff_files.handoff_path(folder, worker['id'])
+                try:
+                    with open(path, encoding='utf-8') as fh:
+                        if json.load(fh).get('new_thread') != worker['thread_id']:
+                            raise ValueError('stale')
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    _os.remove(path)  # an older, unconfirmed handoff for another chat is replaced
+                record = handoff_files.write_handoff(folder, worker['id'], dict(handoff=worker['handoff'],
+                    old_thread=(worker.get('retired_threads') or [''])[-1], new_thread=worker['thread_id'],
+                    run_id=task.get('run_id', ''), task_id=task['id']), time.time())
+                prompt = (handoff_files.first_message(record) +
+                          '\n\nAfter the token line, do the current assignment:\n' + prompt)
+                handoff_token = record['token']
+                self.store.event('handoff_file_written', task.get('run_id', ''), worker_id=worker['id'],
+                                 message=record['path'], chars=len(worker['handoff']))
+            except Exception as exc:
+                self.store.event('handoff_file_failed', task.get('run_id', ''), worker_id=worker['id'],
+                                 message=str(exc)[:160] + '; checkpoint is sent inline')
+                handoff_token = ''
+        if handoff_included and not handoff_token:
             # Without a server-side reset the earlier history stays visible; mark it as superseded.
             note = '' if worker.get('context_reset') else ('\n\nEarlier messages in this chat are superseded by '
                                                           'this checkpoint; use them only as reference history.')
@@ -812,6 +935,7 @@ class NotionAdapter:
             saved['thread_id'] = worker['thread_id']
             saved['submitted_prompt'] = prompt
             saved['handoff_included'] = handoff_included
+            saved['handoff_token'] = handoff_token
             saved['step_id'] = self.new_id(client.info['space_id'])
             saved['sent_at'] = time.time()
             saved['request_fingerprint'] = hashlib.sha256(prompt.encode()).hexdigest()
@@ -872,6 +996,8 @@ class NotionAdapter:
             remote_done('http_'+str(exc.status), http_class(exc.status))
             if exc.status==429:
                 raise RateLimited(exc.retry_after) from None
+            if exc.status==404:
+                raise ThreadMissing(worker.get('thread_id', ''), 'runInferenceTranscript') from None
             raise ValueError(f'Notion inference: HTTP {exc.status}') from None
         except (OSError,TimeoutError,json.JSONDecodeError):
             remote_done('unknown', 'REMOTE_UNKNOWN')
@@ -912,7 +1038,9 @@ class NotionAdapter:
             raise PendingRemote()
         marker=min(markers,key=lambda e:e.get('sequence',0))
         after=marker.get('sequence',0)
-        until=min([e.get('sequence',0) for e in fresh if e.get('kind')=='user_message' and e.get('sequence',0)>after],default=float('inf'))
+        resumes=set((self.store.get('tasks',task.get('id',''),{}) or {}).get('resume_steps') or [])  # automatic continue messages stay inside this turn
+        until=min([e.get('sequence',0) for e in fresh if e.get('kind')=='user_message' and e.get('sequence',0)>after
+                   and not ({e.get('id'),e.get('client_message_id')} & resumes)],default=float('inf'))
         own_turn=[e for e in fresh if after<e.get('sequence',0)<until]
         completed = any(e.get('kind')=='turn_completed' for e in own_turn) or (session.get('status')=='idle' and not transcript.get('session_pending'))
         text = '\n'.join(text_content(e.get('content',[])) for e in sorted(own_turn,key=lambda e:e.get('sequence',0))
@@ -927,6 +1055,21 @@ class NotionAdapter:
                         fresh_worker['handoff_delivered'] = True
                         fresh_worker['context_reset'] = False
                         self.store.put('workers', fresh_worker)
+            token = task.get('handoff_token') or (self.store.get('tasks', task.get('id', ''), {}) or {}).get('handoff_token')
+            if token and worker.get('id'):
+                from . import handoff_files
+                folder = str(self.store.directory / 'handoffs')
+                acked = handoff_files.verify_ack(text, token)
+                try:
+                    if acked:
+                        handoff_files.mark_acked(folder, worker['id'], time.time())
+                    handoff_files.mark_first_task_done(folder, worker['id'], time.time())
+                except Exception as exc:
+                    self.store.event('handoff_file_failed', task.get('run_id', ''), worker_id=worker['id'], message=str(exc)[:160])
+                self.store.event('handoff_acked' if acked else 'handoff_ack_missing', task.get('run_id', ''),
+                                 worker_id=worker['id'], message=('token confirmed; file removed' if acked else
+                                 'reply has no ack token; file kept for review (deleted after 24 h)'))
+                text = '\n'.join(line for line in text.splitlines() if line.strip() != token).strip()
             tool_activity=any(any(word in str(e.get('kind',e.get('type',''))).lower() for word in ('tool','execution','computer')) or e.get('tool_use_id') for e in own_turn)
             return VerifiedReply(text,tool_activity)
         if completed and not text:
@@ -968,6 +1111,30 @@ class NotionAdapter:
         if state == 'error':
             self.turn_failed(task, error)
 
+    def continue_turn(self, worker, text, step_id):
+        """Auto-resume: send one plain continue message into an idle harness chat and drain its stream.
+
+        Returns False when the chat is busy again (nothing was sent). The tool environment stays enabled
+        because interrupted turns are usually tool turns (NotionTool MCP).
+        """
+        client = self.client(worker['account_id'])
+        transcript = client.transcript(worker['thread_id'], limit=10)
+        session = transcript.get('session') or {}
+        if transcript.get('session_pending') or session.get('status') not in (None, 'idle', 'completed'):
+            return False
+        account = self.store.get('accounts', worker['account_id']) or {}
+        model = account.get('model') or self.template['transcript'][0]['value'].get('model')
+        body = self.body(client, worker['thread_id'], step_id, text, model, computer=True)
+        timeout = float(self.store.settings().get('task_timeout') or 1800)
+        try:
+            for _ in client.transport.stream('runInferenceTranscript', body, client.headers(), timeout=timeout):
+                pass
+        except NotionHttpError as exc:
+            if exc.status == 404:
+                raise ThreadMissing(worker['thread_id'], 'runInferenceTranscript') from None
+            raise
+        return True
+
     def thread_busy(self, client, thread_id):
         """True while Notion has not written the outcome of the latest turn in this chat."""
         try:
@@ -981,6 +1148,31 @@ class NotionAdapter:
             return False  # The session checks still apply when the record cannot be read.
         # A turn without an outcome for longer than the task timeout counts as abandoned.
         return latest > done and time.time() * 1000 - latest < self.store.settings()['task_timeout'] * 1000
+
+    def stop_turn(self, thread_id, worker=None):
+        """Ask Notion to stop the running turn in a worker chat (used by stall_watch).
+
+        Returns dict(ok, reason). Setting stop_turn=False switches it off. A missing
+        thread raises ThreadMissing; every other failure is reported, never raised.
+        """
+        settings = self.store.settings()
+        if not settings.get('stop_turn', True):
+            return dict(ok=False, reason='disabled')
+        if worker is None:
+            worker = next((w for w in self.store.all('workers') if w.get('thread_id') == thread_id), None)
+        if not worker or not worker.get('account_id'):
+            return dict(ok=False, reason='unknown_thread')
+        client = self.client(worker['account_id'])
+        endpoint = str(settings.get('stop_turn_endpoint') or 'stopInference')
+        try:
+            client.call(endpoint, {'spaceId': client.info.get('space_id', ''), 'threadId': thread_id})
+        except ThreadMissing:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed stop must not break the stall loop
+            self.store.event('stop_turn_failed', message=type(exc).__name__, thread_id=thread_id)
+            return dict(ok=False, reason='error', error=str(exc)[:300])
+        self.store.event('stop_turn_sent', thread_id=thread_id)
+        return dict(ok=True, reason='sent')
 
     def verify_response_model(self,worker,task):
         # Check the committed own turn, framed by verify_started / verify_done events.
