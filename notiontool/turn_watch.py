@@ -27,7 +27,8 @@ RESUME_TEXT = ('Continue: your previous turn was interrupted before it finished 
                'Pick up exactly where you stopped and finish the task.')
 CHECK_SECONDS = 30
 GRACE_SECONDS = 150  # a Main often thinks or waits on a slow tool for more than a minute between steps
-PENDING_TOOL_SECONDS = 900  # newest step is a tool call without result: the tool is most likely still running
+PENDING_TOOL_SECONDS = 420  # newest step is a tool call without result; every NotionTool tool times out well before this
+STALL_SECONDS = 600  # chat still says 'running' but nothing new for 10 min: a hung turn (e.g. a broken tool call)
 MAX_CHAIN = 5
 MAX_CHAIN_OPERATOR = 20  # the operator Main may work in idle mode for hours
 CHAIN_WINDOW = 1800   # without a visible user message, a resume within 30 min continues the chain
@@ -127,15 +128,20 @@ def _pending_tool(last, entities):
     return True
 
 
-def interrupted_turn(transcript):
+def interrupted_turn(transcript, now=None):
     """{'key', 'kind', 'stamp', 'user_ids', 'user_text'} when the newest turn ended without a reply, else None."""
     session = transcript.get('session') or {}
-    if transcript.get('session_pending') or session.get('status') not in IDLE:
-        return None
     entities = sorted((p.get('entity') or {} for p in transcript.get('patches', []) if p.get('op') == 'put'),
                       key=lambda e: e.get('sequence', 0))
+    stalled = False
+    if transcript.get('session_pending') or session.get('status') not in IDLE:
+        # A turn that still says 'running' but wrote nothing for STALL_SECONDS is hung, not working.
+        newest_any = max([stamp(e) for e in entities] or [0])
+        if now is None or not newest_any or now - newest_any < STALL_SECONDS:
+            return None
+        stalled = True
     relevant = [e for e in entities if _role(e)]
-    if not relevant or _role(relevant[-1]) == 'assistant_message':
+    if not relevant or (_role(relevant[-1]) == 'assistant_message' and not stalled):
         return None
     last = relevant[-1]
     key = str(last.get('id') or last.get('sequence') or '')
@@ -148,7 +154,7 @@ def interrupted_turn(transcript):
     # Any newer entry (also metadata) is activity: quiet time counts from the newest entry, not the last step.
     newest = max([stamp(e) for e in entities] + [stamp(last)])
     return dict(key=key, kind=str(last.get('kind') or last.get('type') or ''), stamp=newest,
-                pending=_pending_tool(last, entities),
+                pending=False if stalled else _pending_tool(last, entities), stalled=stalled,
                 user_ids=[str(x) for x in (user.get('client_message_id'), user.get('id')) if x],
                 user_text=user_text)
 
@@ -282,7 +288,7 @@ class TurnWatch:
         client = self.adapter.client(worker['account_id'])
         transcript = client.transcript(worker['thread_id'], limit=WINDOW)
         self.measure_usage(worker, client, transcript)
-        found = interrupted_turn(transcript)
+        found = interrupted_turn(transcript, now=self.clock())
         if not found:
             return None
         if (self.store.get('workers', worker['id'], {}).get('resume') or {}).get('key') == found['key']:
@@ -333,7 +339,8 @@ class TurnWatch:
                     task['resume_steps'] = (list(task.get('resume_steps') or []) + [step])[-10:]
                     self.store.put('tasks', task)
             self.sending.add(worker['id'])
-        self.store.event('turn_interrupted', worker_id=worker['id'], thread_id=worker['thread_id'], after=found['kind'],
+        self.store.event('turn_stalled' if found.get('stalled') else 'turn_interrupted', worker_id=worker['id'],
+                         thread_id=worker['thread_id'], after=found['kind'],
                          chain=chain, message='Interrupted turn detected; NotionTool sends an automatic continue message')
         self.spawn(self.send, worker, step, found['key'])
         return step
