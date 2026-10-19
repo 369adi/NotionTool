@@ -1035,7 +1035,7 @@ class Application:
                 return register_operator(self.store, str(body.get('worker_id') or ''), str(body.get('project_path') or ''))
             if path=='/api/operator/delegate':
                 from .operator_main import delegate
-                return delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''))
+                return delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''), quality=str(body.get('quality') or ''))
             if path=='/api/chat/update':
                 chat = self.store.get('chats',body['id'])
                 if not chat:

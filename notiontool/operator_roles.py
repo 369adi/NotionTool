@@ -10,7 +10,7 @@ import re
 QUALITIES = ('fast', 'standard', 'high')
 MAX_FIX_ROUNDS = 2
 LIVE = ('queued', 'retry', 'running', 'uncertain', 'cancelling')
-UI_WORDS = re.compile(r'(?i)\b(ui|ux|design|designer|layout|css|styles?|styling|look|visual|theme|sidebar|'
+UI_WORDS = re.compile(r'(?i)\b(ui|ux|design|designer|layout|css|styles?|styling|visual|theme|sidebar|'
                       r'buttons?|colou?rs?|spacing|frontend|front-end|typography|icons?)\b')
 UI_FILES = re.compile(r'(?i)\.(css|scss|html?|jsx|tsx|vue|svg)$|(^|/)web/')
 CODE_FILES = re.compile(r'(?i)\.(py|js|ts|jsx|tsx|ps1|sh|go|rs|java|cs|cpp|c|h|rb|php|sql)$')
