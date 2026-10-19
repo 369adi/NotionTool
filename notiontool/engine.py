@@ -12,6 +12,7 @@ from .store import uid
 from . import plain_protocol
 from . import prompt_once
 from . import file_registry
+from . import coworker_age_guard
 from .allocation import allocation, parallel_width, validate_allocation
 from .team_size import coworker_capacity
 from .model_routing import DEFAULT_MODEL, MODELS, validate_models, with_reason
@@ -973,6 +974,8 @@ class Engine:
                    self.store.get('tasks', pending_rotations[w['id']]['task_id'], {}).get('state') in TERMINAL]
         if not choices and not main_role and run['capacity'] == 0:
             choices = [w for w in workers if w['id'] == run['main_worker'] and w.get('enabled') and w['state'] == 'ready']
+        # I32: a Coworker chat 23 h or older gets no new task in any branch (executor, reviewer, fixer, fallbacks).
+        choices = coworker_age_guard.young(self.store, choices, time.time(), run.get('id', ''))
         counts = {}
         checkpoint_workers = {ident for ident, rotation in pending_rotations.items()
                               if rotation.get('state') == 'submitted' or
@@ -1021,6 +1024,7 @@ class Engine:
         choices = [w for w in choices if not pending_rotations.get(w['id'], {}).get('task_id') or
                    pending_rotations[w['id']]['task_id'] == task['id'] or
                    self.store.get('tasks', pending_rotations[w['id']]['task_id'], {}).get('state') in TERMINAL]
+        choices = [w for w in choices if not (coworker_age_guard.is_coworker(w) and coworker_age_guard.too_old(w, time.time()))]
         choices.sort(key=lambda w: (w.get('last_used', 0), counts.get(w['account_id'], 0)))
         preferred = [w for w in choices if task.get('prefer_worker') and w['id'] == task['prefer_worker']]
         return (preferred or choices)[0] if choices else None

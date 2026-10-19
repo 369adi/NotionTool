@@ -229,6 +229,9 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         if not coworkers:
             raise ValueError('No enabled Coworker in this account')
         stamp = time.time() if now is None else now
+        # I32: chats 23 h or older count for no capacity; with none young the tasks wait queued for the rotation.
+        from .coworker_age_guard import young
+        coworkers = young(store, coworkers, stamp) or coworkers[:1]
         capacity = max(1, min(int(store.settings().get('max_workers') or 1), team_size(store.settings()), len(coworkers)))
         run = dict(id=uid('r'), chat_id=chat['id'], main_worker=operator['id'], goal=goal, state='executing',
                    stage='', context='', project_path=chat.get('project_path', ''), folder_id=chat.get('folder_id', ''),
