@@ -34,7 +34,7 @@ ASK_TOKENS = 1300000  # ask early: the user sees lag from about 1.5M
 ASK_TURNS = 1000
 LAG_MS = 20000  # measured Main reply lag that counts as a real need for a switch
 NO_SWITCH_TRIGGERS = ('team_setup', 'ensure_team', 'team_grow')
-OLD_TITLE = 'Main (old, %s)'
+OLD_TITLE = 'Main (old, Archive %s)'
 BRIEF_MAX_CHARS = 8000
 ASK_TEXT = 'The Main chat is getting long. Ask the user whether to switch to a fresh Main chat.'
 ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
@@ -337,6 +337,12 @@ def _advance(store, record, ops, now):
                 renamed = False
         record = _move(store, record, 'switched', stamp, archive_renamed=renamed,
                        reason='operator Main moved to the new Welcome chat; old chat kept')
+    if record['state'] == 'switched' and not record.get('archive_renamed') and record.get('operator_thread'):
+        try:
+            if ops.rename_chat(record['operator_thread'], _archive_title(stamp)):
+                record = _note(store, record, stamp, archive_renamed=True)
+        except Exception:
+            pass
     return record
 
 

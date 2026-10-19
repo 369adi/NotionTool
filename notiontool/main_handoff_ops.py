@@ -312,6 +312,8 @@ class MainHandoffOps:
             reason = 'chat not listed'
         elif is_protected(current) or is_protected(title) or self._user_named(chat_id):
             reason = 'named chat'
+        elif self.operator and self._old_operator_of_switch(chat_id) and str(title).startswith((ARCHIVE_PREFIX, OLD_OPERATOR_PREFIX)):
+            reason = ''
         elif self._our_welcome(chat_id):
             reason = '' if title == 'Main' else 'Welcome chat may only become Main'
         elif self._old_main_of_handoff(chat_id):
