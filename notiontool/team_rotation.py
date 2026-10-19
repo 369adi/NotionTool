@@ -174,13 +174,14 @@ class TeamRotator:
             if not worker or worker.get('purpose', 'worker') != 'worker' or worker.get('state') == 'missing':
                 continue
             age = age_seconds(worker, now)
-            if age is None or age < limit:
+            forced = bool(worker.get('compress_requested'))
+            if not forced and (age is None or age < limit):
                 continue
             reason = busy_reason(worker, tasks, rotations)
             if reason:
                 waiting[worker['id']] = reason
                 continue
-            due.append((-age, role, worker))
+            due.append((-(age or 0) - (10 ** 9 if forced else 0), role, worker))
         if not due:
             return None, None, waiting
         _, role, worker = min(due, key=lambda entry: (entry[0], entry[1]))
@@ -253,6 +254,11 @@ class TeamRotator:
             return result
         self.store.event('team_rotation_done', message=role + ' moved to a fresh Welcome chat; the old chat is retired and kept',
                          account_id=ident, role=role, worker_id=worker_id, thread_id=result.get('thread_id', ''))
+        try:
+            from . import retired_chats
+            retired_chats.delete_retired(self.store, self.adapter)
+        except Exception as exc:
+            self.store.event('coworker_old_chat_delete_failed', message=str(exc)[:200], account_id=ident)
         return result
 
     def _set_enabled(self, worker_id, enabled):
