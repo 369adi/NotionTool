@@ -133,9 +133,10 @@ class SettingsTabKeys(unittest.TestCase):
         self.assertEqual(team_size({}), 10)
         entries = {e['key']: e for e in ds.settings_schema({})['harness']}
         self.assertEqual(entries['per_account']['value'], 10)
-        self.assertEqual(entries['coworker_max_age_hours']['value'], 23)
+        # Rotation runs at 22 h on purpose (commit 49abeb2): 1 h safety margin before the hard 23 h limit (I32).
+        self.assertEqual(entries['coworker_max_age_hours']['value'], 22)
         store = (ROOT / 'notiontool' / 'store.py').read_text(encoding='utf-8')
-        self.assertIn('max_workers=40, per_account=10, coworker_max_age_hours=23', store)
+        self.assertIn('max_workers=40, per_account=10, coworker_max_age_hours=22', store)
 
     def test_team_keys_go_to_the_server_route(self):
         keys = notion_shell.page_settings_keys()
