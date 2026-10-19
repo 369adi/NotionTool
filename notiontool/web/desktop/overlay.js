@@ -311,6 +311,94 @@
     ageClass: ageClass, ageLabel: ageLabel, coworkerRows: coworkerRows,
     createdText: createdText, ageBadge: ageBadge, coworkerAges: coworkerAges, ensureHeading: ensureHeading };
 
+  // ---- Named chats (own New chat dialog, Chats section, gear menu): pure helpers ------------
+  // Actions go through ctx.call only: app_chat_create / app_chat_rename / app_chat_promote, which
+  // the desktop shell maps to POST /api/app/chat/create, /rename and /promote.
+  var CHAT_NAME_MAX = 80;
+  var CHAT_NAME_COUNTER_AT = 60;
+  var CHATS_KEY = 'ntDesk.chatsCollapsed';
+  var OPEN_WAIT_MS = 15000;
+  var PLUS_GLYPH = '+';
+  var GEAR_GLYPH = '\u2699\uFE0E';
+
+  // One uuid per dialog: a double click or a retry sends the same request_id, so the backend
+  // never creates the chat twice.
+  function newRequestId() {
+    var c = window.crypto;
+    try { if (c && typeof c.randomUUID === 'function') return c.randomUUID(); } catch (e) { /* fallback below */ }
+    var b = [];
+    try {
+      if (c && typeof c.getRandomValues === 'function') b = Array.prototype.slice.call(c.getRandomValues(new Uint8Array(16)));
+    } catch (e) { b = []; }
+    for (var i = b.length; i < 16; i++) b.push(Math.floor(Math.random() * 256));
+    b[6] = (b[6] & 15) | 64;
+    b[8] = (b[8] & 63) | 128;
+    var h = b.map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join('');
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20, 32);
+  }
+
+  function cleanName(value) { return String(value == null ? '' : value).replace(/\s+/g, ' ').trim(); }
+
+  function nameError(name) {
+    if (!name) return 'Enter a chat name.';
+    if (name.length > CHAT_NAME_MAX) return 'Use at most ' + CHAT_NAME_MAX + ' characters.';
+    return '';
+  }
+
+  function createArgs(name, main, requestId) {
+    return { name: cleanName(name), main: !!main, request_id: String(requestId || '') };
+  }
+
+  function renameArgs(info, name) {
+    return { thread_id: String((info && info.thread_id) || ''), name: cleanName(name) };
+  }
+
+  function promoteArgs(info, main) {
+    var args = { main: !!main };
+    if (info && info.chat_id) args.chat_id = String(info.chat_id);
+    if (info && info.thread_id) args.thread_id = String(info.thread_id);
+    return args;
+  }
+
+  // Private chats (purpose 'private'): state.private_chats, else workers with that purpose.
+  function privateChatRows(state) {
+    var src = list(state && state.private_chats);
+    if (!src.length) src = list(state && state.workers).filter(function (w) { return w && w.purpose === 'private'; });
+    var seen = {};
+    return src.map(function (c) {
+      c = c || {};
+      return { kind: 'private', name: cleanName(c.name || c.title || c.label) || 'Untitled chat',
+        chat_id: String(c.chat_id || ''), worker_id: String(c.worker_id || c.id || ''),
+        thread_id: String(c.thread_id || ''), thread: threadKey(c.thread_id || ''), url: String(c.url || '') };
+    }).filter(function (row) {
+      if (!row.thread || seen[row.thread]) return false;
+      seen[row.thread] = true;
+      return true;
+    });
+  }
+
+  function mainChatInfo(main) {
+    main = main || {};
+    return { kind: 'main', name: cleanName(main.title || main.label) || 'Main', chat_id: String(main.chat_id || ''),
+      worker_id: String(main.worker_id || ''), thread_id: String(main.thread_id || ''), operator: !!main.operator };
+  }
+
+  // Gear menu of one chat row: Rename plus Make Main (private) or Remove Main rights (Main).
+  function chatMenuItems(info) {
+    var items = [{ id: 'rename', label: 'Rename' }];
+    if (info && info.kind === 'main') {
+      items.push({ id: 'demote', label: 'Remove Main rights', danger: true, disabled: !!info.operator,
+        title: info.operator ? 'The Operator Main always keeps its Main rights' : '' });
+    } else {
+      items.push({ id: 'promote', label: 'Make Main' });
+    }
+    return items;
+  }
+
+  window.__ntDesk.newChatUtil = { newRequestId: newRequestId, cleanName: cleanName, nameError: nameError,
+    createArgs: createArgs, renameArgs: renameArgs, promoteArgs: promoteArgs, privateChatRows: privateChatRows,
+    mainChatInfo: mainChatInfo, chatMenuItems: chatMenuItems, CHAT_NAME_MAX: CHAT_NAME_MAX };
+
   window.__ntDesk.sidebar = function (ctx) {
     var timer = 0;
     var busy = false;
@@ -596,6 +684,7 @@
         row.classList.toggle(CLS_OPERATOR, !!(main && main.operator));
         stylePill(link, !!(main && main.operator));
         styleCard(row, main, state);
+        styleGear(row, main);
       }
     }
 
@@ -641,6 +730,7 @@
         stylePill(row, !!(main && main.operator));
         styleCard(row, main, state);
         styleAge(row, main ? null : (ages[key] || null));
+        styleGear(row, main);
       }
     }
 
@@ -739,16 +829,18 @@
 
     function applyCoworkers(state, root) {
       var section = document.querySelector('[data-nt-desk="coworkers"]');
-      var mainRow = root ? root.querySelector('.' + CLS_MAIN_ROW) : null;
-      var anchor = mainRow ? (mainRow.closest('[role="menu"]') || mainRow.parentElement) : null;
-      if (!anchor || anchor === root || !root.contains(anchor) || !anchor.parentNode) {
+      var anchor = sectionAnchor(root);
+      if (!anchor) {
         if (section) dropOwn(section);
         return;
       }
-      if (section && section.previousSibling !== anchor) { dropOwn(section); section = null; }
+      // The Chats section (private chats) sits between the Mains and this section.
+      var next = anchor.nextSibling;
+      var before = next && next.getAttribute && next.getAttribute('data-nt-desk') === 'chats' ? next : anchor;
+      if (section && section.previousSibling !== before) { dropOwn(section); section = null; }
       if (!section) {
         section = el('div', { cls: 'nt-desk-coworkers', 'data-nt-desk': 'coworkers' });
-        anchor.parentNode.insertBefore(section, anchor.nextSibling);
+        anchor.parentNode.insertBefore(section, before.nextSibling);
       }
       var collapsed = coworkersCollapsed();
       section.classList.toggle('nt-desk-collapsed', collapsed);
@@ -810,10 +902,491 @@
       }
     }
 
+    // ---- Named chats: own New chat dialog, Chats section, gear menu ------------------------
+    // Only our own nodes (data-nt-desk-own). Opening a chat clicks Notion's own row; without one
+    // the URL is pushed into history (same origin, no reload). Nothing here sends a chat message.
+    var dialog = null;
+    var menu = null;
+    var pendingOpen = null;
+    var pendingTimer = 0;
+    var promoting = {};
+
+    function mk(tag, attrs, kids) {
+      var node = document.createElement(tag);
+      attrs = attrs || {};
+      Object.keys(attrs).forEach(function (name) {
+        var value = attrs[name];
+        if (value == null || value === false) return;
+        if (name === 'cls') node.className = value;
+        else if (name === 'text') node.textContent = String(value);
+        else node.setAttribute(name, value === true ? '' : String(value));
+      });
+      node.setAttribute('data-nt-desk-own', '1');
+      (kids || []).forEach(function (kid) { if (kid) node.appendChild(kid); });
+      return node;
+    }
+
+    function stopEv(ev) { ev.stopPropagation(); }
+
+    // Events inside our dialog/menu stay ours, so Notion's shortcuts and handlers never see them.
+    function guard(node, types) { types.forEach(function (type) { node.addEventListener(type, stopEv); }); }
+
+    function failText(err) {
+      var text = message(err) || 'Unknown error';
+      if (/not allowed|not available|unknown action/i.test(text)) {
+        return 'NotionTool does not offer this action yet. Update and restart NotionTool.';
+      }
+      return text;
+    }
+
+    function checkResult(result) {
+      if (result && (result.ok === false || result.error)) throw new Error(String(result.error || 'The request failed.'));
+      if (result && String(result.state || '').toLowerCase() === 'failed') {
+        throw new Error(String(result.error || 'Creating the chat failed. Close this dialog and try again.'));
+      }
+      return result || {};
+    }
+
+    function sectionAnchor(root) {
+      var mainRow = root ? root.querySelector('.' + CLS_MAIN_ROW) : null;
+      var anchor = mainRow ? (mainRow.closest('[role="menu"]') || mainRow.parentElement) : null;
+      return anchor && anchor !== root && root.contains(anchor) && anchor.parentNode ? anchor : null;
+    }
+
+    // -- dialog (create, rename, confirm)
+    function closeDialog(restore) {
+      if (!dialog) return;
+      var d = dialog;
+      dialog = null;
+      dropOwn(d.scrim);
+      if (restore !== false && d.opener && typeof d.opener.focus === 'function' && document.contains(d.opener)) {
+        try { d.opener.focus(); } catch (e) { /* focus is best effort */ }
+      }
+    }
+
+    function openDialog(opts) {
+      closeMenu(false);
+      closeDialog(false);
+      var opener = opts.opener || document.activeElement;
+      var helpText = 'Up to ' + CHAT_NAME_MAX + ' characters.';
+      var kids = [mk('h2', { cls: 'nt-desk-dialog-title', id: 'nt-desk-dlg-title', text: opts.title })];
+      if (opts.sub) kids.push(mk('p', { cls: 'nt-desk-dialog-sub', id: 'nt-desk-dlg-sub', text: opts.sub }));
+      var input = null;
+      var msg = null;
+      var box = null;
+      if (opts.nameLabel) {
+        kids.push(mk('label', { cls: 'nt-desk-label', 'for': 'nt-desk-dlg-name', text: opts.nameLabel }));
+        input = mk('input', { cls: 'nt-desk-input', id: 'nt-desk-dlg-name', type: 'text', maxlength: CHAT_NAME_MAX,
+          autocomplete: 'off', spellcheck: 'false', placeholder: opts.placeholder || null,
+          'aria-describedby': 'nt-desk-dlg-msg' });
+        input.value = opts.name || '';
+        msg = mk('div', { cls: 'nt-desk-field-msg', id: 'nt-desk-dlg-msg', 'aria-live': 'polite', text: helpText });
+        kids.push(input, msg);
+      }
+      if (opts.check) {
+        box = mk('input', { cls: 'nt-desk-checkbox', id: 'nt-desk-dlg-main', type: 'checkbox',
+          'aria-describedby': 'nt-desk-dlg-main-help' });
+        box.checked = !!opts.check.checked;
+        kids.push(mk('label', { cls: 'nt-desk-check', 'for': 'nt-desk-dlg-main' }, [box,
+          mk('span', { cls: 'nt-desk-check-text' }, [
+            mk('span', { cls: 'nt-desk-check-label', text: opts.check.label }),
+            mk('span', { cls: 'nt-desk-check-help', id: 'nt-desk-dlg-main-help', text: opts.check.help })
+          ])
+        ]));
+      }
+      var banner = mk('div', { cls: 'nt-desk-banner', role: 'alert', hidden: true });
+      var cancel = mk('button', { cls: 'nt-desk-btn nt-desk-btn-ghost', type: 'button', text: 'Cancel' });
+      var ok = mk('button', { cls: 'nt-desk-btn ' + (opts.danger ? 'nt-desk-btn-danger' : 'nt-desk-btn-primary'),
+        type: 'button', text: opts.submit, 'aria-disabled': 'false' });
+      kids.push(banner, mk('div', { cls: 'nt-desk-actions' }, [cancel, ok]));
+      var panel = mk('div', { cls: 'nt-desk-dialog', role: opts.danger ? 'alertdialog' : 'dialog', 'aria-modal': 'true',
+        'aria-labelledby': 'nt-desk-dlg-title', 'aria-describedby': opts.sub ? 'nt-desk-dlg-sub' : null }, kids);
+      var scrim = mk('div', { cls: 'nt-desk-scrim', 'data-nt-desk': 'dialog' }, [panel]);
+      var self = { scrim: scrim, opener: opener, busy: false };
+
+      function isOpen() { return dialog === self; }
+
+      // aria-disabled instead of disabled: the focused button keeps focus while busy.
+      function setBusy(on) {
+        self.busy = on;
+        ok.textContent = on ? opts.busyText : opts.submit;
+        ok.setAttribute('aria-disabled', on ? 'true' : 'false');
+        ok.setAttribute('aria-busy', on ? 'true' : 'false');
+        if (input) input.readOnly = on;
+        if (box) box.setAttribute('aria-disabled', on ? 'true' : 'false');
+      }
+
+      function fieldMsg() {
+        if (!msg) return;
+        var n = input.value.length;
+        msg.classList.remove('nt-desk-field-error');
+        input.removeAttribute('aria-invalid');
+        msg.textContent = n >= CHAT_NAME_COUNTER_AT ? n + '/' + CHAT_NAME_MAX : helpText;
+      }
+
+      function showError(text, onField) {
+        if (onField && msg) {
+          msg.textContent = text;
+          msg.classList.add('nt-desk-field-error');
+          input.setAttribute('aria-invalid', 'true');
+          return;
+        }
+        banner.textContent = text;
+        banner.hidden = false;
+      }
+
+      function submit() {
+        if (self.busy) return;
+        var values = { name: input ? cleanName(input.value) : '', main: !!(box && box.checked) };
+        if (input) {
+          var err = nameError(values.name);
+          if (err) { showError(err, true); input.focus(); return; }
+        }
+        banner.hidden = true;
+        banner.textContent = '';
+        setBusy(true);
+        Promise.resolve().then(function () { return opts.onSubmit(values, isOpen); }).then(function () {
+          if (isOpen()) closeDialog();
+        }, function (err) {
+          if (!isOpen()) { ctx.toast(failText(err), 'error'); return; }
+          setBusy(false);
+          showError(failText(err), false);
+          try { ok.focus(); } catch (e) { /* best effort */ }
+        });
+      }
+
+      if (input) input.addEventListener('input', fieldMsg);
+      if (box) box.addEventListener('click', function (ev) { if (self.busy) ev.preventDefault(); });
+      cancel.addEventListener('click', function (ev) { ev.preventDefault(); closeDialog(); });
+      ok.addEventListener('click', function (ev) { ev.preventDefault(); submit(); });
+      panel.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          closeDialog();
+        } else if (ev.key === 'Enter' && (ev.target === input || ev.target === box)) {
+          ev.preventDefault();
+          submit();
+        } else if (ev.key === 'Tab') {
+          // Focus trap: name -> Main -> Cancel -> Create -> name.
+          var ring = [input, box, cancel, ok].filter(Boolean);
+          var at = ring.indexOf(document.activeElement);
+          var to = ev.shiftKey ? (at <= 0 ? ring.length - 1 : at - 1) : (at < 0 || at === ring.length - 1 ? 0 : at + 1);
+          ev.preventDefault();
+          ring[to].focus();
+        }
+      });
+      scrim.addEventListener('mousedown', function (ev) { if (ev.target === scrim && !self.busy) closeDialog(); });
+      guard(scrim, ['keydown', 'keyup', 'keypress', 'input', 'beforeinput', 'paste', 'copy', 'cut',
+        'pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click', 'wheel']);
+      document.body.appendChild(scrim);
+      dialog = self;
+      var first = input || (opts.danger ? cancel : ok);
+      try {
+        first.focus();
+        if (input && input.value) input.select();
+      } catch (e) { /* best effort */ }
+      return self;
+    }
+
+    function openCreate(opener) {
+      // Generated once per dialog: every Create click of this dialog sends the same request_id.
+      var requestId = newRequestId();
+      openDialog({ title: 'New chat', sub: 'Creates a fresh Notion chat with this name.', nameLabel: 'Chat name',
+        placeholder: 'e.g. Tax return 2026', check: { label: 'Main', help: 'Main chats can delegate work to coworkers' },
+        submit: 'Create', busyText: 'Creating chat...', opener: opener,
+        onSubmit: function (values, isOpen) {
+          return ctx.call('app_chat_create', createArgs(values.name, values.main, requestId)).then(function (result) {
+            result = checkResult(result);
+            var key = threadKey(result.thread_id || '');
+            schedule();
+            if (!key) {
+              ctx.toast('Chat "' + values.name + '" is being created. It appears in the sidebar when it is ready.', 'info');
+              return;
+            }
+            if (isOpen()) openChat(key, result.url);
+            else ctx.toast('Chat "' + values.name + '" created', 'info');
+          });
+        } });
+    }
+
+    // -- opening a chat without a reload
+    function clickRow(key) {
+      if (!key) return false;
+      var rows = document.querySelectorAll('[data-nt-desk="chat-row"]');
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute('data-nt-desk-thread') === key) { rows[i].click(); return true; }
+      }
+      return false;
+    }
+
+    function softNavigate(url) {
+      try {
+        var target = new URL(url, location.href);
+        if (target.origin !== location.origin) throw new Error('other origin');
+        if (target.href === location.href) return;
+        history.pushState(history.state, '', target.pathname + target.search + target.hash);
+        window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+      } catch (e) {
+        ctx.toast('The chat is ready. Open it from the sidebar.', 'info');
+      }
+    }
+
+    function openChat(key, url) {
+      if (clickRow(key)) return;
+      pendingOpen = { key: key, url: String(url || ''), until: Date.now() + OPEN_WAIT_MS };
+      schedule();
+    }
+
+    // The new row shows up in Notion's list a little later: retry every second for up to 15 s.
+    function applyPendingOpen() {
+      if (!pendingOpen) return;
+      if (clickRow(pendingOpen.key)) { pendingOpen = null; return; }
+      if (Date.now() < pendingOpen.until) {
+        if (!pendingTimer) pendingTimer = setTimeout(function () { pendingTimer = 0; schedule(); }, 1000);
+        return;
+      }
+      var url = pendingOpen.url;
+      pendingOpen = null;
+      if (url) softNavigate(url);
+      else ctx.toast('The chat is ready. Open it from the sidebar.', 'info');
+    }
+
+    // -- our New chat button in the MAINS header (Notion's own New chat stays as it is)
+    function applyNewChatButton() {
+      var heading = document.querySelector('[data-nt-desk="heading"]');
+      if (!heading || heading.querySelector('[data-nt-desk="newchat-open"]')) return;
+      var btn = mk('button', { cls: 'nt-desk-icon-btn nt-desk-newchat-open', 'data-nt-desk': 'newchat-open', type: 'button',
+        'aria-label': 'New chat', title: 'New chat: choose a name', 'aria-haspopup': 'dialog' },
+        [mk('span', { cls: 'nt-desk-plus', 'aria-hidden': 'true', text: PLUS_GLYPH })]);
+      guard(btn, ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'keydown']);
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openCreate(btn);
+      });
+      heading.appendChild(btn);
+    }
+
+    // -- Chats section (private chats, purpose 'private'), between Mains and Coworkers
+    function chatsCollapsed() {
+      try { return window.localStorage.getItem(CHATS_KEY) === '1'; } catch (e) { return false; }
+    }
+
+    function setChatsCollapsed(value) {
+      try { window.localStorage.setItem(CHATS_KEY, value ? '1' : '0'); } catch (e) { /* not persisted */ }
+    }
+
+    function privateRow(row) {
+      var node = mk('div', { cls: 'nt-desk-chat', 'data-nt-desk': 'private-chat', 'data-nt-desk-thread': row.thread,
+        role: 'link', tabindex: '0', title: row.name }, [
+        mk('span', { cls: 'nt-desk-chat-icon', 'aria-hidden': 'true' }),
+        mk('span', { cls: 'nt-desk-chat-name', text: row.name }),
+        gearButton(row)
+      ]);
+      function go(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!clickRow(row.thread) && row.url) softNavigate(row.url);
+      }
+      node.addEventListener('click', go);
+      node.addEventListener('keydown', function (ev) {
+        if (ev.target === node && (ev.key === 'Enter' || ev.key === ' ')) go(ev);
+      });
+      return node;
+    }
+
+    function applyChats(state, root) {
+      var section = document.querySelector('[data-nt-desk="chats"]');
+      var anchor = sectionAnchor(root);
+      if (!anchor) {
+        if (section) dropOwn(section);
+        return;
+      }
+      if (section && section.previousSibling !== anchor) { dropOwn(section); section = null; }
+      if (!section) {
+        section = mk('div', { cls: 'nt-desk-chats', 'data-nt-desk': 'chats' });
+        anchor.parentNode.insertBefore(section, anchor.nextSibling);
+      }
+      var collapsed = chatsCollapsed();
+      section.classList.toggle('nt-desk-collapsed', collapsed);
+      var rows = privateChatRows(state);
+      var sig = JSON.stringify(rows);
+      if (section.getAttribute('data-nt-desk-sig') === sig) return;
+      if (menu && section.contains(menu.button)) closeMenu(false);
+      section.setAttribute('data-nt-desk-sig', sig);
+      Array.prototype.slice.call(section.childNodes).forEach(dropOwn);
+      var head = mk('button', { cls: 'nt-desk-section-head', 'data-nt-desk': 'chats-head', type: 'button',
+        'aria-expanded': String(!collapsed), 'aria-controls': 'nt-desk-chats-list' }, [
+        mk('span', { cls: 'nt-desk-chevron', 'aria-hidden': 'true' }),
+        mk('span', { cls: 'nt-desk-coworkers-title', text: 'Chats' }),
+        mk('span', { cls: 'nt-desk-chip nt-desk-count', text: String(rows.length) })
+      ]);
+      head.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var next = !chatsCollapsed();
+        setChatsCollapsed(next);
+        section.classList.toggle('nt-desk-collapsed', next);
+        head.setAttribute('aria-expanded', String(!next));
+      });
+      var body = mk('div', { cls: 'nt-desk-chat-list', id: 'nt-desk-chats-list', 'data-nt-desk': 'chats-list' });
+      if (!rows.length) body.appendChild(mk('div', { cls: 'nt-desk-chat-empty', text: 'No private chats' }));
+      rows.forEach(function (row) { body.appendChild(privateRow(row)); });
+      section.appendChild(head);
+      section.appendChild(body);
+    }
+
+    // -- gear button and settings menu
+    function gearButton(info) {
+      var btn = mk('button', { cls: 'nt-desk-gear', 'data-nt-desk': 'gear', type: 'button',
+        'aria-label': 'Chat settings for ' + info.name, title: 'Chat settings', 'aria-haspopup': 'menu',
+        'aria-expanded': 'false' }, [mk('span', { cls: 'nt-desk-gear-icon', 'aria-hidden': 'true', text: GEAR_GLYPH })]);
+      btn.__ntChat = info;
+      guard(btn, ['pointerdown', 'mousedown', 'mouseup', 'pointerup']);
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (menu && menu.button === btn) closeMenu();
+        else openMenu(btn);
+      });
+      btn.addEventListener('keydown', function (ev) {
+        ev.stopPropagation();
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'ArrowDown') {
+          ev.preventDefault();
+          openMenu(btn);
+        }
+      });
+      return btn;
+    }
+
+    // Main rows get a gear (Rename, Remove Main rights); other rows lose a stale one.
+    function styleGear(row, main) {
+      var gear = null;
+      for (var i = 0; i < row.children.length; i++) {
+        if (row.children[i].getAttribute('data-nt-desk') === 'gear') gear = row.children[i];
+      }
+      if (!main) {
+        if (gear) {
+          if (menu && menu.button === gear) closeMenu(false);
+          dropOwn(gear);
+        }
+        return;
+      }
+      var info = mainChatInfo(main);
+      if (!gear) {
+        gear = gearButton(info);
+        row.appendChild(gear);
+      } else {
+        gear.__ntChat = info;
+      }
+      var label = 'Chat settings for ' + info.name;
+      if (gear.getAttribute('aria-label') !== label) gear.setAttribute('aria-label', label);
+    }
+
+    function closeMenu(restore) {
+      if (!menu) return;
+      var m = menu;
+      menu = null;
+      document.removeEventListener('mousedown', m.outside, true);
+      window.removeEventListener('resize', m.dismiss);
+      window.removeEventListener('blur', m.dismiss);
+      window.removeEventListener('scroll', m.dismiss, true);
+      m.button.setAttribute('aria-expanded', 'false');
+      dropOwn(m.node);
+      if (restore !== false && document.contains(m.button)) {
+        try { m.button.focus(); } catch (e) { /* best effort */ }
+      }
+    }
+
+    function openMenu(btn) {
+      closeMenu(false);
+      var info = btn.__ntChat || {};
+      var node = mk('div', { cls: 'nt-desk-menu', role: 'menu', 'data-nt-desk': 'chat-menu', 'aria-label': 'Chat settings' });
+      var items = chatMenuItems(info).map(function (item) {
+        var b = mk('button', { cls: 'nt-desk-menu-item' + (item.danger ? ' nt-desk-menu-danger' : ''), type: 'button',
+          role: 'menuitem', tabindex: '-1', text: item.label, title: item.title || null,
+          'aria-disabled': item.disabled ? 'true' : null });
+        b.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (item.disabled) return;
+          closeMenu(false);
+          runMenuItem(item.id, info, btn);
+        });
+        node.appendChild(b);
+        return b;
+      });
+      node.addEventListener('keydown', function (ev) {
+        var at = items.indexOf(document.activeElement);
+        var n = items.length;
+        if (ev.key === 'ArrowDown') { ev.preventDefault(); items[(at + 1) % n].focus(); }
+        else if (ev.key === 'ArrowUp') { ev.preventDefault(); items[(at - 1 + n) % n].focus(); }
+        else if (ev.key === 'Home') { ev.preventDefault(); items[0].focus(); }
+        else if (ev.key === 'End') { ev.preventDefault(); items[n - 1].focus(); }
+        else if (ev.key === 'Escape' || ev.key === 'Tab') { ev.preventDefault(); closeMenu(); }
+      });
+      guard(node, ['keydown', 'keyup', 'pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click']);
+      document.body.appendChild(node);
+      var r = btn.getBoundingClientRect();
+      var top = r.bottom + 4;
+      if (top + node.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - node.offsetHeight - 4);
+      node.style.top = Math.round(top) + 'px';
+      node.style.left = Math.round(Math.max(8, Math.min(r.left, window.innerWidth - node.offsetWidth - 8))) + 'px';
+      var dismiss = function () { closeMenu(false); };
+      var outside = function (ev) { if (!node.contains(ev.target) && !btn.contains(ev.target)) closeMenu(false); };
+      document.addEventListener('mousedown', outside, true);
+      window.addEventListener('resize', dismiss);
+      window.addEventListener('blur', dismiss);
+      window.addEventListener('scroll', dismiss, true);
+      menu = { node: node, button: btn, outside: outside, dismiss: dismiss };
+      btn.setAttribute('aria-expanded', 'true');
+      var enabled = items.filter(function (b) { return b.getAttribute('aria-disabled') !== 'true'; });
+      (enabled[0] || items[0]).focus();
+    }
+
+    function promote(info, main) {
+      var key = String(info.thread_id || info.chat_id || '');
+      if (promoting[key]) return Promise.resolve();
+      promoting[key] = true;
+      return Promise.resolve().then(function () {
+        return ctx.call('app_chat_promote', promoteArgs(info, main));
+      }).then(function (result) {
+        checkResult(result);
+        schedule();
+        ctx.toast(main ? '"' + info.name + '" is now a Main' : '"' + info.name + '" is now a private chat', 'info');
+      }).then(function () { delete promoting[key]; }, function (err) { delete promoting[key]; throw err; });
+    }
+
+    function runMenuItem(id, info, btn) {
+      if (id === 'rename') {
+        openDialog({ title: 'Rename chat', nameLabel: 'Chat name', name: info.name, submit: 'Rename',
+          busyText: 'Renaming...', opener: btn,
+          onSubmit: function (values) {
+            return ctx.call('app_chat_rename', renameArgs(info, values.name)).then(function (result) {
+              checkResult(result);
+              schedule();
+              ctx.toast('Chat renamed to "' + values.name + '"', 'info');
+            });
+          } });
+      } else if (id === 'promote') {
+        ctx.toast('Making "' + info.name + '" a Main...', 'info');
+        promote(info, true).then(null, function (err) {
+          ctx.toast('Could not make "' + info.name + '" a Main: ' + failText(err), 'error');
+        });
+      } else if (id === 'demote') {
+        // Confirm first: removing Main rights stops delegation to coworkers.
+        openDialog({ title: 'Remove Main rights?', sub: '"' + info.name + '" becomes a private chat and can no longer'
+          + ' delegate work to coworkers. You can make it a Main again later.', submit: 'Remove Main rights',
+          busyText: 'Removing...', danger: true, opener: btn,
+          onSubmit: function () { return promote(info, false); } });
+      }
+    }
+
     // ---- New chat control ----------------------------------------------------------------
     function newChatControl(target) {
       var node = target && target.closest ? target.closest(CONTROL_SELECTOR) : null;
       if (!node || !node.closest(SIDEBAR_SELECTOR)) return null;
+      if (node.closest('[data-nt-desk-own]')) return null;  // our own buttons are never Notion's New chat
       if (node.getAttribute('data-nt-desk') === 'new-chat') return node;
       return isNewChatLabel(visibleLabel(node)) ? node : null;
     }
@@ -823,7 +1396,7 @@
       for (var i = 0; i < nodes.length; i++) {
         var node = nodes[i];
         if (node.getAttribute('data-nt-desk') === 'new-chat') continue;
-        if (!node.closest(SIDEBAR_SELECTOR)) continue;
+        if (!node.closest(SIDEBAR_SELECTOR) || node.closest('[data-nt-desk-own]')) continue;
         var label = visibleLabel(node);
         if (label.length > 20 || !isNewChatLabel(label)) continue;
         node.setAttribute('data-nt-desk', 'new-chat');
@@ -879,7 +1452,12 @@
       var state = typeof ctx.getState === 'function' ? ctx.getState() : null;
       if (!online(state)) {
         // Harness offline: hide nothing and re-label nothing; undo what an earlier run did.
-        if (applied) resetMarks();
+        if (applied) {
+          closeMenu(false);
+          closeDialog(false);
+          pendingOpen = null;
+          resetMarks();
+        }
         applied = false;
         markNewChat();
         showOffline();
@@ -894,12 +1472,15 @@
         applyBrand(root);
         applyOffline(root, false);
         applyHeading(root);
+        applyNewChatButton();
         chatGroups = [];
         applyClutter(root);
         applyRows(state, root);
+        applyChats(state, root);
         applyCoworkers(state, root);
         collapseEmpty(root);
       } catch (e) { /* branding is cosmetic; never break the filter or the New chat routing */ }
+      try { applyPendingOpen(); } catch (e) { pendingOpen = null; }
     }
 
     function schedule() {
@@ -929,6 +1510,11 @@
         document.removeEventListener('mousedown', onPress, true);
         document.removeEventListener('click', onClick, true);
         document.removeEventListener('keydown', onKey, true);
+        closeMenu(false);
+        closeDialog(false);
+        pendingOpen = null;
+        if (pendingTimer) clearTimeout(pendingTimer);
+        pendingTimer = 0;
         resetMarks();
       }
     };
