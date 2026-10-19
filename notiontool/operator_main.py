@@ -47,6 +47,10 @@ def _with_result_line(prompt):
     return prompt.rstrip() + '\n\n' + RESULT_LINE
 
 
+KNOWN_TASK_KEYS = frozenset(('id', 'title', 'prompt', 'acceptance', 'depends_on', 'deps', 'after', 'files', 'model',
+                             'role', 'task_class', 'summary', 'quality', 'use_main'))
+
+
 def _warnings(store, chat, tasks):
     """Non-blocking hints for the operator about what the Coworkers will not be able to do."""
     worker = store.get('workers', chat.get('main_worker'), {}) if chat.get('main_worker') else {}
@@ -58,6 +62,10 @@ def _warnings(store, chat, tasks):
                         % ', '.join(with_files))
     if not store.settings().get('advertise_project_tools', False):
         warnings.append('Setting advertise_project_tools is off: Coworkers get no project tools')
+    for t in tasks:
+        unknown = sorted(str(k) for k in t if k not in KNOWN_TASK_KEYS)
+        if unknown:
+            warnings.append('Task %s: unknown key(s) %s were ignored' % (t.get('id', '?'), ', '.join(unknown)))
     return warnings
 
 
