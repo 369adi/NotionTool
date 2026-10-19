@@ -1099,6 +1099,13 @@ class Engine:
             else:
                 label=f"[{task['id']}] {task['title']}"
             check = ('\nAcceptance: '+task['acceptance']) if task.get('acceptance') else ''
+            state = task.get('patch_state')
+            if state == 'merged':
+                check += '\nWhere: merged into the main project folder; read its files there.'
+            elif task.get('patch_worktree') and state in ('working', 'waiting', 'conflict'):
+                check += '\nWhere: not merged yet, files are in ' + str(task['patch_worktree'])
+            elif state == 'failed':
+                check += '\nWhere: the merge failed; these changes are NOT in the main folder.'
             parts.append(f"{label}{check}\n{result[:6000]}" +
                          ('\n[Full report available using the context tool.]' if len(result)>6000 else ''))
         text = '\n\n'.join(parts)
