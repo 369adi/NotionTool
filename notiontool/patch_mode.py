@@ -309,8 +309,11 @@ class PatchMode:
         if modules:
             commands.append(('task tests', [self.python, '-m', 'unittest'] + modules))
         if (cwd / 'tests').is_dir():
+            # '-t .' only works when tests/ is a real package; without __init__.py discover
+            # aborts with 'Start directory is not importable' and every merge would be red.
+            top_level = ['-t', '.'] if (cwd / 'tests' / '__init__.py').is_file() else []
             commands.append(('desktop suite', [self.python, '-m', 'unittest', 'discover', '-s', 'tests', '-p',
-                                               self.desktop_pattern, '-t', '.']))
+                                               self.desktop_pattern] + top_level))
         return commands
 
     def verify(self, task, cwd=None):
