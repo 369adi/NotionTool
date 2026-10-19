@@ -222,6 +222,80 @@
     return { cls: 'on', text: 'Connected' };
   }
 
+  // Problems (top of Live, merged with 'Needs you'): one list of everything that went wrong.
+  // Each item: {key, what, todo, def (one action or null), at, count}. Identical problems are merged.
+  var WARN_EVENTS = ['welcome_warning', 'welcome_failed', 'team_warning', 'team_grow_failed', 'team_growth_failed'];
+  var PROBLEM_TASK_STATES = ['failed', 'blocked', 'error'];
+  function problems(s, opts) {
+    s = obj(s); opts = obj(opts);
+    var dismissed = obj(opts.dismissed), byKey = {}, bySig = {}, out = [];
+    var runs = {};
+    list(s.runs).forEach(function (r) { r = obj(r); if (r.id) runs[r.id] = r; });
+    function add(p) {
+      var sigKey = p.what + '|' + p.todo, prev = byKey[p.key] || bySig[sigKey];
+      if (prev) {
+        prev.count += 1;
+        if ((stamp(p.at) || 0) > (stamp(prev.at) || 0)) prev.at = p.at;
+        return;
+      }
+      p.count = 1;
+      byKey[p.key] = bySig[sigKey] = p;
+      out.push(p);
+    }
+    list(s.runs).forEach(function (r) {
+      r = obj(r);
+      if (!r.id) return;
+      var st = token(r.state), at = r.finished || r.created;
+      if (st === 'awaiting_main') {
+        add({ key: 'ok-' + r.id, what: quote(runSummary(r)) + ' is finished and waits for your OK.',
+          todo: 'Check the result, then confirm it.', def: confirmDef(r), at: at });
+      } else if (st === 'blocked') {
+        add({ key: 'retry-' + r.id, what: 'Some steps of ' + quote(runSummary(r)) + ' ran into a problem.',
+          todo: 'Try the failed steps again, or stop the request.', def: retryDef(r), at: at });
+      }
+    });
+    list(s.tasks).forEach(function (t) {
+      t = obj(t);
+      if (!t.id) return;
+      var st = token(t.state), at = t.finished || t.last_output_at || t.started || t.created;
+      if ((t.remote_unknown || st === 'uncertain') && !t.checked) {
+        add({ key: 'accept-' + t.id, what: 'A coworker finished ' + quote(taskSummary(t)) + ', but the answer got lost.',
+          todo: 'Check the work, then accept it if it looks right. Nothing is sent again.', def: acceptDef(t), at: at });
+      } else if (PROBLEM_TASK_STATES.indexOf(st) >= 0) {
+        var reason = firstSentence(t.error);
+        var blockedRun = token(obj(runs[t.run_id]).state) === 'blocked';
+        add({ key: 'task-' + t.id, what: 'The step ' + quote(taskSummary(t)) + ' did not finish' + (reason ? ': ' + clip(reason, 120) : '.'),
+          todo: blockedRun ? 'Use Try again on its request.' : 'Open the request under Working to see what went wrong.', def: null, at: at });
+      }
+      var proof = obj(t.proof);
+      if (proof.tests_status === 'failed') {
+        add({ key: 'proof-' + t.id, what: 'Tests failed in the proof of ' + quote(taskSummary(t)) + '.',
+          todo: 'Open the step under Working to see which tests failed.', def: null, at: proof.created || at });
+      }
+    });
+    list(s.events).forEach(function (ev) {
+      ev = obj(ev);
+      var kind = token(ev.kind), msg = clip(firstSentence(ev.message) || ev.message, 160);
+      if (msg && !/[.!?]$/.test(msg)) msg += '.';
+      if (WARN_EVENTS.indexOf(kind) >= 0) {
+        add({ key: 'ev-' + kind + '-' + msg, what: msg || 'Creating a chat or coworker did not work.',
+          todo: 'Check the chats under Team. NotionTool does not try again on its own.', def: null, at: ev.ts });
+      } else if (kind === 'ui_error') {
+        add({ key: 'ev-ui-' + msg, what: msg || 'A part of the NotionTool overlay hit an error.',
+          todo: 'Usually harmless. If Live looks wrong, close it and open it again.', def: null, at: ev.ts });
+      }
+    });
+    var c = opts.connection;
+    if (c && (c.cls === 'off' || c.cls === 'warn')) {
+      add({ key: 'conn', what: c.cls === 'off' ? 'The harness is not connected.' : 'The harness sent ' + c.text.toLowerCase() + '.',
+        todo: 'Wait a minute. If it stays like this, use the safe restart in Settings.', def: null, at: opts.now ? opts.now / 1000 : null });
+    }
+    return out.filter(function (p) { return !dismissed[p.key]; }).sort(function (a, b) {
+      if (!!a.def !== !!b.def) return a.def ? -1 : 1;
+      return (stamp(b.at) || 0) - (stamp(a.at) || 0);
+    });
+  }
+
   function effortWord(v) { var t = str(v).trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : 'Default'; }
 
   function humanKind(kind) {
@@ -229,12 +303,48 @@
     return text ? text.charAt(0).toUpperCase() + text.slice(1) : 'Event';
   }
 
+  // Request templates: same texts as notiontool/templates.py (a test keeps them equal). Drafts are never sent.
+  var REQUEST_FIELDS = [['what', 'What', 'What should change, in one or two sentences'],
+    ['where', 'Where', 'Page, file, screen or link'], ['done_when', 'Done when', 'How we know it is finished']];
+  var REQUEST_TEMPLATES = [
+    { id: 'ui_bug', title: 'Fix a UI bug', hint: 'Something on screen looks or works wrong.', checks: [
+      'Reproduce the bug first and describe what you saw.', 'Fix it with the smallest change that works.',
+      'Run the related tests and the desktop tests, and node --check for changed scripts.', 'Check the screen again and say what changed.'] },
+    { id: 'feature', title: 'Build a feature', hint: 'Add something new.', checks: [
+      'Split the work into small steps before you start.', 'Keep existing behaviour and settings unchanged.',
+      'Add tests for the new behaviour and run the related tests.', 'Explain how to use it in plain words.'] },
+    { id: 'review', title: 'Review and test', hint: 'Check existing work and run the tests.', checks: [
+      'Read the changed files and list problems you find.', 'Run the full test suite and report failures with the test name.',
+      'Do not change code unless a fix is clearly needed; ask first for larger changes.', 'End with a short verdict: ready or not ready.'] },
+    { id: 'research', title: 'Research', hint: 'Find out how something works or what to do.', checks: [
+      'Collect the facts first and name your sources.', 'Do not change any files.',
+      'Give two or three options with pros and cons.', 'End with one clear recommendation.'] }
+  ];
+  function requestTemplate(id) {
+    var key = str(id).trim().toLowerCase();
+    return REQUEST_TEMPLATES.filter(function (t) { return t.id === key || t.title.toLowerCase() === key; })[0] || null;
+  }
+  function cleanField(v) {
+    return str(v).trim().split(/\r?\n/).map(function (line) { return line.split(/\s+/).filter(Boolean).join(' '); }).join('\n').trim().slice(0, 2000);
+  }
+  function requestDraft(id, values) {
+    var t = requestTemplate(id);
+    if (!t) return '';
+    values = obj(values);
+    var lines = ['New request: ' + t.title, ''];
+    REQUEST_FIELDS.forEach(function (f) { lines.push(f[1] + ': ' + (cleanField(values[f[0]]) || '(fill in)')); });
+    lines.push('', 'Checks before you report done:');
+    t.checks.forEach(function (step, i) { lines.push((i + 1) + '. ' + step); });
+    return lines.join('\n');
+  }
+
   window.__ntDesk.liveUtil = {
+    REQUEST_TEMPLATES: REQUEST_TEMPLATES, REQUEST_FIELDS: REQUEST_FIELDS, requestTemplate: requestTemplate, requestDraft: requestDraft,
     HASH: HASH, PILL_ID: PILL_ID, PANEL_ID: PANEL_ID, RENDER_MS: RENDER_MS, STALE_SELECTORS: STALE_SELECTORS,
     taskStatus: taskStatus, taskSummary: taskSummary, runSummary: runSummary, firstSentence: firstSentence,
     elapsedFor: elapsedFor, stepText: stepText, progressOf: progressOf, openRuns: openRuns, historyRows: historyRows,
     outcomeText: outcomeText, needsYou: needsYou, runControls: runControls, teamRows: teamRows, initials: initials,
-    connection: connection, span: span, ago: ago, humanKind: humanKind
+    connection: connection, span: span, ago: ago, humanKind: humanKind, problems: problems
   };
 
   window.__ntDesk.live = function (ctx) {
@@ -274,6 +384,156 @@
     var confirmBox = el('div', { cls: 'nt-desk-lv-confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-label': 'Please confirm' });
     confirmBox.hidden = true;
     root.appendChild(confirmBox);
+
+    // ---- New request: a template fills a draft into the Notion chat box. The user checks and sends it (never sent here).
+    var requestBox = el('div', { cls: 'nt-desk-lv-request', role: 'dialog', 'aria-label': 'New request' });
+    requestBox.hidden = true;
+    root.appendChild(requestBox);
+    var newRequestButton = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-btn-main nt-desk-lv-new-request', type: 'button',
+      text: 'New request', title: 'Start a request from a template' });
+    newRequestButton.addEventListener('click', function () { showRequest(''); });
+    var requestBar = el('div', { cls: 'nt-desk-lv-toolbar' }, [newRequestButton]);
+    if (typeof root.insertBefore === 'function' && root.firstChild) root.insertBefore(requestBar, root.firstChild); else root.appendChild(requestBar);
+    function clearOwn(node) { clear(node); }
+    var requestInputs = {}, requestText = null, requestId = '';
+    function hideRequest() { requestBox.hidden = true; clearOwn(requestBox); requestInputs = {}; requestText = null; requestId = ''; }
+    function draftValues() { var v = {}; Object.keys(requestInputs).forEach(function (k) { v[k] = requestInputs[k].value; }); return v; }
+    function refreshDraft() { if (requestText) requestText.value = requestDraft(requestId, draftValues()); }
+    function plainButton(text, cls, onClick) {
+      var b = el('button', { cls: cls || 'nt-desk-lv-btn', type: 'button', text: text });
+      b.addEventListener('click', function (event) { if (event && event.stopPropagation) event.stopPropagation(); onClick(); });
+      return b;
+    }
+    function showRequest(id) {
+      clearOwn(requestBox);
+      requestInputs = {}; requestText = null;
+      var t = requestTemplate(id), buttons = [];
+      requestId = t ? t.id : '';
+      var kids = [el('h3', { cls: 'nt-desk-lv-title', text: t ? 'New request: ' + t.title : 'New request' })];
+      if (!t) {
+        kids.push(el('p', { cls: 'nt-desk-lv-empty', text: 'Pick a template. The text goes into the chat box; you check it and send it yourself.' }));
+        kids.push(el('div', { cls: 'nt-desk-lv-request-list' }, REQUEST_TEMPLATES.map(function (tpl) {
+          var b = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-request-pick', type: 'button', 'data-template': tpl.id }, [
+            el('span', { cls: 'nt-desk-lv-request-name', text: tpl.title }), el('span', { cls: 'nt-desk-lv-request-hint', text: tpl.hint })]);
+          b.addEventListener('click', function () { showRequest(tpl.id); });
+          return b;
+        })));
+      } else {
+        REQUEST_FIELDS.forEach(function (f) {
+          var big = f[0] === 'what';
+          var input = el(big ? 'textarea' : 'input', { cls: 'nt-desk-lv-request-input', placeholder: f[2], 'aria-label': f[1],
+            rows: big ? '3' : null, type: big ? null : 'text', 'data-field': f[0] });
+          input.addEventListener('input', refreshDraft);
+          input.addEventListener('keydown', function (event) { if (event && event.stopPropagation) event.stopPropagation(); });
+          requestInputs[f[0]] = input;
+          kids.push(el('label', { cls: 'nt-desk-lv-request-field' }, [el('span', { cls: 'nt-desk-lv-detail-label', text: f[1] }), input]));
+        });
+        kids.push(el('p', { cls: 'nt-desk-lv-detail-label', text: 'Checks (always added)' }));
+        kids.push(el('ol', { cls: 'nt-desk-lv-request-checks' }, t.checks.map(function (c) { return el('li', { text: c }); })));
+        requestText = el('textarea', { cls: 'nt-desk-lv-request-text', rows: '8', readonly: 'readonly', 'aria-label': 'Message for the Main' });
+        kids.push(requestText);
+        buttons.push(plainButton('Put in chat', 'nt-desk-lv-btn nt-desk-lv-btn-main', putRequest));
+        buttons.push(plainButton('Copy', '', function () { copyText(requestDraft(requestId, draftValues())); }));
+        buttons.push(plainButton('Other template', '', function () { showRequest(''); }));
+      }
+      buttons.push(plainButton('Cancel', '', hideRequest));
+      kids.push(el('div', { cls: 'nt-desk-lv-request-bar' }, buttons));
+      requestBox.appendChild(el('div', { cls: 'nt-desk-lv-request-card' }, kids));
+      requestBox.hidden = false;
+      refreshDraft();
+      try { if (requestInputs.what && requestInputs.what.focus) requestInputs.what.focus(); } catch (e) { /* focus is optional */ }
+    }
+    function chatBox() {
+      var boxes = [];
+      try {
+        boxes = Array.prototype.slice.call(document.querySelectorAll('.nt-desk-composer [contenteditable="true"], .nt-desk-composer textarea'));
+      } catch (e) { boxes = []; }
+      return boxes.filter(function (b) { return !root.contains(b) && !panel.contains(b); })[0] || null;
+    }
+    function copyText(text) {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          navigator.clipboard.writeText(text).then(function () { toast('Copied. Paste it in the chat and send it yourself.'); },
+            function () { toast('Could not copy the text.', true); });
+          return;
+        }
+      } catch (e) { /* fall through */ }
+      toast('Could not copy the text.', true);
+    }
+    // Only puts text into the composer: no Enter key, no click on Send (I5: nothing is sent from here).
+    function putRequest() {
+      var text = requestDraft(requestId, draftValues());
+      if (!text) return;
+      var sh = window.__ntShell;
+      if (registered && sh && typeof sh.open === 'function') { try { sh.open('chat'); } catch (e) { /* stay */ } }
+      setTimeout(function () {
+        var box = chatBox();
+        if (!box) { copyText(text); toast('Chat box not found. The text was copied; paste it in the chat.'); return; }
+        try {
+          box.focus();
+          if (box.tagName === 'TEXTAREA') box.value = text;
+          else document.execCommand('insertText', false, text);
+          toast('The draft is in the chat box. Check it and send it yourself.');
+          hideRequest();
+        } catch (e) { copyText(text); }
+      }, 300);
+    }
+    function openRequest(id) { open(); showRequest(id || ''); }
+
+    // ---- History search: ctx.call('history_search') -> templates.search (same as GET /api/history/search).
+    // Input and results are kept as nodes so a repaint never takes the focus away while typing.
+    var historyQuery = '', historyTimer = null, historySeq = 0, historyRecent = null;
+    var historyInput = el('input', { cls: 'nt-desk-lv-history-search', type: 'search', placeholder: 'Search all requests and steps',
+      'aria-label': 'Search history', autocomplete: 'off', spellcheck: 'false' });
+    var historyFound = el('div', { cls: 'nt-desk-lv-history-found', role: 'status' });
+    historyInput.addEventListener('input', function () {
+      if (historyTimer) clearTimeout(historyTimer);
+      historyTimer = setTimeout(runHistorySearch, 300);
+    });
+    historyInput.addEventListener('keydown', function (event) {
+      if (event && event.stopPropagation) event.stopPropagation();
+      if (event && event.key === 'Escape' && historyInput.value) { event.preventDefault(); historyInput.value = ''; runHistorySearch(); }
+    });
+    function paintFound(res) {
+      clearOwn(historyFound);
+      if (historyRecent) historyRecent.hidden = !!historyQuery;
+      if (!historyQuery) return;
+      res = obj(res);
+      if (res.busy) { historyFound.appendChild(empty('Searching...')); return; }
+      if (res.error) { historyFound.appendChild(empty(res.error)); return; }
+      var rows = list(res.results), total = num(res.total) || rows.length;
+      if (!rows.length) { historyFound.appendChild(empty('Nothing found.')); return; }
+      historyFound.appendChild(el('p', { cls: 'nt-desk-lv-history-count', text: total > rows.length
+        ? 'Showing ' + rows.length + ' of ' + total + ' results.' : rows.length + (rows.length === 1 ? ' result.' : ' results.') }));
+      historyFound.appendChild(el('ul', { cls: 'nt-desk-lv-history nt-desk-lv-history-results' }, rows.map(function (h) {
+        h = obj(h);
+        var bad = /did not|blocked|lost|fail/i.test(str(h.outcome));
+        return el('li', { cls: bad ? 'nt-desk-lv-past nt-desk-lv-hit nt-desk-lv-past-bad' : 'nt-desk-lv-past nt-desk-lv-hit nt-desk-lv-past-ok', 'data-kind': str(h.kind) }, [
+          el('span', { cls: 'nt-desk-lv-past-goal', text: (h.kind === 'task' ? 'Step: ' : 'Request: ') + clip(h.title, 160) }),
+          h.kind === 'task' && h.request ? el('span', { cls: 'nt-desk-lv-hit-request', text: 'In: ' + clip(h.request, 120) }) : null,
+          el('span', { cls: 'nt-desk-lv-past-outcome', text: clip(h.outcome, 160) || 'No outcome yet.' }),
+          h.snippet ? el('span', { cls: 'nt-desk-lv-hit-snippet', text: (h.field ? h.field + ': ' : '') + clip(h.snippet, 200) }) : null,
+          el('span', { cls: 'nt-desk-lv-time', text: str(h.date) || '-' })]);
+      })));
+    }
+    function runHistorySearch() {
+      historyTimer = null;
+      var q = cleanField(historyInput.value).slice(0, 200), seq = ++historySeq;
+      historyQuery = q;
+      if (!q) { paintFound(null); return; }
+      if (typeof ctx.call !== 'function') { paintFound({ error: 'Search needs the harness.' }); return; }
+      paintFound({ busy: true });
+      try {
+        Promise.resolve(ctx.call('history_search', { q: q, limit: 50 })).then(function (res) {
+          if (seq === historySeq && !stopped) paintFound(res);
+        }, function (e) {
+          if (seq === historySeq && !stopped) paintFound({ error: 'Search did not work: ' + clip(e && e.message ? e.message : e, 120) });
+        });
+      } catch (e) { paintFound({ error: 'Search did not work.' }); }
+    }
+    function historyFrozen() {
+      return !!historyQuery || (typeof document !== 'undefined' && document.activeElement === historyInput);
+    }
 
     var connDot = el('span', { cls: 'nt-desk-lv-dot nt-desk-lv-dot-off', 'aria-hidden': 'true' });
     var connText = el('span', { cls: 'nt-desk-lv-conn-text', text: 'Waiting for the harness' });
@@ -320,11 +580,36 @@
       return b;
     }
 
-    function needsSection(s) {
-      var items = needsYou(s).map(function (item) {
-        return el('div', { cls: 'nt-desk-lv-need' }, [el('p', { cls: 'nt-desk-lv-need-text', text: item.text }), actionButton(item.def, true)]);
+    // Problems: dismissed keys live in memory (and localStorage when the page allows it).
+    var DISMISS_KEY = 'nt-desk-problems-dismissed';
+    var dismissed = (function () {
+      try { var saved = JSON.parse(window.localStorage.getItem(DISMISS_KEY) || '{}'); return saved && typeof saved === 'object' ? saved : {}; } catch (e) { return {}; }
+    })();
+    function dismiss(key) {
+      dismissed[key] = Date.now();
+      var keys = Object.keys(dismissed).sort(function (a, b) { return dismissed[b] - dismissed[a]; });
+      keys.slice(200).forEach(function (k) { delete dismissed[k]; });
+      try { window.localStorage.setItem(DISMISS_KEY, JSON.stringify(dismissed)); } catch (e) { /* memory only */ }
+      sigs.needs = null;
+      renderNow();
+      updatePill();
+    }
+    function problemList(s, now) {
+      return problems(s, { dismissed: dismissed, now: now, connection: connection(s, now, lastPush) });
+    }
+    function needsSection(s, now) {
+      var items = problemList(s, now).map(function (p) {
+        var off = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-dismiss', type: 'button', text: 'Dismiss', title: 'Hide this problem' });
+        off.addEventListener('click', function (event) { if (event && event.stopPropagation) event.stopPropagation(); dismiss(p.key); });
+        var when = p.at ? ago(p.at, now) : '';
+        return el('div', { cls: 'nt-desk-lv-need nt-desk-lv-problem', 'data-problem': p.key }, [
+          el('p', { cls: 'nt-desk-lv-need-text', text: p.what + (p.count > 1 ? ' (' + p.count + ' times)' : '') }),
+          el('p', { cls: 'nt-desk-lv-problem-todo', text: 'What to do: ' + p.todo }),
+          el('div', { cls: 'nt-desk-lv-problem-foot' }, [
+            when ? el('span', { cls: 'nt-desk-lv-time', text: when }) : null,
+            p.def ? actionButton(p.def, true) : null, off])]);
       });
-      return section('needs', 'Needs you', items.length ? items : [empty('Nothing needs you right now.')], items.length);
+      return section('needs', 'Problems', items.length ? items : [empty('No problems right now.')], items.length);
     }
 
     function taskDetails(t, workers) {
@@ -335,9 +620,52 @@
         detail('Effort', effortWord(t.effort)),
         detail('Coworker', clip(w.label, 40) || 'Not picked yet'),
         detail('Files', files.length ? files.join(', ') : 'None'),
+        proofDetail(t.proof),
         el('div', { cls: 'nt-desk-lv-detail nt-desk-lv-detail-result' }, [el('span', { cls: 'nt-desk-lv-detail-label', text: 'Result' }),
           el('pre', { cls: 'nt-desk-lv-result', text: str(t.result) || str(t.error) || 'No result yet.' })])
       ]);
+    }
+
+    // Proof (proof.py record on the task): files with +/- lines, reported tests (green/red), screenshot path.
+    function proofFileText(f) {
+      f = obj(f);
+      var name = str(f.path) || 'file';
+      if (f.binary) return name + ' (binary)';
+      var counts = '+' + (num(f.added) || 0) + ' -' + (num(f.removed) || 0);
+      return name + ' ' + counts + (f.change === 'added' ? ' (new)' : f.change === 'removed' ? ' (deleted)' : '');
+    }
+    function proofTestText(r) {
+      r = obj(r);
+      var head = 'Ran ' + (num(r.ran) || 0) + ' tests: ';
+      if (r.status === 'passed') return head + 'OK';
+      if (r.status === 'failed') {
+        var parts = [];
+        if (num(r.failures)) parts.push(num(r.failures) + (num(r.failures) === 1 ? ' failure' : ' failures'));
+        if (num(r.errors)) parts.push(num(r.errors) + (num(r.errors) === 1 ? ' error' : ' errors'));
+        return head + 'FAILED' + (parts.length ? ' (' + parts.join(', ') + ')' : '');
+      }
+      return head + 'result not clear';
+    }
+    function proofLines(p) {
+      var lines = [];
+      var files = list(p.files);
+      lines.push({ text: 'Files: ' + (!p.files_checked ? 'Not checked' : files.length ? files.map(proofFileText).join(', ') : 'No changes'),
+        cls: p.files_checked ? '' : 'none' });
+      if (p.files_checked && list(p.unknown).length) lines.push({ text: 'Not checked: ' + list(p.unknown).map(str).join(', '), cls: 'none' });
+      var tests = list(p.tests);
+      var tcls = p.tests_status === 'passed' ? 'pass' : p.tests_status === 'failed' ? 'fail' : 'none';
+      lines.push({ text: 'Tests: ' + (tests.length ? tests.map(proofTestText).join('; ') : 'Not checked'), cls: tcls });
+      if (str(p.screenshot)) lines.push({ text: 'Screenshot: ' + str(p.screenshot), cls: '' });
+      return lines;
+    }
+    function proofDetail(raw) {
+      var p = obj(raw);
+      var lines = Object.keys(p).length ? proofLines(p) : [{ text: 'Not checked', cls: 'none' }];
+      return el('div', { cls: 'nt-desk-lv-detail nt-desk-lv-detail-proof' }, [
+        el('span', { cls: 'nt-desk-lv-detail-label', text: 'Proof' }),
+        el('span', { cls: 'nt-desk-lv-proof-lines' }, lines.map(function (line) {
+          return el('span', { cls: 'nt-desk-lv-proof-line' + (line.cls ? ' nt-desk-lv-proof-' + line.cls : ''), text: line.text });
+        }))]);
     }
 
     function taskRow(t, workers, now) {
@@ -390,13 +718,14 @@
     function historySection(s, now) {
       var rows = historyRows(s);
       return fold('history', 'History', rows.length, function () {
-        if (!rows.length) return [empty('No finished requests yet.')];
-        return [el('ul', { cls: 'nt-desk-lv-history' }, rows.map(function (r) {
+        historyRecent = !rows.length ? empty('No finished requests yet.') : el('ul', { cls: 'nt-desk-lv-history' }, rows.map(function (r) {
           return el('li', { cls: 'nt-desk-lv-past nt-desk-lv-past-' + outcomeClass(r) }, [
             el('span', { cls: 'nt-desk-lv-past-goal', text: runSummary(r) }),
             el('span', { cls: 'nt-desk-lv-past-outcome', text: outcomeText(r) }),
             el('span', { cls: 'nt-desk-lv-time', text: ago(r.finished || r.created, now) })]);
-        }))];
+        }));
+        historyRecent.hidden = !!historyQuery;
+        return [el('div', { cls: 'nt-desk-lv-history-searchbar' }, [historyInput]), historyFound, historyRecent];
       });
     }
 
@@ -446,11 +775,54 @@
     }
 
     function updatePill() {
-      var count = needsYou(state()).length;
+      var count = problemList(state(), Date.now()).length;
       pillBadge.hidden = !count;
       pillBadge.textContent = count ? String(count) : '';
       pill.className = 'nt-desk-live-pill' + (count ? ' nt-desk-live-pill-alert' : '') + (isOpen || shellShown ? ' nt-desk-live-pill-on' : '');
-      pill.setAttribute('aria-label', count ? 'Open Live, ' + count + ' need you' : 'Open Live');
+      pill.setAttribute('aria-label', count ? 'Open Live, ' + count + (count === 1 ? ' problem' : ' problems') : 'Open Live');
+      tabBadge(count);
+    }
+    // Badge count on the Live tab of the v3 shell; every shell API is optional.
+    var lastTabBadge = null;
+    function tabBadge(count) {
+      if (!registered || count === lastTabBadge) return;
+      var sh = window.__ntShell, text = count ? String(count) : '';
+      try {
+        if (shellHandle && typeof shellHandle.setBadge === 'function') shellHandle.setBadge(text);
+        else if (sh && typeof sh.setBadge === 'function') sh.setBadge('live', text);
+        else if (sh && typeof sh.badge === 'function') sh.badge('live', text);
+        else return;
+        lastTabBadge = count;
+      } catch (e) { /* the shell has no badges */ }
+    }
+
+    // Overlay errors (window error events from our parts only) -> ctx.call('ui_error') -> problems.py.
+    // Deduped and at most ERROR_MAX reports per minute here; the server limits again.
+    var ERROR_MAX = 3, errorTimes = [], errorSeen = {};
+    function ourError(event) {
+      var e = obj(event), err = obj(e.error), file = str(e.filename), stack = str(err.stack);
+      if (!str(e.message) || /^script error\.?$/i.test(str(e.message))) return false;
+      if (/__ntDesk|nt-desk|NotionTool/.test(stack)) return true;
+      return !file || !/^(https?|chrome-extension|app):/i.test(file);
+    }
+    function reportError(message, source, line, part) {
+      if (stopped || typeof ctx.call !== 'function') return false;
+      var text = clip(message, 200), now = Date.now();
+      if (!text || errorSeen[text]) return false;
+      errorTimes = errorTimes.filter(function (t) { return now - t < 60000; });
+      if (errorTimes.length >= ERROR_MAX) return false;
+      errorTimes.push(now);
+      errorSeen[text] = now;
+      try {
+        Promise.resolve(ctx.call('ui_error', { message: text, source: clip(source, 120), line: num(line) || 0, part: part || '' }))
+          .then(null, function () { /* never retried */ });
+      } catch (e) { /* reporting is best effort */ }
+      return true;
+    }
+    function onError(event) {
+      if (!ourError(event)) return;
+      var e = obj(event);
+      reportError(e.message, e.filename, e.lineno, 'overlay');
     }
 
     function render() {
@@ -460,14 +832,16 @@
       var raw = state(), s = obj(raw), now = Date.now(), tick = Math.floor(now / REFRESH_MS);
       updateConnection(raw, now);
       try {
-        paint('needs', sig([s.runs, s.tasks]), function () { return needsSection(s); });
+        paint('needs', sig([s.runs, s.tasks, list(s.events).slice(-EVENT_LIMIT), connection(raw, now, lastPush).cls, Object.keys(dismissed).length, tick]),
+          function () { return needsSection(raw, now); });
         paint('working', sig([s.runs, s.tasks, s.workers, tick, Object.keys(expanded)]), function () { return workingSection(s, now); });
         paint('team', sig([s.workers, tick]), function () { return teamSection(s, now); });
-        paint('history', sig([folds.history, s.runs, folds.history ? tick : 0]), function () { return historySection(s, now); });
+        paint('history', sig([folds.history, folds.history && historyFrozen() ? 'search' : [s.runs, folds.history ? tick : 0]]), function () { return historySection(s, now); });
         paint('details', sig([folds.details, folds.details ? [s.rate, s.workers, s.tasks, s.attention, list(s.events).slice(-EVENT_LIMIT), tick, !!raw] : 0]),
           function () { return detailsSection(raw, s, now); });
       } catch (e) {
         if (window.console && console.warn) console.warn('[NotionTool] Live view failed', e);
+        reportError('Live view failed: ' + str(e && e.message ? e.message : e), 'live.js', 0, 'live');
       }
       updatePill();
     }
@@ -649,9 +1023,12 @@
       stopRefresh();
       if (dockTimer) clearInterval(dockTimer);
       if (hideTimer) clearTimeout(hideTimer);
-      dockTimer = hideTimer = null;
+      if (historyTimer) clearTimeout(historyTimer);
+      dockTimer = hideTimer = historyTimer = null;
+      if (window.__ntDesk.openRequestTemplate === openRequest) window.__ntDesk.openRequestTemplate = null;
       window.removeEventListener('keydown', onKey, true);
       window.removeEventListener('hashchange', onHash);
+      window.removeEventListener('error', onError);
       if (typeof document.removeEventListener === 'function') document.removeEventListener('visibilitychange', onVisibility);
       if (typeof unsubscribe === 'function') { try { unsubscribe(); } catch (e) { /* already gone */ } }
       var sh = window.__ntShell;
@@ -668,6 +1045,7 @@
     }
 
     window.__ntDeskLiveOwner = owner;
+    window.__ntDesk.openRequestTemplate = openRequest; // used by Ctrl+K (extras.js)
     sweep();
     closeButton.addEventListener('click', close);
     pill.addEventListener('click', function () { if (isOpen) close(); else open(); });
@@ -675,6 +1053,7 @@
     document.body.appendChild(panel);
     window.addEventListener('keydown', onKey, true);
     window.addEventListener('hashchange', onHash);
+    window.addEventListener('error', onError);  // like window.onerror, without replacing Notion's handler
     if (typeof document.addEventListener === 'function') document.addEventListener('visibilitychange', onVisibility);
     if (typeof ctx.onState === 'function') unsubscribe = ctx.onState(onPush);
     tryRegister();

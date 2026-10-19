@@ -1,4 +1,9 @@
-"""Static and node-based checks for the desktop overlay Live dashboard (notiontool/web/desktop/live.js + live.css)."""
+"""Static and node-based checks for the desktop overlay Live view (notiontool/web/desktop/live.js + live.css).
+
+The Live view was redesigned on 2026-10-19 (Simple Live view + live coworker progress): sections Problems,
+Working now, Team, History (folded) and Details (folded) replace the old tiles / timeline / Main switches
+dashboard. Hard rules that stay: no network calls, never remove Notion nodes, every class is nt-desk- prefixed.
+"""
 import json
 import os
 import re
@@ -41,19 +46,24 @@ def test_open_triggers_and_close():
 
 
 def test_state_contract_fields():
+    # State fields the Simple Live view reads (the Main switches section moved to extras.js with the redesign).
     js = read(JS)
-    for needle in ('onState', 'getState', 'estimated_tokens', 'attention', 'events', 'used_per_min',
-                   'limit_per_min', 'runs', 'workers', 'tasks', 'switches', 'last_tool_at', 'needs_main',
-                   "purpose !== 'main'", 'task_id', 'last_output_at', 'generation', 'operator', 'goal'):
+    for needle in ('onState', 'getState', 'runs', 'tasks', 'workers', 'events', 'attention', 'rate',
+                   'used_per_min', 'limit_per_min', 'estimated_tokens', 'run_id', 'task_id', 'worker_id',
+                   "purpose === 'worker'", 'goal', 'summary', 'remote_unknown', 'awaiting_main', 'proof',
+                   'started_at', 'last_output_at'):
         assert needle in js, needle
 
 
 def test_throttle_limits_and_meter_levels():
+    # Redesign: at most one render per second, only changed sections repaint, timers stop while hidden.
     js = read(JS)
-    assert 'RENDER_MS = 500' in js
-    assert 'EVENT_LIMIT = 50' in js and '.slice(-EVENT_LIMIT)' in js
-    assert 'ratio < 0.7' in js and 'ratio < 0.9' in js
-    assert "return '-'" in js  # missing fields render as '-'
+    assert 'RENDER_MS = 1000' in js and 'REFRESH_MS = 5000' in js
+    assert 'EVENT_LIMIT = 10' in js and '.slice(-EVENT_LIMIT)' in js
+    assert 'HISTORY_LIMIT = 20' in js and '.slice(0, HISTORY_LIMIT)' in js
+    assert 'if (sigs[name] === key) return;' in js
+    assert 'document.hidden' in js
+    assert "text: value || '-'" in js  # missing detail values render as '-'
 
 
 def test_no_inner_html():
@@ -66,16 +76,42 @@ def test_no_network_and_no_notion_node_removal():
     js = read(JS)
     for needle in ('fetch(', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'sendBeacon', '.remove()'):
         assert needle not in js, needle
-    # the only removeChild calls are on the part's own panel and its own body children
+    # removeChild only lives in the two helpers, and the helpers only get the part's own nodes.
     assert js.count('removeChild') == 2
-    assert 'panel.parentNode.removeChild(panel)' in js
+    assert 'function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }' in js
+    assert 'function detach(node) { if (node && node.parentNode) node.parentNode.removeChild(node); }' in js
+    assert set(re.findall(r'\bdetach\(([^)]*)\)', js)) <= {'node', 'root', 'panel', 'pill'}
+    assert set(re.findall(r'\bclear\(([^)]*)\)', js)) <= {'node', 'confirmBox', 'slots[name]'}
+    # detach(node) outside the helper is the sweep of stale copies of our own pill/panel/view.
+    assert 'if (node !== panel && node !== pill && node !== root) detach(node);' in js
+    assert "PILL_ID = 'nt-desk-" in js and "PANEL_ID = 'nt-desk-" in js
+    stale = re.search(r'var STALE_SELECTORS = \[(.*?)\];', js, re.S)
+    assert stale
+    for selector in re.findall(r"'([^']*)'", stale.group(1)):
+        assert selector == '#' or selector.startswith('[data-nt-desk="'), selector
+
+
+EL_CLS = re.compile(r"el\('[a-z0-9]+', \{ cls: (.*?)(?:, '?[A-Za-z-]+'?: | \})")
+
+
+def class_names(expr):
+    for literal in re.findall(r"'([^']*)'", expr):
+        for name in literal.split():
+            yield name
 
 
 def test_js_classes_prefixed():
+    # Every class set on a DOM node (el(..., { cls }), .className =, classList) is nt-desk- prefixed.
+    # Plain data fields like connection().cls ('on'/'off') are only used as suffixes of prefixed classes.
     js = read(JS)
-    for value in re.findall(r"cls: '([^']*)'", js):
-        for name in value.split():
-            assert name.startswith('nt-desk-'), name
+    exprs = EL_CLS.findall(js) + re.findall(r'\.className = (.*?);', js)
+    assert len(exprs) > 40
+    names = [name for expr in exprs for name in class_names(expr)]
+    assert names
+    for name in names:
+        assert name.startswith('nt-desk-'), name
+    for name in re.findall(r"classList\.(?:add|remove|toggle|contains)\('([^']*)'", js):
+        assert name.startswith('nt-desk-'), name
 
 
 def test_css_selectors_prefixed():
@@ -85,17 +121,20 @@ def test_css_selectors_prefixed():
     assert classes
     for name in classes:
         assert name.startswith('nt-desk-'), name
-    assert 'prefers-color-scheme: dark' in css and 'var(--nt-desk-' in css
+    # Colours come from the shared theme tokens (theme.css owns light/dark), always with a fallback.
+    assert 'var(--nt-' in css
 
 
 def test_dashboard_structure():
     js = read(JS)
     assert "text: 'Live'" in js
-    for needle in ('nt-desk-conn-dot', 'nt-desk-tiles', 'nt-desk-tile-', 'nt-desk-worker-elapsed',
-                   'nt-desk-progress', 'nt-desk-timeline', 'kindClass(ev.kind)', 'age(ev.ts, now)'):
+    assert "['needs', 'working', 'team', 'history', 'details']" in js
+    for needle in ('nt-desk-lv-conn', 'nt-desk-lv-dot', 'nt-desk-lv-card', 'nt-desk-lv-progress', 'nt-desk-lv-bar-fill',
+                   'nt-desk-lv-step', 'nt-desk-lv-task-head', 'nt-desk-lv-member', 'nt-desk-lv-fold',
+                   'nt-desk-lv-events', 'nt-desk-lv-confirm', 'nt-desk-live-pill'):
         assert needle in js, needle
-    for label in ("'Running'", "'Ready'", "'Recovering'", "'Blocked'", "'Coworkers'", "'Runs'",
-                  "'Event timeline'", "'Needs attention'", "'Main switches'"):
+    for label in ("'Problems'", "'Working now'", "'Team'", "'History'", "'Details'", "'Nothing is running.'",
+                  "'No problems right now.'", "'What to do: '"):
         assert label in js, label
 
 
@@ -132,7 +171,8 @@ def test_node_check():
     assert result.returncode == 0, result.stderr
 
 
-# Minimal fake DOM: enough for live.js to build, open, render and close the panel.
+# Minimal fake DOM: enough for live.js to build, open, render, act and close the panel. Timers are global
+# in a browser (live.js calls setTimeout/setInterval directly), so the sandbox provides them as globals.
 NODE_DOM = r"""
 const fs = require('fs'), vm = require('vm');
 const code = fs.readFileSync(process.argv[1], 'utf8');
@@ -146,7 +186,7 @@ function Node(tag) {
     contains(c) { return self.className.split(' ').indexOf(c) >= 0; }
   };
 }
-Node.prototype.appendChild = function (k) { k.parentNode = this; this.children.push(k); return k; };
+Node.prototype.appendChild = function (k) { if (k.parentNode) k.parentNode.removeChild(k); k.parentNode = this; this.children.push(k); return k; };
 Node.prototype.removeChild = function (k) { this.children = this.children.filter(x => x !== k); k.parentNode = null; return k; };
 Node.prototype.setAttribute = function (k, v) { this.attrs[k] = String(v); };
 Node.prototype.addEventListener = function (t, f) { this.listeners[t] = f; };
@@ -154,68 +194,95 @@ Object.defineProperty(Node.prototype, 'firstChild', { get() { return this.childr
 Object.defineProperty(Node.prototype, 'offsetWidth', { get() { return 1; } });
 function text(n) { return (n.textContent || '') + ' ' + n.children.map(text).join(' '); }
 function find(n, cls, out) { out = out || []; if (n.className.split(' ').indexOf(cls) >= 0) out.push(n); n.children.forEach(k => find(k, cls, out)); return out; }
+function buttons(n, label, out) { out = out || []; if (n.tagName === 'button' && text(n).indexOf(label) >= 0) out.push(n); n.children.forEach(k => buttons(k, label, out)); return out; }
+function click(n) { n.listeners.click({ stopPropagation() {}, preventDefault() {} }); }
 const body = new Node('body');
 const notionNode = body.appendChild(new Node('div'));
 let timers = [];
 const listeners = {};
 const win = {
-  setTimeout(f) { timers.push(f); return timers.length; }, clearTimeout() {},
   addEventListener(t, f) { listeners[t] = f; }, removeEventListener(t) { delete listeners[t]; },
   history: { replaceState() {} }
 };
 const sandbox = { window: win, document: { body: body, documentElement: body,
   createElement: t => new Node(t), createTextNode: t => { const n = new Node('#text'); n.textContent = t; return n; } },
-  location: { hash: '', pathname: '/', search: '' }, history: win.history, Date, Math, JSON, Object, Array, String, Number, isFinite };
+  location: { hash: '', pathname: '/', search: '' }, history: win.history,
+  setTimeout(f) { timers.push(f); return timers.length; }, clearTimeout() {},
+  setInterval() { return 1; }, clearInterval() {}, console: { warn() {} } };
 vm.runInNewContext(code, sandbox);
 const now = Date.now();
 const stateObj = {
   rate: { used_per_min: 3, limit_per_min: 10 },
-  runs: [{ id: 'r1', state: 'executing', goal: 'Ship it', needs_main: [{ reason: 'review' }] }, { id: 'r2', state: 'blocked', goal: 'Old' }],
-  tasks: [{ id: 't1', run_id: 'r1', state: 'running', title: 'Build tiles', started_at: (now - 125000) / 1000, last_tool_at: now / 1000 },
-          { id: 't2', run_id: 'r1', state: 'done', title: 'Plan' }],
-  workers: [{ id: 'w1', label: 'Cowork 1', purpose: 'worker', state: 'busy', task_id: 't1', context: { estimated_tokens: 50, limit: 100 } },
+  runs: [{ id: 'r1', state: 'executing', goal: 'Ship it. Then more words', created: now / 1000 - 300 },
+         { id: 'r2', state: 'blocked', goal: 'Old fix', created: now / 1000 - 200 },
+         { id: 'r3', state: 'done', goal: 'Finished one', created: now / 1000 - 900, finished: now / 1000 - 600 }],
+  tasks: [{ id: 't1', run_id: 'r1', state: 'running', title: 'Build tiles', worker_id: 'w1', created: 1, started_at: (now - 125000) / 1000 },
+          { id: 't2', run_id: 'r1', state: 'done', title: 'Plan', created: 2 },
+          { id: 't3', run_id: 'r1', state: 'uncertain', title: 'Write docs', created: 3 }],
+  workers: [{ id: 'w1', label: 'Cowork 1', purpose: 'worker', state: 'busy', task_id: 't1', context_usage: { estimated_tokens: 50000 } },
             { id: 'w2', label: 'Cowork 2', purpose: 'worker', state: 'ready' },
             { id: 'm', label: 'Main', purpose: 'main', state: 'busy' }],
-  attention: [{ kind: 'held', message: 'Check me', id: 'a1' }],
-  switches: [{ id: 's1', state: 'pending' }],
+  attention: [{ message: 'Check me' }],
   events: [{ ts: now / 1000 - 30, kind: 'notion_inference_error', message: 'boom' }, { ts: now / 1000, kind: 'task_done', message: 'ok' }]
 };
+const calls = [];
+let unsubscribed = false;
 const util = win.__ntDesk.liveUtil;
-const part = win.__ntDesk.live({ getState: () => stateObj, onState: () => () => {} });
-const panel = body.children[1];
-const out = { appended: body.children.length === 2 && body.children[0] === notionNode, hiddenAtStart: panel.hidden };
+const part = win.__ntDesk.live({ getState: () => stateObj, onState: () => () => { unsubscribed = true; },
+  call: (action, args) => { calls.push([action, args]); return Promise.resolve({}); } });
+const panel = find(body, 'nt-desk-live')[0];
+const out = { appended: body.children.length === 3 && body.children[0] === notionNode && !!panel, hiddenAtStart: panel.hidden };
 listeners.keydown({ ctrlKey: true, shiftKey: true, altKey: false, key: 'L', preventDefault() {} });
 out.openAfterKey = !panel.hidden && panel.classList.contains('nt-desk-live-open');
-const t = text(panel);
-out.texts = ['Live', 'Connected', 'Running', 'Ready', 'Recovering', 'Blocked', 'Cowork 1', 'Build tiles', 'Elapsed 2m',
-  '1/2 tasks', 'Needs the Main: review', 'Check me', 's1', 'notion_inference_error', 'just now', '30s ago',
-  'Requests per minute: 3 / 10 (30%)', 'Context: 50 / 100 (50%)'].filter(x => t.indexOf(x) < 0);
-out.mainHidden = t.indexOf('Main ') >= 0 && find(panel, 'nt-desk-worker').length === 2;
-out.tileValues = find(panel, 'nt-desk-tile-value').map(n => n.textContent);
-out.eventKinds = find(panel, 'nt-desk-event').map(n => n.className);
-out.progressWidth = find(panel, 'nt-desk-progress-fill').map(n => n.style.width);
+let t = text(panel);
+out.texts = ['Live', 'Connected', 'Problems', 'Working now', 'Team', 'History', 'Details', 'Ship it.', 'Step 2 of 3',
+  'Getting started', 'Build tiles', 'Working', 'Done', 'Problem', '2m', 'Cowork 1', 'Cowork 2', 'Busy', 'Idle', '1 of 2 busy',
+  'Some steps of \u201cOld fix\u201d ran into a problem.', 'Try again',
+  'A coworker finished \u201cWrite docs\u201d, but the answer got lost.', 'Check & accept', 'What to do: ', 'Pause', 'Stop'
+].filter(x => t.indexOf(x) < 0);
+const teamSlot = find(panel, 'nt-desk-lv-slot-team')[0];
+out.teamMembers = find(teamSlot, 'nt-desk-lv-member').length;
+out.mainHidden = text(teamSlot).indexOf('Main') < 0;
+out.problemCount = find(panel, 'nt-desk-lv-problem').length;
+out.progressWidth = find(panel, 'nt-desk-lv-bar-fill').map(n => n.style.width);
+out.foldedClosed = t.indexOf('Finished one') < 0 && t.indexOf('Requests per minute') < 0;
+click(buttons(panel, 'History')[0]);
+click(buttons(panel, 'Details')[0]);
+t = text(panel);
+out.foldTexts = ['Finished one', 'Finished.', '10m ago', 'Requests per minute', '3 of 10', 'Coworkers busy', 'Open steps',
+  'Chat size Cowork 1', '50k tokens', 'Check me', 'Notion inference error', 'boom', 'Task done', '30s ago', 'just now'
+].filter(x => t.indexOf(x) < 0);
+click(buttons(find(panel, 'nt-desk-lv-slot-needs')[0], 'Try again')[0]);
+const confirmBox = find(panel, 'nt-desk-lv-confirm')[0];
+out.askFirst = !confirmBox.hidden && text(confirmBox).indexOf('Try the failed steps again?') >= 0 && calls.length === 0;
+click(buttons(confirmBox, 'Try again')[0]);
+out.calls = calls;
+out.confirmClosed = confirmBox.hidden;
 listeners.keydown({ key: 'Escape', ctrlKey: false, shiftKey: false, preventDefault() {} });
 out.closingClassRemoved = !panel.classList.contains('nt-desk-live-open');
 out.hiddenBeforeTimer = panel.hidden;
 timers.splice(0).forEach(f => f());
 out.hiddenAfterTimer = panel.hidden;
-find(panel, 'nt-desk-close');
 out.util = {
-  bucket: [util.bucket('busy'), util.bucket('ready'), util.bucket('recovering'), util.bucket('blocked'), util.bucket('weird')],
-  progress: util.progress(stateObj.tasks, 'r1'),
-  progressEmpty: util.progress([], 'x'),
-  kinds: [util.kindClass('notion_inference_error'), util.kindClass('task_held'), util.kindClass('task_done'), util.kindClass('tool_call'), util.kindClass('misc')],
-  elapsedNone: util.elapsed({}, {}, now),
-  conn: [util.connection(null).cls, util.connection({ connected: false }).cls, util.connection({}).cls]
+  status: ['running', 'done', 'uncertain', 'cancelled', 'queued'].map(s => util.taskStatus({ state: s })),
+  checked: util.taskStatus({ state: 'done', checked: true }),
+  steps: [util.stepText(0, 0), util.stepText(1, 3), util.stepText(1, 1), util.stepText(3, 3)],
+  progressEmpty: util.progressOf({}, []),
+  initials: [util.initials('Cowork 12'), util.initials('Main'), util.initials('')],
+  conn: [util.connection(null, now, 0).cls, util.connection({}, now, now - 20000).cls, util.connection({}, now, now).cls],
+  span: [util.span(5), util.span(125), util.span(3700)],
+  controls: [util.runControls({ id: 'x', state: 'blocked' }), util.runControls({ id: 'x', state: 'executing' }),
+    util.runControls({ id: 'x', state: 'awaiting_main' })].map(list => list.map(d => d.key))
 };
 part.stop();
-out.removedOnStop = body.children.length === 1 && body.children[0] === notionNode && !listeners.keydown;
+out.removedOnStop = body.children.length === 1 && body.children[0] === notionNode && !listeners.keydown &&
+  unsubscribed && win.__ntDeskLiveOwner === null;
 process.stdout.write(JSON.stringify(out));
 """
 
 
 def run_dom():
-    result = subprocess.run([NODE, '-e', NODE_DOM, JS], capture_output=True, text=True, timeout=60)
+    result = subprocess.run([NODE, '-e', NODE_DOM, JS], capture_output=True, text=True, encoding='utf-8', timeout=60)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -226,19 +293,25 @@ def test_node_dashboard_behaviour():
     assert out['appended'] and out['hiddenAtStart']
     assert out['openAfterKey']
     assert out['texts'] == [], out['texts']
-    assert out['mainHidden']
-    assert out['tileValues'] == ['1', '1', '0', '0']
-    assert 'nt-desk-kind-bad' in out['eventKinds'][0] and 'nt-desk-kind-ok' in out['eventKinds'][1]
-    assert out['progressWidth'] == ['50%', '0%']
+    assert out['teamMembers'] == 2 and out['mainHidden']  # the Main is not a coworker
+    assert out['problemCount'] == 2
+    assert out['progressWidth'] == ['33%', '0%']
+    assert out['foldedClosed']
+    assert out['foldTexts'] == [], out['foldTexts']
+    assert out['askFirst']  # every action asks first, nothing is called before OK
+    assert out['calls'] == [['run_retry', {'id': 'r2'}]]
+    assert out['confirmClosed']
     assert out['closingClassRemoved'] and not out['hiddenBeforeTimer'] and out['hiddenAfterTimer']
     util = out['util']
-    assert util['bucket'] == ['running', 'ready', 'recovering', 'blocked', None]
-    assert util['progress'] == {'done': 1, 'total': 2, 'ratio': 0.5}
-    assert util['progressEmpty'] == {'done': 0, 'total': 0, 'ratio': 0}
-    assert util['kinds'] == ['nt-desk-kind-bad', 'nt-desk-kind-warn', 'nt-desk-kind-ok', 'nt-desk-kind-info', 'nt-desk-kind-muted']
-    assert util['elapsedNone'] == '-'
-    assert util['conn'] == ['nt-desk-dot-off', 'nt-desk-dot-bad', 'nt-desk-dot-ok']
-    assert out['removedOnStop']
+    assert util['status'] == ['Working', 'Done', 'Problem', 'Stopped', 'Waiting']
+    assert util['checked'] == 'Checked'
+    assert util['steps'] == ['Getting started', 'Step 2 of 3', 'The step is done', 'All 3 steps done']
+    assert util['progressEmpty'] == {'done': 0, 'total': 0, 'ratio': 0, 'text': 'Getting started'}
+    assert util['initials'] == ['C12', 'M', '?']
+    assert util['conn'] == ['off', 'warn', 'on']
+    assert util['span'] == ['5s', '2m', '1h 1m']
+    assert util['controls'] == [['cancel'], ['pause', 'cancel'], []]
+    assert out['removedOnStop']  # only our own nodes go; the Notion node stays
 
 
 class LiveDashboardTests(unittest.TestCase):

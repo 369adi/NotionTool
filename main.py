@@ -22,6 +22,15 @@ def instance_lock(directory):
     return handle
 
 
+def new_app_is_ui(data_dir):
+    """True when the NotionTool desktop app opens on start (data/desktop_app.json app_autostart)."""
+    try:
+        from notiontool.desktop_shell import load_app_settings
+        return bool(load_app_settings(data_dir).get('app_autostart'))
+    except Exception:
+        return False
+
+
 def main():
     if '--gateway' in sys.argv:  # process 2: MCP gateway / backup MCP, no window, no instance lock
         from notiontool.gateway import main as gateway_main
@@ -30,6 +39,8 @@ def main():
     sys.argv = handoff(sys.argv)  # waits for the previous instance; installs a downloaded update
     parser = argparse.ArgumentParser()
     parser.add_argument('--serve',action='store_true')
+    parser.add_argument('--headless',action='store_true',help='No classic window; the NotionTool desktop app is the UI')
+    parser.add_argument('--classic',action='store_true',help='Force the classic window')
     parser.add_argument('--data-dir',default=default_data_dir(sys.executable,Path(__file__).parent,getattr(sys,'frozen',False)))
     parser.add_argument('--port',type=int,default=None,help='Host API port (default: setting host_api_port, 8790)')
     args = parser.parse_args()
@@ -38,8 +49,10 @@ def main():
     app = Application(args.data_dir)
     url = app.launch(args.port)
     try:
-        if args.serve:
-            print(url,flush=True)
+        if args.serve or (not args.classic and (args.headless or new_app_is_ui(args.data_dir))):
+            # The NotionTool desktop app (separate Notion instance) is the UI: no classic window.
+            if args.serve:
+                print(url,flush=True)
             while True:
                 time.sleep(1)
         else:

@@ -877,6 +877,100 @@
   window.__ntDesk.settingsLogic = { sections: TAB_SECTIONS, text: TAB_TEXT, entriesOf: entriesOf, validate: validate,
     planWrite: planWrite, verify: verify, teamSize: teamSize, saveField: saveField, optionsOf: optionsOf };
 
+  // Backups and Details cards (notiontool/backup.py: backup_status, backup_now, usage_report).
+  function backupText(res) {
+    var last = res && res.last;
+    if (!last) return 'Last backup: none yet';
+    var when = last.time_text || res.last_text || new Date(Number(last.time) * 1000).toLocaleString();
+    return 'Last backup: ' + when;
+  }
+  function duration(sec) {
+    var s = Math.round(Number(sec) || 0);
+    if (s < 60) return s + ' s';
+    return Math.floor(s / 60) + ' min ' + (s % 60) + ' s';
+  }
+  function usageLines(report) {
+    report = report || {};
+    var lines = [];
+    var req = report.requests || {};
+    var limit = Number(req.limit_per_minute) || 0;
+    lines.push('Requests in the last minute: ' + (Number(req.last_minute) || 0) +
+      (limit ? ' of ' + limit + ' allowed' : ' (no limit set)'));
+    lines.push(report.average_task_seconds == null ? 'Average task time: no finished tasks yet'
+      : 'Average task time: ' + duration(report.average_task_seconds));
+    var turns = report.turns || [];
+    if (!turns.length) lines.push('Turns per model: none in the last ' + (report.days || 7) + ' days');
+    turns.slice(0, 14).forEach(function (t) { lines.push('Turns on ' + t.day + ' with ' + t.model + ': ' + t.turns); });
+    var team = report.coworkers || [];
+    if (!team.length) lines.push('Tasks per coworker: none yet');
+    team.slice(0, 20).forEach(function (c) { lines.push('Tasks by ' + c.name + ': ' + c.tasks + ' (' + c.done + ' done)'); });
+    return lines;
+  }
+  window.__ntDesk.settingsLogic.backupText = backupText;
+  // Work in parallel copies (patch_mode on the server; engine.patch_status).
+  function patchText(st) {
+    if (!st || typeof st !== 'object') return 'Status: not available yet';
+    return 'Merges today: ' + (Number(st.merges_today) || 0) + ' - Conflicts waiting: ' + (Number(st.conflicts_waiting) || 0) +
+      ' - Waiting to merge: ' + (Number(st.waiting_to_merge) || 0);
+  }
+  window.__ntDesk.settingsLogic.patchText = patchText;
+  window.__ntDesk.settingsLogic.usageLines = usageLines;
+
+  // Restart card (notiontool/restart_guard.py: app_restart, app_restart_status, app_health).
+  var RESTART_KEY = 'nt-desk-restart-pending';
+  function restartConfirmText(running) {
+    running = running || [];
+    if (!running.length) return 'Restart NotionTool now? No task is running.';
+    var lines = ['Restart NotionTool now? These tasks are still running:'];
+    running.slice(0, 15).forEach(function (t) { lines.push('- ' + (t.title || t.id) + ' (' + t.state + ')'); });
+    if (running.length > 15) lines.push('- and ' + (running.length - 15) + ' more');
+    lines.push('Their answers may need manual checking.');
+    return lines.join('\n');
+  }
+  function restartText(res) {
+    res = res || {};
+    if (res.ok === false) return res.error || 'The restart could not be started.';
+    if (res.state === 'waiting') {
+      var n = (res.running || []).length;
+      return 'Waiting for ' + n + (n === 1 ? ' task' : ' tasks') + ' to finish. New tasks wait. Then NotionTool restarts.';
+    }
+    if (res.state === 'restarting') return 'Restarting...';
+    if (res.state === 'failed') return res.error || 'The restart failed.';
+    return '';
+  }
+  // Polls until the restarted harness answers. onState('waiting'|'restarting'|'offline'|'online'|'failed'|'timeout').
+  // opts.resumed: a restart was started before this overlay was injected again.
+  function watchRestart(callFn, opts) {
+    opts = opts || {};
+    var wait = opts.wait || function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+    var interval = opts.interval || 2000, tries = opts.tries || 300;
+    var onState = opts.onState || function () {};
+    var seen = !!opts.resumed, down = false;
+    function again(n) { return wait(interval).then(function () { return step(n + 1); }); }
+    function step(n) {
+      if (n >= tries) { onState('timeout'); return Promise.resolve({ ok: false, state: 'timeout' }); }
+      return Promise.resolve().then(function () { return callFn('app_restart_status', {}); }).then(function (res) {
+        if (!res || typeof res.state !== 'string') throw new Error('No answer');
+        if (res.state === 'waiting' || res.state === 'restarting') { seen = true; onState(res.state, res); return again(n); }
+        if (res.state === 'failed' && !down) { onState('failed', res); return { ok: false, state: 'failed', error: res.error }; }
+        if (!seen && !down) return { ok: true, state: 'idle' };
+        return Promise.resolve().then(function () { return callFn('app_health', {}); }).then(function (h) {
+          if (!h || h.ok === false) throw new Error('Not healthy yet');
+          onState('online', h);
+          return { ok: true, state: 'online' };
+        });
+      }).then(null, function () {
+        down = true;
+        onState('offline');
+        return again(n);
+      });
+    }
+    return step(0);
+  }
+  window.__ntDesk.settingsLogic.restartConfirmText = restartConfirmText;
+  window.__ntDesk.settingsLogic.restartText = restartText;
+  window.__ntDesk.settingsLogic.watchRestart = watchRestart;
+
   // ---- view ------------------------------------------------------------------------------
   window.__ntDesk.settingsTab = function (ctx) {
     ctx = ctx || {};
@@ -1036,7 +1130,229 @@
         });
         view.nav.appendChild(btn);
       });
+      extraCards(view);
     }
+
+    function card(view, id, title, help) {
+      var c = node('section', 'nt-desk-stab-card');
+      c.setAttribute('data-nt-section', id);
+      c.appendChild(node('h3', 'nt-desk-stab-h', title));
+      c.appendChild(node('p', 'nt-desk-stab-sub', help));
+      view.body.appendChild(c);
+      var btn = node('button', 'nt-desk-stab-navbtn', title);
+      btn.type = 'button';
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        try { c.scrollIntoView({ block: 'start', behavior: 'smooth' }); } catch (err) { /* ignore */ }
+      });
+      view.nav.appendChild(btn);
+      return c;
+    }
+
+    function patchCard(view) {
+      var p = card(view, 'parallel', 'Parallel copies',
+        'Each coworker edits its own copy of the project. NotionTool tests each change and adds it to the project by itself. ' +
+        'Only a real clash between two changes goes to one coworker to fix. When off, coworkers share one folder and files are locked instead.');
+      var label = node('label', 'nt-desk-stab-help');
+      var box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = true;
+      label.appendChild(box);
+      label.appendChild(document.createTextNode(' Work in parallel copies (recommended)'));
+      var line = node('p', 'nt-desk-stab-help', 'Status: loading...');
+      var status = node('div', 'nt-desk-stab-status');
+      status.setAttribute('role', 'status');
+      box.addEventListener('change', function () {
+        var want = !!box.checked;
+        setStatus(status, 'saving', 'Saving...');
+        Promise.resolve().then(function () { return call('settings_set', { values: { patch_mode: want } }); }).then(function (res) {
+          if (failed(res)) throw res;
+          setStatus(status, 'applied', want ? 'On. New tasks use their own copy.' : 'Off. Files are locked again.');
+        }, function (err) {
+          box.checked = !want;
+          setStatus(status, 'error', 'Not saved: ' + errText(err));
+        });
+      });
+      p.appendChild(label);
+      p.appendChild(line);
+      p.appendChild(status);
+      Promise.resolve().then(function () { return call('settings_get', {}); }).then(function (res) {
+        var v = res && (res.values || res.settings || res);
+        if (v && Object.prototype.hasOwnProperty.call(v, 'patch_mode')) box.checked = String(v.patch_mode).toLowerCase() !== 'false' && v.patch_mode !== false;
+      }, function () { /* keep the default: on */ });
+      Promise.resolve().then(function () { return call('patch_status', {}); }).then(function (res) {
+        if (failed(res)) throw res;
+        line.textContent = patchText(res);
+      }, function () { line.textContent = patchText(null); });
+    }
+
+    function extraCards(view) {
+      patchCard(view);
+      var b = card(view, 'backups', 'Backups', 'A copy of the app data is made before every restart and once a day. The last 10 are kept.');
+      var last = node('p', 'nt-desk-stab-help', 'Last backup: loading...');
+      var status = node('div', 'nt-desk-stab-status');
+      status.setAttribute('role', 'status');
+      var now = node('button', 'nt-desk-stab-navbtn', 'Back up now');
+      now.type = 'button';
+      now.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        now.disabled = true;
+        setStatus(status, 'saving', 'Backing up...');
+        Promise.resolve().then(function () { return call('backup_now', {}); }).then(function (res) {
+          if (failed(res)) throw res;
+          now.disabled = false;
+          setStatus(status, 'applied', 'Backup made.');
+          last.textContent = backupText({ last: res });
+        }, function (err) {
+          now.disabled = false;
+          setStatus(status, 'error', 'Backup failed: ' + errText(err));
+        });
+      });
+      b.appendChild(last);
+      b.appendChild(now);
+      b.appendChild(status);
+      Promise.resolve().then(function () { return call('backup_status', {}); }).then(function (res) {
+        if (failed(res)) throw res;
+        last.textContent = backupText(res);
+      }, function (err) { last.textContent = 'Last backup: not available (' + errText(err) + ')'; });
+
+      var d = card(view, 'details', 'Details', 'How much the app is used. Read only.');
+      var lines = node('ul', 'nt-desk-stab-usage');
+      d.appendChild(lines);
+      Promise.resolve().then(function () { return call('usage_report', {}); }).then(function (res) {
+        if (failed(res)) throw res;
+        usageLines(res).forEach(function (t) { lines.appendChild(node('li', 'nt-desk-stab-help', t)); });
+      }, function (err) { lines.appendChild(node('li', 'nt-desk-stab-help', 'Not available: ' + errText(err))); });
+      restartCard(view);
+    }
+
+    // ---- Restart NotionTool ----
+    var watching = false;
+    function remember(on) {
+      try {
+        if (on) window.sessionStorage.setItem(RESTART_KEY, String(Date.now()));
+        else window.sessionStorage.removeItem(RESTART_KEY);
+      } catch (err) { /* no storage: the notice only lives in this overlay */ }
+    }
+    function pending() {
+      try {
+        var t = Number(window.sessionStorage.getItem(RESTART_KEY)) || 0;
+        return t > 0 && Date.now() - t < 15 * 60 * 1000;
+      } catch (err) { return false; }
+    }
+    // Small notice that stays visible outside the Settings tab while the harness restarts.
+    function notice(text) {
+      if (typeof document === 'undefined' || !document.body) return;
+      var el = document.querySelector && document.querySelector('.nt-desk-restart-note');
+      if (!text) { if (el) el.remove(); return; }
+      if (!el) {
+        el = node('div', 'nt-desk-restart-note');
+        el.setAttribute('role', 'status');
+        el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483000;padding:8px 14px;' +
+          'border-radius:8px;background:#1f2937;color:#fff;font:13px/1.4 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.3)';
+        document.body.appendChild(el);
+      }
+      el.textContent = text;
+    }
+    function watch(resumed, show) {
+      if (watching) return;
+      watching = true;
+      show = show || function () {};
+      watchRestart(call, { resumed: resumed, onState: function (state, res) {
+        if (state === 'waiting') { notice(restartText(res)); show('saving', restartText(res)); }
+        if (state === 'restarting' || state === 'offline') { notice('Restarting...'); show('saving', 'Restarting...'); }
+        if (state === 'online') {
+          remember(false);
+          notice('Back online');
+          show('applied', 'Back online');
+          setTimeout(function () { notice(''); }, 5000);
+        }
+        if (state === 'failed' || state === 'timeout') {
+          remember(false);
+          var msg = state === 'failed' ? restartText(res) : 'NotionTool did not come back. Check work/restart.out.';
+          notice(msg);
+          show('error', msg);
+          setTimeout(function () { notice(''); }, 10000);
+        }
+      } }).then(function () { watching = false; }, function () { watching = false; });
+    }
+    function restartCard(view) {
+      var r = card(view, 'restart', 'Restart NotionTool',
+        'When idle waits until no task is running, preparing or uncertain; new tasks wait meanwhile. Now restarts right away. A backup is made first.');
+      var mode = node('select', 'nt-desk-stab-select');
+      [['idle', 'When idle'], ['now', 'Now']].forEach(function (o) {
+        var opt = node('option', null, o[1]);
+        opt.value = o[0];
+        mode.appendChild(opt);
+      });
+      mode.value = 'idle';
+      var go = node('button', 'nt-desk-stab-navbtn', 'Restart NotionTool');
+      go.type = 'button';
+      var cancel = node('button', 'nt-desk-stab-navbtn', 'Cancel restart');
+      cancel.type = 'button';
+      cancel.hidden = true;
+      var ask = node('div', 'nt-desk-stab-confirm');
+      ask.hidden = true;
+      var status = node('div', 'nt-desk-stab-status');
+      status.setAttribute('role', 'status');
+      function show(kind, text) { setStatus(status, kind, text); }
+      function start(m) {
+        go.disabled = true;
+        ask.hidden = true;
+        show('saving', m === 'now' ? 'Restarting...' : 'Asking NotionTool to restart when idle...');
+        Promise.resolve().then(function () { return call('app_restart', { mode: m }); }).then(function (res) {
+          if (!res || res.ok === false) throw res;
+          remember(true);
+          cancel.hidden = res.state !== 'waiting';
+          show('saving', restartText(res));
+          notice(restartText(res));
+          watch(false, function (kind, text) { if (kind !== 'saving') { go.disabled = false; cancel.hidden = true; } show(kind, text); });
+        }, function (err) {
+          go.disabled = false;
+          show('error', (err && err.error) || ('Restart failed: ' + errText(err)));
+        });
+      }
+      go.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        if (mode.value !== 'now') return start('idle');
+        go.disabled = true;
+        Promise.resolve().then(function () { return call('app_restart_status', {}); }).then(function (res) {
+          return (res && res.running) || [];
+        }, function () { return []; }).then(function (running) {
+          go.disabled = false;
+          ask.textContent = '';
+          restartConfirmText(running).split('\n').forEach(function (t) { ask.appendChild(node('p', 'nt-desk-stab-help', t)); });
+          var yes = node('button', 'nt-desk-stab-navbtn', 'Restart now');
+          yes.type = 'button';
+          var no = node('button', 'nt-desk-stab-navbtn', 'Keep running');
+          no.type = 'button';
+          yes.addEventListener('click', function (e) { e.preventDefault(); start('now'); });
+          no.addEventListener('click', function (e) { e.preventDefault(); ask.hidden = true; });
+          ask.appendChild(yes);
+          ask.appendChild(no);
+          ask.hidden = false;
+        });
+      });
+      cancel.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        Promise.resolve().then(function () { return call('app_restart', { mode: 'cancel' }); }).then(function (res) {
+          if (!res || res.ok === false) throw res;
+          remember(false);
+          notice('');
+          cancel.hidden = true;
+          go.disabled = false;
+          show('applied', 'Restart cancelled. Tasks can start again.');
+        }, function (err) { show('error', (err && err.error) || errText(err)); });
+      });
+      r.appendChild(mode);
+      r.appendChild(go);
+      r.appendChild(cancel);
+      r.appendChild(ask);
+      r.appendChild(status);
+      if (pending()) { go.disabled = true; show('saving', 'Restarting...'); }
+    }
+    // Overlay injected again after a restart (no page reload): finish the notice with 'Back online'.
+    if (pending()) watch(true);
 
     // Builds the view into container; returns a handle { root, el, stop }.
     function mount(container) {

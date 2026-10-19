@@ -11,7 +11,10 @@ Safety rules:
 - Only Welcome chats are created, through ops.create_welcome (mains.Mains Welcome path).
 - The operator Main is repointed only by ops.confirm_ack (MainHandoffOps._repoint_after_ack),
   i.e. only after the new chat answered with the handoff check word.
-- The old operator chat is never deleted here; renaming is left to ops.rename_chat rules.
+- A switch starts only when the Main needs it (tokens/turns near the limit or measured lag, see
+  need_reasons) and never from team setup (ensure_team never calls start()).
+- On a switch the NEW chat is renamed 'Main' and, after the ack, the OLD chat is renamed
+  'Main (old, YYYY-MM-DD HH:MM)'. The old operator chat is never deleted here.
 - advance() never raises; remote errors are kept on the record and retried on the next call.
 - Real MainHandoffOps repoints a new chat as a pool Main (purpose 'main', enabled), which is
   wrong for the operator. Until ops declares supports_operator = True, advance() stops at
@@ -22,12 +25,16 @@ import re
 import time
 
 from . import handoff_files
+from .agent_guard import GUARD_RULE
 
 KIND = 'main_switches'
 OPERATOR = 'operator'
 POLICIES = ('ask', 'auto')
 ASK_TOKENS = 1300000  # ask early: the user sees lag from about 1.5M
 ASK_TURNS = 1000
+LAG_MS = 20000  # measured Main reply lag that counts as a real need for a switch
+NO_SWITCH_TRIGGERS = ('team_setup', 'ensure_team', 'team_grow')
+OLD_TITLE = 'Main (old, %s)'
 BRIEF_MAX_CHARS = 8000
 ASK_TEXT = 'The Main chat is getting long. Ask the user whether to switch to a fresh Main chat.'
 ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
@@ -36,7 +43,7 @@ RUN_FAILED = ('failed', 'cancelled')
 OPS_GAP_REASON = ('Brief is ready, but the handoff ops cannot repoint an operator Main yet '
                   '(MainHandoffOps repoints the new chat as a pool Main); no chat was created')
 RESUME_INSTRUCTIONS = ('You are now the operator Main of NotionTool. Read resume_brief, keep every fixed '
-                       'user rule, and continue from the next steps. Delegate work to the Coworkers.')
+                       'user rule, and continue from the next steps. Delegate work to the Coworkers. ' + GUARD_RULE)
 _SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 
 
@@ -59,17 +66,37 @@ def _settings(store):
 
 
 # ---- 1. check ----------------------------------------------------------------
+def need_reasons(usage, settings):
+    """Why the Main really needs a switch: 'tokens'/'turns' near the context limit or measured 'lag'."""
+    settings, usage = dict(settings or {}), dict(usage or {})
+    reasons = []
+    if _int(usage.get('estimated_tokens')) >= _int(settings.get('main_context_ask_tokens', ASK_TOKENS)):
+        reasons.append('tokens')
+    if _int(usage.get('turns')) >= _int(settings.get('main_context_ask_turns', ASK_TURNS)):
+        reasons.append('turns')
+    if usage.get('lag_ms') is not None and _int(usage.get('lag_ms')) >= _int(settings.get('main_context_lag_ms', LAG_MS)):
+        reasons.append('lag')
+    return reasons
+
+
+def needs_switch(worker, settings):
+    """(needed, measured) for an operator worker: a stored context_ask or measured usage over a limit."""
+    ask = (worker or {}).get('context_ask') or {}
+    if ask.get('ask'):
+        return True, True
+    usage = (worker or {}).get('context_usage')
+    if not usage:
+        return False, False
+    return bool(need_reasons(usage, settings)), True
+
+
 def check(store, worker, usage, settings, now=None):
     """Notice dict for a long operator chat, else None. worker['context_ask'] is written only on change."""
     if not worker or worker.get('purpose') != OPERATOR:
         return None
     settings, usage = dict(settings or {}), dict(usage or {})
     tokens, turns = _int(usage.get('estimated_tokens')), _int(usage.get('turns'))
-    reasons = []
-    if tokens >= _int(settings.get('main_context_ask_tokens', ASK_TOKENS)):
-        reasons.append('tokens')
-    if turns >= _int(settings.get('main_context_ask_turns', ASK_TURNS)):
-        reasons.append('turns')
+    reasons = need_reasons(usage, settings)
     previous = worker.get('context_ask')
     if not reasons:
         if previous:
@@ -112,7 +139,8 @@ def brief_task(path, rel):
         'Sources: the tail of project-memory/NotionTool.md, work/audit/*.md, and the harness state '
         'through your NotionTool tools (context, runs, tasks, workers). Report facts only; mark '
         'anything unverified as unverified. Do not edit any other file, do not create or rename '
-        'chats, no git, no network.' % (path, BRIEF_MAX_CHARS))
+        'chats, no git, no network.' % (path, BRIEF_MAX_CHARS)
+        + '\nUnder ## Fixed user rules always copy this rule (I12) verbatim: ' + GUARD_RULE)
     task = dict(id='main-brief', title='Write the Main switch brief', prompt=prompt,
                 acceptance='The brief file exists, uses LF only, is under %d characters and has '
                            'all six sections.' % BRIEF_MAX_CHARS,
@@ -133,7 +161,7 @@ def write_seed(path, text):
     return True
 
 
-def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text=None):
+def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text=None, trigger=None):
     """Queue the brief task once per request_id and store the 'main_switches' record.
 
     brief_text: optional seed brief from the operator Main. It is written before the Coworker task,
@@ -152,6 +180,11 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
     worker = store.get('workers', chat.get('main_worker') or '') if chat.get('main_worker') else None
     if not chat.get('operator') or chat.get('state') == 'released' or not worker or worker.get('purpose') != OPERATOR:
         return dict(ok=False, state='skipped', reason='Not an active operator Main chat')
+    if str(trigger or '') in NO_SWITCH_TRIGGERS:
+        return dict(ok=False, state='skipped', reason='A Main switch never starts from team setup')
+    needed, measured = needs_switch(worker, _settings(store))
+    if measured and not needed:
+        return dict(ok=False, state='skipped', reason='The Main does not need a switch (context and lag below the limits)')
     path = brief_path(store, rid)
     seeded = False
     if brief_text:
@@ -159,6 +192,19 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
             seeded = write_seed(path, brief_text)
         except OSError as exc:
             return dict(ok=False, state='failed', reason='seed brief not written: ' + str(exc)[:200])
+    if seeded and not read_brief(path)[1]:
+        # The operator Main wrote a complete brief itself: no Coworker run is needed. A Coworker cannot
+        # write below data/ anyway (bridge write guard), so a brief run only waited forever on
+        # 'RESULT: DONE' (root cause of the stuck switch on 2026-10-19 17:12).
+        stamp = _now(now)
+        record = dict(id=rid, request_id=rid, state='brief_ready', run_id='',
+                      operator_chat_id=chat['id'], operator_worker_id=worker['id'],
+                      operator_thread=worker.get('thread_id', ''), account_id=worker.get('account_id', ''),
+                      brief_path=path, handoff_id='switch_' + rid, new_chat_id='', reason='brief from the Main',
+                      error='', created=stamp, updated=stamp)
+        store.put(KIND, record)
+        store.event('main_switch_brief_ready', '', message='Main switch brief written by the Main', switch_id=rid)
+        return dict(record, ok=True, duplicate=False)
     body = dict(chat_id=chat['id'], goal='Prepare the switch of the operator Main to a fresh Welcome chat',
                 request_id='main-switch-' + rid,
                 tasks=[brief_task(path, _project_rel(path, chat.get('project_path', '')))])
@@ -212,8 +258,8 @@ def read_brief(path):
 
 
 def _archive_title(ts):
-    from .main_handoff import archive_title
-    return archive_title(ts)
+    """Title of the OLD operator Main after a switch: 'Main (old, YYYY-MM-DD HH:MM)' in local time."""
+    return OLD_TITLE % time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))
 
 
 def advance(store, record, ops, now=None):
@@ -243,11 +289,17 @@ def _advance(store, record, ops, now):
         if run.get('state') in RUN_FAILED:
             return _move(store, record, 'failed', stamp, reason='brief run ' + run['state'])
         if run.get('state') not in RUN_DONE:
-            return _note(store, record, stamp, reason='waiting for the brief run')
-        _text, problem = read_brief(record['brief_path'])
-        if problem:
-            return _move(store, record, 'failed', stamp, reason=problem)
-        record = _move(store, record, 'brief_ready', stamp, reason='brief ready')
+            # A run that only waits for the Main (e.g. answer without 'RESULT: DONE') must not block
+            # the switch when the brief file itself is usable.
+            if run.get('state') == 'awaiting_main' and not read_brief(record['brief_path'])[1]:
+                record = _move(store, record, 'brief_ready', stamp, reason='brief usable; run awaits the Main')
+            else:
+                return _note(store, record, stamp, reason='waiting for the brief run')
+        if record['state'] == 'brief_requested':
+            _text, problem = read_brief(record['brief_path'])
+            if problem:
+                return _move(store, record, 'failed', stamp, reason=problem)
+            record = _move(store, record, 'brief_ready', stamp, reason='brief ready')
     if record['state'] == 'brief_ready':
         if not getattr(ops, 'supports_operator', False):
             return _note(store, record, stamp, reason=OPS_GAP_REASON)

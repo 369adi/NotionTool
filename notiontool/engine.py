@@ -10,12 +10,28 @@ import time
 from .protocol import ContractError, json_object, validate_plan, prompt_for
 from .store import uid
 from . import plain_protocol
+from . import prompt_once
 from . import file_registry
 from .allocation import allocation, parallel_width, validate_allocation
 from .team_size import coworker_capacity
 from .model_routing import DEFAULT_MODEL, MODELS, validate_models, with_reason
 from .model_verification import ModelVerificationError
 from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, run_with_priority
+from . import proof as task_proof
+from . import patch_mode as patch_mod
+import subprocess
+
+# Patch mode (patch_mode.py): on by default for git projects with a main branch; the setting turns it off.
+PATCH_MODE_DEFAULT = True
+# Merge results that are worth one more try later; anything else stays 'failed' for the operator.
+PATCH_RETRY = ('main_moved', 'main_busy')
+PATCH_RETRY_LIMIT = 3
+PATCH_NOTE = ('\n\nWork only inside this folder: %s\nIt is your own copy of the project (a git worktree on branch %s). '
+              'Read and edit files only there, never in the main project folder. Do not commit, merge or push: '
+              'NotionTool commits, tests and merges your change when you are done.')
+# Plain labels for the Live view, per task patch_state.
+PATCH_LABELS = dict(working='Working in own copy', waiting='Waiting to merge', merged='Merged',
+                    conflict='Conflict - being resolved', failed='Not merged')
 
 # add_task: marks 'no explicit model' (Phase 4 change 1); resolves to DEFAULT_MODEL as before.
 _UNSET_MODEL = object()
@@ -459,14 +475,21 @@ class Engine:
             if t['state'] != 'done':
                 continue
             why = []
-            failed = self._machine_check(run, t)
+            # Read-only stage tasks and builds superseded by a fixer are judged through their chain.
+            staged = t.get('read_only') or t.get('fixed_by')
+            failed = None if staged else self._machine_check(run, t)
             if failed:
                 machine[t['id']] = failed
                 why.append(failed)
-            if run.get('operator') and not result_done(t.get('result', '')):
+            if run.get('operator') and not staged and not result_done(t.get('result', '')):
                 why.append('Answer has no line RESULT: DONE')
+            if t.get('review_open'):
+                why.append('Review open points: ' + t['review_open'])
             if t.get('requires_review'):
                 why.append('The task asked for review')
+            if t.get('agent_red_flag'):  # I12: never auto-accepted
+                from .agent_guard import PROBLEM_TITLE
+                why.append(PROBLEM_TITLE)
             if why:
                 reasons[t['id']] = '; '.join(why)
         run['needs_main_reasons'], run['machine_check_failed'] = reasons, machine
@@ -542,7 +565,12 @@ class Engine:
 
     def coordination(self):
         budget = self._budget()
-        return budget.status() if budget is not None else dict(paused=False)
+        out = budget.status() if budget is not None else dict(paused=False)
+        try:
+            out = dict(out, patch=self.patch_status())
+        except Exception:
+            pass
+        return out
 
     def resume_remote(self):
         # Manual resume after ACCOUNT_BLOCKED: lift the pause and requeue only the tasks it stopped.
@@ -631,22 +659,175 @@ class Engine:
         sep = '\\' if '\\' in a or '\\' in b else '/'
         return a == b or a.startswith(b.rstrip(sep) + sep) or b.startswith(a.rstrip(sep) + sep)
 
+    def _lock_files(self, run, files):
+        """Files that lock. A folder in files ('tests/', '.', or an existing folder) is advisory and never locks."""
+        root = self._project_root(run) if run else None
+        kept = []
+        for name in files or []:
+            text = str(name).strip()
+            if not text or text.endswith(('/', '\\')) or text in ('.', './'):
+                continue
+            try:
+                if root is not None and (root / text).is_dir():
+                    continue
+            except (OSError, ValueError):
+                pass
+            kept.append(name)
+        return kept
+
     def _conflicts(self, task, run):
-        keys = self._resource_keys(run, task['files']) + task.get('absolute_resources',[])
+        # Patch mode: every task edits its own worktree, so project file and folder locks are skipped.
+        # Explicit full-PC paths (absolute_resources) still lock in both modes.
+        patch = self._patch_on(run)
+        keys = ([] if patch else self._resource_keys(run, self._lock_files(run, task['files']))) + task.get('absolute_resources',[])
+        if not keys:
+            return False
         for other in self.store.all('tasks'):
             if other['id'] == task['id'] or (other['state'] not in ('running', 'cancelling', 'uncertain') and not other.get('remote_unknown')):
                 continue
             other_run = self.store.get('runs', other['run_id'])
+            theirs = ([] if patch or self._patch_on(other_run) else self._resource_keys(other_run, self._lock_files(other_run, other['files'])))
+            theirs = theirs + other.get('absolute_resources',[])
             for a in keys:
-                if any(self._overlap(a,b) for b in self._resource_keys(other_run, other['files']) + other.get('absolute_resources',[])):
+                if any(self._overlap(a,b) for b in theirs):
                     return True
         return False
+
+    # ---- patch mode (patch_mode.py) ------------------------------------------
+    def _patch_on(self, run):
+        """True when patch mode applies: setting patch_mode (default on) and a git project with a main branch."""
+        if not run or not run.get('project_path'):
+            return False
+        value = self.store.settings().get(patch_mod.SETTING, PATCH_MODE_DEFAULT)
+        if not patch_mod.enabled({patch_mod.SETTING: value}):
+            return False
+        root = str(self._project_root(run))
+        cache = self.__dict__.setdefault('_patch_roots', {})
+        now = time.monotonic()
+        hit = cache.get(root)
+        if hit and now - hit[1] < 60:
+            return hit[0]
+        ok = False
+        if (Path(root) / '.git').exists():
+            try:
+                ok = subprocess.run(['git', '-C', root, 'rev-parse', '--verify', '-q', 'refs/heads/' + patch_mod.BASE],
+                                    capture_output=True, timeout=10,
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).returncode == 0
+            except Exception:
+                ok = False
+        cache[root] = (ok, now)
+        return ok
+
+    def _patcher(self, run):
+        root = str(self._project_root(run))
+        patchers = self.__dict__.setdefault('_patchers', {})
+        if root not in patchers:
+            factory = getattr(self, 'patch_factory', None) or patch_mod.PatchMode
+            patchers[root] = factory(root)
+        return patchers[root]
+
+    def _patch_prepare(self, task, run):
+        """Own worktree for an executor before dispatch. On a git error the task runs as before (with locks off)."""
+        try:
+            patcher = self._patcher(run)
+            task['patch_branch'] = patcher.branch_name(task)
+            task['patch_worktree'] = patcher.prepare(task)
+            task['patch_state'] = 'working'
+        except Exception as exc:
+            for key in ('patch_branch', 'patch_worktree', 'patch_state'):
+                task.pop(key, None)
+            self.store.event('patch_prepare_failed', run['id'], commit=False, task_id=task['id'], message=str(exc)[:300])
+
+    def _start_merges(self):
+        """collect -> verify -> merge for finished patch tasks, one at a time (PatchMode merge queue)."""
+        with self.lock:
+            self._start_merges_locked()
+
+    def _start_merges_locked(self):
+        merging = self.__dict__.setdefault('_patch_merging', set())
+        for task in self.store.all('tasks'):
+            if task.get('patch_state') != 'waiting' or task['id'] in merging or not task.get('patch_worktree'):
+                continue
+            run = self.store.get('runs', task['run_id'])
+            if not run:
+                continue
+            merging.add(task['id'])
+            try:
+                future = self._patcher(run).submit(dict(task))
+            except Exception as exc:
+                merging.discard(task['id'])
+                self._patch_result(task['id'], dict(status='error', message=str(exc)[:600]))
+                continue
+            # The result is stored from a fresh thread, never inside the caller that may hold self.lock.
+            future.add_done_callback(lambda f, tid=task['id']: threading.Thread(
+                target=self._merged, args=(tid, f), daemon=True, name='patch-result').start())
+
+    def _merged(self, task_id, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = dict(status='error', message=str(exc)[:600])
+        self._patch_result(task_id, result)
+
+    def _patch_result(self, task_id, result):
+        with self.lock:
+            merging = self.__dict__.setdefault('_patch_merging', set())
+            task = self.store.get('tasks', task_id)
+            if not task:
+                merging.discard(task_id)
+                return
+            status = str(result.get('status') or 'error')
+            tries = task.get('patch_tries', 0) + 1
+            if status in ('merged', 'nothing'):
+                state = 'merged'
+            elif status == 'conflict':
+                state = 'conflict'
+            elif status in PATCH_RETRY and tries < PATCH_RETRY_LIMIT:
+                state = 'waiting'
+            else:
+                state = 'failed'
+            task.update(patch_state=state, patch_tries=tries,
+                        patch_result=dict(status=status, message=str(result.get('message') or '')[:600], at=time.time(),
+                                          main_after=str(result.get('main_after') or ''), pushed=bool(result.get('pushed'))))
+            run = self.store.get('runs', task['run_id'])
+            if state == 'conflict' and run and not task.get('patch_follow_up'):
+                follow = result.get('follow_up') or {}
+                new = self.add_task(run, 'executor', follow.get('prompt') or 'Resolve the merge conflict.',
+                                    title=follow.get('title') or 'Resolve conflict', files=follow.get('files') or [],
+                                    acceptance='The conflict is fixed in the given folder and the tests pass')
+                new.update(patch_branch=follow.get('patch_branch') or task.get('patch_branch'),
+                           patch_worktree=follow.get('patch_worktree') or task.get('patch_worktree'),
+                           patch_origin=task['id'])
+                self.store.put('tasks', new)
+                task['patch_follow_up'] = new['id']
+            origin = self.store.get('tasks', task['patch_origin']) if task.get('patch_origin') else None
+            if origin and state in ('merged', 'failed'):
+                origin.update(patch_state=state, patch_result=task['patch_result'])
+                self.store.put('tasks', origin)
+            self.store.event('patch_' + state, task['run_id'], commit=False, task_id=task_id, status=status,
+                             message=task['patch_result']['message'][:300])
+            self.store.put('tasks', task)
+            merging.discard(task_id)  # only after the new patch_state is stored, so no second merge starts
+
+    def patch_status(self):
+        """Settings status: is patch mode on, merges today, conflicts waiting, tasks waiting to merge."""
+        start = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+        tasks = self.store.all('tasks')
+        value = self.store.settings().get(patch_mod.SETTING, PATCH_MODE_DEFAULT)
+        return dict(enabled=patch_mod.enabled({patch_mod.SETTING: value}),
+                    merges_today=sum(1 for t in tasks if t.get('patch_state') == 'merged' and not t.get('patch_origin')
+                                     and (t.get('patch_result') or {}).get('at', 0) >= start),
+                    conflicts_waiting=sum(1 for t in tasks if t.get('patch_state') == 'conflict'),
+                    waiting_to_merge=sum(1 for t in tasks if t.get('patch_state') == 'waiting'),
+                    labels={t['id']: PATCH_LABELS[t['patch_state']] for t in tasks if t.get('patch_state') in PATCH_LABELS})
 
     def claim_file(self, task_id, lease, relative):
         with self.lock:
             task = self.store.get('tasks', task_id)
             if not task or task['state'] not in LIVE_TASK_STATES or task['lease'] != lease:
                 raise ValueError('Assignment is no longer active')
+            if task.get('read_only'):
+                raise ValueError('This role is read-only; describe the needed change in your result instead')
             run = self.store.get('runs', task['run_id'])
             root = self._project_root(run)
             relative = file_registry.normalize(root, relative)
@@ -659,6 +840,8 @@ class Engine:
             if self._conflicts(trial, run):
                 raise ValueError('Another active task owns this file; request a dependency instead')
             task['files'] = trial['files']
+            if task.get('proof_base'):
+                task_proof.extend(task['id'], relative, root)  # Proof base for the newly claimed file.
             self.store.put('tasks', task)
 
     def check_lease(self, task_id, lease):
@@ -688,6 +871,7 @@ class Engine:
                 if future.done():
                     del self.inflight[future]
                     self._complete(future, info)
+            self._start_merges()
             self._reconcile()
             self._heal_workers()
             runs = self.store.all('runs')
@@ -776,7 +960,11 @@ class Engine:
         choices = [w for w in choices if accounts.get(w['account_id'], {}).get('state')=='ready'
                    and counts.get(w['account_id'], 0) - int(w['id'] in checkpoint_workers) < self._parallel_cap(settings['per_account'])
                    and accounts.get(w['account_id'], {}).get('cooldown_until', 0) <= time.time()]
-        if task['role'] == 'reviewer':
+        if task.get('review_of'):
+            # Operator review: a different Coworker than every worker of the reviewed chain; never a Main.
+            choices = [w for w in choices if w['id'] not in set(task.get('exclude_workers') or [])
+                       and w.get('purpose') == 'worker']
+        elif task['role'] == 'reviewer':
             executors = {t.get('worker_id') for t in self.tasks(run['id']) if t['role']=='executor'}
             independent = [w for w in choices if w['id'] not in executors]
             if independent:
@@ -809,7 +997,8 @@ class Engine:
                    pending_rotations[w['id']]['task_id'] == task['id'] or
                    self.store.get('tasks', pending_rotations[w['id']]['task_id'], {}).get('state') in TERMINAL]
         choices.sort(key=lambda w: (w.get('last_used', 0), counts.get(w['account_id'], 0)))
-        return choices[0] if choices else None
+        preferred = [w for w in choices if task.get('prefer_worker') and w['id'] == task['prefer_worker']]
+        return (preferred or choices)[0] if choices else None
 
     def _dispatch(self, task, run, worker):
         account=self.store.get('accounts',worker['account_id'],{})
@@ -823,6 +1012,11 @@ class Engine:
         # Every attempt keeps its own timing record for the metrics.
         task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
             dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
+        if task.get('files') and not task.get('proof_base'):
+            # Proof: base snapshot of the write scope, taken once when the task starts (proof.py).
+            task['proof_base'] = task_proof.start(task['id'], task['files'], self._project_root(run))
+        if task['role'] == 'executor' and self._patch_on(run):
+            self._patch_prepare(task, run)  # own git worktree before dispatch (patch_mode.py)
         self.store.put('tasks', task)  # Commit the submission marker BEFORE the API can accept it.
         worker.update(state='busy', lease=task['lease'], last_used=time.time(),
                       prev_task_id=worker.get('last_task_id', ''), last_task_id=task['id'])
@@ -832,6 +1026,8 @@ class Engine:
         completed = [t for t in self.tasks(run['id']) if t['state']=='done']
         if task['role']=='planner':
             context_tasks = [t for t in completed if t['role'] in ('architect','researcher','quality_planner')]
+        elif task.get('review_of'):
+            context_tasks = [t for t in completed if t['id'] in task.get('review_scope', [])]
         elif task['role']=='reviewer':
             # Checks use actual deliverables, not speculative approach answers.
             context_tasks = [t for t in completed if t['role']=='executor']
@@ -844,7 +1040,17 @@ class Engine:
         # Every chat sees which files other chats (coworker tasks or the operator) are editing right now.
         claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id']) if task['role'] in ('planner', 'executor') else ''
         tools_available = bool(account.get('bridge_connected') and self.store.settings().get('advertise_project_tools', False))
-        prompt = make_prompt(task, dict(run, file_claims=claims) if claims else run, context, task['lease'], tools_available)
+        prompt_task = dict(task, prompt=task['prompt'] + PATCH_NOTE % (task['patch_worktree'], task.get('patch_branch', ''))) if task.get('patch_worktree') else task
+        prompt = make_prompt(prompt_task, dict(run, file_claims=claims) if claims else run, context, task['lease'], tools_available)
+        # I18: stable parts (request, memory, project, rules) go only once into each coworker chat.
+        full_chars = len(prompt)
+        prompt, sent_state = prompt_once.compact(worker, task, run, prompt,
+                                                 enabled=self.store.settings().get('prompt_send_once', True))
+        worker['prompt_sent'] = sent_state
+        if len(prompt) < full_chars:
+            self.store.event('prompt_compacted', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'],
+                             full_chars=full_chars, sent_chars=len(prompt))
+        self.store.put('workers', worker)
         # Committed together with task_started right after the submit.
         self.store.event('context_built', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'], attempt=task['attempts'],
                          context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt))
@@ -952,6 +1158,10 @@ class Engine:
                 task['requires_review']=bool(data.get('requires_review'))
                 task['error'] = data.get('summary', '') if task['state'] != 'done' else ''
             task['finished'] = time.time()
+            # Proof record: changed files in the write scope, reported tests, screenshot (proof.py, never raises).
+            task['proof'] = task_proof.record(task, text, self._project_root(run)) if task.get('proof_base') else task_proof.record(dict(task, id=''), text, None)
+            if task.get('patch_worktree') and task['state'] == 'done':
+                task['patch_state'] = 'waiting'  # tick() starts collect -> verify -> merge
             self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'])
         except ModelVerificationError as exc:
             failure=exc
@@ -1062,6 +1272,12 @@ class Engine:
                 checks=task.get('reconcile_checks',0)+1
                 task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
                             reconcile_checks=checks,reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))), error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                stored = self.store.get('tasks', task['id'], {}) or {}
+                if stored.get('awaiting_approval'):
+                    # Known cause: the turn is paused on an approval click, not lost. Say so plainly.
+                    task.update(awaiting_approval=stored['awaiting_approval'],
+                                error='Waiting for approval of ' + stored['awaiting_approval'] +
+                                      ' in the coworker chat; the request is not resent')
                 worker = self.store.get('workers', info['worker_id'])
                 worker['state'] = 'recovering'
                 self.store.put('workers', worker)
@@ -1217,6 +1433,10 @@ class Engine:
         tasks = self.tasks(run['id'])
         if not tasks:
             return
+        if run.get('operator') and run.get('quality') in ('standard', 'high') and run['state'] in ('executing', 'fixing'):
+            from .operator_roles import step  # review/fix stages; never a turn in the operator's chat
+            if step(self, run, tasks):
+                tasks = self.tasks(run['id'])
         if any(t['state'] in ('queued','retry','running','uncertain','cancelling') for t in tasks):
             return
         problems = [t for t in tasks if t['state'] in ('failed','blocked')]
@@ -1250,8 +1470,8 @@ class Engine:
                     # Operator runs end here: the operator's own chat reviews and integrates the reports.
                     # A finished task is accepted only when its answer ends with a line RESULT: DONE.
                     from .operator_main import result_done
-                    done = [t for t in tasks if t['state'] == 'done']
-                    unaccepted = [t for t in done if not result_done(t.get('result', ''))]
+                    done = [t for t in tasks if t['state'] == 'done' and t['role'] == 'executor' and not t.get('fixed_by')]
+                    unaccepted = [t for t in done if not result_done(t.get('result', '')) or t.get('agent_red_flag')]
                     run['unaccepted'] = [t['id'] for t in unaccepted]
                     summary = '%d delegated task(s) finished; %d accepted with RESULT: DONE' % (len(done), len(done) - len(unaccepted))
                     if unaccepted:

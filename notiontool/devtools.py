@@ -20,6 +20,40 @@ LIMIT = 60000
 BINARY = ('.exe', '.dll', '.pyd', '.png', '.jpg', '.jpeg', '.ico', '.zip', '.db', '.pyc', '.woff', '.woff2', '.gif', '.pdf')
 
 
+# nt_shell guard: Windows Defender flags long inline code in PowerShell commands (here-strings piped to
+# python, hidden cmd /c launches) as Trojan:Win32/Commando.A!ml. Such commands are rejected before running.
+SHELL_BLOCKED = ('Blocked: write files with nt_write_file and run tests with python -m pytest directly. '
+                 'Long inline code in shell commands triggers antivirus false alarms.')
+INLINE_MAX = 400  # characters of inline code a shell command may carry
+_HERE_OPEN = re.compile(r'@([\'"])[ \t]*\r?\n')
+_PY = r'py(?:thon[0-9.]*)?(?:\.exe)?'
+_PY_C = re.compile(r'(?<![\w-])' + _PY + r'[\'"]?\s+(?:-\w+\s+)*-c\b', re.I)
+_PY_PIPE = re.compile(r'\|\s*(?:&\s*)?[\'"]?(?:[^\s|;\'"]*[\\/])?' + _PY + r'[\'"]?\s+-(?=\s|$|[|;)])', re.I)
+_START = re.compile(r'\bStart-Process\b', re.I)
+_HIDDEN = re.compile(r'-WindowStyle\s+[\'"]?Hidden\b', re.I)
+_CMD_C = re.compile(r'\bcmd(?:\.exe)?\b[^;\n]*?(?<![\w./\\])/[ck]\b', re.I)
+_PS_CMD = re.compile(r'\b(?:powershell|pwsh)(?:\.exe)?\b.*?(?<![\w-])-(?:c|command|e|ec|enc|encodedcommand)\b', re.I | re.S)
+
+
+def shell_guard(command):
+    """Return SHELL_BLOCKED for command shapes antivirus flags as droppers, else None."""
+    c = str(command or '')
+    for m in _HERE_OPEN.finditer(c):
+        end = re.search(r'\r?\n' + m.group(1) + '@', c[m.end():])
+        body = c[m.end():m.end() + end.start()] if end else c[m.end():]
+        if len(body) > INLINE_MAX:
+            return SHELL_BLOCKED
+    m = _PY_C.search(c)
+    if m and len(c[m.end():].strip()) > INLINE_MAX:
+        return SHELL_BLOCKED
+    m = _PY_PIPE.search(c)
+    if m and len(c[:m.start()].strip()) > INLINE_MAX:
+        return SHELL_BLOCKED
+    if _START.search(c) and _HIDDEN.search(c) and (_CMD_C.search(c) or _PS_CMD.search(c)):
+        return SHELL_BLOCKED
+    return None
+
+
 def _schema(props, required=()):
     return {'type': 'object', 'properties': props, 'required': list(required)}
 
@@ -28,13 +62,13 @@ S = {'type': 'string'}; I = {'type': 'integer'}; B = {'type': 'boolean'}; N = {'
 RO = {'readOnlyHint': True, 'destructiveHint': False}
 RW = {'readOnlyHint': False, 'destructiveHint': True}
 TOOLS = [
-    {'name': 'nt_shell', 'description': 'Dev: run a PowerShell command on the owner PC (cwd defaults to the NotionTool app folder). Returns exit code, stdout, stderr (capped). Use for builds, tests, git, processes.', 'annotations': RW, 'inputSchema': _schema({'command': S, 'cwd': S, 'timeout': N}, ['command'])},
+    {'name': 'nt_shell', 'description': 'Dev: run a PowerShell command on the owner PC (cwd defaults to the NotionTool app folder). Returns exit code, stdout, stderr (capped). Use for builds, tests, git, processes. Files must be written with nt_write_file, never with inline code in the command: long here-strings, code piped into python and hidden cmd /c launches are blocked because they trigger antivirus false alarms.', 'annotations': RW, 'inputSchema': _schema({'command': S, 'cwd': S, 'timeout': N}, ['command'])},
     {'name': 'nt_read_file', 'description': 'Dev: read a text file with line numbers (relative paths are inside the app folder). Returns sha256 for safe writes.', 'annotations': RO, 'inputSchema': _schema({'path': S, 'offset': I, 'limit': I}, ['path'])},
     {'name': 'nt_write_file', 'description': 'Dev: create, overwrite or append a utf-8 text file. Pass expected_sha256 from nt_read_file to never overwrite newer changes. A backup is kept in work/backups.', 'annotations': RW, 'inputSchema': _schema({'path': S, 'content': S, 'expected_sha256': S, 'append': B}, ['path', 'content'])},
     {'name': 'nt_edit_file', 'description': 'Dev: replace exact text in a file. Fails without changes unless old_text occurs exactly count times (default 1). Backup kept.', 'annotations': RW, 'inputSchema': _schema({'path': S, 'old_text': S, 'new_text': S, 'count': I}, ['path', 'old_text', 'new_text'])},
     {'name': 'nt_list_dir', 'description': 'Dev: list a folder; recursive mode skips build, cache and data folders.', 'annotations': RO, 'inputSchema': _schema({'path': S, 'recursive': B, 'max_entries': I})},
     {'name': 'nt_search_code', 'description': 'Codebase: regex search over source files (glob filter like *.py). Returns path:line: text.', 'annotations': RO, 'inputSchema': _schema({'pattern': S, 'path': S, 'glob': S, 'ignore_case': B, 'max_results': I}, ['pattern'])},
-    {'name': 'nt_file_outline', 'description': 'Codebase: classes, functions and methods of a .py file, or functions and element ids of a .js/.html file, with line numbers.', 'annotations': RO, 'inputSchema': _schema({'path': S}, ['path'])},
+    {'name': 'nt_file_outline', 'description': 'Codebase: classes, functions and methods of a .py file, or functions and element ids of a .js/.html file, with line numbers.', 'annotations': RO, 'inputSchema': _schema({'path': S})},
     {'name': 'nt_memory_read', 'description': 'Project memory: read the durable notes of a project (default NotionTool): goals, architecture, decisions, status, open tasks. project="*" lists projects.', 'annotations': RO, 'inputSchema': _schema({'project': S})},
     {'name': 'nt_memory_update', 'description': 'Project memory: replace (or append to) one "## section" of a project memory file. Update after every significant change.', 'annotations': {'readOnlyHint': False, 'destructiveHint': False}, 'inputSchema': _schema({'project': S, 'section': S, 'content': S, 'append': B}, ['section', 'content'])},
     {'name': 'nt_restart_app', 'description': 'Dev: restart this NotionTool instance visibly after code changes. The MCP connection drops for about 15 s.', 'annotations': RW, 'inputSchema': _schema({})},
@@ -98,6 +132,9 @@ def _rel(f):
 def call(name, args):
     args = args or {}
     if name == 'nt_shell':
+        blocked = shell_guard(args.get('command'))
+        if blocked:
+            raise ValueError(blocked)
         timeout = min(float(args.get('timeout') or 120), 1800)
         cwd = _path(args.get('cwd') or '.')
         if os.name == 'nt':

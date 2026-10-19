@@ -254,9 +254,29 @@ class Application:
                             return self.response(200,{'tasks':task_metrics(app.store,query.get('run_id',[''])[0] or None)})
                         if method=='GET' and path=='/api/coordination':
                             return self.response(200,app.engine.coordination())
+                        if method=='GET' and path=='/api/backup':
+                            from .backup import status as backup_status
+                            return self.response(200,backup_status(app.data_dir or app.store.directory))
+                        if method=='POST' and path=='/api/backup/now':
+                            from .backup import backup_now
+                            return self.response(200,backup_now(app.data_dir or app.store.directory,app.store,reason='manual'))
+                        if method=='GET' and path=='/api/patch':
+                            return self.response(200,app.engine.patch_status())
+                        if method=='GET' and path=='/api/usage':
+                            from .backup import usage_report
+                            return self.response(200,usage_report(app.store))
                         if method=='GET' and path=='/api/report':
                             task = app.store.get('tasks',query.get('id',[''])[0])
                             return self.response(200,{'task':app.safe_task(task),'result':task['result'],'partial':task.get('raw_response') or task.get('partial','')})
+                        if method=='GET' and (path=='/api/notes' or path.startswith('/api/notes/')):
+                            from .notes_routes import http_route as notes_http_route
+                            return self.response(*notes_http_route(app,path,query))
+                        if method=='GET' and path=='/api/history/search':
+                            from . import templates  # Live History search over all runs and tasks, limit 50
+                            return self.response(200,templates.http_search(app,query))
+                        if method=='POST' and path=='/api/ui/error':
+                            from . import problems  # Live view problem inbox: overlay errors, deduped and rate limited
+                            return self.response(200,problems.handle(app,self.read_body()))
                         if method=='POST' and path=='/api/run/confirm':
                             return self.response(*app.confirm_run_request(self.read_body()))
                         if method=='POST' and path=='/api/run/retry':
@@ -327,6 +347,8 @@ class Application:
         self.prune_handoffs()  # once at start; sweep_main_archives repeats it every 60 s
         threading.Thread(target=self.sweep_main_archives,daemon=True,name='main-archive-sweep').start()
         threading.Thread(target=self.sweep_main_switches,daemon=True,name='main-switch-sweep').start()
+        from .backup import daily_loop  # one backup per day in data/backups (backup.py)
+        threading.Thread(target=daily_loop,args=(self.data_dir or self.store.directory,self.store,self.engine.stop_event),daemon=True,name='daily-backup').start()
         self.updater = Updater(self)
         self.updater.start()
         if self.store.settings().get('ui_mode','classic')=='notion':
@@ -334,6 +356,12 @@ class Application:
             threading.Thread(target=self.start_notion_shell,daemon=True,name='notion-shell').start()
         try:
             # NotionTool desktop app (docs/DESKTOP_APP.md): opens only when app_autostart is on.
+            from . import restart_guard
+            restart_guard.install_desk_actions()  # overlay actions app_restart, app_restart_status, app_health
+            from . import problems
+            problems.install_desk_actions()  # overlay action ui_error (Live view Problems)
+            from . import templates
+            templates.install_desk_actions()  # overlay actions request_templates, request_draft, history_search
             from .desktop_shell import DesktopController
             self.desktop = DesktopController(self)
             self.desktop.autostart()
@@ -464,6 +492,8 @@ class Application:
         return shell
 
     def close(self):
+        from .backup import before_restart
+        before_restart(self)  # backup before every stop, restart and update; never raises
         if getattr(self, 'desktop', None) is not None:
             try:self.desktop.stop(close_window=False)
             except Exception:pass
@@ -1083,6 +1113,8 @@ class Application:
                     settings['host_api_port'] = max(0,min(65535,int(body['host_api_port'])))
                 if 'host_api_allow_network' in body:
                     settings['host_api_allow_network'] = str(body['host_api_allow_network']).lower() in ('true','1','on','yes')
+                if 'patch_mode' in body:  # Work in parallel copies (patch_mode.py); default on
+                    settings['patch_mode'] = str(body['patch_mode']).lower() in ('true','1','on','yes')
                 if 'host_api_bind' in body:
                     settings['host_api_bind'] = str(body['host_api_bind']).strip()[:64] or '127.0.0.1'
                 if 'coworker_fresh_context' in body:
@@ -1148,9 +1180,19 @@ class Application:
             # The chosen account's Main is loaded (created once if missing); nothing is deleted.
             self.job_once('Load Main chat and MCP', lambda: self.prepare_account(account_id), 'main:'+account_id)
             return result
+        if path=='/api/app/restart':
+            # Safe restart (restart_guard.py): 'idle' waits for running tasks, 'now' restarts right away.
+            from . import restart_guard
+            return restart_guard.handle(self,body)
         if path in ('/api/app/start','/api/app/stop','/api/app/status','/api/app/settings'):
             # NotionTool desktop app lifecycle (desktop_shell.DesktopController).
             from . import desktop_shell
+            from . import restart_guard
+            restart_guard.install_desk_actions()
+            from . import problems
+            problems.install_desk_actions()  # overlay action ui_error (Live view Problems)
+            from . import templates
+            templates.install_desk_actions()  # overlay actions request_templates, request_draft, history_search
             if getattr(self,'desktop',None) is None:
                 self.desktop = desktop_shell.DesktopController(self)
             if path=='/api/app/start':

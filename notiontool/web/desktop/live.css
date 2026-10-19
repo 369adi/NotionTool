@@ -49,6 +49,10 @@
   border-left: 3px solid var(--nt-warning, #f59e0b);
 }
 .nt-desk-lv-need-text { flex: 1; margin: 0; }
+.nt-desk-lv-problem { flex-direction: column; align-items: stretch; }
+.nt-desk-lv-problem-todo { margin: 2px 0 0; opacity: 0.8; }
+.nt-desk-lv-problem-foot { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 4px; }
+.nt-desk-lv-problem-foot .nt-desk-lv-time { margin-right: auto; }
 
 /* Buttons */
 .nt-desk-lv-btn {
@@ -180,3 +184,10 @@ body > .nt-desk-live-pill { position: fixed; right: 14px; bottom: 14px; z-index:
 @media (prefers-reduced-motion: reduce) {
   .nt-desk-live, .nt-desk-lv-bar-fill, .nt-desk-lv-btn { transition: none; }
 }
+
+/* Proof in task details (proof.py record: files, tests, screenshot) */
+.nt-desk-lv-proof-lines { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.nt-desk-lv-proof-line { word-break: break-word; }
+.nt-desk-lv-proof-pass { color: var(--nt-green, #2e9b5f); }
+.nt-desk-lv-proof-fail { color: var(--nt-red, #d64545); }
+.nt-desk-lv-proof-none { color: var(--nt-muted, #8a90a2); }

@@ -66,7 +66,7 @@ html.nt-theme:not(.nt-desk-off) .notion-dark-theme {
   --ca-borSecTra: rgba(255, 255, 255, .06);  /* was rgba(255,255,243,.082) */
   --c-texPri: #eef0f6;                       /* was #f0efed: cooler, high contrast */
   --c-texSec: #a9afc2;                       /* was #ada9a3 */
-  --c-texTer: #7f869b;                       /* was #7d7a75 */
+  --c-texTer: #8c93a8;                       /* was #7d7a75: readable secondary text */
   --ca-sidIteSelBac: rgba(124, 92, 255, .18);/* was rgba(255,255,255,.055): selected sidebar item */
   --ca-sidSecBac: transparent;               /* was rgba(0,0,0,.024) */
   --ca-butHovBac: rgba(124, 92, 255, .12);   /* was rgba(255,255,255,.055) */
@@ -242,10 +242,6 @@ html.nt-theme:not(.nt-desk-off) [role="option"]:hover,
 html.nt-theme:not(.nt-desk-off) [role="tab"]:hover {
   background-color: var(--nt-hover);
 }
-html.nt-theme:not(.nt-desk-off) [role="button"]:hover,
-html.nt-theme:not(.nt-desk-off) button:hover {
-  box-shadow: 0 0 0 1px rgba(124, 92, 255, .28), 0 0 16px rgba(124, 92, 255, .22);
-}
 html.nt-theme:not(.nt-desk-off) [role="option"][aria-selected="true"],
 html.nt-theme:not(.nt-desk-off) [role="tab"][aria-selected="true"],
 html.nt-theme:not(.nt-desk-off) [role="menuitem"][aria-checked="true"] {
@@ -405,13 +401,13 @@ html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] {
 html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container]::before {
   content: '';
   position: absolute;
-  inset: -10px 8px -6px 8px;
+  inset: 4px 16px 2px 16px;              /* stays inside the composer box: no bleed */
   z-index: -1;
   border-radius: 22px;
   background: linear-gradient(120deg, rgba(124, 92, 255, .32), rgba(34, 211, 238, .22), rgba(124, 92, 255, .32));
   background-size: 220% 220%;
-  filter: blur(22px);
-  opacity: .55;
+  filter: blur(14px);
+  opacity: .35;
   pointer-events: none;
   animation: nt-desk-composer-glow 9s ease-in-out infinite;
 }
@@ -429,8 +425,8 @@ html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] > div:focus-w
 }
 html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] [role="textbox"] { background: transparent !important; }
 @keyframes nt-desk-composer-glow {
-  0%, 100% { background-position: 0% 50%; opacity: .45; }
-  50% { background-position: 100% 50%; opacity: .7; }
+  0%, 100% { background-position: 0% 50%; opacity: .25; }
+  50% { background-position: 100% 50%; opacity: .4; }
 }
 
 /* ---- (3) rebrand: breadcrumb 'Notion AI' -> 'NotionTool', workspace switcher chip ------ */
@@ -483,27 +479,24 @@ html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"] {
 html.nt-theme:not(.nt-desk-off) .notion-collection-item:hover,
 html.nt-theme:not(.nt-desk-off) .notion-selectable.notion-page-block:hover,
 html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"]:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, .35), 0 0 0 1px rgba(124, 92, 255, .18);
+  background-color: var(--nt-hover);
 }
 
 /* ---- (5) messages ------------------------------------------------------------------------- */
-/* User message bubble (live DOM: bg #181c26, 1px border) gets a gradient border. */
+/* User message bubble (live DOM: bg #181c26, 1px border): calm raised surface, faint accent edge. */
 html.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] > div > div > div > div[style*="min-height: 40px"] {
-  border: 1px solid transparent !important;
-  background: linear-gradient(var(--nt-raised), var(--nt-raised)) padding-box,
-    var(--nt-accent-gradient) border-box !important;
-  box-shadow: 0 6px 22px rgba(124, 92, 255, .16), 0 2px 8px rgba(0, 0, 0, .35) !important;
+  border: 1px solid rgba(124, 92, 255, .22) !important;
+  background: var(--nt-raised) !important;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .28) !important;
 }
 /* Assistant answer (content root wrapper [data-active-edit-reference-id]): raised panel, accent line. */
 html.nt-theme:not(.nt-desk-off) .layout-chat [data-active-edit-reference-id] {
-  background: rgba(24, 28, 38, .55);
+  background: rgba(24, 28, 38, .38);
   border: 1px solid rgba(255, 255, 255, .05);
-  border-left: 3px solid transparent;
   border-image: none;
   border-radius: var(--nt-radius);
-  box-shadow: inset 3px 0 0 var(--nt-accent-from), inset 4px 0 12px -6px var(--nt-accent-to);
-  padding: 6px 12px 6px 14px;
+  box-shadow: none;
+  padding: 8px 14px;
 }
 html.nt-theme:not(.nt-desk-off) .layout-chat .notion-inline-code-container > span {
   color: #9ff0ff !important;
@@ -518,21 +511,58 @@ html.nt-theme:not(.nt-desk-off) .nt-desk-steps {
   align-items: center;
   padding: 1px 10px !important;
   border-radius: 999px;
-  background: var(--nt-accent-soft);
-  border: 1px solid rgba(124, 92, 255, .35);
-  color: #d9d2ff !important;
+  background: rgba(255, 255, 255, .05);
+  border: 1px solid rgba(255, 255, 255, .08);
+  color: var(--c-texSec) !important;
   font-size: 12px !important;
   font-weight: 600;
   letter-spacing: .01em;
   transition: background-color var(--nt-transition), border-color var(--nt-transition);
 }
 html.nt-theme:not(.nt-desk-off) [role="button"]:hover > .nt-desk-steps {
-  background: rgba(124, 92, 255, .26);
-  border-color: rgba(34, 211, 238, .5);
+  background: rgba(124, 92, 255, .14);
+  border-color: rgba(124, 92, 255, .3);
 }
 
 @media (prefers-reduced-motion: reduce) {
   html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container]::before { animation: none; }
   html.nt-theme:not(.nt-desk-off) .notion-collection-item:hover,
   html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"]:hover { transform: none; }
+}
+/* ---- (6) tool groups: consecutive tool-call rows of one answer folded into 'N tool steps' -----
+ * theme.js marks the first row .nt-desk-toolgroup-head (count in data-nt-tool-count) and the other
+ * rows .nt-desk-toolgroup-member; .nt-desk-toolgroup-open shows all rows. Rows are hidden by
+ * class only, never removed. */
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-member:not(.nt-desk-toolgroup-open) {
+  display: none !important;
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head:not(.nt-desk-toolgroup-open) > * {
+  display: none !important;
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head::before {
+  content: '\25B8\00a0\00a0' attr(data-nt-tool-count) ' tool steps';
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  width: max-content;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .04);
+  border: 1px solid rgba(255, 255, 255, .07);
+  color: var(--c-texSec);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 26px;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--nt-transition), border-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head:hover::before {
+  background: rgba(124, 92, 255, .10);
+  border-color: rgba(124, 92, 255, .25);
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head.nt-desk-toolgroup-open::before {
+  content: '\25BE\00a0\00a0' attr(data-nt-tool-count) ' tool steps';
+  margin-bottom: 4px;
 }

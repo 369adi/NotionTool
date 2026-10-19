@@ -66,7 +66,7 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(adapter.clear_account_pause('a'))
         self.assertFalse(adapter.network_budget.status()['paused'])
     def test_exactly_five_welcome_workers_and_one_welcome_main(self):
-        adapter=self.adapter();result=adapter.ensure_team('a')
+        adapter=self.adapter();result=adapter.ensure_team('a', create_main=True)
         self.assertEqual(result['welcome_chats'],6)
         self.assertEqual(len(self.client.created),6)
         self.assertTrue(all(b['agentMessageKey']=='unboxing_m5' for b in self.client.created))
@@ -77,7 +77,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(sum(w['purpose']=='main' and w['label']=='Main' for w in workers),1)
         self.assertEqual(len(self.store.all('chats')),1)
     def test_team_setup_is_idempotent(self):
-        adapter=self.adapter();adapter.ensure_team('a');adapter.ensure_team('a')
+        adapter=self.adapter();adapter.ensure_team('a', create_main=True);adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created),6)
         self.assertEqual(len(self.store.all('chats')),1)
 
@@ -114,7 +114,7 @@ class NativeTests(unittest.TestCase):
         adapter=self.adapter()
         account=self.store.get('accounts','a');account['team_threads']={'main':{'id':'440869f1-58c1-81c8-b3d1-0003ec9a0dfc','pending':True}}
         self.store.put('accounts',account)
-        with self.assertRaisesRegex(ValueError,'unconfirmed'):adapter.ensure_team('a')
+        with self.assertRaisesRegex(ValueError,'unconfirmed'):adapter.ensure_team('a', create_main=True)
         self.assertFalse(self.client.created)
 
     def test_malformed_welcome_creation_stays_pending_without_rename_or_resend(self):
@@ -123,12 +123,12 @@ class NativeTests(unittest.TestCase):
         self.client.stream=Mock(return_value=iter(['[']))
         self.client.call=Mock(side_effect=AssertionError('No rename or settings write allowed'))
         with self.assertRaisesRegex(ValueError, 'unconfirmed'):
-            adapter.ensure_team('a')
+            adapter.ensure_team('a', create_main=True)
         ledger=self.store.get('accounts','a')['team_threads']
         self.assertEqual(list(ledger), ['main'])
         self.assertTrue(ledger['main']['pending'])
         with self.assertRaisesRegex(ValueError, 'unconfirmed'):
-            adapter.ensure_team('a')
+            adapter.ensure_team('a', create_main=True)
         self.client.stream.assert_called_once()
         self.client.call.assert_not_called()
 
@@ -137,7 +137,7 @@ class NativeTests(unittest.TestCase):
         adapter=self.adapter()
         self.client.stream=Mock(return_value=iter([]))
         with self.assertRaisesRegex(ValueError, 'unconfirmed'):
-            adapter.ensure_team('a')
+            adapter.ensure_team('a', create_main=True)
         self.assertTrue(self.store.get('accounts','a')['team_threads']['main']['pending'])
 
     def test_admin_disabled_ai_blocks_welcome_before_any_submission(self):
@@ -145,7 +145,7 @@ class NativeTests(unittest.TestCase):
         self.client.info['records']={'space':{self.client.info['space_id']:{'value':{
             'settings':{'enable_ai_feature':False,'disable_ai_feature':True,'notion_admin_disabled_ai_feature':True}}}}}
         with self.assertRaisesRegex(ValueError,'AI is disabled'):
-            adapter.ensure_team('a')
+            adapter.ensure_team('a', create_main=True)
         self.assertFalse(self.client.created)
         self.assertNotIn('team_threads',self.store.get('accounts','a'))
         self.assertEqual(self.store.get('accounts','a')['state'],'ai_disabled')
@@ -171,7 +171,7 @@ class NativeTests(unittest.TestCase):
         ident='440869f1-58c1-81c8-b3d1-0003ec9a0dfc'
         account=self.store.get('accounts','a');account['team_threads']={'main':{'id':ident,'pending':True}}
         self.store.put('accounts',account);self.client.titles[ident]='Welcome to Notion'
-        adapter.ensure_team('a')
+        adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created),5)
         self.assertEqual(self.client.titles[ident],'Main')
     def test_opus_unavailable_is_not_silently_substituted(self):

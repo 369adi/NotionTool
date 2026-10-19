@@ -18,10 +18,12 @@ import types
 
 from . import handoff_files
 from . import main_handoff as mh
+from .agent_guard import GUARD_RULE
 from .cowork_names import is_pool_title
 
 PROTECTED_TITLES = ('NotionTool', 'Sonstiges', 'Studio432', 'Roblox')
 ARCHIVE_PREFIX = 'Main (Archive '
+OLD_OPERATOR_PREFIX = 'Main (old, '  # main_switch.OLD_TITLE: old operator Main after a switch (never auto-deleted)
 PROMPTS = 'main_handoff_prompts'
 WELCOMES = 'main_handoff_welcomes'
 MAX_STEPS = 24
@@ -34,7 +36,7 @@ OPERATOR_CANDIDATE = 'operator_candidate'  # switch Welcome worker before the ac
 SWITCH_FILE_PREFIX = 'switch_'             # own handoff file per switch; never main_<account>
 OPERATOR_FIRST_LINES = ('You are the new Main (operator) of NotionTool.\n'
                         'Read the brief file %s and project-memory\\NotionTool.md with the NotionTool '
-                        'read_file tool; answer with the check word (the ack token below).\n')
+                        'read_file tool; answer with the check word (the ack token below).\n' + GUARD_RULE + '\n')
 
 
 def is_protected(title):
@@ -318,7 +320,7 @@ class MainHandoffOps:
             elif not (current.startswith('Main') or is_pool_title(current) or current.lower().startswith('welcome')):
                 reason = 'old Main has a custom title'
         elif self.operator and self._old_operator_of_switch(chat_id):
-            if not str(title).startswith(ARCHIVE_PREFIX):
+            if not str(title).startswith((ARCHIVE_PREFIX, OLD_OPERATOR_PREFIX)):
                 reason = 'old operator Main may only get an archive title'
         else:
             reason = 'not our Welcome chat or Main archive'

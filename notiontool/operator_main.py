@@ -2,8 +2,11 @@
 
 The harness never writes into the operator's thread. Its worker gets purpose 'operator'
 (never Main, never Coworker, never re-enabled by the pool rules), and operator runs have no
-planner, reviewer or integrator turn: the operator reads the reports itself
+planner or integrator turn: the operator reads the reports itself
 (GET /api/run?id=<run>, GET /api/report?id=<task>) and integrates them in its own chat.
+A run's quality ('fast' | 'standard' | 'high', operator_roles.choose_quality) adds Coworker stages:
+standard and high review every build on a different Coworker and fix it (max 2 rounds); high starts
+with one read-only design/approach task that every build depends on.
 """
 import json
 import re
@@ -157,24 +160,32 @@ def run_outcome(run):
 
 
 def _summary(engine, run, duplicate=False, warnings=None):
+    from .operator_roles import run_stage, stage_of
+    own = engine.tasks(run['id'])
     tasks = [dict(id=t['id'], title=t.get('title', ''), summary=plain_task_summary(t), state=t.get('state', ''),
-                  worker_id=t.get('worker_id', ''))
-             for t in engine.tasks(run['id'])]
+                  worker_id=t.get('worker_id', ''), stage=stage_of(t))
+             for t in own]
     return dict(ok=True, run_id=run['id'], state=run.get('state', ''), chat_id=run['chat_id'], tasks=tasks,
+                quality=run.get('quality', 'fast'), stage=run.get('stage') or run_stage(own),
                 duplicate=duplicate, warnings=list(warnings or []))
 
 
-def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary=''):
+def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality=''):
     """Queue the operator's own plan as executor tasks for the Coworkers; no Main turn is ever sent.
 
     tasks use the planner contract: id, title, prompt, acceptance, optional depends_on, files,
     model, role (specialty) and task_class, plus an optional plain-language 'summary' sentence per task
     and for the whole request (shown in the Live view). use_main is always forced off.
+    quality ('fast' | 'standard' | 'high', also accepted as a task field) is chosen automatically when empty.
     """
     store = engine.store
     goal = str(goal or '').strip()
     if not isinstance(tasks, list) or not tasks or not all(isinstance(t, dict) for t in tasks):
         raise ValueError('tasks must be a non-empty list of task objects')
+    from .operator_roles import choose_quality, design_prompt, is_ui
+    quality = quality or next((t['quality'] for t in tasks if t.get('quality')), '')
+    tasks = [{k: v for k, v in t.items() if k != 'quality'} for t in tasks]
+    quality, quality_reason = choose_quality(goal, tasks, quality)
     plan = {'tasks': [dict(t, use_main=False, **({'prompt': _with_result_line(t['prompt'])} if 'prompt' in t else {}))
                       for t in tasks]}
     validate_plan(plan, max_tasks=MAX_DELEGATED_TASKS)
@@ -206,7 +217,8 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary=''):
                    fixes=0, summary='', error='', request_id=request_id, operator=True, harness=True,
                    model_routing=False, goal_summary=clean_summary(summary),
                    allocation=dict(mode='operator', budget=capacity, advisers=0,
-                                   reason='Operator Main delegates directly to Coworkers'))
+                                   reason='Operator Main delegates directly to Coworkers'),
+                   quality=quality, quality_reason=quality_reason)
         run['worker_budget'] = max(1, min(capacity, parallel_width(plan['tasks'])))
         engine._import_plan(run, plan)  # checks every planned file path before any task is queued
         created = [t for t in engine.tasks(run['id']) if t.get('role') == 'executor']
@@ -215,6 +227,17 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary=''):
             if text and task.get('title') == spec['title']:
                 task['summary'] = text
                 store.put('tasks', task)
+        if quality == 'high':
+            ui = is_ui(goal, plan['tasks'])
+            design = engine.add_task(run, 'architect', design_prompt(goal, plan['tasks'], ui),
+                                     'Design: visual spec' if ui else 'Design: approach',
+                                     specialty='designer' if ui else 'architect')
+            design.update(stage_role='design', read_only=True)  # no files: holds no lock
+            store.put('tasks', design)
+            for task in created:
+                task['deps'] = list(task['deps']) + [design['id']]  # its result is injected via the deps context
+                store.put('tasks', task)
+        run['stage'] = 'Designing' if quality == 'high' else 'Building'
         store.put('runs', run)
         store.message(chat['id'], 'user', goal, run['id'])
         store.event('run_created', run['id'], message='Operator delegated %d task(s)' % len(plan['tasks']))

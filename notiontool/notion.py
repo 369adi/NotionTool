@@ -20,6 +20,16 @@ from .model_verification import verify_execution,ModelVerificationError,turn_sta
 from .telemetry import http_class
 
 
+def pending_tool_label(entity):
+    """Readable name of a tool call that waits for approval (e.g. 'nt_write_file')."""
+    payload = entity.get('payload') or {}
+    if payload.get('tool_name'):
+        return str(payload['tool_name'])[:80]
+    text = json.dumps(entity.get('text') or '', ensure_ascii=False)
+    match = re.search(r'nt_[a-z_]+', text)
+    return match.group(0) if match else str(entity.get('name') or 'a tool call')[:80]
+
+
 class ThreadMissing(ValueError):
     """Notion answered HTTP 404 for a worker thread (the chat was deleted)."""
     def __init__(self, thread_id, path=''):
@@ -31,6 +41,10 @@ class ThreadMissing(ValueError):
 
 class ChatListUnavailable(ValueError):
     """The Notion chat list could not be read. Never treat it as an empty list: postpone or report, never create."""
+
+
+class MainMissing(ValueError):
+    """No usable Main or operator Main, and the user did not ask to create one (create_main=False)."""
 
 
 # Calls that address one worker thread; HTTP 404 there means the thread is gone.
@@ -566,7 +580,8 @@ class NotionAdapter:
         account = self.store.get('accounts', account_id)
         workers = [w for w in self.store.all('workers') if w['account_id'] == account_id and w.get('state') != 'missing']
         ledger = account.get('team_threads') or {}
-        main = pick_main(workers, (ledger.get('main') or {}).get('id', ''))
+        # A reachable operator Main is the account's single Main: no pool chat is promoted next to it.
+        main = None if self.operator_main(account_id) else pick_main(workers, (ledger.get('main') or {}).get('id', ''))
         if main and (main.get('purpose') != 'main' or not main.get('enabled')):
             main.update(purpose='main', enabled=True, welcome=True)
             self.store.put('workers', main)
@@ -643,8 +658,10 @@ class NotionAdapter:
         clean = not failed and not any(isinstance(s, dict) and s.get('type') == 'error' for s in steps)
         return listed, clean
 
-    def ensure_main(self, account_id):
-        """Load the account's Main (title Main or Main Chat); create one Welcome chat named Main only if none exists."""
+    def ensure_main(self, account_id, create=True):
+        """Load the account's Main (title Main or Main Chat); create one Welcome chat named Main only if none exists.
+
+        create=False never creates: without a usable Main it raises (team setup passes the user's create_main)."""
         from .chat_pool import MAIN_TITLE
         self.refresh(account_id)
         chat = self.ensure_main_chat(account_id)
@@ -664,6 +681,9 @@ class NotionAdapter:
             tid = item['id']
         elif item.get('pending'):
             raise ValueError('A previous Main creation is unconfirmed. Refresh the account before creating again.')
+        elif not create:
+            raise MainMissing('No usable Main or operator Main on this account; no Main was created. '
+                              'Create one only on purpose (create_main=true).')
         else:
             model = client.model()
             tid = self.new_id(client.info['space_id'], '00a9')
@@ -824,18 +844,54 @@ class NotionAdapter:
                 raise ValueError('Notion did not confirm the selected explicit model; no inference submitted')
         return {'model': model, 'explicit': True, 'corrected': len(changed)}
 
-    def ensure_team(self,account_id):
+    def operator_main(self, account_id, known=None):
+        """The account's reachable operator Main worker, else None.
+
+        Operator Main = purpose 'operator', or a 'main' worker whose thread is the operator chat's thread.
+        known: thread ids in Notion's chat list (reachability); None skips that check."""
+        workers = [w for w in self.store.all('workers') if w.get('account_id') == account_id
+                   and w.get('state') != 'missing' and w.get('join_state') != 'released']
+        operator_threads = set()
+        for chat in self.store.all('chats'):
+            if chat.get('operator') and chat.get('state') != 'released' and chat.get('main_worker'):
+                owner = self.store.get('workers', chat['main_worker']) or {}
+                if owner.get('account_id') == account_id and owner.get('thread_id'):
+                    operator_threads.add(owner['thread_id'])
+        for worker in workers:
+            if worker.get('purpose') == 'operator' or (worker.get('purpose') == 'main' and worker.get('thread_id') in operator_threads):
+                if known is None or worker.get('thread_id') in known:
+                    return worker
+        return None
+
+    def ensure_team(self,account_id,create_main=False):
         """Idempotent desired team: one Main and N Welcome Coworkers (team_size.py, from the settings).
 
+        A reachable operator Main counts as the Main: no Main is created and the ledger 'main' points at
+        the operator thread. Without any usable Main, a new one is created only when create_main=True.
         Spare joined/pending pool chats fill empty roles first; nothing is created twice. Roles above N
         stay in the ledger untouched (never deleted). Coworkers are renamed only after joining."""
         from .team_size import team_roles
-        self.ensure_main(account_id)
         client=self.client(account_id)
+        known={self.thread_key(t) for t in client.threads() if self.thread_key(t)}
+        operator=self.operator_main(account_id,known)
+        if operator:
+            # A reachable operator Main is the Main: never create one, point the ledger at it.
+            account=self.store.get('accounts',account_id)
+            ledger=account.get('team_threads') or {}
+            if (ledger.get('main') or {}).get('id')!=operator['thread_id'] or (ledger.get('main') or {}).get('pending'):
+                ledger['main']={'id':operator['thread_id'],'pending':False}
+                account['team_threads']=ledger
+                self.store.put('accounts',account)
+                self.store.event('team_setup',message='Ledger Main points at the operator Main; no Main created',slot=account.get('slot'))
+        else:
+            try:
+                self.ensure_main(account_id,create=bool(create_main))
+            except MainMissing as exc:
+                # No Main without the user's explicit create_main=true; Coworkers are still filled.
+                self.store.event('team_setup',message=str(exc),slot=(self.store.get('accounts',account_id) or {}).get('slot'))
         model=client.model()
         account=self.store.get('accounts',account_id)
         ledger=account.get('team_threads') or {}
-        known={self.thread_key(t) for t in client.threads() if self.thread_key(t)}
         roles=team_roles(self.store.settings())
         # Existing pool chats fill empty slots first; nothing is created twice.
         taken={(item or {}).get('id') for item in ledger.values()}
@@ -1135,8 +1191,28 @@ class NotionAdapter:
         if completed and not text:
             # Notion may have ended this turn with an error step and no reply (confirmed retry).
             self.confirm_turn_error(worker,task)
+        self.note_pending_interaction(task, own_turn)
         # A timeout is not evidence that the server didn't accept the POST.
         raise PendingRemote()
+
+    def note_pending_interaction(self, task, own_turn):
+        """Record when the turn is paused on a tool call that waits for an approval click in the chat.
+
+        Notion ends the stream and keeps the turn open until someone approves; without this the task
+        looked like an unconfirmed completion and silently blocked its run.
+        """
+        pending = [e for e in own_turn if e.get('interaction_status') == 'pending']
+        if not pending:
+            return None
+        entity = max(pending, key=lambda e: e.get('sequence', 0))
+        label = pending_tool_label(entity)
+        stored = self.store.get('tasks', task.get('id', ''), {}) or {}
+        if stored.get('awaiting_approval') != label:
+            self.mark_task(task['id'], awaiting_approval=label, awaiting_approval_at=time.time())
+            self.store.event('turn_awaiting_approval', task.get('run_id', ''), task_id=task.get('id', ''),
+                             tool=label, message='The coworker chat waits for an approval of ' + label +
+                             '; approve it in that Notion chat. The request is not resent.')
+        return label
 
     def turn_failed(self, task, error):
         """Notion recorded our turn as failed before any output: record it and retry after a cooldown."""
@@ -1380,6 +1456,33 @@ class NotionAdapter:
         self.store.put('accounts', account)
         return {'account_id': account_id, 'removed_defaults': removed}
 
+    BACKUP_MCP_NAMES = ('MCP Test',)
+
+    def ensure_backup_autorun(self, client, records, skip=''):
+        """Backup MCP servers (used when a NotionTool request times out) run read and write tools automatically.
+
+        A backup left on 'always ask' pauses the Coworker turn on an approval click that never comes: the stream
+        ends, the turn stays open and the task ends up unconfirmed (root cause found 2026-10-19).
+        Idempotent: only modules whose permissions differ are changed. Returns the changed module ids."""
+        names = {n.lower() for n in ((self.store.get('settings', 'app') or {}).get('backup_mcp_names') or self.BACKUP_MCP_NAMES)}
+        changed = []
+        for ident, value in (records or {}).items():
+            data = value.get('data') or {}
+            label = str(data.get('name') or value.get('name') or '').strip().lower()
+            if ident == skip or not value.get('alive', True) or label not in names:
+                continue
+            if data.get('runReadToolsAutomatically') is True and data.get('runWriteToolsAutomatically') is True:
+                continue
+            self.transaction(client, 'mcpServerSettings.updateToolPermissions', [
+                {'pointer': {'table': 'workflow_module', 'id': ident, 'spaceId': client.info['space_id']},
+                 'path': ['data', key], 'command': 'set', 'args': True}
+                for key in ('runReadToolsAutomatically', 'runWriteToolsAutomatically')])
+            changed.append(ident)
+        if changed:
+            self.store.event('backup_mcp_autorun_set', modules=len(changed),
+                             message='Backup MCP tools now run automatically (no approval pause)')
+        return changed
+
     def connect_bridge(self, account_id, url, token, name='NotionTool', read_auto=True, write_auto=True, registry_id=''):
         if not url.startswith('https://'):
             raise ValueError('Notion requires a reachable public HTTPS MCP URL')
@@ -1427,6 +1530,7 @@ class NotionAdapter:
                 {'pointer':{'table':'workflow_module','id':integration,'spaceId':client.info['space_id']},
                  'path':['data',key],'command':'set','args':value} for key,value in
                  (('runReadToolsAutomatically',read_auto),('runWriteToolsAutomatically',write_auto))])
+        self.ensure_backup_autorun(client, records, skip=integration)
         account = self.store.get('accounts',account_id)
         if registry_id:
             connections=account.setdefault('mcp_connections',{})

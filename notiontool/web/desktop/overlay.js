@@ -217,21 +217,77 @@
     return hours < 1 ? Math.max(1, Math.floor(hours * 60)) + 'm' : Math.floor(hours) + 'h';
   }
 
+  var MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  // created_at of a worker (team_rotation.py: epoch seconds), else derived from age_s; 0 when unknown.
+  function createdOf(w, now) {
+    var c = seconds(w && w.created_at);
+    if (c) return c;
+    var age = w && w.age_s != null ? Number(w.age_s) : NaN;
+    return isFinite(age) && age >= 0 ? (seconds(now) || Date.now() / 1000) - age : 0;
+  }
+
+  // 'Created 19 Oct 12:04 - 16h old' in local time; '' when the creation time is unknown.
+  function createdText(created, now) {
+    var c = seconds(created);
+    var hours = ageHours(c, now);
+    if (!c || hours < 0) return '';
+    var d = new Date(c * 1000);
+    return 'Created ' + d.getDate() + ' ' + MONTHS_SHORT[d.getMonth()] + ' ' + pad2(d.getHours()) + ':' +
+      pad2(d.getMinutes()) + ' - ' + ageLabel(hours) + ' old';
+  }
+
+  function workerBusy(w) {
+    return !!(w && (w.task_title || BUSY_WORKER_STATES.indexOf(String(w.state || '').toLowerCase()) >= 0));
+  }
+
+  // Age badge of one coworker chat: { text, level ('ok' | 'amber' | 'red'), title, created, rotating };
+  // null while the creation time is unknown. Red and busy: 'rotating soon' (a fresh chat takes over).
+  function ageBadge(w, now) {
+    var c = createdOf(w, now);
+    var hours = ageHours(c, now);
+    if (!c || hours < 0) return null;
+    var level = ageClass(hours);
+    var rotating = level === 'red' && workerBusy(w);
+    var created = createdText(c, now);
+    var note = rotating ? ' - rotating soon: a fresh chat takes over after this task'
+      : (level === 'red' ? ' - a fresh chat takes over soon' : '');
+    return { text: ageLabel(hours) + (rotating ? ' - rotating soon' : ''), level: level, title: created + note,
+      created: created, rotating: rotating };
+  }
+
+  // Thread key -> age badge for every coworker chat (purpose 'worker'). Mains are never in this map.
+  function coworkerAges(state) {
+    var out = {};
+    var now = state && state.ts;
+    list(state && state.workers).forEach(function (w) {
+      if (!w || w.purpose !== 'worker' || !w.thread_id) return;
+      var badge = ageBadge(w, now);
+      if (badge) out[threadKey(w.thread_id)] = badge;
+    });
+    return out;
+  }
+
   // Coworker chats (workers with purpose 'worker'). An age helper of the team run
   // (window.__ntDesk.ageInfo(created, now) -> { label, level }) is used when present.
   function coworkerRows(state) {
     var now = state && state.ts;
     var shared = typeof window.__ntDesk.ageInfo === 'function' ? window.__ntDesk.ageInfo : null;
     return list(state && state.workers).filter(function (w) { return w && w.purpose === 'worker'; }).map(function (w) {
-      var hours = ageHours(w.created_at, now);
+      var hours = ageHours(createdOf(w, now), now);
       var age = { label: ageLabel(hours), level: ageClass(hours) };
       if (shared) {
         try { var info = shared(w.created_at, now); if (info && info.label) age = { label: String(info.label), level: String(info.level || '') }; } catch (e) { /* keep ours */ }
       }
       var task = String(w.task_title || '');
+      var badge = ageBadge(w, now);
+      var rotating = !!(badge && badge.rotating);
       return { id: String(w.id || ''), label: String(w.label || 'Coworker'), thread: threadKey(w.thread_id),
         url: String(w.url || ''), model: String(w.model || ''), task: task || 'Idle', busy: !!task,
-        age: age.label, ageCls: age.level };
+        age: age.label + (rotating ? ' - rotating soon' : ''), ageCls: age.level, rotating: rotating,
+        created: badge ? badge.created : '', ageTitle: badge ? badge.title : '' };
     });
   }
 
@@ -252,7 +308,8 @@
   }
 
   window.__ntDesk.sidebarUtil = { mainStatus: mainStatus, runsOfMain: runsOfMain, ageHours: ageHours,
-    ageClass: ageClass, ageLabel: ageLabel, coworkerRows: coworkerRows, ensureHeading: ensureHeading };
+    ageClass: ageClass, ageLabel: ageLabel, coworkerRows: coworkerRows,
+    createdText: createdText, ageBadge: ageBadge, coworkerAges: coworkerAges, ensureHeading: ensureHeading };
 
   window.__ntDesk.sidebar = function (ctx) {
     var timer = 0;
@@ -553,6 +610,7 @@
 
     function applyRows(state, root) {
       if (!root) return;
+      var ages = coworkerAges(state);
       chatGroups.forEach(function (group) {
         if (!group.getAttribute('data-nt-desk')) group.setAttribute('data-nt-desk', 'chat-group');
         group.classList.add(CLS_GROUP);
@@ -582,6 +640,7 @@
         row.classList.toggle(CLS_OPERATOR, !!(main && main.operator));
         stylePill(row, !!(main && main.operator));
         styleCard(row, main, state);
+        styleAge(row, main ? null : (ages[key] || null));
       }
     }
 
@@ -623,6 +682,24 @@
       setText(part(card, 'progress-count'), info.total ? info.done + '/' + info.total : '');
     }
 
+    // Age badge on Notion's own coworker row: an own child element; the row itself is not changed.
+    function styleAge(row, info) {
+      var badge = null;
+      for (var i = 0; i < row.children.length; i++) {
+        if (row.children[i].getAttribute('data-nt-desk') === 'age') badge = row.children[i];
+      }
+      if (!info) { if (badge) dropOwn(badge); return; }
+      if (!badge) {
+        badge = el('span', { cls: 'nt-desk-chip nt-desk-age', 'data-nt-desk': 'age' });
+        row.appendChild(badge);
+      }
+      setCls(badge, 'nt-desk-chip nt-desk-age nt-desk-row-age nt-desk-age-' + (info.level || 'ok') +
+        (info.rotating ? ' nt-desk-age-rotating' : ''));
+      setText(badge, info.text);
+      if (badge.getAttribute('title') !== info.title) badge.setAttribute('title', info.title);
+      if (badge.getAttribute('aria-label') !== info.title) badge.setAttribute('aria-label', info.title);
+    }
+
     function coworkersCollapsed() {
       try { return window.localStorage.getItem(COWORKERS_KEY) === '1'; } catch (e) { return false; }
     }
@@ -647,11 +724,12 @@
         el('span', { cls: 'nt-desk-dot nt-desk-dot-' + (row.busy ? 'running' : 'idle'), 'aria-hidden': 'true' }),
         el('span', { cls: 'nt-desk-coworker-main' }, [
           el('span', { cls: 'nt-desk-coworker-name', text: row.label }),
-          el('span', { cls: 'nt-desk-coworker-task', text: row.task })
-        ])
+          el('span', { cls: 'nt-desk-coworker-task', text: row.task }),
+          row.created ? el('span', { cls: 'nt-desk-coworker-created', 'data-nt-desk': 'created', text: row.created }) : null
+        ].filter(Boolean))
       ];
       if (row.model) kids.push(el('span', { cls: 'nt-desk-chip nt-desk-model', text: row.model }));
-      if (row.age) kids.push(el('span', { cls: 'nt-desk-chip nt-desk-age nt-desk-age-' + (row.ageCls || 'ok'), text: row.age, title: 'Chat age' }));
+      if (row.age) kids.push(el('span', { cls: 'nt-desk-chip nt-desk-age nt-desk-age-' + (row.ageCls || 'ok') + (row.rotating ? ' nt-desk-age-rotating' : ''), text: row.age, title: row.ageTitle || 'Chat age' }));
       var props = { cls: 'nt-desk-coworker', 'data-nt-desk': 'coworker', 'data-nt-desk-thread': row.thread, title: row.task };
       if (row.url) props.href = row.url;
       var node = el(row.url ? 'a' : 'div', props, kids);
@@ -683,7 +761,8 @@
         'aria-expanded': String(!collapsed) }, [
         el('span', { cls: 'nt-desk-chevron', 'aria-hidden': 'true' }),
         el('span', { cls: 'nt-desk-coworkers-title', text: 'Coworkers' }),
-        el('span', { cls: 'nt-desk-chip nt-desk-count', text: String(rows.length) })
+        el('span', { cls: 'nt-desk-chip nt-desk-count', text: String(typeof window.__ntDesk.counts === 'function'
+          ? window.__ntDesk.counts(state).coworkers : rows.length) })
       ]);
       head.addEventListener('click', function (ev) {
         ev.preventDefault();

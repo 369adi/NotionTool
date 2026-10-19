@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import itertools
 
 
@@ -59,6 +60,7 @@ READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewe
 CUSTOM_READ_ONLY = 'read_only'
 READ_ONLY_REFUSAL = 'This planning/review role has read-only PC access'
 from .screen_capture import SCREEN_TOOLS, SCREEN_OPERATOR_TOOLS, SCREEN_OPERATOR_NAMES, ScreenCapture
+from .agent_guard import GUARD_RULE
 
 
 def shell_command(command):
@@ -99,7 +101,7 @@ def unittest_python():
 
 # Operator scope: only with the owner Host API key (never the worker bridge token).
 OPERATOR_TOOLS = [
-    {'name':'nt_api','description':'Operator: call a NotionTool Host API route on the owner PC. GET or POST /api/... (e.g. /api/health, /api/state, /api/chats, /api/send, /api/main/create, /api/operations).',
+    {'name':'nt_api','description':'Operator: call a NotionTool Host API route on the owner PC. GET or POST /api/... (e.g. /api/health, /api/state, /api/chats, /api/send, /api/main/create, /api/operations). ' + GUARD_RULE,
      'annotations':{'readOnlyHint':False,'destructiveHint':True},
      'inputSchema':{'type':'object','properties':{'method':{'type':'string','enum':['GET','POST']},'path':{'type':'string'},'body':{'type':'object'},'timeout':{'type':'number'}},'required':['path']}},
     {'name':'nt_notion_call','description':'Operator: raw internal Notion API call (POST /api/v3/<method>) as the selected harness account. For verified reverse-engineering tests.',
@@ -274,7 +276,36 @@ class Bridge:
         return path
 
     # ---- tools ------------------------------------------------------------
+    def _tool_started(self, run_id, task_id='', tool='', message=''):
+        """Record a tool start; call() records the matching tool_finished (also on errors and timeouts)."""
+        self.store.event('tool_started', run_id, task_id=task_id, tool=tool, message=message)
+        self._tool_ctx().started = (run_id, task_id, tool, time.monotonic())
+
+    def _tool_ctx(self):
+        return self.__dict__.setdefault('_tool_local', threading.local())
+
     def call(self, name, args, token):
+        ctx = self._tool_ctx()
+        ctx.started = None
+        try:
+            result = self._call(name, args, token)
+        except BaseException as exc:
+            started, ctx.started = ctx.started, None
+            if started:
+                run_id, task_id, tool, begun = started
+                self.store.event('tool_finished', run_id, task_id=task_id, tool=tool, ok=False,
+                                 seconds=round(time.monotonic() - begun, 3),
+                                 error=(type(exc).__name__ + ': ' + str(exc))[:200])
+            raise
+        started, ctx.started = ctx.started, None
+        if started:
+            run_id, task_id, tool, begun = started
+            extra = {'exit_code': result.get('exit_code')} if isinstance(result, dict) and 'exit_code' in result else {}
+            self.store.event('tool_finished', run_id, task_id=task_id, tool=tool, ok=True,
+                             seconds=round(time.monotonic() - begun, 3), **extra)
+        return result
+
+    def _call(self, name, args, token):
         if name in SCREEN_TOOLS and self.screen_access() and not self.has_assignment(token):
             # Read-only screen tools also work in the user's own chats (Main), which have no assignment token.
             return self.screen().call(name, args, role='chat')
@@ -294,7 +325,7 @@ class Bridge:
                 raise ValueError('Unknown or disabled tool' + (' (enable browser access in Settings)' if name in BROWSER_TOOLS else ' (enable '+LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+' in Settings)' if name in TOOL_SERVER else ''))
             if name in TOOL_SERVER:
                 rea = self.local_client(TOOL_SERVER[name])
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message=LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+': '+str(args.get('name','discover'))[:100])
+                self._tool_started(run['id'],task_id=task['id'],tool=name,message=LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+': '+str(args.get('name','discover'))[:100])
             if self.role_is_read_only(task['role']) and (name=='write_file' or name in BROWSER_ACTIONS
                     or (name=='run_shell' and read_only_test_modules(args.get('command')) is None)):
                 raise ValueError('This planning/review role has read-only PC access')
@@ -305,7 +336,7 @@ class Bridge:
             elif name in BROWSER_TOOLS:
                 if name in BROWSER_ACTIONS:
                     detail = args.get('url') or args.get('selector') or args.get('text') or args.get('expression') or ''
-                    self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message='Browser: '+name+' '+str(detail)[:200])
+                    self._tool_started(run['id'],task_id=task['id'],tool=name,message='Browser: '+name+' '+str(detail)[:200])
             elif name=='context':
                 wanted = args.get('task_id')
                 if args.get('thread_id'):
@@ -346,7 +377,7 @@ class Bridge:
                 if cwd is None:
                     raise ValueError('Read-only test runs need a project folder')
                 self.engine.check_lease(task['id'],token)
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,
+                self._tool_started(run['id'],task_id=task['id'],tool=name,
                                  message='Tests in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             elif name=='run_shell':
                 cwd = self.path(run,str(args.get('cwd') or '.'))
@@ -360,7 +391,7 @@ class Bridge:
                     self.engine.claim_absolute(task['id'],token,Path(cwd).anchor)
                 else:
                     self.engine.check_lease(task['id'],token)
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,
+                self._tool_started(run['id'],task_id=task['id'],tool=name,
                                  message='Shell in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             else:
                 path = self.path(run,str(args.get('path','.')))
@@ -389,7 +420,7 @@ class Bridge:
                     text = str(args.get('text',''))
                     if len(text)>2*1024*1024:
                         raise ValueError('Write is too large')
-                    self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message='Write: '+str(path)[:300])
+                    self._tool_started(run['id'],task_id=task['id'],tool=name,message='Write: '+str(path)[:300])
                     self.snapshot_before_write(task, run, path)
                     path.parent.mkdir(parents=True,exist_ok=True)
                     path.write_text(text,encoding='utf-8',newline='')
@@ -487,7 +518,6 @@ class Bridge:
                     process.kill()
                 process.communicate()
                 raise ValueError('Command timed out; its process tree was stopped') from None
-            self.store.event('tool_finished',run['id'],task_id=task['id'],tool=name,exit_code=process.returncode)
             return dict(exit_code=process.returncode,output=output.decode('utf-8',errors='replace')[-30000:])
         finally:
             self.shell_gate.release()

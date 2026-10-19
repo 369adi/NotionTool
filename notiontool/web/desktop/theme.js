@@ -7,7 +7,13 @@
  * Studio v2: a throttled scan only toggles marker classes on Notion nodes (never adds, moves or
  * removes them): the top bar breadcrumb 'Notion AI' (shown as 'NotionTool' via CSS ::after, the
  * original text is hidden visually only), the chat title next to it and the 'N Schritte' step
- * labels in the chat (styled as pills). stop() removes every marker class again.
+ * labels in the chat (styled as pills).
+ * Tool groups: runs of TOOL_MIN_GROUP or more consecutive tool-call rows ('NotionTool / nt_shell')
+ * of one answer are folded into one compact line 'N tool steps' (CSS ::before on the first row,
+ * the other rows are hidden by class only). A click on that line toggles the group; clicks on the
+ * tool rows themselves go to Notion untouched, so Notion's own expand keeps working. The scan runs
+ * again after every Notion re-render, the open state is kept per container.
+ * stop() removes every marker class and data attribute again.
  * Never removes or moves Notion nodes, no network, no timers besides the debounce.
  */
 (function () {
@@ -21,10 +27,32 @@
   var SCAN_LIMIT = 20000;       // max text nodes visited per chat scan
   var CRUMB_TEXT = 'Notion AI';
   var STEPS_RE = /^\d+\s+(Schritte?|steps?)$/i;
-  var MARKS = ['nt-desk-crumb-host', 'nt-desk-crumb-src', 'nt-desk-chat-title', 'nt-desk-steps'];
+  // Tool-call row label (live DOM): icon letter + 'NotionTool / nt_shell'.
+  var TOOL_RE = /^.{0,3}[^\/\n]{1,40} \/ [\w.-]{1,60}$/;
+  var TOOL_MIN_GROUP = 3;
+  var TOOL_MAX_DEPTH = 6;       // max levels from the tool button up to its row item
+  var TOOL_HEAD_PX = 30;        // height of the 'N tool steps' line on an open group
+  var COUNT_ATTR = 'data-nt-tool-count';
+  var GROUP_HEAD = 'nt-desk-toolgroup-head';
+  var GROUP_MEMBER = 'nt-desk-toolgroup-member';
+  var GROUP_OPEN = 'nt-desk-toolgroup-open';
+  var MARKS = ['nt-desk-crumb-host', 'nt-desk-crumb-src', 'nt-desk-chat-title', 'nt-desk-steps',
+    GROUP_HEAD, GROUP_MEMBER, GROUP_OPEN];
 
   function isStepsLabel(text) { return STEPS_RE.test(String(text || '').trim()); }
-  window.__ntDesk.themeUtil = { isStepsLabel: isStepsLabel, CRUMB_TEXT: CRUMB_TEXT, MARKS: MARKS };
+  function isToolLabel(text) { return TOOL_RE.test(String(text || '').replace(/\s+/g, ' ').trim()); }
+  // Pure helper (tested): split a list of booleans into runs [start, length] of true values.
+  function toolRuns(flags, min) {
+    var runs = [], start = -1;
+    for (var i = 0; i <= flags.length; i++) {
+      if (i < flags.length && flags[i]) { if (start < 0) start = i; continue; }
+      if (start >= 0 && i - start >= (min || TOOL_MIN_GROUP)) runs.push([start, i - start]);
+      start = -1;
+    }
+    return runs;
+  }
+  window.__ntDesk.themeUtil = { isStepsLabel: isStepsLabel, isToolLabel: isToolLabel, toolRuns: toolRuns,
+    CRUMB_TEXT: CRUMB_TEXT, MARKS: MARKS, TOOL_MIN_GROUP: TOOL_MIN_GROUP };
 
   window.__ntDesk.theme = function (ctx) {
     ctx = ctx || {};
@@ -34,9 +62,15 @@
     var observer = null;
     var scanTimer = 0;
     var bodyObserver = null;
+    var clickBound = false;
+    // Open tool groups per container: container -> { headIndex: true }. Survives re-renders of rows.
+    var openGroups = typeof WeakMap === 'function' ? new WeakMap() : null;
 
     function mark(node, cls) {
       if (node && node.classList && !node.classList.contains(cls)) node.classList.add(cls);
+    }
+    function unmarkNode(node, cls) {
+      if (node && node.classList && node.classList.contains(cls)) node.classList.remove(cls);
     }
     function roleButton(node) {
       while (node && node !== document.body) {
@@ -78,6 +112,111 @@
         if (n.nodeValue && n.nodeValue.length < 24 && isStepsLabel(n.nodeValue)) mark(n.parentElement, 'nt-desk-steps');
       }
     }
+
+    // ---- tool groups --------------------------------------------------------------------
+    function toolButtonsIn(node) {
+      var out = [];
+      var list = node.querySelectorAll('[role="button"][aria-expanded]');
+      for (var i = 0; i < list.length; i++) {
+        var t = list[i].textContent || '';
+        if (t.length < 120 && isToolLabel(t)) out.push(list[i]);
+      }
+      return out;
+    }
+    // A tool row item holds exactly one tool button and sits in a container (one answer) without
+    // user messages. Live DOM: the button is 3-4 levels below the item.
+    function isToolItem(node) {
+      return !!(node && node.querySelectorAll && toolButtonsIn(node).length === 1);
+    }
+    function toolItem(button) {
+      var node = button;
+      for (var depth = 0; depth < TOOL_MAX_DEPTH && node && node.parentElement; depth++) {
+        var parent = node.parentElement;
+        if (parent.querySelector('[data-agent-chat-user-step-id]')) return null;
+        if (isToolItem(node.previousElementSibling) || isToolItem(node.nextElementSibling)) {
+          return toolButtonsIn(node).length === 1 ? node : null;
+        }
+        node = parent;
+      }
+      return null;
+    }
+    function openSet(parent, create) {
+      if (!openGroups) return null;
+      var set = openGroups.get(parent);
+      if (!set && create) { set = {}; openGroups.set(parent, set); }
+      return set || null;
+    }
+    function clearGroupMarks(node) {
+      unmarkNode(node, GROUP_HEAD);
+      unmarkNode(node, GROUP_MEMBER);
+      unmarkNode(node, GROUP_OPEN);
+      if (node.getAttribute && node.getAttribute(COUNT_ATTR) !== null) node.removeAttribute(COUNT_ATTR);
+    }
+    function groupParent(parent) {
+      var kids = parent.children, flags = [];
+      for (var i = 0; i < kids.length; i++) flags.push(isToolItem(kids[i]));
+      var runs = toolRuns(flags, TOOL_MIN_GROUP);
+      var inRun = {};
+      var open = openSet(parent, false) || {};
+      runs.forEach(function (run) {
+        var start = run[0], len = run[1];
+        var isOpen = !!open[start];
+        for (var k = start; k < start + len; k++) {
+          inRun[k] = true;
+          var node = kids[k];
+          if (k === start) {
+            mark(node, GROUP_HEAD);
+            unmarkNode(node, GROUP_MEMBER);
+            if (node.getAttribute(COUNT_ATTR) !== String(len)) node.setAttribute(COUNT_ATTR, String(len));
+          } else {
+            mark(node, GROUP_MEMBER);
+            unmarkNode(node, GROUP_HEAD);
+            if (node.getAttribute(COUNT_ATTR) !== null) node.removeAttribute(COUNT_ATTR);
+          }
+          if (isOpen) mark(node, GROUP_OPEN); else unmarkNode(node, GROUP_OPEN);
+        }
+      });
+      for (var j = 0; j < kids.length; j++) if (!inRun[j]) clearGroupMarks(kids[j]);
+    }
+    function scanToolGroups(chat) {
+      var buttons = toolButtonsIn(chat);
+      var parents = [];
+      for (var i = 0; i < buttons.length; i++) {
+        var item = toolItem(buttons[i]);
+        if (item && item.parentElement && parents.indexOf(item.parentElement) < 0) parents.push(item.parentElement);
+      }
+      parents.forEach(groupParent);
+      // Stale marks (a container that no longer qualifies) are cleared too.
+      var stale = chat.querySelectorAll('.' + GROUP_HEAD + ', .' + GROUP_MEMBER);
+      for (var s = 0; s < stale.length; s++) {
+        if (parents.indexOf(stale[s].parentElement) < 0) clearGroupMarks(stale[s]);
+      }
+    }
+    function toggleGroup(head) {
+      var parent = head.parentElement;
+      if (!parent) return;
+      var index = Array.prototype.indexOf.call(parent.children, head);
+      var next = !head.classList.contains(GROUP_OPEN);
+      var set = openSet(parent, true);
+      if (set) { if (next) set[index] = true; else delete set[index]; }
+      var node = head;
+      while (node && (node === head || node.classList.contains(GROUP_MEMBER))) {
+        if (next) mark(node, GROUP_OPEN); else unmarkNode(node, GROUP_OPEN);
+        node = node.nextElementSibling;
+      }
+    }
+    // Only clicks on the 'N tool steps' line itself (target is the head item, i.e. its ::before
+    // or, when closed, the whole folded line) are handled; every other click reaches Notion.
+    function onClick(ev) {
+      if (stopped || !root.classList.contains(ROOT_CLASS)) return;
+      var head = ev.target;
+      if (!head || !head.classList || !head.classList.contains(GROUP_HEAD)) return;
+      if (head.classList.contains(GROUP_OPEN) && typeof ev.offsetY === 'number' && ev.offsetY > TOOL_HEAD_PX) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      try { toggleGroup(head); } catch (err) { /* never throw */ }
+    }
+
     function scan() {
       scanTimer = 0;
       if (stopped || typeof document.createTreeWalker !== 'function' || typeof document.querySelector !== 'function') return;
@@ -85,7 +224,10 @@
         var content = document.querySelector('.layout-content');
         if (content) scanHeader(content);
         var chat = document.querySelector('.layout-chat');
-        if (chat) scanSteps(chat);
+        if (chat) {
+          scanSteps(chat);
+          scanToolGroups(chat);
+        }
       } catch (err) { /* never throw */ }
     }
     function scheduleScan() {
@@ -98,6 +240,9 @@
         Array.prototype.slice.call(document.querySelectorAll('.' + cls)).forEach(function (node) {
           node.classList.remove(cls);
         });
+      });
+      Array.prototype.slice.call(document.querySelectorAll('[' + COUNT_ATTR + ']')).forEach(function (node) {
+        node.removeAttribute(COUNT_ATTR);
       });
     }
 
@@ -124,6 +269,10 @@
         bodyObserver = new MutationObserver(scheduleScan);
         bodyObserver.observe(document.body, { childList: true, subtree: true });
       }
+      if (typeof document.addEventListener === 'function') {
+        document.addEventListener('click', onClick, true);
+        clickBound = true;
+      }
     } catch (err) { /* never throw */ }
 
     return {
@@ -137,6 +286,8 @@
         scanTimer = 0;
         if (bodyObserver) bodyObserver.disconnect();
         bodyObserver = null;
+        if (clickBound) document.removeEventListener('click', onClick, true);
+        clickBound = false;
         try { unmark(); } catch (err) { /* never throw */ }
         if (root) {
           root.classList.remove(ROOT_CLASS);

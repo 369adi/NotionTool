@@ -2,7 +2,7 @@
  * NotionTool Studio part (studio.js): window.__ntDesk.studio = function (ctx) { ... return { stop } }.
  *
  * - Status strip above the composer: Main model + reasoning effort for the next turn (read-only,
- *   from state), coworkers busy x/N, current run progress.
+ *   from state), 'Coworkers 1 of 10 busy' and 'Run 2 of 3 steps' (both from window.__ntDesk.counts).
  * - Notification center: bell chip in the brand header (unread count), drawer with the last 50
  *   toasts, native desktop notifications (asked once) when a run finishes, a task needs the Main
  *   (unclear) or the harness goes offline.
@@ -36,6 +36,14 @@
     var key = String(code).toLowerCase();
     return MODEL_LABEL[key] || String(code);
   }
+  var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', auto: 'Auto' };
+  function nextTurnText(nt) {
+    var code = nt && nt.model ? String(nt.model) : '';
+    var model = code && code.toLowerCase() !== 'auto' ? modelLabel(code) : 'Auto model';
+    var e = nt && nt.effort ? String(nt.effort).toLowerCase() : 'auto';
+    var effort = EFFORT_LABEL[e] || (e.charAt(0).toUpperCase() + e.slice(1)).replace(/_/g, ' ');
+    return 'Next turn: ' + model + ' \u00b7 ' + effort + ' effort';
+  }
   function nextTurn(state) {
     // Read-only: the harness may publish next_turn {model, effort}; older states only have it on the Main row.
     var s = state || {};
@@ -44,9 +52,9 @@
     return { model: nt.model || main.model || '', effort: nt.effort || nt.reasoning_effort || main.effort || '' };
   }
   function coworkers(state) {
-    var list = (state && Array.isArray(state.chats) ? state.chats : []).filter(function (c) { return c && c.role === 'coworker'; });
-    var busy = list.filter(function (c) { return !!(c.task_title || Number(c.started) > 0); }).length;
-    return { busy: busy, total: list.length };
+    // The one shared helper (extras.js): enabled workers of the active account, never chat rows.
+    var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
+    return c ? { busy: c.busy, total: c.coworkers } : { busy: 0, total: 0 };
   }
   function currentRun(state) {
     var runs = state && Array.isArray(state.runs) ? state.runs : [];
@@ -60,7 +68,7 @@
       'Run id: ' + run.id].join('\n');
   }
   window.__ntDesk.studioUtil = { nextTurn: nextTurn, coworkers: coworkers, currentRun: currentRun,
-    runSummary: runSummary, modelLabel: modelLabel };
+    runSummary: runSummary, modelLabel: modelLabel, nextTurnText: nextTurnText };
 
   window.__ntDesk.studio = function (ctx) {
     ctx = ctx || {};
@@ -205,23 +213,19 @@
       var off = root.classList.contains('nt-desk-off');
       if (!r || off) { ui.strip.hidden = true; root.classList.remove(STRIP_ON); return; }
       var nt = nextTurn(state);
-      ui.model.textContent = 'Next turn: ' + (modelLabel(nt.model) || 'auto') + ' \u00b7 effort ' + (nt.effort || 'auto');
+      ui.model.textContent = nextTurnText(nt);
       ui.model.setAttribute('title', nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
         : 'The harness has not published the next-turn model yet');
-      var crew = coworkers(state);
-      ui.crew.textContent = 'Coworkers busy ' + crew.busy + '/' + crew.total;
-      ui.crew.classList.toggle('nt-desk-strip-hot', crew.busy > 0);
-      var run = currentRun(state);
-      if (run) {
-        var total = Number(run.tasks_total) || 0, done = Number(run.tasks_done) || 0;
-        ui.runText.textContent = 'Run ' + (run.state || '') + (run.stage ? ' \u00b7 ' + run.stage : '') + ' \u00b7 ' + done + '/' + total;
-        ui.run.setAttribute('title', String(run.title || run.id));
-        ui.runFill.style.width = (total ? Math.round(100 * done / total) : 0) + '%';
-      } else {
-        ui.runText.textContent = 'No run';
-        ui.run.removeAttribute('title');
-        ui.runFill.style.width = '0%';
-      }
+      // Every number comes from window.__ntDesk.counts, the same helper the Live tab and grid use.
+      var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
+      ui.crew.textContent = c ? c.coworkersText : 'No coworkers';
+      ui.crew.classList.toggle('nt-desk-strip-hot', !!(c && c.busy > 0));
+      var run = c ? c.run : null;
+      ui.runText.textContent = c ? c.runText : 'No run yet';
+      if (run) ui.run.setAttribute('title', run.title || 'Current run');
+      else ui.run.removeAttribute('title');
+      ui.runFill.style.width = (run ? run.percent : 0) + '%';
+      ui.run.classList.toggle('nt-desk-strip-idle', !(run && run.active));
       ui.strip.hidden = false;
       var h = ui.strip.offsetHeight || 26;
       ui.strip.style.left = Math.round(r.left) + 'px';
@@ -255,7 +259,10 @@
       seeded = true;
     }
     function checkOffline() {
-      var down = (lastPush && Date.now() - lastPush > OFFLINE_MS) || !!(state && state.connected === false);
+      // Any harness message counts as alive: state pushes and the 3 s heartbeat (__ntDeskLastMessage).
+      var beat = typeof window.__ntDeskLastMessage === 'number' ? window.__ntDeskLastMessage : 0;
+      var seen = Math.max(lastPush || 0, beat);
+      var down = (seen && Date.now() - seen > OFFLINE_MS) || !!(state && state.connected === false);
       if (down && !offline) notify('NotionTool harness is offline', 'No state update for 20 seconds', 'nt-offline', 'error');
       else if (!down && offline) record('NotionTool harness is back online', 'success');
       offline = !!down;

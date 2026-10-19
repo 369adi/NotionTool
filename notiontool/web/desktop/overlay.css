@@ -159,4 +159,7 @@
 .nt-desk-age-ok { background: rgba(255, 255, 255, .1); color: #d6dbea; }
 .nt-desk-age-amber { background: #f59e0b; color: #0b0d12; }
 .nt-desk-age-red { background: #ef4444; color: #ffffff; }
+.nt-desk-age-rotating { box-shadow: 0 0 0 1px rgba(255, 255, 255, .55); }
+.nt-desk-coworker-created { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #8f9ab8; }
+.nt-desk-row-age { flex: 0 0 auto; align-self: center; margin: 0 6px 0 auto; padding: 0 6px; font-size: 10px; line-height: 16px; border-radius: 999px; }
 .nt-desk-offline { margin-left: auto; background: #f59e0b; color: #0b0d12; text-transform: lowercase; }

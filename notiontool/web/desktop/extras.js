@@ -1,8 +1,9 @@
 /* NotionTool desktop overlay part: extras (docs/DESKTOP_APP.md, overlay part contract).
  *
  * window.__ntDesk.extras = function (ctx) { ... return { stop } }.
- * - Floating bar: Live button (location.hash '#nt-live'), attention badge, status dot. It docks
- *   inside the sidebar, just above the footer row ('New chat'), so it never covers that row.
+ * - Status dot: a small harness dot right after the 'NotionTool' brand name. The Live tab in the
+ *   tab bar is the only Live entry point (no floating Live bar).
+ * - window.__ntDesk.counts(state): the one shared helper for every number shown in the UI.
  * - Switch banner: offers a fresh Main chat when state.context_ask is set. A running switch is a
  *   short toast per status change (deduped by code), never a persistent banner.
  * - Disconnected banner: no state push for 20 s. Banners and toasts sit bottom right, above the
@@ -33,8 +34,6 @@
   var TOAST_ERROR_MS = 6000;
   var TOAST_OUT_MS = 200;
   var TOAST_MAX = 5;
-  var BAR_GAP_PX = 8;            // Live bar spacing above the sidebar footer row
-  var FOOTER_LABELS = ['new chat', 'neuer chat'];
   // Harness actions the palette may call. Every one exists in desktop_shell.DESK_ACTIONS.
   var PALETTE_ACTIONS = ['state', 'run_pause', 'mcp_refresh', 'new_welcome_chat', 'main_switch_start'];
 
@@ -146,24 +145,62 @@
     };
   }
 
-  // Where the Live bar docks: inside the sidebar, gap px above the footer row ('New chat').
-  // Rects are plain {left, top, bottom, width}. Returns null when the sidebar is missing or
-  // collapsed; the CSS fallback position is used then.
-  function dockPosition(sidebar, footer, viewportHeight, gap) {
-    if (!sidebar || !(sidebar.width >= 160) || !(viewportHeight > 0)) return null;
-    var g = typeof gap === 'number' ? gap : BAR_GAP_PX;
-    var anchor = Math.min(sidebar.bottom, viewportHeight);
-    if (footer && footer.top >= viewportHeight * 0.5 && footer.top <= anchor) anchor = footer.top;
-    return {
-      left: Math.round(sidebar.left + 12),
-      bottom: Math.max(g, Math.round(viewportHeight - anchor + g)),
-      maxWidth: Math.max(0, Math.round(sidebar.width - 24))
-    };
+  // ---- shared counts -------------------------------------------------------------------
+  // window.__ntDesk.counts(state) is the one source for every number in the UI (Live tab badge,
+  // composer chips, coworker grid). Coworkers = enabled 'worker' rows of state.workers, which the
+  // harness already limits to the active account; the filters below only guard stale data.
+  var COUNT_BUSY = ['busy', 'running', 'sending', 'recovering'];
+  var RUN_ACTIVE = ['running', 'executing', 'paused', 'planning', 'queued', 'starting', 'active',
+    'reviewing', 'waiting'];
+  var RUN_WORDS = { running: 'running', executing: 'running', active: 'running', planning: 'planning',
+    queued: 'queued', starting: 'starting', reviewing: 'reviewing', waiting: 'waiting', paused: 'paused',
+    done: 'done', finished: 'done', complete: 'done', completed: 'done', failed: 'failed', error: 'failed',
+    cancelled: 'canceled', canceled: 'canceled', stopped: 'stopped' };
+
+  function runText(run) {
+    if (!run) return 'No run yet';
+    var steps = run.total ? run.done + ' of ' + run.total + (run.total === 1 ? ' step' : ' steps') : '';
+    if (run.active && run.word === 'running') return steps ? 'Run ' + steps : 'Run in progress';
+    var lead = run.active ? 'Run ' + (run.word || 'in progress') : 'Last run ' + (run.word || 'ended');
+    return steps ? lead + ' \u00b7 ' + steps : lead;
   }
 
+  function counts(state) {
+    var s = state && typeof state === 'object' ? state : {};
+    var account = s.active_account_id || s.account_id || null;
+    var crew = (Array.isArray(s.workers) ? s.workers : []).filter(function (w) {
+      if (!w || typeof w !== 'object' || w.enabled === false) return false;
+      if (account && w.account_id != null && String(w.account_id) !== String(account)) return false;
+      return String(w.purpose || 'worker') === 'worker';
+    });
+    var busy = crew.filter(function (w) {
+      return !!(w.task_id || w.task_title || COUNT_BUSY.indexOf(String(w.state || '').toLowerCase()) >= 0);
+    }).length;
+    var attention = Array.isArray(s.attention) ? s.attention.length : 0;
+    var runs = (Array.isArray(s.runs) ? s.runs : []).filter(function (r) { return r && typeof r === 'object'; });
+    var row = null, active = false;
+    for (var i = runs.length - 1; i >= 0 && !row; i--) {
+      if (RUN_ACTIVE.indexOf(String(runs[i].state || '').toLowerCase()) >= 0) { row = runs[i]; active = true; }
+    }
+    if (!row && runs.length) row = runs[runs.length - 1];
+    var run = null;
+    if (row) {
+      var total = Math.max(0, Math.floor(Number(row.tasks_total) || 0));
+      var done = Math.min(total, Math.max(0, Math.floor(Number(row.tasks_done) || 0)));
+      run = { id: row.id, title: String(row.title || row.goal || row.id || ''), active: active,
+        word: RUN_WORDS[String(row.state || '').toLowerCase()] || '', done: done, total: total,
+        percent: total ? Math.round(100 * done / total) : 0 };
+    }
+    return { coworkers: crew.length, busy: busy, idle: crew.length - busy, attention: attention,
+      liveBadge: attention > 0 ? String(attention) : '', run: run,
+      coworkersText: crew.length ? 'Coworkers ' + busy + ' of ' + crew.length + ' busy' : 'No coworkers',
+      runText: runText(run) };
+  }
+
+  window.__ntDesk.counts = counts;
   window.__ntDesk.extrasUtil = { fuzzyScore: fuzzyScore, friendly: friendly, statusText: statusText,
-    toastKind: toastKind, toastKey: toastKey, makeStatusDedupe: makeStatusDedupe,
-    dockPosition: dockPosition };
+    toastKind: toastKind, toastKey: toastKey, makeStatusDedupe: makeStatusDedupe, counts: counts,
+    runText: runText };
 
   window.__ntDesk.extras = function (ctx) {
     ctx = ctx || {};
@@ -271,37 +308,18 @@
       try { location.hash = LIVE_HASH; } catch (e) { /* ignore */ }
     }
 
-    // ---- layout: Live bar docking and the bottom-right stack ------------------------------
-    function rectOf(node) {
-      try {
-        var r = node.getBoundingClientRect();
-        return { left: r.left, top: r.top, bottom: r.bottom, width: r.width };
-      } catch (e) { return null; }
-    }
-
-    // The sidebar footer row: a row marked by the sidebar part, else the 'New chat' control.
-    function sidebarFooter(root) {
-      var node = root.querySelector('[data-nt-desk="sidebar-footer"]') || root.querySelector('.nt-desk-newchat');
-      if (node) return node;
-      var nodes = root.querySelectorAll('[role="button"],button,a');
-      for (var i = 0; i < nodes.length; i++) {
-        var label = String(nodes[i].textContent || '').trim().toLowerCase();
-        if (FOOTER_LABELS.indexOf(label) >= 0) return nodes[i];
+    // ---- layout: status dot next to the brand name, and the bottom-right stack ----------
+    // overlay.js builds (and may rebuild) the brand header, so the dot is re-placed on render.
+    function placeDot() {
+      if (!ui.dot) return;
+      var brand = document.querySelector('[data-nt-desk="brand"]');
+      if (!brand) {
+        if (ui.dot.parentNode) ui.dot.parentNode.removeChild(ui.dot);  // own node only
+        return;
       }
-      return null;
-    }
-
-    // Dock the Live bar just above the sidebar footer row so it never covers it.
-    function dockBar() {
-      if (!ui.bar) return;
-      var root = document.querySelector('[data-nt-desk="sidebar"]') || document.querySelector('.notion-sidebar');
-      var footer = root ? sidebarFooter(root) : null;
-      var pos = root ? dockPosition(rectOf(root), footer ? rectOf(footer) : null, window.innerHeight || 0,
-        BAR_GAP_PX) : null;
-      ui.bar.classList.toggle('nt-desk-bar-docked', !!pos);
-      ui.bar.style.left = pos ? pos.left + 'px' : '';
-      ui.bar.style.bottom = pos ? pos.bottom + 'px' : '';
-      ui.bar.style.maxWidth = pos ? pos.maxWidth + 'px' : '';
+      var name = brand.querySelector('.nt-desk-brand-name');
+      if (name && name.parentNode && name.nextSibling !== ui.dot) name.parentNode.insertBefore(ui.dot, name.nextSibling);
+      else if (!name && ui.dot.parentNode !== brand) brand.appendChild(ui.dot);
     }
 
     // Toasts stack above the visible banners (both bottom right, above the composer area).
@@ -313,14 +331,7 @@
     }
 
     function build() {
-      ui.live = el('button', { cls: 'nt-desk-bar-live', type: 'button', title: 'Open the Live tab (Ctrl+Shift+L)',
-        text: 'Live' });
-      ui.badge = el('span', { cls: 'nt-desk-badge', role: 'status', text: '0' });
-      ui.dot = el('span', { cls: 'nt-desk-dot', title: 'No state from the harness yet' });
-      ui.bar = el('div', { cls: 'nt-desk-bar' }, [ui.live, ui.badge, ui.dot]);
-      ui.live.addEventListener('click', openLive);
-      ui.badge.addEventListener('click', openLive);
-      show(ui.badge, false);
+      ui.dot = el('span', { cls: 'nt-desk-brand-dot', role: 'status', title: 'No state from the harness yet' });
 
       ui.offText = el('span', { cls: 'nt-desk-banner-text',
         text: 'NotionTool lost connection to the harness - retrying' });
@@ -346,8 +357,7 @@
 
     function mount() {
       if (stopped || !document.body) return;
-      if (!ui.bar) build();
-      if (!ui.bar.isConnected) document.body.appendChild(ui.bar);
+      if (!ui.banners) build();
       if (!ui.banners.isConnected) document.body.appendChild(ui.banners);
       render();
     }
@@ -377,20 +387,15 @@
     }
 
     function render() {
-      if (stopped || !ui.bar) return;
+      if (stopped || !ui.banners) return;
       try {
         var now = Date.now();
         // Any message counts as alive: a state push or the harness heartbeat ({type:'heartbeat'}, every 3 s).
         var beat = typeof window.__ntDeskLastMessage === 'number' ? window.__ntDeskLastMessage : 0;
         var seen = Math.max(lastPush || 0, beat);
         var age = seen ? now - seen : Infinity;
-        var count = state && Array.isArray(state.attention) ? state.attention.length : 0;
-        ui.badge.textContent = String(count);
-        ui.badge.setAttribute('title', count === 1 ? '1 item needs attention' : count + ' items need attention');
-        show(ui.badge, count > 0);
-
         var fresh = age <= FRESH_MS && !(state && state.connected === false);
-        ui.dot.classList.toggle('nt-desk-dot-ok', fresh);
+        ui.dot.classList.toggle('nt-desk-brand-dot-ok', fresh);
         ui.dot.setAttribute('title', fresh ? 'Harness connected' : 'No recent state from the harness');
 
         show(ui.offBanner, age > DISCONNECTED_MS);
@@ -415,7 +420,7 @@
           }
         }
         layoutStack();
-        dockBar();
+        placeDot();
       } catch (e) { /* never throw into the page */ }
     }
 
@@ -481,6 +486,12 @@
       }, function (err) { toast('Could not update the run: ' + message(err), 'error'); });
     }
 
+    function openRequestTemplate(id) {
+      var openIt = window.__ntDesk.openRequestTemplate;
+      if (typeof openIt !== 'function') { toast('The Live view is not ready yet. Try again in a moment.', 'info'); return; }
+      try { openIt(id); } catch (e) { toast('Could not open the request template.', 'error'); }
+    }
+
     function commands() {
       var off = isOff();
       var list = [
@@ -512,6 +523,11 @@
           list.push({ title: 'Resume run: ' + goal, hint: 'Run ' + String(run.id).slice(-8), keys: '',
             words: 'resume continue run', run: function () { return pauseRun(run, false); } });
         }
+      });
+      // Request templates (live.js): only fill a draft into the chat box; the user sends it.
+      [['ui_bug', 'Fix a UI bug'], ['feature', 'Build a feature'], ['review', 'Review and test'], ['research', 'Research']].forEach(function (tpl) {
+        list.push({ title: 'New request: ' + tpl[1], hint: 'Fill a draft for the Main (you send it)', keys: '',
+          words: 'template request new draft ' + tpl[0].replace('_', ' '), run: function () { openRequestTemplate(tpl[0]); } });
       });
       // Other parts (studio.js) add entries here; a failing hook never breaks the palette.
       var extra = window.__ntDesk.paletteExtra;
@@ -670,7 +686,7 @@
     }
 
     function onResize() {
-      dockBar();
+      layoutStack();
     }
 
     function onReady() {
@@ -689,7 +705,7 @@
       }
       window.addEventListener('keydown', onKey, true);
       window.addEventListener('resize', onResize);
-      tick = setInterval(render, TICK_MS);  // dot, banner and bar docking depend on time and layout
+      tick = setInterval(render, TICK_MS);  // dot and banners depend on time and layout
       if (document.body) mount();
       else document.addEventListener('DOMContentLoaded', onReady);
     } catch (e) { /* never throw into the page */ }
@@ -707,7 +723,7 @@
           window.removeEventListener('resize', onResize);
           document.removeEventListener('DOMContentLoaded', onReady);
           // Only our own nodes are removed; Notion nodes are never touched.
-          if (ui.bar && ui.bar.parentNode) ui.bar.parentNode.removeChild(ui.bar);
+          if (ui.dot && ui.dot.parentNode) ui.dot.parentNode.removeChild(ui.dot);
           if (ui.banners && ui.banners.parentNode) ui.banners.parentNode.removeChild(ui.banners);
           if (pal && pal.backdrop.parentNode) pal.backdrop.parentNode.removeChild(pal.backdrop);
         } catch (e) { /* ignore */ }

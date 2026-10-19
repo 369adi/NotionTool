@@ -102,8 +102,8 @@ class OperatorModeTest(OperatorSwitchBase):
         self.assertEqual(self.store.get('accounts', ACCT)['team_threads']['main']['id'], T_OLD)
         [op] = self.store.all('operations')
         self.assertEqual((op['purpose'], op['chat_id']), ('operator_candidate', ''))
-        # Old operator chat renamed to an archive title, never deleted.
-        self.assertTrue(self.title(T_OP).startswith('Main (Archive '))
+        # Old operator chat renamed 'Main (old, YYYY-MM-DD HH:MM)', never deleted.
+        self.assertRegex(self.title(T_OP), r'^Main \(old, \d{4}-\d{2}-\d{2} \d{2}:\d{2}\)$')
         self.assertEqual(self.adapter.deletes, [])
         self.assertEqual(self.adapter.cl.welcome_creations, 1)
         # First message: who the chat is, brief file, project memory, check word.

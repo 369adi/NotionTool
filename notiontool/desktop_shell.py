@@ -754,13 +754,15 @@ class DesktopController:
         self.state = 'stopped'
         self.error = ''
         self.started_at = None
+        self.pusher = None
 
     def status(self):
         shell = self.shell
         app = getattr(shell, 'app', None)
         return dict(state=self.state, error=self.error, port=self.port, profile=self.profile_dir,
                     pid=getattr(app, 'pid', None), target_id=getattr(shell, 'target_id', '') if shell else '',
-                    started_at=self.started_at)
+                    started_at=self.started_at,
+                    push=self.pusher.stats.snapshot() if getattr(self, 'pusher', None) is not None else None)
 
     def autostart(self):
         if load_app_settings(self.data_dir).get('app_autostart'):
@@ -819,9 +821,15 @@ class DesktopController:
                         return
             self.state, self.error = 'running', ''
             self.server.store.event('desktop_app_started', message='NotionTool window attached on port %d' % self.port)
+            # Cached state + non-blocking pusher with a 3 s heartbeat (desktop_state_cache.py). The old loop
+            # pushed only on change, so an idle harness sent nothing and the overlay showed
+            # 'lost connection to the harness' although the bridge was fine.
+            from . import desktop_state_cache
+            cache = desktop_state_cache.DesktopStateCache(self.server, self.data_dir)
+            self.pusher = desktop_state_cache.StatePusher(shell, cache, store=self.server.store)
             while not self.stop_event.is_set() and shell.alive:
                 try:
-                    shell.push(desktop_state(self.server, load_app_settings(self.data_dir)))
+                    self.pusher.tick()
                 except Exception as exc:
                     self.error = 'state: ' + str(exc)[:160]
                 self.stop_event.wait(self.push_interval)

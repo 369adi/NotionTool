@@ -97,20 +97,20 @@ class TeamSizeEnsureTeam(unittest.TestCase):
 
     def test_ten_coworkers_when_the_setting_is_ten(self):
         self.size(10)
-        result = self.adapter.ensure_team('a')
+        result = self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 11)  # one Main + ten Welcome Coworkers
         self.assertEqual(ledger_roles(self.ledger()), ['worker%d' % i for i in range(1, 11)])
         self.assertEqual(result['team_size'], 10)
         self.assertEqual(result['welcome_chats'], 11)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 11)  # idempotent, nothing created twice
 
     def test_growing_adds_only_the_missing_roles(self):
         self.size(5)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         first = dict(self.ledger())
         self.size(7)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 8)
         for role in ledger_roles(first):
             self.assertEqual(self.ledger()[role]['id'], first[role]['id'])
@@ -118,22 +118,22 @@ class TeamSizeEnsureTeam(unittest.TestCase):
 
     def test_lowering_keeps_every_chat(self):
         self.size(6)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         workers = len(self.store.all('workers')); threads = dict(self.client.titles)
         self.size(2)
-        result = self.adapter.ensure_team('a')
+        result = self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 7)  # nothing new
         self.assertEqual(len(self.store.all('workers')), workers)  # nothing deleted
         self.assertEqual(set(self.client.titles), set(threads))
         self.assertEqual(ledger_roles(self.ledger()), ['worker%d' % i for i in range(1, 7)])  # extra roles stay recorded
         self.assertEqual(result['team_size'], 2)
         self.size(4)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 7)  # the kept chats fill the roles again
 
     def test_spare_joined_pool_chat_fills_a_new_role_first(self):
         self.size(2)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         spare = self.adapter.new_id(SPACE, '00a9')
         self.client.titles[spare] = 'Welcome to Notion'
         self.adapter.refresh('a')
@@ -141,19 +141,19 @@ class TeamSizeEnsureTeam(unittest.TestCase):
         record.update(purpose='worker', join_state='joined', enabled=True, state='ready')
         self.store.put('workers', record)
         self.size(3)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 3)  # no new Welcome chat
         self.assertEqual(self.ledger()['worker3']['id'], spare)
 
     def test_unconfirmed_new_role_is_never_resent(self):
         self.size(2)
-        self.adapter.ensure_team('a')
+        self.adapter.ensure_team('a', create_main=True)
         account = self.store.get('accounts', 'a')
         account['team_threads']['worker3'] = {'id': self.adapter.new_id(SPACE, '00a9'), 'pending': True}
         self.store.put('accounts', account)
         self.size(3)
         with self.assertRaisesRegex(ValueError, 'unconfirmed'):
-            self.adapter.ensure_team('a')
+            self.adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created), 3)
         self.assertTrue(self.ledger()['worker3']['pending'])
 
