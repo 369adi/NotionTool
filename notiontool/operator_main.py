@@ -9,6 +9,7 @@ standard and high review every build on a different Coworker and fix it (max 2 r
 with one read-only design/approach task that every build depends on.
 """
 import json
+import os
 import re
 import time
 
@@ -141,7 +142,12 @@ def result_summary(result):
         except ValueError:
             data = None
     if isinstance(data, dict):
-        return first_sentence(data.get('summary')) if isinstance(data.get('summary'), str) else ''
+        summary = data.get('summary') if isinstance(data.get('summary'), str) else ''
+        path = data.get('result_file')
+        if isinstance(path, str) and path.strip() and os.path.isfile(path.strip()):
+            short = clean_summary(summary)
+            return (short + ' ' if short else '') + 'Full result: ' + path.strip()
+        return first_sentence(summary) if summary else ''
     match = re.search(r'^\s*(?:summary|zusammenfassung)\s*:\s*(.+)$', text, re.I | re.M)
     return first_sentence(match.group(1)) if match else ''
 
