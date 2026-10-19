@@ -137,6 +137,8 @@ def step(engine, run, tasks):
         if (task['role'] != 'executor' or task['state'] != 'done' or task.get('fixed_by')
                 or task.get('review_state') in ('approved', 'open')):
             continue
+        if task.get('patch_worktree') and task.get('patch_state') in ('working', 'waiting'):
+            continue  # Review only after the merge settled: the copy is removed when it merges.
         chain = _chain(task, by_id)
         review = by_id.get(task.get('review_task') or '')
         if not review:
