@@ -151,6 +151,28 @@ def choose_effort(client, model_id, purpose='', task_class='', risk=''):
     return choose_reasoning_effort(purpose, task_class, risk, supported, default)
 
 
+def choose_task_effort(client, model_id, purpose='', task=None):
+    """(effort or None, reason) for one task request (Rule I38).
+
+    The effort the Main set on the task (requested_effort, from operator_main.delegate) wins, clamped to
+    the model's supportedReasoningEfforts; otherwise the automatic choose_effort. Turns of the Main chat
+    itself (purpose 'main') always keep the automatic choice."""
+    from .effort_policy import REASONING_ORDER, catalog_efforts, clamp_effort
+    task = task if isinstance(task, dict) else {}
+    asked = task.get('requested_effort')
+    asked = asked.strip().lower() if isinstance(asked, str) else ''
+    if purpose != 'main' and asked in REASONING_ORDER:
+        supported, _default = catalog_efforts(catalog_entry(client, model_id))
+        effort = clamp_effort(asked, supported)
+        if effort is None:
+            return None, ('set by Main: %s; not sent: no supportedReasoningEfforts for this model '
+                          'in the cached catalog' % asked)
+        if effort == asked:
+            return effort, 'set by Main: ' + asked
+        return effort, 'set by Main: %s, clamped to %s' % (asked, effort)
+    return choose_effort(client, model_id, purpose, task.get('task_class', ''), task.get('risk', ''))
+
+
 def own_turn_steps(records, ids, step_id, chunk=20):
     # Read thread messages newest first until our own user step is loaded. Only the
     # own turn is checked, so older history is skipped; without a match all is read.
@@ -1011,8 +1033,9 @@ class NotionAdapter:
             prompt = worker['handoff'] + note + '\n\nCurrent assignment (continue from the checkpoint):\n' + prompt
         selected = 'opus' if worker.get('purpose') == 'main' else task.get('model', 'opus')
         model = client.model(selected)
-        effort, effort_reason = choose_effort(client, model, worker.get('purpose', ''),
-                                              task.get('task_class', ''), task.get('risk', ''))
+        # Rule I38: a per-task effort set by the Main wins (clamped to the model); else the automatic choice.
+        effort, effort_reason = choose_task_effort(client, model, worker.get('purpose', ''),
+                                                   task)
         # The saved chat config changes only through our own confirmed write: check once per chat generation.
         config_key = (worker['thread_id'], worker.get('generation', 0), model)
         if getattr(self, 'confirmed_configs', {}).get(worker['thread_id']) != config_key:
