@@ -1,6 +1,7 @@
 """parse_duration: '1h 30m' -> 5400 seconds."""
+import math
 import re
-from decimal import ROUND_HALF_UP, Decimal
+from fractions import Fraction
 
 __all__ = ['parse_duration']
 
@@ -17,8 +18,9 @@ def parse_duration(text: str) -> int:
 
     Units d, h, m, s (case-insensitive), each at most once and in that order; spaces are
     allowed between parts but not between a number and its unit. A plain integer means
-    seconds. Decimals are allowed ('1.5h'); the total is rounded to the nearest second
-    (halves round up). Raises TypeError for non-str input and ValueError for invalid text.
+    seconds. Decimals are allowed ('1.5h'); the total is computed exactly (Fraction) and
+    rounded to the nearest second (halves round up). Raises TypeError for non-str input and
+    ValueError for invalid text.
     """
     if not isinstance(text, str):
         raise TypeError('parse_duration() expects a str, got %s' % type(text).__name__)
@@ -27,7 +29,7 @@ def parse_duration(text: str) -> int:
         raise ValueError('empty duration')
     if _PLAIN.fullmatch(s):
         return int(s)
-    total = Decimal(0)
+    total = Fraction(0)
     last = -1
     pos = 0
     while pos < len(s):
@@ -43,6 +45,6 @@ def parse_duration(text: str) -> int:
         if idx < last:
             raise ValueError('unit %r out of order in %r (use d, h, m, s)' % (unit, text))
         last = idx
-        total += Decimal(number) * _UNITS[idx][1]
+        total += Fraction(number) * _UNITS[idx][1]
         pos = _SPACE.match(s, m.end()).end()
-    return int(total.quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    return math.floor(total + Fraction(1, 2))

@@ -35,6 +35,13 @@ class ValidTests(unittest.TestCase):
     def test_large_values(self):
         self.check([('100000d', 8640000000), ('99999999999s', 99999999999)])
 
+    def test_big_numbers_are_exact(self):
+        nines30 = '9' * 30
+        nines25 = '9' * 25
+        self.check([(nines30 + 's', int(nines30)), (nines25 + 'd', int(nines25) * 86400),
+                    (nines30 + 'S', int(nines30)), (nines25 + 'd ' + nines30 + 's', int(nines25) * 86400 + int(nines30)),
+                    (nines30, int(nines30))])
+
     def test_decimals(self):
         self.check([('1.5h', 5400), ('0.5m', 30), ('1.5d', 129600), ('2.25s', 2), ('1.5h 30m', 7200),
                     ('0.1s', 0), ('0.75s', 1)])
