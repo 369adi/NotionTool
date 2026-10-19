@@ -170,6 +170,24 @@ class EngineMainRedTests(unittest.TestCase):
         self.assertIn('test_x', task['patch_result']['tests'])
         self.assertNotIn('main_red', self.kinds())
 
+    def test_main_red_event_not_repeated_after_restart(self):
+        self.put('t1', patch_state='waiting')
+        self.engine._patch_result('t1', self.main_red())
+        self.assertEqual(self.kinds().count('main_red'), 1)
+        fresh = Engine(self.store, base.FakeAdapter())  # a restart: new engine, empty in-memory memory, same store
+        try:
+            fresh.patch_factory = lambda root: self.fake
+            self.put('t2', patch_state='waiting')
+            fresh._patch_result('t2', self.main_red())
+            self.assertEqual(self.kinds().count('main_red'), 1)  # same red main commit: no second event
+            self.assertEqual(self.store.get('tasks', 't2')['patch_main_red'], 'aaa')
+            other = dict(self.main_red(), main_red_commit='ccc')
+            self.put('t3', patch_state='waiting')
+            fresh._patch_result('t3', other)
+            self.assertEqual(self.kinds().count('main_red'), 2)  # a new red main commit is reported again
+        finally:
+            fresh.close()
+
     def failed(self, ident, status='red', at=None, **extra):
         return self.put(ident, patch_state='failed', patch_tries=1,
                         patch_result=dict(status=status, message='m', at=at or time.time()), **extra)

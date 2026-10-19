@@ -837,7 +837,8 @@ class Engine:
                 red_at = str(result.get('main_red_commit') or result.get('main_before') or '')
                 task['patch_main_red'] = red_at
                 seen = self.__dict__.setdefault('_main_red_seen', set())
-                if red_at not in seen:  # one operator event per red main commit, not one per task
+                # One operator event per red main commit, not one per task; the stored events keep this across restarts.
+                if red_at not in seen and not self._main_red_reported(red_at):
                     seen.add(red_at)
                     self.store.event('main_red', task['run_id'], commit=False, task_id=task_id, main_commit=red_at,
                                      failing=task['patch_result']['failing'], message=task['patch_result']['message'][:300])
@@ -874,6 +875,19 @@ class Engine:
                     conflicts_waiting=sum(1 for t in tasks if t.get('patch_state') == 'conflict'),
                     waiting_to_merge=sum(1 for t in tasks if t.get('patch_state') == 'waiting'),
                     labels={t['id']: PATCH_LABELS[t['patch_state']] for t in tasks if t.get('patch_state') in PATCH_LABELS})
+
+    def _main_red_reported(self, main_commit):
+        """True when the store already holds a 'main_red' event for this main commit (survives restarts)."""
+        db = getattr(self.store, 'db', None)
+        if not main_commit or db is None:
+            return False
+        try:
+            with self.store.lock:
+                row = db.execute("SELECT 1 FROM events WHERE kind='main_red' AND json_extract(doc,'$.main_commit')=? "
+                                 "LIMIT 1", (main_commit,)).fetchone()
+        except Exception:
+            return False
+        return row is not None
 
     def _remerge_refusal(self, task):
         """Why a task may not be merged again, or None. Tasks without their worktree are never touched."""
