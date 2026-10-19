@@ -399,6 +399,98 @@ def _attention(base):
     return items
 
 
+# I33: every Main of the account is shown, also user-renamed ones (e.g. 'Roblox') and several at once.
+MAIN_PURPOSES = ('main', 'operator', 'spare_main')
+ARCHIVED_PURPOSES = ('archived_main', 'archived_operator')
+DEFAULT_TITLES = ('', 'main', 'welcome to notion', 'willkommen bei notion', 'new chat', 'neuer chat', 'new ai chat')
+
+
+def _gone(worker):
+    """Archived or retired workers/threads are never a Main."""
+    purpose = str(worker.get('purpose') or '')
+    return (purpose in ARCHIVED_PURPOSES or purpose.startswith('archived') or purpose.startswith('retired')
+            or bool(worker.get('retired')) or bool(worker.get('archived')) or worker.get('state') in ('retired', 'archived'))
+
+
+def _is_main_worker(worker):
+    purpose = worker.get('purpose')
+    if purpose in MAIN_PURPOSES:
+        return True
+    # A Main the user took over and renamed himself is released to purpose 'external' but stays a Main chat.
+    return purpose == 'external' and bool(worker.get('main_number') or worker.get('released_chat'))
+
+
+def _main_title(worker, chat=None):
+    """The user's own (Notion) title wins; generic defaults fall back to the chat title or 'Main N'."""
+    chat = chat or {}
+    for value in (worker.get('user_set_title'), worker.get('notion_title'), chat.get('user_set_title')):
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:120]
+    label = str(worker.get('label') or '').strip()
+    if label and label.lower() not in DEFAULT_TITLES:
+        return label[:120]
+    title = str(chat.get('title') or '').strip()
+    if title and title.lower() not in DEFAULT_TITLES:
+        return title[:120]
+    if worker.get('main_number'):
+        return 'Main %s' % worker.get('main_number')
+    return label or title or 'Main'
+
+
+def collect_mains(chats, all_workers, account=''):
+    """All non-archived Mains of the account: chat records, operator chat and Main workers without a
+    chat record (also user-renamed ones). Deduplicated by thread_id; coworkers are never listed."""
+    by_id = {w['id']: w for w in all_workers}
+    retired = set()
+    for w in all_workers:
+        retired.update(t for t in w.get('retired_threads') or [] if t)
+    mains, seen = [], {}
+
+    def add(entry):
+        thread = entry['thread_id']
+        if thread and thread in retired:
+            return
+        key = thread or ('chat:' + entry['chat_id'])
+        old = seen.get(key)
+        if old is not None:
+            old['operator'] = old['operator'] or entry['operator']
+            if not old['chat_id']:
+                old['chat_id'] = entry['chat_id']
+            return
+        seen[key] = entry
+        mains.append(entry)
+
+    for chat in chats:
+        if account and chat.get('account_id') and chat.get('account_id') != account:
+            continue
+        if chat.get('archived') or chat.get('state') == 'archived':
+            continue
+        wid = chat.get('main_worker') or (chat.get('worker_id') if chat.get('operator') else '')
+        worker = by_id.get(wid) or {}
+        if not wid or _gone(worker):
+            continue
+        # Chats often carry no account_id: the Main worker's account decides. A Main of another
+        # account is not reachable in this window ('Du hast keinen Zugriff auf diesen Chat').
+        if account and worker.get('account_id') and worker.get('account_id') != account:
+            continue
+        thread = worker.get('thread_id') or chat.get('thread_id') or ''
+        add(dict(chat_id=chat['id'], worker_id=wid, thread_id=thread,
+                 operator=bool(chat.get('operator')) or worker.get('purpose') == 'operator',
+                 title=_main_title(worker, chat), role='main', url=chat_url(thread) if thread else ''))
+    for worker in all_workers:
+        if not _is_main_worker(worker) or _gone(worker):
+            continue
+        if account and worker.get('account_id') and worker.get('account_id') != account:
+            continue
+        thread = worker.get('thread_id') or ''
+        if not thread:
+            continue
+        add(dict(chat_id=str(worker.get('chat_id') or ''), worker_id=worker['id'], thread_id=thread,
+                 operator=worker.get('purpose') == 'operator', title=_main_title(worker), role='main',
+                 url=chat_url(thread)))
+    return mains
+
+
 def desktop_state(server, app_settings=None, now=None):
     """The pushed state for the desktop parts (see docs/DESKTOP_APP.md, part contract)."""
     store = server.store
@@ -421,22 +513,7 @@ def desktop_state(server, app_settings=None, now=None):
     workers = [w for w in all_workers if not account or w.get('account_id') == account]
     by_id = {w['id']: w for w in all_workers}
 
-    mains = []
-    for chat in store.all('chats'):
-        if account and chat.get('account_id') and chat.get('account_id') != account:
-            continue
-        wid = chat.get('main_worker') or (chat.get('worker_id') if chat.get('operator') else '')
-        worker = by_id.get(wid) or {}
-        if not wid or worker.get('purpose') in ('archived_main', 'archived_operator'):
-            continue
-        # Chats often carry no account_id: the Main worker's account decides. A Main of another
-        # account is not reachable in this window ('Du hast keinen Zugriff auf diesen Chat').
-        if account and worker.get('account_id') and worker.get('account_id') != account:
-            continue
-        thread = worker.get('thread_id') or chat.get('thread_id') or ''
-        mains.append(dict(chat_id=chat['id'], worker_id=wid, thread_id=thread, operator=bool(chat.get('operator')),
-                          title=str(chat.get('title') or worker.get('label') or 'Main')[:120],
-                          url=chat_url(thread) if thread else ''))
+    mains = collect_mains(store.all('chats'), all_workers, account)
     main_threads = {m['thread_id'] for m in mains if m['thread_id']}
     hidden = set()
     for worker in all_workers:
