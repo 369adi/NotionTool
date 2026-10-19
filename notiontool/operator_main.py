@@ -33,7 +33,12 @@ def result_done(result):
         data = None
     if isinstance(data, dict):
         texts += [v for v in data.values() if isinstance(v, str)]
-    return any(line.strip().casefold() == 'result: done' for text in texts for line in text.splitlines())
+    # The last RESULT line decides: 'RESULT: DONE' followed by 'RESULT: NOT DONE: ...' is not done.
+    marks = [line.strip().casefold() for text in texts for line in text.splitlines()
+             if line.strip().casefold().startswith('result:')]
+    if any(m.startswith('result: not done') for m in marks):
+        return False
+    return 'result: done' in marks
 
 
 def _with_result_line(prompt):
