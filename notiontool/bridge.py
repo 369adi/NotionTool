@@ -277,6 +277,8 @@ class Bridge:
             candidates.append(self.store.get('tasks', task['review_of'], None) or {})
         for item in candidates:
             folder = item.get('patch_worktree')
+            if item is not task and item.get('patch_state') == 'merged':
+                continue  # A merged change is reviewed in the main project folder.
             if folder and Path(folder).is_dir():
                 return Path(folder).resolve()
         return None
