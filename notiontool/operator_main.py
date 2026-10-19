@@ -224,6 +224,11 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
                    allocation=dict(mode='operator', budget=capacity, advisers=0,
                                    reason='Operator Main delegates directly to Coworkers'),
                    quality=quality, quality_reason=quality_reason)
+        for item in plan['tasks']:
+            # 'deps' / 'after' are common names for depends_on; silently dropping them ran dependent tasks in parallel.
+            for alias in ('deps', 'after'):
+                if isinstance(item, dict) and alias in item and not item.get('depends_on'):
+                    item['depends_on'] = list(item.pop(alias) or [])
         run['worker_budget'] = max(1, min(capacity, parallel_width(plan['tasks'])))
         engine._import_plan(run, plan)  # checks every planned file path before any task is queued
         created = [t for t in engine.tasks(run['id']) if t.get('role') == 'executor']
