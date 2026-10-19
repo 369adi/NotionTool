@@ -934,6 +934,9 @@ class Engine:
                             continue
                         if any(d['state'] != 'done' for d in deps) or self._conflicts(task, run):
                             continue
+                        if any(d.get('patch_worktree') and d.get('patch_state') in ('working', 'waiting') for d in deps):
+                            # A dependency's build is still merging: its copy may vanish and main lacks it yet.
+                            continue
                         first_ready = not task.get('ready_at')
                         if first_ready:
                             # Committed with the next task write, so the dispatch path gets no extra disk sync.
