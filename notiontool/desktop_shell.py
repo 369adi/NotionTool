@@ -429,6 +429,10 @@ def desktop_state(server, app_settings=None, now=None):
         worker = by_id.get(wid) or {}
         if not wid or worker.get('purpose') in ('archived_main', 'archived_operator'):
             continue
+        # Chats often carry no account_id: the Main worker's account decides. A Main of another
+        # account is not reachable in this window ('Du hast keinen Zugriff auf diesen Chat').
+        if account and worker.get('account_id') and worker.get('account_id') != account:
+            continue
         thread = worker.get('thread_id') or chat.get('thread_id') or ''
         mains.append(dict(chat_id=chat['id'], worker_id=wid, thread_id=thread, operator=bool(chat.get('operator')),
                           title=str(chat.get('title') or worker.get('label') or 'Main')[:120],

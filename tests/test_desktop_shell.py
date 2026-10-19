@@ -93,6 +93,16 @@ class DesktopShellTests(unittest.TestCase):
         self.assertEqual(state['rate']['limit_per_min'], 180)
         json.dumps(state)
 
+    def test_state_skips_mains_of_other_accounts(self):
+        # Chats without account_id: the Main worker's account decides (no 'keinen Zugriff' rows).
+        store = self.server.store
+        store.put('workers', dict(id='other:main', account_id='other', purpose='main', thread_id='t-other'))
+        store.put('chats', dict(id='c9', main_worker='other:main', title='Slot 1'))
+        store.put('workers', dict(id='acc:m2', account_id='acc', purpose='main', thread_id='t-m2'))
+        store.put('chats', dict(id='c8', main_worker='acc:m2', title='Main 2'))
+        state = ds.desktop_state(self.server, ds.load_app_settings(self.tmp.name), now=100.0)
+        self.assertEqual(sorted(m['chat_id'] for m in state['mains']), ['c1', 'c8'])
+
     def test_new_welcome_chat_uses_main_create_with_request_id(self):
         handlers = ds.desktop_handlers(self.server, self.tmp.name, sleep=lambda s: None)
         result = handlers['new_welcome_chat']({})
