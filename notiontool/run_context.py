@@ -153,15 +153,27 @@ def json_result(entry):
     return None
 
 
+def valid_result_file(path):
+    """path stripped when it resolves to an existing file inside result_files.ROOT, else ''."""
+    if not isinstance(path, str) or not path.strip():
+        return ''
+    from . import result_files
+    try:
+        real = os.path.normcase(os.path.realpath(path.strip()))
+        root = os.path.normcase(os.path.realpath(result_files.ROOT))
+        inside = real != root and os.path.commonpath([real, root]) == root
+    except (OSError, ValueError):
+        return ''
+    return path.strip() if inside and os.path.isfile(real) else ''
+
+
 def result_file_of(entry):
-    """Path of an existing result file ('result_file' field or inside the JSON result), else ''."""
+    """Path of a real result file ('result_file' field or inside the JSON result), else ''."""
     path = entry.get('result_file')
     if not isinstance(path, str):
         data = json_result(entry)
         path = data.get('result_file') if data else None
-    if isinstance(path, str) and path.strip() and os.path.isfile(path.strip()):
-        return path.strip()
-    return ''
+    return valid_result_file(path)
 
 
 def short_result(entry, path):

@@ -226,6 +226,7 @@ def guarded_capture(capture, args, task=None, project_settings=None, already_tak
 
 RESULT_FILE_HINT=('\nWrite your full detailed result with nt_write_file to {path}. In the chat, reply only with the short JSON result: '
                   '{{"status", "summary" (at most 5 sentences), "files", "tests", "result_file": "{path}"}}, then your final status line.')
+READ_FULL_HINT='\nRead a Full result file only when the review fails, tests fail or more detail is explicitly needed.'
 
 
 def _result_file_hint(task,run,tools_available):
@@ -272,7 +273,7 @@ def _prompt_text(task,run,context,token,tools_available):
         return 'You are the Architect of my request. Decide whether to work alone or delegate, and assign the explicit model of every task. Please make an execution task list:\n'+goal+memory+reference+project+run.get('file_claims','')+adviser_tools+f'\nUp to {run.get("worker_budget",run["capacity"])} people can contribute independent parts. Choose the smallest useful task list that preserves answer quality and speed. Do not invent work to fill available people. Separate independent work only when it saves time or improves quality; avoid duplicate research and merging overhead. Respect any explicit contribution count in my request. Use dependencies where needed. Delegated work will be reviewed and combined separately.'+independence+correction+'\nPlease present the task list as this readable table:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='reviewer':
         focus=('\n'+task['prompt']+'\n') if task.get('review_of') else ''
-        return 'Please check these completed results against my request:\n'+goal+focus+reference+project+tools+screen_tools+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
+        return 'Please check these completed results against my request:\n'+goal+focus+reference+project+tools+screen_tools+READ_FULL_HINT+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='integrator':
         return 'Please combine these checked results into a complete answer to my request:\n'+goal+reference+memory+screen_tools+'\nUse my language. State what was actually checked and any remaining limitations.'
     return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+_result_file_hint(task,run,tools_available)+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'
