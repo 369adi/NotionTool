@@ -1461,6 +1461,9 @@ class Engine:
             from .operator_roles import step  # review/fix stages; never a turn in the operator's chat
             if step(self, run, tasks):
                 tasks = self.tasks(run['id'])
+            if any(t['role'] == 'executor' and t['state'] == 'done' and not t.get('fixed_by')
+                   and t.get('patch_worktree') and t.get('patch_state') in ('working', 'waiting') for t in tasks):
+                return  # The review is queued once the merge settled; the run must not finish before.
         if any(t['state'] in ('queued','retry','running','uncertain','cancelling') for t in tasks):
             return
         problems = [t for t in tasks if t['state'] in ('failed','blocked')]
