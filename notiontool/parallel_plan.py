@@ -16,13 +16,19 @@ count = min(free young coworkers (I32: < 23 h), widest DAG level, file-disjoint 
             network budget 180 req/min / requests per busy coworker per minute, live parallel_limit),
 then reduced while the extra coworkers buy less than min_gain each in expected wall time.
 
-Age limit: I32 is 23 h and this module uses 23 h. team_rotation.DEFAULT_MAX_AGE_HOURS (line 31) is
-still 22; aligning it is a follow-up task (that file is outside this task's file list).
+Age limit: I32 is 23 h, the same as team_rotation.DEFAULT_MAX_AGE_HOURS.
 
-Network budget is on by default: req_per_coworker_min defaults to 14.4, i.e. the 180 req/min hard
-limit times the 0.8 headroom spread over the highest measured network_budget.parallel_limit (10) at
-which the bench saw 0 rate-limit events. The engine hook (engine.py:450-452 _parallel_cap) should
-pass the live value as stats['parallel_limit'] and, once measured, stats['req_per_coworker_min'].
+Network budget is on by default, but the default rate is CONFIGURED, not measured: 14.4 req per
+busy coworker per minute = the 180 req/min hard limit times the 0.8 headroom spread over the highest
+configured network_budget.parallel_limit (10), at which the bench saw 0 rate-limit events. The reason
+text says so. Pass a measured rate as stats['req_per_coworker_min'] together with
+stats['req_rate_source'] = 'measured'. The engine passes the live _parallel_cap value as
+stats['parallel_limit'].
+
+Plan-time estimates: when a task has no est_s, its duration is stats['turn_s_by_role'][role]
+(median busy time of earlier done runs), else turn_s. fixed_s_by_width maps an expected width
+(1, 2, ...) to the median serial time outside tasks of earlier done runs with that peak width.
+stats_from_history(runs) builds both from earlier runs only.
 """
 
 MEASURED_PARALLEL_TOP = 10  # bench: top network_budget.parallel_limit, 0 rate-limit events
