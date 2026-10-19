@@ -265,8 +265,38 @@ class Bridge:
             raise ValueError('No PC project folder configured for this chat')
         raise ValueError('The configured project folder does not exist')
 
-    def path(self, run, relative='.'):
+    def worktree(self, task):
+        """The git worktree a task works in: its own copy, or for a review the reviewed task's copy.
+
+        None when the task has no existing worktree; tools then use the project folder.
+        """
+        if not task:
+            return None
+        candidates = [task]
+        if task.get('review_of'):
+            candidates.append(self.store.get('tasks', task['review_of'], None) or {})
+        for item in candidates:
+            folder = item.get('patch_worktree')
+            if folder and Path(folder).is_dir():
+                return Path(folder).resolve()
+        return None
+
+    def path(self, run, relative='.', task=None):
         root = self.root(run)
+        copy = self.worktree(task)
+        if copy is not None:
+            # The task works in its own copy: relative paths and absolute paths into the main
+            # project folder both mean the same file inside the copy.
+            raw = Path(os.path.expanduser(str(relative)))
+            project = self.project(run)
+            if raw.is_absolute() and project:
+                resolved = raw.resolve()
+                if resolved.is_relative_to(project) and not resolved.is_relative_to(project / 'work'):
+                    raw = resolved.relative_to(project)
+            path = (raw if raw.is_absolute() else copy / raw).resolve()
+            if self.full_access() or path.is_relative_to(copy) or path.is_relative_to(root):
+                return path
+            raise ValueError("File is outside this task's copy of the project (%s)" % copy)
         path = (root/os.path.expanduser(str(relative))).resolve()
         if self.full_access():
             # Full PC access (explicit opt-in in Settings): absolute paths anywhere.
@@ -373,14 +403,14 @@ class Bridge:
             elif name=='run_shell' and self.role_is_read_only(task['role']):
                 # Read-only test run: fixed project root (a cwd argument is ignored),
                 # no folder claim, only the lease check.
-                cwd = self.project(run)
+                cwd = self.worktree(task) or self.project(run)
                 if cwd is None:
                     raise ValueError('Read-only test runs need a project folder')
                 self.engine.check_lease(task['id'],token)
                 self._tool_started(run['id'],task_id=task['id'],tool=name,
                                  message='Tests in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             elif name=='run_shell':
-                cwd = self.path(run,str(args.get('cwd') or '.'))
+                cwd = self.path(run,str(args.get('cwd') or '.'),task=task)
                 if not cwd.is_dir():
                     raise ValueError('Shell folder does not exist')
                 # Shell is a powerful tool, not a filesystem sandbox. With full PC access it is still
@@ -394,7 +424,7 @@ class Bridge:
                 self._tool_started(run['id'],task_id=task['id'],tool=name,
                                  message='Shell in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             else:
-                path = self.path(run,str(args.get('path','.')))
+                path = self.path(run,str(args.get('path','.')),task=task)
                 if name=='list_files':
                     area = self.hidden_area(self.project(run))
                     self.guard_area(path, area, 'Listing')
@@ -630,13 +660,25 @@ class Bridge:
         if not files:
             return
         project = self.project(run)
+        base = project or self.root(run)
+        copy = self.worktree(task)
         key = file_registry.path_key(path)
         for entry in files:
-            target = Path(os.path.expanduser(entry))
-            if not target.is_absolute():
-                target = (project or self.root(run)) / target
-            if _key_inside(key, file_registry.path_key(target)):
-                return
+            raw = Path(os.path.expanduser(entry))
+            targets = [raw if raw.is_absolute() else base / raw]
+            if copy is not None:
+                # The same entry inside the task's own copy (git worktree).
+                rel = raw
+                if raw.is_absolute():
+                    try:
+                        rel = raw.resolve().relative_to(project) if project else None
+                    except ValueError:
+                        rel = None
+                if rel is not None:
+                    targets.append(copy / rel)
+            for target in targets:
+                if _key_inside(key, file_registry.path_key(target)):
+                    return
         raise ValueError("Write refused: %s is not in this task's files list (%s); no file was changed. "
                          "Only the assigned files may be written; report other needed changes in your result."
                          % (path, ', '.join(files)[:300]))
