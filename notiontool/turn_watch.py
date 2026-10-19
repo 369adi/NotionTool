@@ -42,7 +42,9 @@ OPERATOR = 'operator'
 STOP_WORDS = re.compile(r'\b(stop|halt|pause|warte|aufh(?:ö|oe)ren)\b', re.IGNORECASE)
 # No paused-turn marker is documented in notion.py transcript() (it returns getThreadTranscript as is).
 # These defensive markers make a limit/pause entry count as an interruption if Notion ever writes one.
-PAUSE_MARKERS = ('step_limit', 'limit_reached', 'max_steps', 'paused', 'pause', 'interrupt', 'timeout', 'time_limit')
+PAUSE_MARKERS = ('interrupt', 'timeout')
+# Notion's own step/time-limit pause waits for the user's 'Continue' click: never resumed automatically.
+LIMIT_MARKERS = ('step_limit', 'limit_reached', 'max_steps', 'time_limit', 'paused', 'pause', 'confirm')
 
 
 def stamp(entity):
@@ -65,8 +67,17 @@ def text_of(value):
     return ''
 
 
+def _reason(entity):
+    return str(entity.get('stop_reason') or entity.get('stopReason') or entity.get('reason') or '').lower()
+
+
+def _limit_pause(entity, kind):
+    reason = _reason(entity)
+    return any(marker in kind or marker in reason for marker in LIMIT_MARKERS)
+
+
 def _paused(entity, kind):
-    reason = str(entity.get('stop_reason') or entity.get('stopReason') or entity.get('reason') or '').lower()
+    reason = _reason(entity)
     return any(marker in kind or marker in reason for marker in PAUSE_MARKERS)
 
 
@@ -76,6 +87,8 @@ def _role(entity):
         return kind
     if 'survey' in repr(entity).lower():
         return 'assistant_message'  # an open question to the user waits for the user; it is no interruption
+    if _limit_pause(entity, kind):
+        return 'assistant_message'  # waits for the user's Continue click, like an open question
     if _paused(entity, kind):
         return 'error'  # a turn Notion stopped for a step/time limit is unfinished
     if entity.get('tool_use_id') or any(word in kind for word in ('tool', 'execution', 'computer')):
