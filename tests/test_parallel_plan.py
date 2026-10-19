@@ -52,8 +52,7 @@ class TestParallelPlan(unittest.TestCase):
         self.assertEqual(count, 3)
         self.assertIn('3 coworker(s) >= 23 h excluded', reason)
 
-    def test_age_from_created_at_and_unknown_age_counts_as_young(self):
-        # name kept from the review request; unknown age now counts as too old by default
+    def test_age_from_created_at_and_unknown_age_excluded(self):
         now = 2_000_000_000
         free = [dict(created_at=now - 3600), dict(created_at=now - 24 * 3600), dict(id='no-age'), 30]
         self.assertEqual(len(young_coworkers(free, dict(now=now))), 1)
