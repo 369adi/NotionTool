@@ -1,9 +1,9 @@
-"""Automatic age rotation of Welcome Coworker chats (default every 23 hours).
+"""Automatic age rotation of Welcome Coworker chats (default every 22 hours).
 
 Every managed Coworker records created_at (UTC epoch seconds). Missing values are backfilled from the
 Notion thread record (created_time) or, without one, from the first time the harness saw the chat.
 
-When a managed Coworker (ledger role workerK) is older than coworker_max_age_hours (default 23, 1..72)
+When a managed Coworker (ledger role workerK) is older than coworker_max_age_hours (default 22, 1..72)
 and idle, ONE background job for its account creates a fresh Welcome chat with the same flow as
 ensure_team (pending ledger entry first, create_welcome, confirmation from Notion's chat list), points
 the role at the new thread and retires the old worker (enabled False, purpose 'retired_worker'). The
@@ -28,7 +28,7 @@ from .team_size import team_roles
 
 CHECK_S = 300
 BACKOFF_S = 900
-DEFAULT_MAX_AGE_HOURS = 23
+DEFAULT_MAX_AGE_HOURS = 22
 MIN_AGE_HOURS, MAX_AGE_HOURS = 1, 72
 RETIRED_PURPOSE = 'retired_worker'
 TERMINAL_TASK_STATES = ('done', 'failed', 'blocked', 'cancelled')

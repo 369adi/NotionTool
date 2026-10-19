@@ -51,7 +51,7 @@ HARNESS_SETTINGS = [
          'Most helper chats working at the same time, over all accounts.'),
     _int('per_account', 'Coworkers', 'Coworkers', 1, 40, DEFAULT_COWORKERS,
          'Helper chats per Notion account (team size). 1 to 40.'),
-    _int('coworker_max_age_hours', 'Replace chats after (hours)', 'Coworkers', 1, 72, 23,
+    _int('coworker_max_age_hours', 'Replace chats after (hours)', 'Coworkers', 1, 72, 22,
          'A helper chat older than this gets a fresh chat. The old one is kept.'),
     _int('max_runs_per_chat', 'Runs per Main chat', 'Coworkers', 1, 6, 3,
          'How many runs one Main chat may have in progress.'),
