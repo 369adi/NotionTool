@@ -17,7 +17,7 @@ Rule I35:
 Effort: Haiku low, Sonnet medium, Opus high. Sonnet goes low for pure read-only check
 lists (hashes, CRLF, test counts) and small low-risk changes, medium for read-only audits
 that need judgment, high for high risk, 4+ files or a broad change (difficulty.classify
-route 'team'). A fix stage (title 'Fix:' / 'Fix 2:' or a set fix_of) goes one step up.
+score >= BROAD_SCORE, owned here; the team route/threshold is not used). A fix stage (title 'Fix:' / 'Fix 2:' or a set fix_of) goes one step up.
 
 xhigh / max (decision): choose() never returns xhigh or max. Opus on hard work sends
 'high' to Notion. xhigh is only sent as an escalation after a failed attempt of the same
@@ -39,6 +39,9 @@ NOTION_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
 # Only the start of a prompt is scanned: long prompts repeat boilerplate (tool access
 # notes, restart rules) that must not change the class of the task.
 PROMPT_HEAD = 300
+# Sonnet effort goes high for a broad change only at this difficulty score. Owned here on
+# purpose: difficulty.TEAM_THRESHOLD / route 'team' decide team routing and may change.
+BROAD_SCORE = 0.8
 
 _I = re.IGNORECASE
 _PREFIX = re.compile(r'^(?:(?:fix(?:\s*\d+)?|review|part\s+\w+)\s*:\s*)+', _I)
@@ -58,6 +61,8 @@ HARD = (
     ('root-cause hunt (prompt asks for the cause)', re.compile(
         r'root[- ]cause|\bfind (?:out )?(?:the )?(?:cause|reason|why)\b|\bexplain why\b|'
         r'\bfind out why\b|\bwho changed\b|\bdecide (?:if|whether)\b[^.]{0,40}\bwrong\b|; find out\b', _I), 'prompt'),
+    ('forensic proof', re.compile(
+        r'\bdoes notion really run\b|\breally runs? the chosen\b|\bprove that notion\b|\bforensic\w*', _I), 'any'),
     ('critical review', re.compile(
         r'review all changes critically|independently review|integration (?:and )?review|'
         r'review and combine|^review \+|acceptance check|final (?:independent )?review', _I), 'any'),
@@ -81,6 +86,8 @@ HAIKU = (
         r'line-ending guard|^(?:write|add) (?:a |one |the )?(?:[\w.-]+ ){0,3}test\b(?! suite)', _I), 'title'),
     ('rerun and report', re.compile(r'^recheck\b', _I), 'title'),
 )
+# Reviews of backtest fixture work (a file with one line, a file and its test) are mechanical.
+REVIEW_MECH = re.compile(r'\bbacktest\b[^.]{0,20}\bfile\b|\bfile and test\b', _I)
 NOT_SIMPLE_TEST = re.compile(r'integration|end[- ]to[- ]end|\be2e\b|\bsuite\b|\blive\b', _I)
 
 READ_ONLY = re.compile(
@@ -170,6 +177,8 @@ def choose(task):
         return done('opus', 'high', 'design stage (architecture/visual spec)')
     if role == 'reviewer' or task.get('review_of'):
         easy = _haiku_hits(core, '', nfiles)
+        if REVIEW_MECH.search(core):
+            easy.append('backtest file/test')
         if easy and not _hits(HARD, core, ''):
             return done('sonnet', 'low', 'review of mechanical work (%s): no critical review needed'
                         % ', '.join(easy))
@@ -206,7 +215,7 @@ def choose(task):
     elif nfiles >= 4:
         effort = 'high'
         why.append('%d files' % nfiles)
-    elif route['route'] == 'team':
+    elif route['score'] >= BROAD_SCORE:
         effort = 'high'
         why.append('broad change (difficulty score %.2f)' % route['score'])
     elif risk == 'low' and nfiles <= 3:
@@ -218,15 +227,13 @@ def choose(task):
 
 
 def notion_effort(effort, supported=NOTION_EFFORTS, escalation=0):
-    """Effort string to send to Notion. high stays high on the first try; each escalation
-    after a failed attempt adds one step (high -> xhigh -> max). Clamped to `supported`
+    """Effort string to send to Notion. The first try sends the chosen effort unchanged;
+    escalation raises ANY effort by one step per failed attempt of the same task
+    (low -> medium -> high -> xhigh -> max), capped at max. Clamped to `supported`
     (the highest supported level not above the wanted one, else the lowest supported)."""
     effort = effort if effort in NOTION_EFFORTS else 'medium'
     idx = NOTION_EFFORTS.index(effort)
-    if effort == 'high':
-        idx += max(0, int(escalation or 0))
-    else:
-        idx += max(0, int(escalation or 0))
+    idx += max(0, int(escalation or 0))
     idx = min(idx, len(NOTION_EFFORTS) - 1)
     sup = [e for e in NOTION_EFFORTS if e in tuple(supported or ())]
     if not sup:

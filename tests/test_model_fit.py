@@ -409,6 +409,38 @@ class ChooseTest(unittest.TestCase):
         for case in CASES + HOLD:
             self.assertNotIn(model_fit.choose(as_task(case))[1], ('xhigh', 'max'))
 
+    def test_escalation_raises_any_effort_one_step(self):
+        self.assertEqual(model_fit.notion_effort('low', escalation=1), 'medium')
+        self.assertEqual(model_fit.notion_effort('medium', escalation=1), 'high')
+        self.assertEqual(model_fit.notion_effort('medium', escalation=2), 'xhigh')
+        self.assertEqual(model_fit.notion_effort('low', escalation=0), 'low')
+        self.assertEqual(model_fit.notion_effort('medium', escalation=-3), 'medium')
+
+    def test_effort_ignores_difficulty_route(self):
+        # A difficulty version that calls everything 'team' must not raise Sonnet effort.
+        real = model_fit.difficulty.classify
+        try:
+            model_fit.difficulty.classify = lambda text, context=None: {
+                'route': 'team', 'score': 0.6, 'reasons': ['stub']}
+            self.assertEqual(model_fit.choose({})[:2], (S, M))
+            self.assertEqual(model_fit.choose({'title': 'Write parser'})[:2], (S, M))
+            self.assertEqual(model_fit.choose({'title': 'Settings panel layout', 'files': ['web/style.css']})[:2], (S, M))
+            model_fit.difficulty.classify = lambda text, context=None: {
+                'route': 'direct', 'score': model_fit.BROAD_SCORE, 'reasons': ['stub']}
+            self.assertEqual(model_fit.choose({'title': 'Write parser'})[:2], (S, X))
+        finally:
+            model_fit.difficulty.classify = real
+
+    def test_forensic_proof_is_opus(self):
+        task = {'title': 'Does Notion really run the chosen model and effort?', 'files': ['a.py', 'b.py', 'c.py', 'd.py']}
+        self.assertEqual(model_fit.choose(task)[:2], (O, X))
+        self.assertEqual(model_fit.choose({'title': 'Forensic check of model reports'})[:2], (O, X))
+
+    def test_review_of_backtest_fixture_is_mechanical(self):
+        for title in ('Review: Write review backtest 2 file and test', 'Review: Write backtest file (fix 2)'):
+            self.assertEqual(model_fit.choose({'role': 'reviewer', 'title': title})[:2], (S, L), title)
+        self.assertEqual(model_fit.choose({'role': 'reviewer', 'title': 'Review: Composer tools'})[:2], (O, X))
+
 
 class FileFormatTest(unittest.TestCase):
     def test_model_fit_is_lf_and_has_no_io(self):

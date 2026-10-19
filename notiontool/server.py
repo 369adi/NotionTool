@@ -1072,6 +1072,13 @@ class Application:
             if path=='/api/run/retry':
                 self.engine.retry_blocked(body['id'],allow_resend=bool(body.get('allow_resend')))
                 return {'ok':True}
+            if path=='/api/task/remerge':
+                # A merge rejected as red (or main_red) goes back to 'waiting' when its worktree still exists.
+                if body.get('id'):
+                    return dict(ok=True, **self.engine.remerge(task_id=str(body['id'])))
+                if body.get('since') is not None:
+                    return dict(ok=True, **self.engine.remerge(since=float(body['since'])))
+                raise ValueError('Give a task id or since (unix time)')
             if path=='/api/task/reconcile':
                 if body.get('resolution'):
                     # The Main decides an unconfirmed task after checking the work itself; nothing is resent (I5).
