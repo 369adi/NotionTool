@@ -130,6 +130,22 @@ class PatchModeTest(unittest.TestCase):
         self.assertIsNone(again['commit'])
         self.assertEqual(again['added'], 3)
 
+    def test_listed_files_in_ignored_paths_are_reported_not_silently_dropped(self):
+        t = self.task('t1', 's1', 'Bench', files=['work/bench/roman.py', './work/bench/test_roman.py',
+                                                   'work/bench/missing.py', '../evil.py'])
+        wt = Path(self.pm.prepare(t))
+        write(wt / 'work' / 'bench' / 'roman.py', 'X = 1\n')
+        write(wt / 'work' / 'bench' / 'test_roman.py', 'Y = 2\n')
+        stats = self.pm.collect(t)
+        self.assertEqual(sorted(stats['dropped']), ['work/bench/roman.py', 'work/bench/test_roman.py'])
+        self.assertEqual(stats['files_changed'], 0)
+        before = self.main_sha()
+        result = self.pm.merge(t)
+        self.assertEqual(result['status'], 'dropped_files')
+        self.assertIn('work/bench/roman.py', result['message'])
+        self.assertEqual(self.main_sha(), before)
+        self.assertFalse((self.root / 'work' / 'bench' / 'roman.py').exists())
+
     def test_verify_green_then_red(self):
         t = self.task('t1', 's1', 'Swap add')
         self.pm.prepare(t)

@@ -253,6 +253,7 @@ class PatchMode:
         """Commit the coworker's changes in its worktree. Returns diff stats against main for the proof record."""
         path = self._existing(task)
         self._git(['add', '-A', '--', '.'], cwd=path)  # respects .gitignore: ignored files are never added
+        dropped = self._dropped_listed(task, path)
         staged = self._lines(['diff', '--cached', '--name-only', '--no-renames'], cwd=path)
         skipped = [name for name in staged if FORBIDDEN_PATH.search(name)]
         for i in range(0, len(skipped), 50):
@@ -264,8 +265,25 @@ class PatchMode:
             self._git(['commit', '-q', '--no-verify', '-F', '-'], cwd=path, input=self._message(task))
             commit = self.rev('HEAD', cwd=path)
         stats = self.diff_stats(task, cwd=path)
-        stats.update(commit=commit, skipped=skipped)
+        stats.update(commit=commit, skipped=skipped, dropped=dropped)
         return stats
+
+    def _dropped_listed(self, task, path):
+        """Listed task files that exist in the worktree but can never be merged.
+
+        work/, data/ and friends are blocked on purpose (FORBIDDEN_PATH, .gitignore). A task that
+        writes there used to end as 'nothing to merge' and the run reported done although its
+        files were silently dropped; the merge now reports them instead.
+        """
+        dropped = []
+        for raw in task.get('files') or []:
+            name = re.sub(r'^\./', '', str(raw).replace('\\', '/'))
+            if not name or name.startswith('/') or '..' in name.split('/') or not (path / name).is_file():
+                continue
+            if FORBIDDEN_PATH.search(name) or self._git(['check-ignore', '-q', '--', name], cwd=path,
+                                                        check=False).returncode == 0:
+                dropped.append(name)
+        return dropped
 
     def _message(self, task):
         goal = _goal_line(task)
@@ -427,6 +445,10 @@ class PatchMode:
         stats = self.collect(task)
         old_main = self.rev(self.base)
         result.update(stats=stats, main_before=old_main)
+        if not stats['files_changed'] and stats.get('dropped'):
+            return dict(result, status='dropped_files',
+                        message='The task only wrote files that are never merged (ignored or blocked paths): '
+                                + ', '.join(stats['dropped'][:10]) + '. Put real work outside work/ and data/.')
         if not stats['files_changed'] and self._is_ancestor(branch, self.base):
             result['cleanup'] = self._remove(path, branch)
             return dict(result, status='nothing', message='The task changed no files; nothing to merge')
