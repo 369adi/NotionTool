@@ -216,5 +216,33 @@ class PrivateChatSelectionTests(unittest.TestCase):
                                if w.get('purpose', 'worker') == 'worker'])
 
 
+SERVER_SOURCE = (Path(__file__).resolve().parents[1] / 'notiontool' / 'server.py').read_bytes()
+
+
+@unittest.skipUnless(b'/api/app/chat/create' in SERVER_SOURCE, 'server.py does not route /api/app/chat/* yet')
+class ServerRouteTests(AppChatRouteTests):
+    """The three routes through the real POST dispatch (Handler.handle_request -> Application.action)."""
+
+    def post(self, path, **body):
+        from notiontool.server import Application
+        body.setdefault('account_id', 'a')
+        return Application.action(self.server, path, body)
+
+    def test_server_routes_wired(self):
+        made = self.create('Tax 2026', False, 'srv-1')
+        for key in ('id', 'state', 'role', 'thread_id', 'chat_id', 'worker_id', 'duplicate'):
+            self.assertIn(key, made)
+        self.assertEqual(made['role'], 'private')
+        self.assertFalse(made['duplicate'])
+        moved = self.post(own_chats.PROMOTE_ROUTE, thread_id=made['thread_id'], main=True)
+        for key in ('ok', 'role', 'chat_id', 'thread_id', 'worker_id'):
+            self.assertIn(key, moved)
+        self.assertEqual(moved['role'], 'main')
+        named = self.post(own_chats.RENAME_ROUTE, thread_id=made['thread_id'], name='Taxes')
+        for key in ('ok', 'name', 'thread_id', 'worker_id'):
+            self.assertIn(key, named)
+        self.assertEqual(named['name'], 'Taxes')
+
+
 if __name__ == '__main__':
     unittest.main()
