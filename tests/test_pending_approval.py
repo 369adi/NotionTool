@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from notiontool.engine import PendingRemote
-from notiontool.notion import pending_tool_label
+from notiontool.notion import APPROVAL_WAIT_SECONDS, pending_tool_label
 from test_stream_guard import STEP, T1, Base, FakeClient, user
 
 
@@ -31,12 +31,33 @@ class PendingApprovalTests(Base):
 
     def test_pending_tool_is_recorded_once(self):
         transcript = {'patches': [user(6), finished_tool(7), pending_tool(8)], 'session': {'status': 'running'}}
-        with mock.patch.object(self.store, 'event', wraps=self.store.event) as event:
+        clock = [1000.0]
+        with mock.patch.object(self.store, 'event', wraps=self.store.event) as event, \
+                mock.patch('notiontool.notion.time.time', lambda: clock[0]):
+            self.recover(transcript)
+            clock[0] += APPROVAL_WAIT_SECONDS
             self.recover(transcript)
             self.recover(transcript)
         self.assertEqual(self.store.get('tasks', 'task1')['awaiting_approval'], 'nt_write_file')
         kinds = [c.args[0] for c in event.call_args_list]
         self.assertEqual(kinds.count('turn_awaiting_approval'), 1)
+
+    def test_short_pending_auto_run_tool_is_no_approval_wait(self):
+        # Auto-run tools are 'pending' for a moment as well (false alarm on 2026-10-19 23:10).
+        transcript = {'patches': [user(6), finished_tool(7), pending_tool(8)], 'session': {'status': 'running'}}
+        with mock.patch('notiontool.notion.time.time', lambda: 1000.0):
+            self.recover(transcript)
+            self.recover(transcript)
+        self.assertFalse(self.store.get('tasks', 'task1').get('awaiting_approval'))
+
+    def test_mark_is_cleared_when_the_turn_moves_on(self):
+        clock = [1000.0]
+        with mock.patch('notiontool.notion.time.time', lambda: clock[0]):
+            self.recover({'patches': [user(6), pending_tool(8)], 'session': {'status': 'running'}})
+            clock[0] += APPROVAL_WAIT_SECONDS
+            self.recover({'patches': [user(6), pending_tool(8)], 'session': {'status': 'running'}})
+            self.recover({'patches': [user(6), finished_tool(9)], 'session': {'status': 'running'}})
+        self.assertFalse(self.store.get('tasks', 'task1').get('awaiting_approval'))
 
     def test_no_pending_tool_records_nothing(self):
         self.recover({'patches': [user(6), finished_tool(7)], 'session': {'status': 'running'}})

@@ -30,6 +30,8 @@ def pending_tool_label(entity):
     return match.group(0) if match else str(entity.get('name') or 'a tool call')[:80]
 
 
+APPROVAL_WAIT_SECONDS = 90  # a tool call pending this long really waits for a click
+
 class ThreadMissing(ValueError):
     """Notion answered HTTP 404 for a worker thread (the chat was deleted)."""
     def __init__(self, thread_id, path=''):
@@ -1202,11 +1204,21 @@ class NotionAdapter:
         looked like an unconfirmed completion and silently blocked its run.
         """
         pending = [e for e in own_turn if e.get('interaction_status') == 'pending']
+        stored = self.store.get('tasks', task.get('id', ''), {}) or {}
         if not pending:
+            if stored.get('awaiting_approval') or stored.get('approval_seen'):
+                self.mark_task(task['id'], awaiting_approval='', approval_seen=None)  # the turn moved on
             return None
         entity = max(pending, key=lambda e: e.get('sequence', 0))
         label = pending_tool_label(entity)
-        stored = self.store.get('tasks', task.get('id', ''), {}) or {}
+        # Auto-run tools are 'pending' for a moment too: only a call that stays pending is a real approval wait.
+        key = str(entity.get('id') or entity.get('sequence') or label)
+        seen = stored.get('approval_seen') or {}
+        if seen.get('key') != key:
+            self.mark_task(task['id'], approval_seen={'key': key, 'at': time.time()})
+            return None
+        if time.time() - float(seen.get('at') or 0) < APPROVAL_WAIT_SECONDS:
+            return None
         if stored.get('awaiting_approval') != label:
             self.mark_task(task['id'], awaiting_approval=label, awaiting_approval_at=time.time())
             self.store.event('turn_awaiting_approval', task.get('run_id', ''), task_id=task.get('id', ''),
