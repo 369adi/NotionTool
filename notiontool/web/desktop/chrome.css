@@ -1,0 +1,89 @@
+/* NotionTool desktop overlay part: chrome. Hides only rows chrome.js marked; never by Notion class names.
+ * Styles only nt-desk- classes set by chrome.js. Theme variables come from the theme part (--nt-*),
+ * with fallbacks so this part also works alone.
+ */
+.nt-desk-hidden {
+  display: none !important;
+}
+
+/* Upsell and AI quota banners (marked by chrome.js; turn off with app_hide.upsell = false). */
+.nt-desk-upsell {
+  display: none !important;
+}
+
+/* ---- Top bar: slim dark bar with blur ---------------------------------------------- */
+.nt-desk-chrome-on .nt-desk-topbar {
+  background: var(--nt-topbar-bg, rgba(11, 13, 18, 0.72)) !important;
+  -webkit-backdrop-filter: blur(var(--nt-blur, 16px)) saturate(140%);
+  backdrop-filter: blur(var(--nt-blur, 16px)) saturate(140%);
+  border-bottom: 1px solid var(--nt-border, rgba(255, 255, 255, 0.06)) !important;
+  box-shadow: none !important;
+  color: var(--nt-text, #e6e8ef) !important;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+
+/* ---- Chat composer: floating rounded card with gradient focus ring ------------------- */
+.nt-desk-chrome-on .nt-desk-composer {
+  position: relative;
+  border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.08)) !important;
+  border-radius: calc(var(--nt-radius, 12px) + 4px) !important;
+  background: var(--nt-raised, #181c26) !important;
+  box-shadow: var(--nt-shadow-float, 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3)) !important;
+  color: var(--nt-text, #e6e8ef) !important;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.nt-desk-chrome-on .nt-desk-composer:focus-within {
+  border-color: transparent !important;
+  background:
+    linear-gradient(var(--nt-raised, #181c26), var(--nt-raised, #181c26)) padding-box,
+    linear-gradient(135deg, var(--nt-accent-1, #7c5cff), var(--nt-accent-2, #22d3ee)) border-box !important;
+  box-shadow:
+    0 0 0 3px var(--nt-accent-glow, rgba(124, 92, 255, 0.18)),
+    var(--nt-shadow-float, 0 14px 40px rgba(0, 0, 0, 0.45)) !important;
+}
+/* Small branding label on the top-left border of the empty composer. It sits on the border line,
+ * outside the input area, so it never covers the send button, the token counter or the text. */
+.nt-desk-chrome-on .nt-desk-composer-empty::after {
+  content: 'NotionTool';
+  position: absolute;
+  top: 0;
+  left: 16px;
+  transform: translateY(-50%);
+  z-index: 1;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 9px;
+  line-height: 14px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  background: var(--nt-raised, #181c26);
+  color: var(--nt-accent-2, #22d3ee);
+  opacity: 0.8;
+  pointer-events: none;
+}
+/* The label overhangs the top border; the empty composer must not clip it. */
+.nt-desk-chrome-on .nt-desk-composer-empty {
+  overflow: visible !important;
+}
+
+/* ---- Chat messages: readable width and rhythm ---------------------------------------- */
+.nt-desk-chrome-on .nt-desk-message {
+  max-width: var(--nt-message-width, 760px);
+  line-height: 1.6 !important;
+  font-size: 15px;
+  color: var(--nt-text, #e6e8ef);
+}
+.nt-desk-chrome-on .nt-desk-message .nt-desk-code {
+  background: var(--nt-raised, #181c26) !important;
+  color: var(--nt-code-text, #e6e8ef) !important;
+  border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.07)) !important;
+  border-radius: var(--nt-radius-sm, 10px) !important;
+  padding: 12px 14px !important;
+  font-family: var(--nt-font-mono, ui-monospace, "SFMono-Regular", Consolas, monospace) !important;
+  font-size: 13px;
+  line-height: 1.55 !important;
+  overflow-x: auto;
+}

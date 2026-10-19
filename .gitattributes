@@ -1,0 +1,45 @@
+# Line endings: LF everywhere; git never converts a file away from its bytes on disk. See docs/GIT.md.
+* text=auto eol=lf
+
+# CRLF by design (edited by byte patch)
+notiontool/server.py text eol=crlf
+notiontool/devtools.py text eol=crlf
+notiontool/chat_context.py text eol=crlf
+
+# CRLF today (legacy; keep the bytes as they are until the owner converts them to LF on purpose)
+notiontool/notion.py text eol=crlf
+notiontool/mains.py text eol=crlf
+notiontool/mcp_servers.py text eol=crlf
+notiontool/perfection.py text eol=crlf
+notiontool/verifier.py text eol=crlf
+notiontool/template.json text eol=crlf
+notiontool/welcome.json text eol=crlf
+notiontool/vendor/sessions.py text eol=crlf
+notiontool/vendor/transport.py text eol=crlf
+docs/HANDOFF.md text eol=crlf
+project-memory/NotionTool.md text eol=crlf
+project-memory/studio432-432studio-plazcode.md text eol=crlf
+requirements.txt text eol=crlf
+tests/test_devtools.py text eol=crlf
+tests/test_harness_context.py text eol=crlf
+tests/test_harness_multi_main.py text eol=crlf
+tests/test_verifier.py text eol=crlf
+
+# Mixed CRLF/LF: stored byte for byte
+README.md -text
+
+# Binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.bmp binary
+*.pdf binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

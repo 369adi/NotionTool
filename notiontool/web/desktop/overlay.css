@@ -1,0 +1,162 @@
+/* NotionTool desktop overlay - sidebar part. Every class uses the nt-desk- prefix.
+ * Colours come from the theme part (--nt-* variables); every var() has a fallback so the
+ * sidebar still looks right when the theme part is not loaded. */
+.nt-desk-hidden { display: none !important; }
+
+/* Branded header at the top of the sidebar. */
+.nt-desk-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 8px 6px;
+  padding: 10px 12px;
+  border-radius: var(--nt-radius, 12px);
+  background: var(--nt-surface, #12151d);
+  border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.06));
+  color: var(--nt-text, #e8eaf2);
+  font: 600 14px/1.2 var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  letter-spacing: 0.2px;
+  user-select: none;
+}
+
+.nt-desk-brand-mark {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: var(--nt-accent-gradient, linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%));
+  box-shadow: 0 0 14px var(--nt-accent-glow, rgba(124, 92, 255, 0.45));
+}
+
+.nt-desk-brand-name {
+  background: var(--nt-accent-gradient, linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Our 'Mains' label in place of the hidden 'Notion AI' / 'Notion-KI' heading. */
+.nt-desk-heading {
+  margin: 10px 14px 4px;
+  color: var(--nt-muted, #8b93a7);
+  font: 600 11px/1.4 var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  user-select: none;
+}
+
+/* Main chat rows as rounded cards. */
+.nt-desk-main-row {
+  position: relative;
+  margin: 3px 8px;
+  border-radius: var(--nt-radius, 12px);
+  background: var(--nt-raised, #181c26);
+  border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.06));
+  transition: box-shadow 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+}
+
+.nt-desk-main-row:hover {
+  border-color: var(--nt-accent-soft, rgba(124, 92, 255, 0.45));
+  box-shadow: 0 0 0 1px var(--nt-accent-soft, rgba(124, 92, 255, 0.35)),
+    0 0 18px var(--nt-accent-glow, rgba(124, 92, 255, 0.22));
+}
+
+.nt-desk-main-row.nt-desk-active {
+  background: var(--nt-surface, #12151d);
+  border-color: var(--nt-accent-soft, rgba(124, 92, 255, 0.45));
+}
+
+.nt-desk-main-row.nt-desk-active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--nt-accent-gradient, linear-gradient(180deg, #7c5cff 0%, #22d3ee 100%));
+  box-shadow: 0 0 10px var(--nt-accent-glow, rgba(124, 92, 255, 0.45));
+}
+
+.nt-desk-pill {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--nt-accent-gradient, linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%));
+  color: var(--nt-on-accent, #0b0d12);
+  font: 700 10px/1.5 var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  letter-spacing: 0.03em;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* Date groups: their heading is hidden, so drop the group padding that would leave a gap. */
+.nt-desk-chat-group {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+/* The intercepted New chat control: it opens a Welcome chat for the harness. */
+.nt-desk-newchat {
+  border-radius: var(--nt-radius, 12px);
+  box-shadow: inset 2px 0 0 var(--nt-accent, #7c5cff);
+  transition: background 0.16s ease, box-shadow 0.16s ease;
+}
+.nt-desk-newchat:hover {
+  background: var(--nt-accent-wash, rgba(124, 92, 255, 0.10));
+  box-shadow: inset 2px 0 0 var(--nt-accent-2, #22d3ee), 0 0 14px var(--nt-accent-glow, rgba(124, 92, 255, 0.22));
+}
+.nt-desk-newchat.nt-desk-busy { opacity: 0.6; cursor: progress; pointer-events: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .nt-desk-main-row,
+  .nt-desk-newchat { transition: none; }
+}
+
+/* ---- Sidebar v2: Main cards, Coworkers section, offline chip ---------------------------- */
+.nt-desk-sidebar .nt-desk-main-row { height: auto !important; min-height: 30px; flex-wrap: wrap; align-content: center;
+  padding-top: 6px !important; padding-bottom: 6px !important; border-radius: var(--nt-radius, 12px);
+  background: var(--nt-raised, #181c26); }
+.nt-desk-card { flex: 1 0 100%; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 3px 8px 0;
+  font-size: 11px; line-height: 14px; color: #b8c0d9; }
+.nt-desk-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
+.nt-desk-dot-running { background: #22d3ee; animation: nt-desk-pulse 1.4s ease-out infinite; }
+.nt-desk-dot-waiting { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, .85); }
+.nt-desk-dot-idle { background: #6b7280; }
+@keyframes nt-desk-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(124, 92, 255, .9); }
+  70% { box-shadow: 0 0 0 6px rgba(34, 211, 238, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0); }
+}
+@media (prefers-reduced-motion: reduce) { .nt-desk-dot-running { animation: none; box-shadow: 0 0 6px #22d3ee; } }
+.nt-desk-card-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-desk-progress { flex: none; width: 44px; height: 4px; border-radius: 4px; background: rgba(255, 255, 255, .14); overflow: hidden; }
+.nt-desk-progress-fill { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #7c5cff, #22d3ee); }
+.nt-desk-progress-count { flex: none; font-variant-numeric: tabular-nums; color: #f1f4ff; }
+.nt-desk-card.nt-desk-no-run .nt-desk-progress, .nt-desk-card.nt-desk-no-run .nt-desk-progress-count { display: none; }
+.nt-desk-coworkers { margin: 6px 4px 12px; }
+.nt-desk-coworkers-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 8px; border: 0;
+  background: transparent; color: #8f9ab8; font: 600 11px/16px inherit; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
+.nt-desk-coworkers-head:hover { color: #f1f4ff; }
+.nt-desk-chevron::before { content: '\25BE'; }
+.nt-desk-collapsed .nt-desk-chevron::before { content: '\25B8'; }
+.nt-desk-collapsed .nt-desk-coworker-list { display: none; }
+.nt-desk-coworker-list { display: flex; flex-direction: column; gap: 4px; padding-top: 2px; }
+.nt-desk-coworker { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--nt-radius, 12px);
+  background: var(--nt-surface, #12151d); border: 1px solid rgba(255, 255, 255, .06); color: #f1f4ff; text-decoration: none; cursor: pointer; }
+.nt-desk-coworker:hover { background: var(--nt-raised, #181c26); border-color: rgba(124, 92, 255, .6); }
+.nt-desk-coworker-main { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; }
+.nt-desk-coworker-name, .nt-desk-coworker-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-desk-coworker-name { font-size: 12px; font-weight: 600; }
+.nt-desk-coworker-task { font-size: 11px; color: #9aa4c0; }
+.nt-desk-coworker-empty { padding: 4px 8px; font-size: 11px; color: #8f9ab8; }
+.nt-desk-chip { flex: none; padding: 1px 6px; border-radius: 999px; font-size: 10px; line-height: 14px; font-weight: 700;
+  background: rgba(124, 92, 255, .22); color: #d9d0ff; }
+.nt-desk-model { background: rgba(34, 211, 238, .18); color: #a5f3fc; }
+.nt-desk-age-ok { background: rgba(255, 255, 255, .1); color: #d6dbea; }
+.nt-desk-age-amber { background: #f59e0b; color: #0b0d12; }
+.nt-desk-age-red { background: #ef4444; color: #ffffff; }
+.nt-desk-offline { margin-left: auto; background: #f59e0b; color: #0b0d12; text-transform: lowercase; }

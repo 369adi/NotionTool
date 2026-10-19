@@ -1,0 +1,61 @@
+# NotionTool - never commit local data, secrets or build output. See docs/GIT.md.
+
+# Local data: SQLite DB, Notion sessions (data/sessions holds Notion cookies and the host API key),
+# browser profiles with Notion cookies, handoffs, snapshots, runtime files, desktop_app.json.
+data/
+**/browser-profile/
+**/browser-profiles/
+**/sessions/
+**/profile/
+
+# Work outputs, backups, captures, builds
+work/
+dist/
+build/
+bench/out/
+bench/results/
+bench/*.json
+bench/*.csv
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-data/
+.coverage
+htmlcov/
+
+# Databases, logs, process output
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite*
+*.log
+*.out
+
+# Anything that holds tokens, keys or cookies
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+*secret*
+*token*.json
+*token*.txt
+*cookie*
+*credential*
+host_api*.json
+
+# Generated build helper
+notiontool/_build.py
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+# Local agent memory: holds personal email, Notion account and space ids, local paths
+project-memory/
