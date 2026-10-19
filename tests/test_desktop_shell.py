@@ -151,6 +151,93 @@ class DesktopShellTests(unittest.TestCase):
         self.assertEqual(pids, [11])
 
 
+# ---- MCP section: same harness routes as the old app's 'MCP servers' view -----------------------
+SECRET = 'SECRET-HOST-KEY-123456'
+
+
+class McpServer(FakeServer):
+    port = 8765
+
+    def action(self, path, body):
+        res = super().action(path, body)
+        if path == '/api/host/key':
+            return {'api_key': SECRET, 'port': 8765}
+        if path == '/api/mcp/refresh':
+            return {'ok': True, 'servers': []}
+        return res or {'ok': True}
+
+
+class DesktopMcpTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.server = McpServer()
+        seed(self.server.store)
+        self.handlers = ds.desktop_handlers(self.server, self.tmp.name, sleep=lambda s: None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_actions_are_allowed(self):
+        from notiontool import notion_shell
+        for name in ('mcp_list', 'mcp_refresh', 'mcp_add', 'mcp_bridge', 'host_key', 'bridge_tunnel'):
+            self.assertIn(name, notion_shell.ACTIONS)
+            self.assertIn(name, ds.DESK_ACTIONS)
+            self.assertIn(name, self.handlers)
+
+    def test_handlers_use_old_app_routes(self):
+        self.handlers['mcp_add']({'name': 'Ramp', 'url': 'https://ramp.example/mcp', 'token': 'tok',
+                                  'write_auto': 'true', 'evil': 1})
+        self.assertEqual(self.server.actions[-1], ('/api/mcp/add', {'name': 'Ramp', 'url': 'https://ramp.example/mcp',
+                                                                   'token': 'tok', 'write_auto': 'true'}))
+        with self.assertRaises(ValueError):
+            self.handlers['mcp_add']({'name': '', 'url': ''})
+        self.handlers['mcp_refresh']({})
+        self.assertEqual(self.server.actions[-1][0], '/api/mcp/refresh')
+        self.handlers['bridge_tunnel']({})
+        self.assertEqual(self.server.actions[-1][0], '/api/bridge/tunnel')
+        self.handlers['host_key']({'rotate': False})
+        self.assertEqual(self.server.actions[-1], ('/api/host/key', {'rotate': False}))
+        self.handlers['host_key']({'rotate': True})
+        self.assertEqual(self.server.actions[-1], ('/api/host/key', {'rotate': True}))
+        bridge = self.handlers['mcp_bridge']({})
+        self.assertEqual(bridge['local_url'], 'http://127.0.0.1:8765/mcp')
+        self.assertIn('public_url', bridge)
+
+    def test_host_key_is_masked_and_copied_on_this_pc(self):
+        from notiontool import notion_shell
+        res = self.handlers['host_key']({'rotate': False})
+        self.assertNotIn(SECRET, json.dumps(res))
+        self.assertTrue(res['masked'].endswith('3456'))
+        self.assertTrue(res['has_key'])
+        copied = []
+        handlers = notion_shell.default_handlers(self.server, copy_text=copied.append)
+        res = handlers['host_key']({'rotate': True, 'copy': True})
+        self.assertEqual(copied, [SECRET])
+        self.assertTrue(res['copied'])
+        self.assertTrue(res['rotated'])
+        self.assertEqual(self.server.host_api_key, SECRET)
+        self.assertNotIn(SECRET, json.dumps(res))
+
+    def test_key_never_in_desktop_state(self):
+        self.server.host_api_key = SECRET
+        state = ds.desktop_state(self.server, ds.load_app_settings(self.tmp.name), now=100.0)
+        self.assertNotIn(SECRET, json.dumps(state, default=str))
+
+    def test_dispatch_reply_has_no_key(self):
+        replies = []
+
+        class App:
+            pid = None
+
+        shell = ds.DesktopShell(App(), 'acc', self.handlers)
+        shell._reply = lambda ident, payload: replies.append(payload)
+        shell.dispatch(json.dumps({'id': 1, 'action': 'host_key', 'args': {'rotate': False}}))
+        shell.dispatch(json.dumps({'id': 2, 'action': 'mcp_bridge', 'args': {}}))
+        self.assertEqual(len(replies), 2)
+        for reply in replies:
+            self.assertNotIn(SECRET, json.dumps(reply, default=str))
+
+
 # ---- re-attach: build id, teardown of an older overlay (fake CDP client) -----------------------
 import hashlib
 import os

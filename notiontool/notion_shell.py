@@ -43,7 +43,10 @@ import time
 
 BINDING = 'ntHarness'
 ACTIONS = ('state', 'runs', 'run_pause', 'run_cancel', 'run_retry', 'task_reconcile', 'settings_get',
-           'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm')
+           'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm', 'mcp_add', 'mcp_bridge', 'host_key',
+           'bridge_tunnel')
+# Fields the page may send to POST /api/mcp/add (the old app's add form: name, URL, token, write_auto).
+MCP_ADD_FIELDS = ('name', 'url', 'token', 'write_auto')
 ATTENTION_LIMIT = 10
 ATTENTION_TEXT = 160
 PUSH_INTERVAL = 1.0
@@ -687,7 +690,7 @@ def _ident(args):
     return ident[:100]
 
 
-def default_handlers(server, wait_timeout=240.0, sleep=time.sleep, clock=time.monotonic):
+def default_handlers(server, wait_timeout=240.0, sleep=time.sleep, clock=time.monotonic, copy_text=None):
     """Map the whitelisted actions to the existing server and engine methods.
 
     Every write goes through App.action (server.py), so validation and the engine lock stay
@@ -768,6 +771,52 @@ def default_handlers(server, wait_timeout=240.0, sleep=time.sleep, clock=time.mo
     def mcp_refresh(args):
         return server.action('/api/mcp/refresh', {})
 
+    def mcp_add(args):
+        # Same body as the old app's add form: {name, url, token, write_auto} -> POST /api/mcp/add.
+        body = {k: args[k] for k in MCP_ADD_FIELDS if k in args and args[k] is not None}
+        if not str(body.get('name') or '').strip() or not str(body.get('url') or '').strip():
+            raise ValueError('A name and an HTTPS MCP URL are required')
+        return server.action('/api/mcp/add', body)
+
+    def mcp_bridge(args):
+        # Exactly the 'bridge' part of the server state (server.py App.state).
+        return dict(local_url=f'http://127.0.0.1:{getattr(server, "port", "")}/mcp',
+                    public_url=store.settings().get('public_mcp_url', ''))
+
+    def host_key(args):
+        # POST /api/host/key {rotate}. The key itself never goes into the page: the reply would be
+        # withheld by NotionShell._reply (the key is one of shell_secrets) and any script on the
+        # Notion page can call the binding. The page gets a masked form; copy=True puts the full
+        # key on this PC's clipboard instead.
+        rotate = bool(args.get('rotate'))
+        res = server.action('/api/host/key', {'rotate': rotate}) or {}
+        key = str(res.get('api_key') or '')
+        if rotate and key:
+            server.host_api_key = key
+        copied = False
+        if args.get('copy') and key:
+            (copy_text or _copy_to_clipboard)(key)
+            copied = True
+        return dict(masked=_mask(key), has_key=bool(key), rotated=rotate, copied=copied, port=res.get('port'))
+
+    def bridge_tunnel(args):
+        return server.action('/api/bridge/tunnel', {})
+
     return dict(state=state, runs=runs, run_pause=run_pause, run_cancel=run_cancel, run_retry=run_retry,
                 task_reconcile=task_reconcile, settings_get=settings_get, settings_set=settings_set,
-                mcp_list=mcp_list, mcp_refresh=mcp_refresh, run_confirm=run_confirm)
+                mcp_list=mcp_list, mcp_refresh=mcp_refresh, run_confirm=run_confirm, mcp_add=mcp_add,
+                mcp_bridge=mcp_bridge, host_key=host_key, bridge_tunnel=bridge_tunnel)
+
+
+def _mask(key):
+    key = str(key or '')
+    if not key:
+        return ''
+    return '\u2022' * 8 + (key[-4:] if len(key) >= 12 else '')
+
+
+def _copy_to_clipboard(text):
+    """Put text on the Windows clipboard of this PC (the page never sees it)."""
+    import subprocess
+    subprocess.run(['clip.exe'], input=str(text).encode('utf-16-le'), check=True, timeout=10,
+                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
