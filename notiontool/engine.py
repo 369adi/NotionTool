@@ -1103,8 +1103,11 @@ class Engine:
                 label=f"[{task['id']}] {task['title']}"
             check = ('\nAcceptance: '+task['acceptance']) if task.get('acceptance') else ''
             state = task.get('patch_state')
-            if state == 'merged':
-                check += '\nWhere: merged into the main project folder; read its files there.'
+            merge = task.get('patch_result') if isinstance(task.get('patch_result'), dict) else {}
+            if state == 'merged' and merge.get('status') == 'nothing':
+                check += '\nWhere: this task changed no files; its files were already in the main project folder as they are.'
+            elif state == 'merged':
+                check += '\nWhere: merged into the main project folder' + (' (commit ' + str(merge['main_after'])[:10] + ')' if merge.get('main_after') else '') + '; read its files there.'
             elif task.get('patch_worktree') and state in ('working', 'waiting', 'conflict'):
                 check += '\nWhere: not merged yet, files are in ' + str(task['patch_worktree'])
             elif state == 'failed':
