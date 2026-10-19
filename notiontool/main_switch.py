@@ -279,6 +279,15 @@ def advance(store, record, ops, now=None):
 
 def _advance(store, record, ops, now):
     record = store.get(KIND, (record or {}).get('id', '')) or record
+    if record and record.get('state') == 'switched' and not record.get('archive_renamed') and record.get('operator_thread'):
+        # Retry the archive title of the old operator Main (the first try can be refused or fail).
+        stamp = _now(now)
+        try:
+            if ops.rename_chat(record['operator_thread'], _archive_title(stamp)):
+                record = _note(store, record, stamp, archive_renamed=True)
+        except Exception:
+            pass
+        return record
     if not record or record.get('state') not in ACTIVE:
         return record
     stamp = _now(now)
