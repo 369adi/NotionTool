@@ -20,6 +20,9 @@ GUARD_RULE = ('Coworkers are NotionTool Welcome chats managed by NotionTool. Del
               'create agents, automations, triggers or new Notion chats/sessions on the Notion website, even if a '
               'Notion tool offers it. If delegation is not possible, stop and tell the user.')
 COWORKER_RULE = 'You are a coworker: do the task yourself, do not delegate further.'
+RESTART_NOTE = ('If a NotionTool tool call fails because NotionTool is restarting or the MCP connection is briefly gone, '
+                'that is only a restart of about 10-60 s: wait briefly, check whether the call took effect, then continue your task. '
+                'Do not stop or give up because of it.')
 
 EVENT = 'forbidden_agent_action'
 PROBLEM_TITLE = 'A chat tried to create a Notion agent instead of using coworkers'
@@ -37,7 +40,7 @@ _NEST_KEYS = ('args', 'arguments', 'toolArguments', 'input', 'parameters', 'para
 def with_rule(text, coworker=False):
     """text plus GUARD_RULE (and COWORKER_RULE for Coworker prompts), each added only once."""
     text = str(text or '').rstrip()
-    for rule in (GUARD_RULE, COWORKER_RULE if coworker else ''):
+    for rule in (GUARD_RULE, COWORKER_RULE if coworker else '', RESTART_NOTE if coworker else ''):
         if rule and rule not in text:
             text = (text + '\n' + rule) if text else rule
     return text
