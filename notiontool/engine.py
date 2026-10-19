@@ -29,6 +29,28 @@ PATCH_RETRY_LIMIT = 3
 PATCH_NOTE = ('\n\nWork only inside this folder: %s\nIt is your own copy of the project (a git worktree on branch %s). '
               'Read and edit files only there, never in the main project folder. Do not commit, merge or push: '
               'NotionTool commits, tests and merges your change when you are done.')
+REVIEW_TEST_NOTE = ('\nTo run tests, use exactly this form (nothing else is allowed for this role): '
+                    'python -m unittest tests.test_name [tests.test_other ...]')
+
+
+def review_note(reviewed):
+    """Tell a reviewer where the reviewed change lives right now (own copy or already merged)."""
+    if not reviewed:
+        return REVIEW_TEST_NOTE
+    result = reviewed.get('patch_result') or {}
+    folder = reviewed.get('patch_worktree') or ''
+    if reviewed.get('patch_state') == 'merged':
+        commit = str(result.get('main_after') or '')[:12]
+        where = ('\n\nThe change you review is already merged into the main project folder'
+                 + (' (commit %s)' % commit if commit else '')
+                 + '. Its own copy was removed after the merge, so check the files in the main project folder.')
+    elif folder and Path(folder).is_dir():
+        where = '\n\nThe change you review is in its own copy: %s. Read files there, not in the main project folder.' % folder
+    else:
+        where = ''
+    return where + REVIEW_TEST_NOTE
+
+
 # Plain labels for the Live view, per task patch_state.
 PATCH_LABELS = dict(working='Working in own copy', waiting='Waiting to merge', merged='Merged',
                     conflict='Conflict - being resolved', failed='Not merged')
@@ -1041,6 +1063,8 @@ class Engine:
         claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id'], task=task) if task['role'] in ('planner', 'executor') else ''
         tools_available = bool(account.get('bridge_connected') and self.store.settings().get('advertise_project_tools', False))
         prompt_task = dict(task, prompt=task['prompt'] + PATCH_NOTE % (task['patch_worktree'], task.get('patch_branch', ''))) if task.get('patch_worktree') else task
+        if task.get('review_of'):
+            prompt_task = dict(prompt_task, prompt=prompt_task['prompt'] + review_note(self.store.get('tasks', task['review_of'], None)))
         prompt = make_prompt(prompt_task, dict(run, file_claims=claims) if claims else run, context, task['lease'], tools_available)
         # I18: stable parts (request, memory, project, rules) go only once into each coworker chat.
         full_chars = len(prompt)
