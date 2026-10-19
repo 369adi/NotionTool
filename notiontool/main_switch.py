@@ -19,6 +19,10 @@ Safety rules:
 - Real MainHandoffOps repoints a new chat as a pool Main (purpose 'main', enabled), which is
   wrong for the operator. Until ops declares supports_operator = True, advance() stops at
   brief_ready with OPS_GAP_REASON instead of creating any chat.
+- Rule I37: before the brief is used, the harness itself (finalize_brief) REPLACES
+  '## Fixed user rules' with the rule lines of project-memory/NotionTool.md copied by code
+  (fixed_rules_block) and writes '## Open runs (built status)' (open_runs_status). The size limit
+  is kept by cutting other sections, never rules.
 """
 import os
 import re
@@ -45,6 +49,20 @@ OPS_GAP_REASON = ('Brief is ready, but the handoff ops cannot repoint an operato
 RESUME_INSTRUCTIONS = ('You are now the operator Main of NotionTool. Read resume_brief, keep every fixed '
                        'user rule, and continue from the next steps. Delegate work to the Coworkers. ' + GUARD_RULE)
 _SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+# Rule I37: deterministic brief parts.
+RULES_HEADING = '## Fixed user rules'
+RUNS_HEADING = '## Open runs (built status)'
+RUNS_INTRO = 'Starting point only: the new Main verifies every run itself (I37).'
+CUT_NOTE = '(cut at the size limit)'
+MISSING_NOTE = ('(project-memory/NotionTool.md was not readable or has no rule lines: the rules below '
+                'were NOT copied by code; read the memory file)')
+RULE_RE = re.compile(r'^- (?:I\d+|R\d+|PLAN)\b')
+HEADING_RE = re.compile(r'^(#{1,6})\s+(.*?)\s*$')
+CLOSED_RUN = ('done', 'cancelled')
+GOAL_CHARS = 80
+# Other sections are cut in this order (unknown sections first); the rules section is never cut.
+CUT_ORDER = ('current status', 'running and open tasks', 'key ids', 'goal', 'next steps', 'open runs')
 
 
 def _now(now=None):
@@ -140,6 +158,9 @@ def brief_task(path, rel):
         'through your NotionTool tools (context, runs, tasks, workers). Report facts only; mark '
         'anything unverified as unverified. Do not edit any other file, do not create or rename '
         'chats, no git, no network.' % (path, BRIEF_MAX_CHARS)
+        + '\nThe harness afterwards replaces ## Fixed user rules with the rule lines of '
+        'project-memory/NotionTool.md copied by code and adds ## Open runs (built status); keep '
+        'the other sections short.'
         + '\nUnder ## Fixed user rules always copy this rule (I12) verbatim: ' + GUARD_RULE)
     task = dict(id='main-brief', title='Write the Main switch brief', prompt=prompt,
                 acceptance='The brief file exists, uses LF only, is under %d characters and has '
@@ -159,6 +180,249 @@ def write_seed(path, text):
     with open(path, 'wb') as handle:
         handle.write((text + '\n').encode('utf-8'))
     return True
+
+
+# ---- 2b. deterministic brief parts (rule I37) --------------------------------
+def _lf(text):
+    return str(text or '').replace('\r\n', '\n').replace('\r', '\n')
+
+
+def _rules_range(lines):
+    """(start, end): first heading that names rules .. end of the 'Code and files' section (or EOF)."""
+    start = 0
+    for i, line in enumerate(lines):
+        match = HEADING_RE.match(line)
+        if match and 'rule' in match.group(2).lower():
+            start = i
+            break
+    end = len(lines)
+    for i in range(start, len(lines)):
+        match = HEADING_RE.match(lines[i])
+        if match and 'code and files' in match.group(2).lower():
+            level = len(match.group(1))
+            for j in range(i + 1, len(lines)):
+                other = HEADING_RE.match(lines[j])
+                if other and len(other.group(1)) <= level:
+                    end = j
+                    break
+            break
+    return start, end
+
+
+def fixed_rules_block(memory_text):
+    """Every '- I<n>' / '- R<n>' / '- PLAN' line plus its indented continuation lines, verbatim, in file order."""
+    lines = _lf(memory_text).split('\n')
+    start, end = _rules_range(lines)
+    out, inside = [], False
+    for line in lines[start:end]:
+        if RULE_RE.match(line):
+            out.append(line)
+            inside = True
+        elif inside and line[:1] in (' ', '\t') and line.strip():
+            out.append(line)
+        else:
+            inside = False
+    return '\n'.join(out)
+
+
+def rule_count(block):
+    return sum(1 for line in _lf(block).split('\n') if RULE_RE.match(line))
+
+
+def _short(text, size=GOAL_CHARS):
+    text = ' '.join(str(text or '').split()).replace('|', '/')
+    return text if len(text) <= size else text[:size - 3].rstrip() + '...'
+
+
+def _tests_status(task):
+    return str(((task or {}).get('proof') or {}).get('tests_status') or 'not_checked')
+
+
+def open_runs_status(runs, tasks):
+    """One row per run that is not done/cancelled, oldest first.
+
+    built: 'yes' = every executor task done and each one has proof tests 'passed';
+    'partly' = some done (or all done without passed proof tests); 'no' = none done;
+    'unknown' = the run has no executor task (no evidence in the store). Cancelled tasks do not count.
+    """
+    by_run = {}
+    for task in tasks or []:
+        if task.get('role') == 'executor' and task.get('state') != 'cancelled':
+            by_run.setdefault(str(task.get('run_id', '')), []).append(task)
+    rows = []
+    ordered = sorted(runs or [], key=lambda r: (float(r.get('created') or 0), str(r.get('id', ''))))
+    for run in ordered:
+        state = str(run.get('state') or '')
+        if state in CLOSED_RUN:
+            continue
+        execs = by_run.get(str(run.get('id', '')), [])
+        done = [t for t in execs if t.get('state') == 'done']
+        passed = [t for t in done if _tests_status(t) == 'passed']
+        if not execs:
+            built = 'unknown'
+        elif len(done) == len(execs) and len(passed) == len(done):
+            built = 'yes'
+        elif done:
+            built = 'partly'
+        else:
+            built = 'no'
+        evidence = '%d/%d executor tasks done, proof tests passed %d/%d' % (
+            len(done), len(execs), len(passed), len(done))
+        rows.append(dict(id=str(run.get('id', '')), goal=_short(run.get('goal') or run.get('title')),
+                         state=state, built=built, evidence=evidence))
+    return rows
+
+
+def open_runs_section(rows):
+    """Markdown section '## Open runs (built status)' for open_runs_status rows."""
+    lines = [RUNS_HEADING, RUNS_INTRO]
+    if not rows:
+        lines.append('- none')
+    for row in rows:
+        lines.append('- %s | %s | built: %s | %s | %s' % (
+            row['id'], row['state'], row['built'], row['goal'], row['evidence']))
+    return '\n'.join(lines)
+
+
+def _key(heading):
+    heading = str(heading or '')
+    return (heading[3:] if heading.startswith('## ') else heading).strip().lower()
+
+
+def _sections(text):
+    """[[heading or '', body lines]] split at '## ' headings (index 0 = text before the first heading)."""
+    out = [['', []]]
+    for line in _lf(text).split('\n'):
+        if line.startswith('## '):
+            out.append([line.rstrip(), []])
+        else:
+            out[-1][1].append(line)
+    return out
+
+
+def _trim(body):
+    body = list(body)
+    while body and not body[-1].strip():
+        body.pop()
+    while body and not body[0].strip():
+        body.pop(0)
+    return body
+
+
+def _render(sections):
+    parts = []
+    for heading, body in sections:
+        block = ([heading] if heading else []) + _trim(body)
+        if block:
+            parts.append('\n'.join(block))
+    return '\n\n'.join(parts).strip() + '\n'
+
+
+def _find(sections, name):
+    for i, (heading, _body) in enumerate(sections):
+        if heading and _key(heading).startswith(name):
+            return i
+    return -1
+
+
+def _cut_rank(heading):
+    key = _key(heading)
+    for rank, name in enumerate(CUT_ORDER):
+        if key.startswith(name):
+            return rank + 1
+    return 0
+
+
+def apply_to_brief(brief, rules_block, rows, limit=BRIEF_MAX_CHARS, guard_rule=GUARD_RULE):
+    """(text, problem): rules section replaced by the code-copied block, open-run section written.
+
+    Over the limit, other sections are cut line by line from their end (CUT_ORDER); the rules
+    section is never cut. problem is '' unless the text still does not fit.
+    """
+    sections = [s for s in _sections(brief) if not (s[0] and _key(s[0]).startswith('open runs'))]
+    rules_index = _find(sections, 'fixed user rules')
+    old_body = _trim(sections[rules_index][1]) if rules_index >= 0 else []
+    body = rules_block.split('\n') if rules_block else [MISSING_NOTE] + old_body
+    if guard_rule and not any(guard_rule in line for line in body):
+        body.append(guard_rule)
+    rules_section = [RULES_HEADING, body]
+    if rules_index >= 0:
+        sections[rules_index] = rules_section
+    else:
+        goal = _find(sections, 'goal')
+        rules_index = goal + 1 if goal >= 0 else 1
+        sections.insert(rules_index, rules_section)
+    runs_section = [RUNS_HEADING, open_runs_section(rows).split('\n')[1:]]
+    anchor = _find(sections, 'running and open tasks')
+    if anchor >= 0:
+        position = anchor + 1
+    else:
+        nxt = _find(sections, 'next steps')
+        position = nxt if nxt >= 0 else rules_index + 1
+    sections.insert(position, runs_section)
+    text = _render(sections)
+    if len(text) < limit:
+        return text, ''
+    order = sorted((i for i, s in enumerate(sections) if s is not rules_section),
+                   key=lambda i: (_cut_rank(sections[i][0]), i))
+    for i in order:
+        heading, body = sections[i]
+        kept = [line for line in _trim(body) if line != CUT_NOTE]
+        while kept and len(_render(sections)) >= limit:
+            kept = _trim(kept[:-1])
+            sections[i] = [heading, kept + [CUT_NOTE]]
+        text = _render(sections)
+        if len(text) < limit:
+            return text, ''
+    return text, 'brief needs %d characters with all fixed rules (limit %d); rules were not cut' % (len(text), limit)
+
+
+def memory_path(store):
+    """project-memory/NotionTool.md in the project root (the parent of the store's data folder)."""
+    return os.path.join(os.path.dirname(os.path.abspath(str(store.directory))), 'project-memory', 'NotionTool.md')
+
+
+def finalize_brief(store, path, limit=BRIEF_MAX_CHARS):
+    """Rewrite the brief file (LF) with the code-copied rules and the open-run list. Never raises."""
+    info = dict(ok=False, rules=0, runs=0, memory_found=False, problem='')
+    try:
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+        if b'\r' in raw:
+            info['problem'] = 'brief has CR line endings; left unchanged'
+            return info
+        memory = ''
+        try:
+            with open(memory_path(store), 'rb') as handle:
+                memory = handle.read().decode('utf-8', errors='replace')
+        except OSError:
+            memory = ''
+        block = fixed_rules_block(memory)
+        try:
+            runs, tasks = list(store.all('runs')), list(store.all('tasks'))
+        except Exception:
+            runs, tasks = [], []
+        rows = open_runs_status(runs, tasks)
+        text, problem = apply_to_brief(raw.decode('utf-8', errors='replace'), block, rows, limit)
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as handle:
+            handle.write(text.encode('utf-8'))
+        os.replace(tmp, path)
+        info.update(ok=True, rules=rule_count(block), runs=len(rows), memory_found=bool(memory),
+                    problem=problem, chars=len(text))
+    except Exception as exc:
+        info['problem'] = 'finalize failed: ' + str(exc)[:200]
+    return info
+
+
+def _finalize(store, record):
+    """Finalize the record's brief once (I37); the result is kept on the record."""
+    if record.get('brief_finalized') or not os.path.isfile(record.get('brief_path') or ''):
+        return record
+    info = finalize_brief(store, record['brief_path'])
+    record['brief_finalized'] = bool(info.get('ok'))
+    record['brief_rules'] = info
+    return record
 
 
 def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text=None, trigger=None):
@@ -192,6 +456,9 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
             seeded = write_seed(path, brief_text)
         except OSError as exc:
             return dict(ok=False, state='failed', reason='seed brief not written: ' + str(exc)[:200])
+    finalized = None
+    if seeded:
+        finalized = finalize_brief(store, path)
     if seeded and not read_brief(path)[1]:
         # The operator Main wrote a complete brief itself: no Coworker run is needed. A Coworker cannot
         # write below data/ anyway (bridge write guard), so a brief run only waited forever on
@@ -201,7 +468,8 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
                       operator_chat_id=chat['id'], operator_worker_id=worker['id'],
                       operator_thread=worker.get('thread_id', ''), account_id=worker.get('account_id', ''),
                       brief_path=path, handoff_id='switch_' + rid, new_chat_id='', reason='brief from the Main',
-                      error='', created=stamp, updated=stamp)
+                      error='', created=stamp, updated=stamp,
+                      brief_finalized=bool((finalized or {}).get('ok')), brief_rules=finalized or {})
         store.put(KIND, record)
         store.event('main_switch_brief_ready', '', message='Main switch brief written by the Main', switch_id=rid)
         return dict(record, ok=True, duplicate=False)
@@ -300,16 +568,20 @@ def _advance(store, record, ops, now):
         if run.get('state') not in RUN_DONE:
             # A run that only waits for the Main (e.g. answer without 'RESULT: DONE') must not block
             # the switch when the brief file itself is usable.
+            if run.get('state') == 'awaiting_main':
+                record = _finalize(store, record)
             if run.get('state') == 'awaiting_main' and not read_brief(record['brief_path'])[1]:
                 record = _move(store, record, 'brief_ready', stamp, reason='brief usable; run awaits the Main')
             else:
                 return _note(store, record, stamp, reason='waiting for the brief run')
         if record['state'] == 'brief_requested':
+            record = _finalize(store, record)
             _text, problem = read_brief(record['brief_path'])
             if problem:
                 return _move(store, record, 'failed', stamp, reason=problem)
             record = _move(store, record, 'brief_ready', stamp, reason='brief ready')
     if record['state'] == 'brief_ready':
+        record = _finalize(store, record)
         if not getattr(ops, 'supports_operator', False):
             return _note(store, record, stamp, reason=OPS_GAP_REASON)
         text, problem = read_brief(record['brief_path'])
