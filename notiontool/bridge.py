@@ -683,6 +683,14 @@ class Bridge:
                          "Only the assigned files may be written; report other needed changes in your result."
                          % (path, ', '.join(files)[:300]))
 
+    def _task_dev_path(self, token, path):
+        """Resolve a coworker write path: inside the task's worktree when it has one, else as before."""
+        with self.engine.lock:
+            task, run = self.assignment(token)
+            if self.worktree(task) is not None:
+                return self.path(run, str(path or ''), task=task)
+        return dev_path(path)
+
     def _claim_for_task(self, token, path):
         """Claim path for the task behind token (same rules as the write_file tool)."""
         with self.engine.lock:
@@ -740,9 +748,12 @@ class Bridge:
                 if token:
                     # A coworker task writes under its own lock: its own files pass,
                     # files of other tasks or of the operator are still refused.
-                    task, run = self._claim_for_task(token, dev_path(args.get('path')))
+                    # A task with its own git worktree writes into that copy, never into main.
+                    target = self._task_dev_path(token, args.get('path'))
+                    args['path'] = str(target)
+                    task, run = self._claim_for_task(token, target)
                     # O5: only after the owner-token lock passed; never blocks the write.
-                    self.snapshot_before_write(task, run, dev_path(args.get('path')))
+                    self.snapshot_before_write(task, run, target)
                 else:
                     # Register the operator edit so coworker chats see it and leave the file alone.
                     with self.engine.lock:

@@ -77,5 +77,18 @@ class BridgeWorktreeTests(unittest.TestCase):
         self.assertEqual((self.project / 'pkg' / 'mod.py').read_bytes(), b'main write\n')
 
 
+    def op_write(self, token, path, text='new\n'):
+        return self.bridge.operator_call(None, 'nt_write_file', dict(path=str(path), content=text, assignment_token=token))
+
+    def test_operator_write_tool_lands_in_the_copy(self):
+        self.op_write('build', 'pkg/mod.py', 'op rel\n')
+        self.assertEqual((self.copy / 'pkg' / 'mod.py').read_bytes(), b'op rel\n')
+        self.op_write('build', self.project / 'pkg' / 'abs.py', 'op abs\n')
+        self.assertEqual((self.copy / 'pkg' / 'abs.py').read_bytes(), b'op abs\n')
+        self.assertEqual((self.project / 'pkg' / 'mod.py').read_bytes(), b'main\n')
+        self.assertFalse((self.project / 'pkg' / 'abs.py').exists())
+        with self.assertRaisesRegex(ValueError, "not in this task's files list"):
+            self.op_write('build', 'pkg/other.py')
+
 if __name__ == '__main__':
     unittest.main()
