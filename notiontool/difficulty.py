@@ -19,11 +19,13 @@ SCOPE = re.compile(
     r'neugestalt\w*|neu|from\s+scratch|von\s+grund\s+auf|architecture|architektur|'
     r'refactor\w*|refaktor\w*|ganzen?\s+(?:app|anwendung|projekt|seite|ui|code)|'
     r'whole\s+(?:app|project|ui|system|codebase)|system|ui|ux|design|security|sicherheit|'
-    r'migration|migrate|migrier\w*|performance|overhaul|rewrite|umbau\w*|rebuild)\b', _I)
+    r'migration|migrate|migrier\w*|performance|overhaul|rewrite|umbau\w*|rebuild|'
+    r'überarbeit\w*|umgestalt\w*|verbesser\w*|rework\w*|revamp\w*|improv\w*|modernis\w*|moderniz\w*)\b', _I)
 # Restart/reload phrasings: their "neu" is not a scope word (starte ... neu, lade neu, neu installieren).
-_RESTART_VERB = r'(?:start\w*|lad\w*|install\w*|verbind\w*|meld\w*)'
+_RESTART_VERB = (r'(?:start(?:e|en|et|est)|lad(?:e|en|et)|installier(?:e|en|t)|'
+                 r'verbind(?:e|en|et)|meld(?:e|en|et))')
 RESTART = re.compile(
-    r'\b' + _RESTART_VERB + r'\b[^.!?\n]{0,60}?\bneu\b|\bneu\s*' + _RESTART_VERB + r'\b', _I)
+    r'\b' + _RESTART_VERB + r'\b[^.!?\n]{0,60}?\bneu\b(?!\s*(?:machen|gestalten|bauen|schreiben)\b)|\bneu\s*' + _RESTART_VERB + r'\b', _I)
 # Subjective quality goals.
 QUALITY = re.compile(
     r'\b(schön\w*|hübsch\w*|besser\w*|hässlich\w*|beschissen|schrecklich|modern\w*|ugly|'

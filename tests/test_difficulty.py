@@ -165,5 +165,46 @@ class Contract(unittest.TestCase):
             classify('x', context=['a.py'])
 
 
+class ReviewFixes2(unittest.TestCase):
+    def _scope(self, result):
+        return [r for r in result['reasons'] if r.startswith('scope:')]
+
+    def test_restart_verbs_only_as_verbs(self):
+        for text in ('die Startseite neu machen', 'den Ladebalken neu gestalten',
+                     'die Installation neu bauen', 'die Meldungen neu schreiben'):
+            result = classify(text)
+            self.assertEqual(result['route'], 'team', (text, result))
+            self.assertTrue(self._scope(result), (text, result))
+            self.assertFalse(any('restart' in r for r in result['reasons']), (text, result))
+
+    def test_neu_machen_after_restart_verb_still_scope(self):
+        for text in ('Starte bitte: Einstellungen neu gestalten',
+                     'Lade das Logo hoch und die Startseite neu machen'):
+            result = classify(text)
+            self.assertEqual(result['route'], 'team', (text, result))
+            self.assertFalse(any('restart' in r for r in result['reasons']), (text, result))
+
+    def test_real_restarts_still_direct(self):
+        for text in ('starte die App neu', 'starten wir NotionTool neu', 'lade die Seite neu',
+                     'installiere das Paket neu', 'verbinde den Server neu', 'melde dich neu an',
+                     'bitte neu starten', 'die Seite neu laden'):
+            result = classify(text)
+            self.assertEqual(result['route'], 'direct', (text, result))
+            self.assertFalse(self._scope(result), (text, result))
+
+    def test_rework_words_are_scope(self):
+        for text in ('\u00fcberarbeite die Einstellungen', 'die Sidebar umgestalten', 'verbessere die Suche',
+                     'rework the onboarding', 'revamp the dashboard', 'improve the search',
+                     'modernise the build', 'modernize the build'):
+            result = classify(text)
+            self.assertEqual(result['route'], 'team', (text, result))
+            self.assertTrue(self._scope(result), (text, result))
+
+    def test_short_hard_and_long_easy_unchanged(self):
+        for text in ('UI neu', 'mach die app sch\u00f6ner', 'redesign the settings page'):
+            self.assertEqual(classify(text)['route'], 'team')
+        self.assertEqual(classify(LONG_RENAME)['route'], 'direct')
+
+
 if __name__ == '__main__':
     unittest.main()
