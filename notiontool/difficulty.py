@@ -20,6 +20,10 @@ SCOPE = re.compile(
     r'refactor\w*|refaktor\w*|ganzen?\s+(?:app|anwendung|projekt|seite|ui|code)|'
     r'whole\s+(?:app|project|ui|system|codebase)|system|ui|ux|design|security|sicherheit|'
     r'migration|migrate|migrier\w*|performance|overhaul|rewrite|umbau\w*|rebuild)\b', _I)
+# Restart/reload phrasings: their "neu" is not a scope word (starte ... neu, lade neu, neu installieren).
+_RESTART_VERB = r'(?:start\w*|lad\w*|install\w*|verbind\w*|meld\w*)'
+RESTART = re.compile(
+    r'\b' + _RESTART_VERB + r'\b[^.!?\n]{0,60}?\bneu\b|\bneu\s*' + _RESTART_VERB + r'\b', _I)
 # Subjective quality goals.
 QUALITY = re.compile(
     r'\b(schön\w*|hübsch\w*|besser\w*|hässlich\w*|beschissen|schrecklich|modern\w*|ugly|'
@@ -33,6 +37,10 @@ AREAS = re.compile(
 FILE = re.compile(
     r'(?<![\w/.-])((?:[\w.-]+/)*[\w-]+\.(?:py|js|ts|tsx|jsx|md|txt|json|toml|ya?ml|css|scss|html?|'
     r'ps1|sh|cfg|ini))\b|\b(README|CHANGELOG|LICENSE|Makefile|Dockerfile)\b')
+# Framework/tool names that look like files but are not targets.
+FRAMEWORKS = frozenset(('node.js', 'next.js', 'vue.js', 'three.js', 'express.js', 'chart.js',
+                        'nuxt.js', 'react.js', 'angular.js', 'd3.js', 'ember.js', 'backbone.js'))
+_FRAMEWORK_NAME = re.compile(r'^[A-Z][\w-]*\.js$')
 LINE = re.compile(r'\b(?:line|zeile)\s+\d+\b|\.\w{1,5}:\d+\b', _I)
 # Narrow change kinds.
 NARROW = (
@@ -41,7 +49,10 @@ NARROW = (
     ('single bug with error message', re.compile(
         r'\b\w*(?:Error|Exception)\b|\btraceback\b|\bfehlermeldung\b|\bstack\s*trace\b')),
     ('add one test', re.compile(
-        r'\b(?:one|a\s+single|a|ein|einen|einzelnen?)\s+(?:unit\s*)?test(?:fall)?\b', _I)),
+        r'\b(?:add|write|ergänz\w*|schreib\w*)\s+'
+        r'(?:(?:one|a\s+single|a|an|another|ein|einen|einzelnen?|noch\s+einen)\s+)?'
+        r'(?:unit\s*)?test(?:fall)?\b'
+        r'(?![\s-]*(?:framework|suite|harness|plan|infrastructure|infrastruktur|system|setup))', _I)),
     ('bump version', re.compile(
         r'\bbump\w*\b|\bversion\s+(?:erhöh\w*|auf|to)\b|\berhöh\w*\s+(?:die\s+)?version\b', _I)),
 )
@@ -56,15 +67,19 @@ def _distinct(matches):
     return seen
 
 
+def _is_framework(name):
+    return '/' not in name and (name.lower() in FRAMEWORKS or bool(_FRAMEWORK_NAME.match(name)))
+
+
 def _files(text, context):
     found = []
-    for m in FILE.finditer(text):
-        name = (m.group(1) or m.group(2)).replace('\\', '/')
+    names = [(m.group(1) or m.group(2)) for m in FILE.finditer(text)]
+    names += [str(f) for f in ((context or {}).get('files') or [])]
+    for raw in names:
+        name = raw.replace('\\', '/')
+        if not name or _is_framework(name):
+            continue
         if name.lower() not in [f.lower() for f in found]:
-            found.append(name)
-    for f in (context or {}).get('files') or []:
-        name = str(f).replace('\\', '/')
-        if name and name.lower() not in [x.lower() for x in found]:
             found.append(name)
     return found
 
@@ -80,7 +95,10 @@ def classify(text, context=None):
     reasons = []
     score = BASE_SCORE
 
-    scope = _distinct(m.group(0) for m in SCOPE.finditer(text))
+    scope_text = RESTART.sub(' ', text)
+    if scope_text != text:
+        reasons.append('restart/reload phrasing: its "neu" is not counted as scope')
+    scope = _distinct(m.group(0) for m in SCOPE.finditer(scope_text))
     if scope:
         score += min(0.55, 0.35 + 0.1 * (len(scope) - 1))
         reasons.append('scope: ' + ', '.join(scope))
@@ -99,14 +117,17 @@ def classify(text, context=None):
         score += 0.3
         reasons.append('many files: %d' % len(files))
     elif files:
-        score -= 0.2
-        reasons.append('concrete target file: ' + ', '.join(files))
+        if scope or quality:
+            reasons.append('named file inside a broad change: ' + ', '.join(files))
+        else:
+            score -= 0.2
+            reasons.append('concrete target file: ' + ', '.join(files))
     if lines:
         score -= 0.1
         reasons.append('concrete line reference')
     if not files and not lines:
         score += 0.1
-        reasons.append('ambiguous: no concrete target file or line')
+        reasons.append('ambiguous: no named target file or line')
 
     narrow = [name for name, rx in NARROW if rx.search(text)]
     if narrow:

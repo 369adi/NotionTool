@@ -69,6 +69,55 @@ class NarrowIsDirect(unittest.TestCase):
         self.assertEqual(classify('benenne in engine.py die Variable x in count um')['route'], 'direct')
 
 
+class ReviewFixes(unittest.TestCase):
+    def _no_scope(self, result):
+        return not any(r.startswith('scope:') for r in result['reasons'])
+
+    def test_restart_neu_is_not_scope(self):
+        for text in ('starte NotionTool neu', 'lade die Seite neu', 'installiere das Paket neu',
+                     'verbinde den Server neu', 'melde dich neu an', 'bitte neu starten'):
+            result = classify(text)
+            self.assertEqual(result['route'], 'direct', (text, result))
+            self.assertTrue(self._no_scope(result), (text, result))
+
+    def test_real_neu_still_scope(self):
+        self.assertEqual(classify('mach mir die UI neu')['route'], 'team')
+        self.assertEqual(classify('die Einstellungsseite neu machen')['route'], 'team')
+
+    def test_framework_name_is_not_a_file(self):
+        result = classify('migrate the frontend to Next.js')
+        self.assertEqual(result['route'], 'team', result)
+        self.assertFalse(any('concrete target file' in r for r in result['reasons']), result)
+        for name in ('Node.js', 'Vue.js', 'Three.js', 'Express.js', 'Chart.js'):
+            reasons = classify('use %s here' % name)['reasons']
+            self.assertFalse(any('file' in r for r in reasons if 'no named' not in r), (name, reasons))
+
+    def test_real_js_file_still_counts(self):
+        result = classify('fix the label in web/app.js')
+        self.assertTrue(any('concrete target file: web/app.js' in r for r in result['reasons']), result)
+
+    def test_one_file_does_not_cancel_big_change(self):
+        self.assertEqual(classify('redesign settings.js')['route'], 'team')
+        self.assertEqual(classify('security review of server.py')['route'], 'team')
+        text = "fix the KeyError: 'name' in notiontool/server.py line 120"
+        self.assertEqual(classify(text)['route'], 'direct')
+        self.assertEqual(classify('add one test for parse_duration in tests/test_dur.py')['route'], 'direct')
+        self.assertEqual(classify('benenne in engine.py die Variable x in count um')['route'], 'direct')
+
+    def test_add_one_test_needs_verb_and_no_framework(self):
+        result = classify('build a test framework for the whole app')
+        self.assertEqual(result['route'], 'team', result)
+        self.assertFalse(any('add one test' in r for r in result['reasons']), result)
+        for text in ('add a test suite for everything', 'write a test plan', 'add a test-harness'):
+            reasons = classify(text)['reasons']
+            self.assertFalse(any('add one test' in r for r in reasons), (text, reasons))
+        for text in ('add one test for parse_duration in tests/test_dur.py',
+                     'schreibe einen Test für parse_duration', 'ergänze einen Testfall in tests/test_dur.py'):
+            reasons = classify(text)['reasons']
+            self.assertTrue(any('add one test' in r for r in reasons), (text, reasons))
+        self.assertEqual(classify('add one test for parse_duration in tests/test_dur.py')['route'], 'direct')
+
+
 class LengthIsNotASignal(unittest.TestCase):
     def test_padding_does_not_change_easy(self):
         a, b = classify('fix typo in README'), classify('fix typo in README.' + FILLER)
