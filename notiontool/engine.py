@@ -1038,7 +1038,7 @@ class Engine:
         account = self.store.get('accounts', worker['account_id'], {})
         make_prompt=plain_protocol.prompt if getattr(self.adapter,'response_mode','json')=='plain' else prompt_for
         # Every chat sees which files other chats (coworker tasks or the operator) are editing right now.
-        claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id']) if task['role'] in ('planner', 'executor') else ''
+        claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id'], task=task) if task['role'] in ('planner', 'executor') else ''
         tools_available = bool(account.get('bridge_connected') and self.store.settings().get('advertise_project_tools', False))
         prompt_task = dict(task, prompt=task['prompt'] + PATCH_NOTE % (task['patch_worktree'], task.get('patch_branch', ''))) if task.get('patch_worktree') else task
         prompt = make_prompt(prompt_task, dict(run, file_claims=claims) if claims else run, context, task['lease'], tools_available)
