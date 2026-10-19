@@ -20,9 +20,12 @@ Safety rules:
   wrong for the operator. Until ops declares supports_operator = True, advance() stops at
   brief_ready with OPS_GAP_REASON instead of creating any chat.
 - Rule I37: before the brief is used, the harness itself (finalize_brief) REPLACES
-  '## Fixed user rules' with the rule lines of project-memory/NotionTool.md copied by code
-  (fixed_rules_block) and writes '## Open runs (built status)' (open_runs_status). The size limit
-  is kept by cutting other sections, never rules.
+  '## Fixed user rules' with the fixed-rules block of project-memory/NotionTool.md copied by code
+  word for word (fixed_rules_block: the text between the FIXED-RULES start and end marker
+  comments) and writes '## Open runs (built status)' (open_runs_status).
+- Size limits: BRIEF_MAX_CHARS counts only the sections OTHER than '## Fixed user rules'; those are
+  cut to fit, never the rules. The copied rules block comes on top of that limit and has its own
+  limit RULES_MAX_CHARS (never cut; over it the problem is reported).
 """
 import os
 import re
@@ -59,6 +62,13 @@ MISSING_NOTE = ('(project-memory/NotionTool.md was not readable or has no rule l
                 'were NOT copied by code; read the memory file)')
 RULE_RE = re.compile(r'^- (?:I\d+|R\d+|PLAN)\b')
 HEADING_RE = re.compile(r'^(#{1,6})\s+(.*?)\s*$')
+# Marker comments around the fixed rules in project-memory/NotionTool.md, e.g.
+# <!-- FIXED-RULES:START --> ... <!-- FIXED-RULES:END --> (BEGIN/START and END, any separator).
+START_MARK_RE = re.compile(r'^\s*<!--.*\bFIXED[-_ ]?RULES\b.*\b(?:START|BEGIN)\b.*-->\s*$', re.I)
+END_MARK_RE = re.compile(r'^\s*<!--.*\bFIXED[-_ ]?RULES\b.*\bEND\b.*-->\s*$', re.I)
+MARK_RE = re.compile(r'^\s*<!--.*\bFIXED[-_ ]?RULES\b.*-->\s*$', re.I)
+# Own limit of the code-copied rules section (on top of BRIEF_MAX_CHARS, never cut).
+RULES_MAX_CHARS = 32000
 CLOSED_RUN = ('done', 'cancelled')
 GOAL_CHARS = 80
 # Other sections are cut in this order (unknown sections first); the rules section is never cut.
@@ -148,7 +158,8 @@ def _project_rel(path, project):
 def brief_task(path, rel):
     prompt = (
         'Prepare the switch of the operator Main to a fresh chat. Write the file %s '
-        '(UTF-8, LF line endings, under %d characters, Markdown). If the file already exists, it is '
+        '(UTF-8, LF line endings, Markdown; every section except ## Fixed user rules together under %d '
+        'characters: the code-copied rules block comes on top of that limit). If the file already exists, it is '
         'the old Main\'s seed brief: keep every fact from it unless you verified it is wrong, and '
         'complete it. Always include the latest state of the NotionTool desktop app '
         '(GET /api/app/status, docs/DESKTOP_APP.md, data/desktop_app.json). Sections in this order: '
@@ -163,8 +174,10 @@ def brief_task(path, rel):
         'the other sections short.'
         + '\nUnder ## Fixed user rules always copy this rule (I12) verbatim: ' + GUARD_RULE)
     task = dict(id='main-brief', title='Write the Main switch brief', prompt=prompt,
-                acceptance='The brief file exists, uses LF only, is under %d characters and has '
-                           'all six sections.' % BRIEF_MAX_CHARS,
+                acceptance='The brief file exists, uses LF only, has all six sections, and every '
+                           'section except ## Fixed user rules is together under %d characters (the '
+                           'code-copied rules block is added on top, own limit %d).'
+                           % (BRIEF_MAX_CHARS, RULES_MAX_CHARS),
                 files=[rel] if rel else [])
     return task
 
@@ -187,16 +200,48 @@ def _lf(text):
     return str(text or '').replace('\r\n', '\n').replace('\r', '\n')
 
 
+def _marker_range(lines):
+    """(start, end) line indexes of the FIXED-RULES start and end marker comments, else None."""
+    start = None
+    for i, line in enumerate(lines):
+        if start is None:
+            if START_MARK_RE.match(line):
+                start = i
+        elif END_MARK_RE.match(line):
+            return start, i
+    return None
+
+
+def _marked_block(lines, start, end):
+    """Text between the markers word for word; only marker comments and the first
+    '## Fixed rules ...' heading are removed (leading/trailing blank lines dropped)."""
+    body = [line for line in lines[start + 1:end] if not MARK_RE.match(line)]
+    for i, line in enumerate(body):
+        match = HEADING_RE.match(line)
+        if match and match.group(2).lower().startswith('fixed rules'):
+            del body[i]
+            break
+    return '\n'.join(_trim(body))
+
+
 def _rules_range(lines):
-    """(start, end): first heading that names rules .. end of the 'Code and files' section (or EOF)."""
-    start = 0
+    """Fallback without markers: (start, end) from the first heading that names rules to the end
+    of the 'Code and files' section; without that section, up to the next heading of the same or
+    higher level as the rules heading (or EOF)."""
+    start, level = 0, 0
     for i, line in enumerate(lines):
         match = HEADING_RE.match(line)
         if match and 'rule' in match.group(2).lower():
-            start = i
+            start, level = i, len(match.group(1))
             break
     end = len(lines)
-    for i in range(start, len(lines)):
+    if level:
+        for j in range(start + 1, len(lines)):
+            other = HEADING_RE.match(lines[j])
+            if other and len(other.group(1)) <= level and 'code and files' not in other.group(2).lower():
+                end = j
+                break
+    for i in range(start, end):
         match = HEADING_RE.match(lines[i])
         if match and 'code and files' in match.group(2).lower():
             level = len(match.group(1))
@@ -210,8 +255,18 @@ def _rules_range(lines):
 
 
 def fixed_rules_block(memory_text):
-    """Every '- I<n>' / '- R<n>' / '- PLAN' line plus its indented continuation lines, verbatim, in file order."""
+    """The fixed rules of project-memory/NotionTool.md, copied by code.
+
+    With FIXED-RULES start/end marker comments: every line between them word for word (group
+    labels and intro lines included); only the marker comments and the '## Fixed rules ...'
+    heading are removed, and nothing after the end marker is ever read.
+    Without markers (fallback): every '- I<n>' / '- R<n>' / '- PLAN' line plus its indented
+    continuation lines, verbatim, in file order, inside _rules_range.
+    """
     lines = _lf(memory_text).split('\n')
+    marked = _marker_range(lines)
+    if marked:
+        return _marked_block(lines, *marked)
     start, end = _rules_range(lines)
     out, inside = [], False
     for line in lines[start:end]:
@@ -333,11 +388,13 @@ def _cut_rank(heading):
     return 0
 
 
-def apply_to_brief(brief, rules_block, rows, limit=BRIEF_MAX_CHARS, guard_rule=GUARD_RULE):
+def apply_to_brief(brief, rules_block, rows, limit=BRIEF_MAX_CHARS, guard_rule=GUARD_RULE,
+                   rules_limit=RULES_MAX_CHARS):
     """(text, problem): rules section replaced by the code-copied block, open-run section written.
 
-    Over the limit, other sections are cut line by line from their end (CUT_ORDER); the rules
-    section is never cut. problem is '' unless the text still does not fit.
+    limit counts only the sections other than '## Fixed user rules'; over it, those sections are
+    cut line by line from their end (CUT_ORDER). The rules section comes on top of the limit, has
+    its own rules_limit and is never cut. problem is '' unless something still does not fit.
     """
     sections = [s for s in _sections(brief) if not (s[0] and _key(s[0]).startswith('open runs'))]
     rules_index = _find(sections, 'fixed user rules')
@@ -360,21 +417,32 @@ def apply_to_brief(brief, rules_block, rows, limit=BRIEF_MAX_CHARS, guard_rule=G
         nxt = _find(sections, 'next steps')
         position = nxt if nxt >= 0 else rules_index + 1
     sections.insert(position, runs_section)
+
+    def other_chars():
+        return len(_render([s for s in sections if s is not rules_section]))
+
+    rules_chars = len(_render([rules_section]))
+    rules_problem = ''
+    if rules_limit and rules_chars >= rules_limit:
+        rules_problem = ('fixed rules block has %d characters (rules limit %d); rules were not cut'
+                         % (rules_chars, rules_limit))
     text = _render(sections)
-    if len(text) < limit:
-        return text, ''
+    if other_chars() < limit:
+        return text, rules_problem
     order = sorted((i for i, s in enumerate(sections) if s is not rules_section),
                    key=lambda i: (_cut_rank(sections[i][0]), i))
     for i in order:
         heading, body = sections[i]
         kept = [line for line in _trim(body) if line != CUT_NOTE]
-        while kept and len(_render(sections)) >= limit:
+        while kept and other_chars() >= limit:
             kept = _trim(kept[:-1])
             sections[i] = [heading, kept + [CUT_NOTE]]
         text = _render(sections)
-        if len(text) < limit:
-            return text, ''
-    return text, 'brief needs %d characters with all fixed rules (limit %d); rules were not cut' % (len(text), limit)
+        if other_chars() < limit:
+            return text, rules_problem
+    problem = ('other sections need %d characters (limit %d, fixed rules not counted); rules were not cut'
+               % (other_chars(), limit))
+    return text, '; '.join(p for p in (rules_problem, problem) if p)
 
 
 def memory_path(store):
@@ -520,9 +588,23 @@ def read_brief(path):
     text = raw.decode('utf-8', errors='replace')
     if not text.strip():
         return None, 'brief file is empty'
-    if len(text) >= BRIEF_MAX_CHARS:
-        return None, 'brief file has %d characters (limit %d)' % (len(text), BRIEF_MAX_CHARS)
+    rules_chars, other_chars = brief_sizes(text)
+    if other_chars >= BRIEF_MAX_CHARS:
+        return None, ('brief file has %d characters outside the fixed rules (limit %d)'
+                      % (other_chars, BRIEF_MAX_CHARS))
+    if rules_chars >= RULES_MAX_CHARS:
+        return None, ('brief fixed rules section has %d characters (rules limit %d)'
+                      % (rules_chars, RULES_MAX_CHARS))
     return text, ''
+
+
+def brief_sizes(text):
+    """(rules_chars, other_chars): size of '## Fixed user rules' and of all other sections."""
+    sections = _sections(text)
+    index = _find(sections, 'fixed user rules')
+    if index < 0:
+        return 0, len(_render(sections))
+    return len(_render([sections[index]])), len(_render(sections[:index] + sections[index + 1:]))
 
 
 def _archive_title(ts):

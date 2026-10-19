@@ -1,6 +1,7 @@
 """Rule I37: fixed user rules copied by code into the Main switch brief, open runs with built status."""
 import copy
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -52,6 +53,43 @@ EXPECTED = '\n'.join([
     '- R41 still inside Code and files',
 ])
 EXPECTED_RULES = 7
+
+# Real format: FIXED-RULES marker comments, group labels, intro lines, and old rule lines with the
+# same ids after the end marker (they must never be copied).
+MARKED_BODY = [
+    'These rules are fixed by the user. Intro line.',
+    '',
+    '**Safety and scope**',
+    '- I1 First rule.',
+    '  continuation of I1',
+    '- R2 Second rule  with double spaces ',
+    '',
+    '### Planning group',
+    'Group intro line.',
+    '- PLAN plan rule',
+    '\tTab continuation.',
+]
+MARKED_MEMORY = '\n'.join([
+    '# NotionTool project memory',
+    'Intro outside the markers.',
+    '- I1 OLD outside the markers before the start marker',
+    '<!-- FIXED-RULES:START -->',
+    '## Fixed rules (verbatim, never summarise)',
+] + MARKED_BODY + [
+    '<!-- FIXED-RULES:END -->',
+    '',
+    '## Code and files',
+    '- I1 OLD rule one',
+    '- R2 OLD rule two',
+    '- PLAN OLD plan',
+]) + '\n'
+MARKED_EXPECTED = '\n'.join(MARKED_BODY)
+MARKED_RULES = 3
+
+
+def big_marked_memory(count=150):
+    rules = ['- I%d %s' % (i, 'rule text ' * 8) for i in range(count)]
+    return '<!-- FIXED-RULES:START -->\n## Fixed rules\nGroup A\n' + '\n'.join(rules) + '\n<!-- FIXED-RULES:END -->\n'
 
 BRIEF = '\n'.join([
     '## Goal', 'Switch the Main.', '',
@@ -120,9 +158,31 @@ class FixedRulesBlockTests(unittest.TestCase):
         self.assertEqual(ms.fixed_rules_block(''), '')
         self.assertEqual(ms.fixed_rules_block('# Title\nno rules here\n'), '')
 
-    def test_without_code_and_files_heading_runs_to_end(self):
-        text = '## Rules\n- I1 a\n  b\n## Other\n- R2 c\n'
+    def test_fallback_without_code_and_files_stops_at_same_level_heading(self):
+        text = '## Rules\n- I1 a\n  b\n### Group\n- R2 c\n## Other\n- R3 old\n# Top\n- I4 old\n'
         self.assertEqual(ms.fixed_rules_block(text), '- I1 a\n  b\n- R2 c')
+
+    def test_marked_block_is_word_for_word_and_old_lines_are_left_out(self):
+        self.assertEqual(ms.fixed_rules_block(MARKED_MEMORY), MARKED_EXPECTED)
+        self.assertEqual(ms.fixed_rules_block(MARKED_MEMORY.replace('\n', '\r\n')), MARKED_EXPECTED)
+        block = ms.fixed_rules_block(MARKED_MEMORY)
+        self.assertNotIn('OLD', block)
+        self.assertNotIn('outside the markers', block)
+        self.assertNotIn('FIXED-RULES', block)
+        self.assertNotIn('## Fixed rules', block)
+        self.assertIn('**Safety and scope**', block)  # group labels kept
+        self.assertIn('### Planning group', block)  # inner headings kept
+        self.assertEqual(ms.rule_count(block), MARKED_RULES)
+
+    def test_start_marker_without_end_marker_uses_fallback(self):
+        text = '## Rules\n<!-- FIXED-RULES:START -->\nLabel\n- I1 a\n## Other\n- I2 old\n'
+        self.assertEqual(ms.fixed_rules_block(text), '- I1 a')
+
+    def test_marker_spelling_variants(self):
+        for start, end in (('<!-- FIXED-RULES START -->', '<!-- FIXED-RULES END -->'),
+                           ('<!-- fixed_rules:begin -->', '<!-- fixed_rules:end -->')):
+            text = 'x\n%s\n## Fixed rules\nG\n- I1 a\n%s\n- I1 old\n' % (start, end)
+            self.assertEqual(ms.fixed_rules_block(text), 'G\n- I1 a')
 
 
 class ApplyToBriefTests(unittest.TestCase):
@@ -163,16 +223,36 @@ class ApplyToBriefTests(unittest.TestCase):
         self.assertGreater(len(big), ms.BRIEF_MAX_CHARS)
         text, problem = ms.apply_to_brief(big, EXPECTED, [])
         self.assertEqual(problem, '')
-        self.assertLess(len(text), ms.BRIEF_MAX_CHARS)
+        self.assertLess(ms.brief_sizes(text)[1], ms.BRIEF_MAX_CHARS)  # rules come on top
         self.assertIn(ms.RULES_HEADING + '\n' + EXPECTED + '\n', text)
         self.assertIn(ms.CUT_NOTE, text)
         self.assertIn('## Next steps\n- continue', text)  # cut only as far as needed
 
-    def test_rules_alone_over_limit_are_kept_and_reported(self):
+    def test_rules_do_not_count_toward_the_brief_limit(self):
         rules = '\n'.join('- I%d %s' % (i, 'x' * 60) for i in range(200))
-        text, problem = ms.apply_to_brief(BRIEF, rules, [], limit=2000)
+        self.assertGreater(len(rules), ms.BRIEF_MAX_CHARS)
+        text, problem = ms.apply_to_brief(BRIEF, rules, [])
+        self.assertEqual(problem, '')
+        self.assertIn(ms.RULES_HEADING + '\n' + rules + '\n', text)
+        self.assertNotIn(ms.CUT_NOTE, text)  # nothing else had to be cut either
+        self.assertGreater(len(text), ms.BRIEF_MAX_CHARS)
+        self.assertLess(ms.brief_sizes(text)[1], ms.BRIEF_MAX_CHARS)
+
+    def test_rules_over_their_own_limit_are_kept_and_reported(self):
+        self.assertGreaterEqual(ms.RULES_MAX_CHARS, 16000)
+        rules = '\n'.join('- I%d %s' % (i, 'x' * 60) for i in range(200))
+        text, problem = ms.apply_to_brief(BRIEF, rules, [], rules_limit=2000)
         self.assertIn(rules, text)
         self.assertIn('rules were not cut', problem)
+
+    def test_big_rules_and_big_other_sections_cut_only_others(self):
+        rules = '\n'.join('- I%d %s' % (i, 'x' * 60) for i in range(200))
+        big = BRIEF.replace('All fine.', '\n'.join('status line %04d with some padding text' % i for i in range(400)))
+        text, problem = ms.apply_to_brief(big, rules, [])
+        self.assertEqual(problem, '')
+        self.assertIn(ms.RULES_HEADING + '\n' + rules + '\n', text)
+        self.assertIn(ms.CUT_NOTE, text)
+        self.assertLess(ms.brief_sizes(text)[1], ms.BRIEF_MAX_CHARS)
 
 
 class OpenRunsStatusTests(unittest.TestCase):
@@ -270,6 +350,55 @@ class FinalizeIntegrationTests(unittest.TestCase):
         info = ms.finalize_brief(self.store, os.path.join(self.data, 'missing.md'))
         self.assertFalse(info['ok'])
         self.assertIn('finalize failed', info['problem'])
+
+    def test_marked_memory_is_copied_word_for_word_by_finalize(self):
+        write(ms.memory_path(self.store), MARKED_MEMORY.encode('utf-8'))
+        path = os.path.join(self.data, 'brief_marked.md')
+        write(path, BRIEF.encode('utf-8'))
+        info = ms.finalize_brief(self.store, path)
+        self.assertTrue(info['ok'])
+        self.assertEqual(info['rules'], MARKED_RULES)
+        text = self.read(path)
+        self.assertIn(ms.RULES_HEADING + '\n' + MARKED_EXPECTED + '\n', text)
+        self.assertNotIn('OLD', text)
+
+    def test_rules_block_over_8000_chars_still_ok(self):
+        memory = big_marked_memory()
+        block = ms.fixed_rules_block(memory)
+        self.assertGreater(len(block), 8000)
+        write(ms.memory_path(self.store), memory.encode('utf-8'))
+        path = os.path.join(self.data, 'brief_big.md')
+        write(path, BRIEF.encode('utf-8'))
+        info = ms.finalize_brief(self.store, path)
+        self.assertTrue(info['ok'])
+        self.assertEqual(info['problem'], '')
+        self.assertEqual(info['rules'], 150)
+        self.assertGreater(info['chars'], 8000)
+        text = self.read(path)
+        self.assertIn(block, text)
+        self.assertEqual(ms.read_brief(path), (text, ''))
+
+
+class RealMemoryTests(unittest.TestCase):
+    """Read-only check against the real project-memory/NotionTool.md (skipped when absent)."""
+
+    def test_rule_count_matches_rule_lines_between_markers(self):
+        env = os.environ.get('NOTIONTOOL_MEMORY', '')
+        path = Path(env) if env else Path(__file__).resolve().parents[1] / 'project-memory' / 'NotionTool.md'
+        if not path.is_file():
+            self.skipTest('real memory file not present: %s' % path)
+        text = path.read_bytes().decode('utf-8', errors='replace').replace('\r\n', '\n')
+        lines = text.split('\n')
+        starts = [i for i, l in enumerate(lines) if ms.START_MARK_RE.match(l)]
+        if not starts:
+            self.skipTest('real memory file has no FIXED-RULES markers')
+        ends = [i for i, l in enumerate(lines) if i > starts[0] and ms.END_MARK_RE.match(l)]
+        self.assertTrue(ends, 'FIXED-RULES start marker without end marker')
+        rule_re = re.compile(r'^- (?:I\d+|R\d+|PLAN)\b')
+        expected = sum(1 for l in lines[starts[0] + 1:ends[0]] if rule_re.match(l))
+        block = ms.fixed_rules_block(text)
+        self.assertEqual(ms.rule_count(block), expected)
+        self.assertGreater(expected, 0)
 
 
 class FileTests(unittest.TestCase):
