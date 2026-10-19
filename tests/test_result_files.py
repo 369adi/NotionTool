@@ -23,6 +23,8 @@ Some long explanation that is not needed in the summary.
 RESULT: DONE
 '''
 
+LONG = 'Word ' * 400 + '.\nRESULT: NOT DONE: tests failed'
+
 
 class ResultFilesTests(unittest.TestCase):
     def setUp(self):
@@ -84,16 +86,30 @@ class ResultFilesTests(unittest.TestCase):
         self.assertTrue(text.endswith('RESULT: DONE'))
         self.assertNotIn('```', text)
 
+    def test_summary_keeps_outcome_sentence_naming_files(self):
+        reply = 'I created notiontool/a.py and tests/test_a.py. The tests pass.\n\nRESULT: DONE\n'
+        text = rf.summary_of(reply)
+        self.assertTrue(text.startswith('I created notiontool/a.py'), text)
+        self.assertIn('The tests pass.', text)
+        self.assertIn('Files: notiontool/a.py, tests/test_a.py', text)
+        self.assertTrue(text.endswith('RESULT: DONE'))
+
     def test_summary_limit_keeps_status(self):
-        long = 'Word ' * 400 + '.\nRESULT: NOT DONE: tests failed'
         for limit in (80, 200, 600):
-            text = rf.summary_of(long, limit=limit)
+            text = rf.summary_of(LONG, limit=limit)
             self.assertLessEqual(len(text), limit)
             self.assertTrue(text.endswith('RESULT: NOT DONE: tests failed'))
         self.assertEqual(rf.summary_of(''), '')
         self.assertEqual(rf.summary_of('just one line'), 'just one line')
         with self.assertRaises(TypeError):
             rf.summary_of(None)
+
+    def test_summary_respects_very_small_limits(self):
+        self.assertLessEqual(len(rf.summary_of(LONG, limit=10)), 10)
+        for limit in (1, 2, 5, 31, 33, 40):
+            self.assertLessEqual(len(rf.summary_of(LONG, limit=limit)), limit)
+            self.assertLessEqual(len(rf.summary_of(REPLY, limit=limit)), limit)
+        self.assertLessEqual(len(rf.summary_of(LONG, limit=0)), 1)
 
     def test_prune_deletes_old_keeps_young(self):
         now = time.time()

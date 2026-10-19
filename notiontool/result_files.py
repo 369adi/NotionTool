@@ -91,6 +91,7 @@ _TESTS = re.compile(r'(\bRan \d+ tests?\b|^OK\b|\bFAILED\b|\b\d+ (passed|failed)
 _FILE = re.compile(r'(?<![\w/.-])[\w.-]+(?:/[\w.-]+)*\.(?:py|js|ts|json|md|txt|css|html|toml|yml|yaml|ini|cfg)\b')
 _SENTENCE = re.compile(r'(?<=[.!?])\s+')
 _NOISE = re.compile(r'^(```|\||---|#+\s*$)')
+_LIST_ITEM = re.compile(r'^([-*]|\d+\.)')
 
 
 def _clean(line):
@@ -101,11 +102,11 @@ def summary_of(reply_text, limit=600):
     """Short summary of a reply: first sentences, changed files, test result lines, status line.
 
     The status line (RESULT:/verdict) is always kept at the end; the whole text is at most limit
-    characters.
+    characters (minimum 1).
     """
     if not isinstance(reply_text, str):
         raise TypeError('reply_text must be a str, got %s' % type(reply_text).__name__)
-    limit = max(40, int(limit))
+    limit = max(1, int(limit))
     lines = [l.strip() for l in reply_text.replace('\r', '').split('\n')]
     lines = [l for l in lines if l and not _NOISE.match(l)]
     if not lines:
@@ -123,12 +124,13 @@ def summary_of(reply_text, limit=600):
         if _TESTS.search(text):
             if text not in tests and len(tests) < 3:
                 tests.append(text)
-        elif _FILE.search(text):
-            names = [m.group(0) for m in _FILE.finditer(text)]
-            for name in names:
-                if name not in files and len(files) < 6:
-                    files.append(name)
-        elif not _STATUS.match(text):
+            continue
+        for match in _FILE.finditer(text):
+            name = match.group(0)
+            if name not in files and len(files) < 6:
+                files.append(name)
+        # Sentences (not list items) also count as prose, even when they name files.
+        if not _LIST_ITEM.match(line) and not _STATUS.match(text):
             prose.append(text)
     first = ' '.join(_SENTENCE.split(' '.join(prose[:3]))[:2]).strip()
     parts = []
@@ -146,7 +148,7 @@ def summary_of(reply_text, limit=600):
         if len(part) <= left:
             out.append(part)
         else:
-            if left > 20:
+            if left >= 2:
                 out.append(part[:left - 1].rstrip() + '\u2026')
             break
     if status:
