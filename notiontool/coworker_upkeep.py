@@ -6,7 +6,17 @@ listing glitch never retires a chat), give their queued tasks back to the queue 
 Welcome coworkers until the pool reaches the target (setting coworker_target, default 10).
 """
 
+import json
+
+from .context_archive import prune_ids
+
 INTERVAL = 180
+PRUNE_INTERVAL = 3600  # thread_context pruning runs at most once per hour
+PRUNE_BATCH = 10
+PRUNE_PAUSE = 0.05
+DEFAULT_KEEP_HOURS = 6
+VACUUM_MB = 50  # VACUUM only after more than this many MB were deleted
+VACUUM_INTERVAL = 86400
 MISSING_GRACE = 300
 MAX_NEW_PER_CYCLE = 2
 DEFAULT_TARGET = 10
@@ -48,6 +58,9 @@ class CoworkerUpkeep:
         self.store, self.adapter, self.engine = store, adapter, engine
         self.clock = clock or time.time
         self.blocked_until = 0
+        self.last_prune = None  # clock time of the last thread_context pruning pass
+        self.last_vacuum = None
+        self.pending_mb = 0.0  # MB deleted since the last VACUUM
 
     def account(self):
         from .harness_account import selected_account
@@ -107,6 +120,68 @@ class CoworkerUpkeep:
                 self.store.event('coworker_refill_failed', message=type(exc).__name__ + ': ' + str(exc)[:200])
         return dict(decision, created=created)
 
+    def context_rows(self):
+        """Light rows (id, updated) and byte sizes of every thread_context record, without loading the documents."""
+        if hasattr(self.store, 'db') and hasattr(self.store, 'lock'):
+            with self.store.lock:
+                rows = self.store.db.execute("SELECT id, json_extract(doc, '$.updated'), length(CAST(doc AS BLOB)) "
+                                             "FROM objects WHERE kind='thread_context'").fetchall()
+            return [dict(id=i, updated=u) for i, u, _ in rows], {i: n or 0 for i, _, n in rows}
+        records = self.store.all('thread_context')
+        return ([dict(id=r.get('id'), updated=r.get('updated')) for r in records],
+                {r.get('id'): len(json.dumps(r, ensure_ascii=False).encode('utf-8')) for r in records})
+
+    def vacuum(self, now):
+        """VACUUM once the freed space is large enough, at most once per day and never while a task runs."""
+        if self.pending_mb <= VACUUM_MB or not hasattr(self.store, 'db'):
+            return False
+        if self.last_vacuum is not None and now - self.last_vacuum < VACUUM_INTERVAL:
+            return False
+        with self.engine.lock:
+            if any(t.get('state') in BUSY_TASK_STATES for t in self.store.all('tasks')):
+                return False
+            with self.store.lock:
+                self.store.db.commit()
+                self.store.db.execute('VACUUM')
+        self.last_vacuum, self.pending_mb = now, 0.0
+        return True
+
+    def prune_contexts(self):
+        """Delete thread_context records nobody needs (context_archive.prune_ids); at most once per hour."""
+        now = self.clock()
+        if self.last_prune is not None and now - self.last_prune < PRUNE_INTERVAL:
+            return None
+        self.last_prune = now
+        try:
+            hours = float(self.store.settings().get('thread_context_keep_hours', DEFAULT_KEEP_HOURS))
+        except (TypeError, ValueError):
+            hours = DEFAULT_KEEP_HOURS
+        if hours != hours or hours < 0:
+            hours = DEFAULT_KEEP_HOURS
+        records, sizes = self.context_rows()
+        with self.engine.lock:
+            workers, chats, tasks = self.store.all('workers'), self.store.all('chats'), self.store.all('tasks')
+        doomed = prune_ids(records, workers, chats, tasks, now, hours * 3600)
+        deleted, freed = 0, 0
+        for start in range(0, len(doomed), PRUNE_BATCH):
+            if start and self.engine.stop_event.wait(PRUNE_PAUSE):
+                break
+            for ident in doomed[start:start + PRUNE_BATCH]:
+                self.store.delete('thread_context', ident)
+                deleted += 1
+                freed += sizes.get(ident, 0)
+        mb = freed / 1048576
+        self.pending_mb += mb
+        try:
+            vacuumed = self.vacuum(now)
+        except Exception:
+            vacuumed = False
+        result = dict(count=deleted, mb=round(mb, 2), vacuumed=vacuumed)
+        if deleted:
+            self.store.event('thread_context_pruned', count=deleted, mb=result['mb'], vacuumed=vacuumed,
+                             keep_hours=hours)
+        return result
+
     def loop(self):
         last = ''
         while not self.engine.stop_event.wait(INTERVAL):
@@ -120,3 +195,10 @@ class CoworkerUpkeep:
                         self.store.event('coworker_upkeep_failed', message=last[:300])
                     except Exception:
                         return
+            try:
+                self.prune_contexts()
+            except Exception as exc:
+                try:
+                    self.store.event('thread_context_prune_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+                except Exception:
+                    return
