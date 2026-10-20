@@ -52,9 +52,24 @@ class MainEffortInheritTest(unittest.TestCase):
         client = FakeClient([uc(effort='max')])
         self.assertEqual(notion.inherit_main_config(client, 't')[:3], ('opus', 'albuquerque-quinn', 'max'))
 
-    def test_no_choice_or_error_falls_back(self):
-        self.assertIsNone(notion.inherit_main_config(FakeClient([{'type': 'user'}]), 't'))
-        self.assertIsNone(notion.inherit_main_config(FakeClient([uc('x', 'low')], fail=True), 't'))
+    def test_no_choice_or_error_uses_high_not_auto(self):
+        self.assertEqual(notion.inherit_main_config(FakeClient([{'type': 'user'}]), 't')[:3],
+                         ('opus', 'albuquerque-quinn', 'high'))
+        self.assertEqual(notion.inherit_main_config(FakeClient([uc('x', 'low')], fail=True), 't')[:3],
+                         ('opus', 'albuquerque-quinn', 'high'))
+
+    def test_model_only_gets_high(self):
+        self.assertEqual(notion.inherit_main_config(FakeClient([uc('achira-donut')]), 't')[:3],
+                         ('sonnet', 'achira-donut', 'high'))
+
+    def test_own_steps_are_not_user_choices(self):
+        own = dict(uc('albuquerque-quinn', 'medium'), id='3fea1b13-e54d-80a6-868a-00aa12345678')
+        user = dict(uc('albuquerque-quinn', 'xhigh'), id='3fea1b13-e54d-80a6-868a-00ab12345678')
+        self.assertEqual(notion.latest_user_config([user, own]), ('albuquerque-quinn', 'xhigh'))
+        self.assertEqual(notion.latest_user_config([own]), ('', ''))
+        notion.OWN_CONFIG_IDS.add('remembered-id')
+        self.assertEqual(notion.latest_user_config([user, dict(uc(effort='low'), id='remembered-id')]),
+                         ('albuquerque-quinn', 'xhigh'))
 
     def test_only_main_purposes(self):
         self.assertIn('main', notion.MAIN_OWN_CONFIG)
