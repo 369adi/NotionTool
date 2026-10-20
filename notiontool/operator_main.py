@@ -49,7 +49,16 @@ def _with_result_line(prompt):
 
 
 KNOWN_TASK_KEYS = frozenset(('id', 'title', 'prompt', 'acceptance', 'depends_on', 'deps', 'after', 'files', 'model',
-                             'role', 'task_class', 'summary', 'quality', 'use_main'))
+                             'role', 'task_class', 'summary', 'quality', 'use_main', 'effort', 'risk'))
+# Notion reasoning effort names a task may set (Rule I38); notion.choose_task_effort clamps them per model.
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+
+
+def task_effort(task):
+    """The valid per-task effort set by the Main, lower case ('' when missing or not one of EFFORTS)."""
+    value = (task or {}).get('effort') if isinstance(task, dict) else None
+    value = value.strip().lower() if isinstance(value, str) else ''
+    return value if value in EFFORTS else ''
 
 
 def _warnings(store, chat, tasks):
@@ -67,6 +76,9 @@ def _warnings(store, chat, tasks):
         unknown = sorted(str(k) for k in t if k not in KNOWN_TASK_KEYS)
         if unknown:
             warnings.append('Task %s: unknown key(s) %s were ignored' % (t.get('id', '?'), ', '.join(unknown)))
+        if t.get('effort') not in (None, '') and not task_effort(t):
+            warnings.append('Task %s: effort %r is not one of %s and was ignored (automatic effort is used)'
+                            % (t.get('id', '?'), t.get('effort'), ', '.join(EFFORTS)))
     return warnings
 
 
@@ -253,6 +265,11 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
             text = clean_summary(spec.get('summary'))
             if text and task.get('title') == spec['title']:
                 task['summary'] = text
+                store.put('tasks', task)
+            effort = task_effort(spec)
+            if effort and task.get('title') == spec['title']:
+                # Rule I38: the Main's effort; notion.choose_task_effort sends it (clamped) instead of the automatic one.
+                task['requested_effort'] = effort
                 store.put('tasks', task)
         if quality == 'high':
             ui = is_ui(goal, plan['tasks'])

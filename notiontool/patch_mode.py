@@ -152,6 +152,37 @@ def _root_lock(root):
         return _ROOT_LOCKS.setdefault(os.path.normcase(str(root)), threading.Lock())
 
 
+_FAILED_TEST = re.compile(r'^(?:FAIL|ERROR): (\S+) \(([\w.]+)\)', re.M)
+TAIL_LIMIT = 1500
+
+
+def failing_tests(text, limit=10):
+    """Names of failed unittest tests in a test output ('tests.test_x.Case.test_y')."""
+    names = []
+    for name, where in _FAILED_TEST.findall(text or ''):
+        full = where if where.endswith('.' + name) else where + '.' + name
+        if full not in names:
+            names.append(full)
+    return names[:limit]
+
+
+def test_tail(result, limit=TAIL_LIMIT):
+    """Short output tails of the failed test runs (task copy and clean main), at most `limit` characters."""
+    parts = []
+    for r in ((result or {}).get('tests') or {}).get('commands') or []:
+        if not r.get('ok'):
+            parts.append(('[task copy] %s' % r.get('name'), r.get('tail') or ''))
+    base = (result or {}).get('main_tests') or {}
+    for r in base.get('commands') or []:
+        if not r.get('ok'):
+            parts.append(('[main %s] %s' % (str(base.get('commit') or '')[:10], r.get('name')), r.get('tail') or ''))
+    if not parts:
+        return ''
+    share = max(100, limit // len(parts) - 40)
+    text = '\n'.join('%s:\n%s' % (head, tail.strip()[-share:]) for head, tail in parts)
+    return text[-limit:]
+
+
 class PatchMode:
     def __init__(self, root, base=BASE, remote='origin', python=None, test_timeout=TEST_TIMEOUT_S,
                  desktop_pattern=DESKTOP_PATTERN, create_task=None, lock_wait=900):
@@ -167,6 +198,7 @@ class PatchMode:
         self._follow_ups = {}
         self._queue = None
         self._queue_guard = threading.Lock()
+        self._baseline = {}  # (main commit, argv) -> test run on clean main; main is red or green per commit
 
     # ---- git ---------------------------------------------------------------
     def _git(self, args, cwd=None, check=True, timeout=GIT_TIMEOUT_S, input=None):
@@ -361,8 +393,65 @@ class PatchMode:
             code, timed_out = None, True
             out = _text(exc.stdout) + _text(exc.stderr) + '\nTimed out after %s s' % self.test_timeout
         ok = not timed_out and code in (0, 5)  # 5: no tests found
-        return dict(name=name, command=' '.join(argv[1:]), code=code, ok=ok, timed_out=timed_out,
+        return dict(name=name, command=' '.join(argv[1:]), argv=list(argv), code=code, ok=ok, timed_out=timed_out,
                     seconds=round(time.monotonic() - started, 2), tail=out[-2000:])
+
+    # ---- 3b. baseline: is main itself red? -------------------------------
+    def main_baseline(self, failed, main_sha):
+        """Run the commands that failed in the task copy again on a clean checkout of main_sha.
+
+        Results are cached per (main commit, command), so a red main costs one extra run per commit.
+        Returns dict(commit, red, failing, commands, error). On a git error red stays False (plain 'red').
+        """
+        out = dict(commit=main_sha, red=False, failing=[], commands=[], error=None)
+        todo = []
+        for r in failed:
+            argv = r.get('argv')
+            if not argv or not main_sha:
+                continue
+            key = (main_sha, tuple(argv))
+            if key in self._baseline:
+                out['commands'].append(self._baseline[key])
+            else:
+                todo.append((key, r.get('name') or 'tests', list(argv)))
+        if todo:
+            path = self.root / WORKTREES / ('_main-' + main_sha[:12])
+            try:
+                if not (path / '.git').exists():
+                    self._git(['worktree', 'prune'])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    self._git(['worktree', 'add', '-q', '--detach', str(path), main_sha])
+                if len(self._baseline) > 64:
+                    self._baseline.clear()
+                for key, name, argv in todo:
+                    argv = self._on_main(argv, path)
+                    if argv is None:
+                        res = dict(name=name, command='', argv=[], code=0, ok=True, timed_out=False, seconds=0,
+                                   tail='The task test files do not exist on main')
+                    else:
+                        res = self._run_tests(name, argv, path)
+                    res['commit'] = main_sha
+                    self._baseline[key] = res
+                    out['commands'].append(res)
+            except (GitError, OSError) as exc:
+                out['error'] = str(exc)[:300]
+            finally:
+                self._git(['worktree', 'remove', '--force', str(path)], check=False)
+        bad = [r for r in out['commands'] if not r.get('ok')]
+        out['red'] = bool(bad)
+        for r in bad:
+            for name in failing_tests(r.get('tail')) or [r.get('name')]:
+                if name not in out['failing']:
+                    out['failing'].append(name)
+        return out
+
+    @staticmethod
+    def _on_main(argv, path):
+        """The same command for clean main; task test modules that main does not have are left out."""
+        if list(argv[1:3]) != ['-m', 'unittest'] or 'discover' in argv:
+            return argv
+        mods = [m for m in argv[3:] if (Path(path) / (m.replace('.', '/') + '.py')).is_file()]
+        return list(argv[:3]) + mods if mods else None
 
     # ---- secret scan -------------------------------------------------------
     def secret_scan(self, old, new, cwd=None):
@@ -477,7 +566,21 @@ class PatchMode:
         result['tests'] = check
         if not check['green']:
             self._undo(path, before)
-            return dict(result, status='red', message='Tests are red; main was not changed')
+            failed = [r for r in check['commands'] if not r.get('ok')]
+            base = self.main_baseline(failed, old_main)
+            result['main_tests'] = base
+            if base['red']:
+                # main itself is red (e.g. 49abeb2 at 23:41): not the task's fault; the engine retries later.
+                names = ', '.join(base['failing'][:5]) or 'the desktop suite'
+                return dict(result, status='main_red', main_red_commit=old_main, failing=base['failing'],
+                            message='main itself is red at %s (%s); main was not changed and the merge is '
+                                    'retried once main is green' % (old_main[:10], names))
+            names = []
+            for r in failed:
+                names += [n for n in failing_tests(r.get('tail')) or [r.get('name')] if n not in names]
+            result['failing'] = names
+            return dict(result, status='red', message='Tests are red; main was not changed'
+                        + (' (%s)' % ', '.join(names[:5]) if names else ''))
         if self.rev(self.base) != old_main:
             self._undo(path, before)
             return dict(result, status='main_moved', message='main changed during the merge; merge again')
