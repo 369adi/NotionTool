@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # The bounds the /api/settings route in server.py clamps to.
 SERVER_CLAMPS = {'max_workers': (1, 40), 'per_account': (1, 40), 'coworker_max_age_hours': (1, 72), 'max_runs_per_chat': (1, 6),
-                 'context_token_limit': (8000, 2000000), 'main_context_ask_tokens': (50000, 5000000),
+                 'context_token_limit': (8000, 10000000), 'main_context_ask_tokens': (50000, 10000000),
                  'main_context_ask_turns': (20, 5000)}
 SERVER_BOOLS = {'coworker_delete_old_chat', 'main_auto_continue', 'turn_watch'}
 SERVER_CHOICES = {'coworker_fresh_context': ['threshold', 'every_task'], 'main_context_policy': ['hint', 'auto', 'ask']}

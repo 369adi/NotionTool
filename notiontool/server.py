@@ -1115,7 +1115,7 @@ class Application:
                 from .team_size import team_size
                 old_team = team_size(settings)
                 for key,lo,hi in [('max_workers',1,40),('per_account',1,40),('max_attempts',1,5),
-                                 ('task_timeout',60,3600),('max_fix_rounds',0,4),('context_token_limit',8000,2000000),
+                                 ('task_timeout',60,3600),('max_fix_rounds',0,4),('context_token_limit',8000,10000000),
                                  ('context_turn_limit',5,2000),('context_handoff_chars',8000,40000),('max_runs_per_chat',1,6),('coworker_max_age_hours',1,72)]:
                     if key in body:
                         settings[key] = max(lo,min(hi,int(body[key])))
@@ -1150,7 +1150,7 @@ class Application:
                 if 'coworker_delete_old_chat' in body:
                     # False keeps a retired coworker chat (renamed) instead of deleting it in Notion.
                     settings['coworker_delete_old_chat'] = str(body['coworker_delete_old_chat']).lower() in ('true','1','on','yes')
-                for key, low, high in (('main_context_ask_tokens', 50000, 5000000), ('main_context_ask_turns', 20, 5000)):
+                for key, low, high in (('main_context_ask_tokens', 50000, 10000000), ('main_context_ask_turns', 20, 5000)):
                     if key in body:
                         # When the operator Main reaches this size, it asks the user about a switch (main_switch.py).
                         settings[key] = max(low, min(high, int(body[key])))
