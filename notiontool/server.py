@@ -350,6 +350,9 @@ class Application:
         from .coworker_upkeep import CoworkerUpkeep  # retire deleted/missing coworkers, refill the pool
         self.coworker_upkeep=CoworkerUpkeep(self.store,self.adapter,self.engine)
         threading.Thread(target=self.coworker_upkeep.loop,daemon=True,name='coworker-upkeep').start()
+        from .main_wake import MainWake  # tells the operator Main once when a delegated run is completely finished
+        self.main_wake=MainWake(self.store,self.adapter,self.engine)
+        threading.Thread(target=self.main_wake.loop,daemon=True,name='main-wake').start()
         from .backup import daily_loop  # one backup per day in data/backups (backup.py)
         threading.Thread(target=daily_loop,args=(self.data_dir or self.store.directory,self.store,self.engine.stop_event),daemon=True,name='daily-backup').start()
         self.updater = Updater(self)
