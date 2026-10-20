@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 8;
+  var VERSION = 9;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -146,13 +146,54 @@
     return null;
   }
 
-  function hold(el, prevH, prevTop) {
+  // v9: while Notion re-mounts the list after a load all messages vanished for a moment (user report). A static
+  // copy of what was on screen covers the chat until the new list is in place, then fades out.
+  function bgOf(el) {
+    for (var p = el; p && p.nodeType === 1; p = p.parentElement) {
+      var c = '';
+      try { c = window.getComputedStyle(p).backgroundColor; } catch (e) { c = ''; }
+      if (c && c !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(c)) return c;
+    }
+    return '#191919';
+  }
+  function cover(el) {
+    try {
+      if (!el.cloneNode || !document.body) return null;
+      var r = el.getBoundingClientRect();
+      var c = el.cloneNode(true);
+      var marked = c.querySelectorAll('[data-agent-chat-user-step-id],[id]');
+      for (var i = 0; i < marked.length; i++) { marked[i].removeAttribute('data-agent-chat-user-step-id'); marked[i].removeAttribute('id'); }
+      c.removeAttribute('id');
+      c.setAttribute('data-nt-stepcap-cover', '1');
+      c.setAttribute('aria-hidden', 'true');
+      c.style.cssText += ';position:fixed;margin:0;top:' + r.top + 'px;left:' + r.left + 'px;width:' + r.width +
+        'px;height:' + r.height + 'px;z-index:2147482000;pointer-events:none;overflow:hidden;background:' + bgOf(el) +
+        ';transition:opacity 120ms ease-out;opacity:1';
+      document.body.appendChild(c);
+      c.scrollTop = el.scrollTop;
+      return c;
+    } catch (e) { return null; }
+  }
+  function uncover(c) {
+    if (!c) return;
+    try { c.style.opacity = '0'; } catch (e) { /* gone */ }
+    setTimeout(function () { try { c.remove(); } catch (e) { /* gone */ } }, 140);
+  }
+
+  function hold(el, prevH, prevTop, shield) {
     var t0 = Date.now();
     var raf = window.requestAnimationFrame || function (f) { return setTimeout(f, 16); };
+    var lastH = -1, still = 0, grown = false;
     function tick() {
       var h = el.scrollHeight;
       if (h !== prevH) el.scrollTop = prevTop + (h - prevH);
+      if (h > prevH) grown = true;
+      still = h === lastH ? still + 1 : 0;
+      lastH = h;
+      // The new list is in place once it is taller than before and stopped changing for a few frames.
+      if (shield && ((grown && still >= 4) || Date.now() - t0 > ANCHOR_MS)) { uncover(shield); shield = null; }
       if (Date.now() - t0 < ANCHOR_MS && el.isConnected !== false) raf(tick);
+      else if (shield) { uncover(shield); shield = null; }
     }
     raf(tick);
   }
@@ -172,8 +213,9 @@
     expanded[id] = el;
     var prevH = el.scrollHeight;
     var prevTop = el.scrollTop;
+    var shield = cover(el);
     emit(ts);
-    hold(el, prevH, prevTop);
+    hold(el, prevH, prevTop, shield);
     return n;
   }
 
@@ -267,8 +309,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound8) return;
-    window.__ntStepExpBound8 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound9) return;
+    window.__ntStepExpBound9 = true;
     window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');
