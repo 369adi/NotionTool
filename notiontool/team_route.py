@@ -191,20 +191,23 @@ def _fallback(decision, reason):
     return decision
 
 
-def apply_route(decision, tasks, quality, quality_reason):
+def apply_route(decision, tasks, quality, quality_reason, goal=''):
     """Apply a decision to the (alias-converted) task list.
 
     Enforced: tasks = team_graph.expand(tasks, decision, kind); on an error or when the graph would exceed
     the cap (no task carries a team key) the decision falls back to direct and the tasks stay as they are.
     Quality is raised to at least standard so the review step runs. Not enforced: tasks and quality stay
     unchanged; a TEAM decision only records the graph size it would have (None when that fails).
+    expand gets a copy of the decision plus the request goal (team_graph reads route['goal'] for the design,
+    critique and integrate prompts); the stored decision does not repeat the goal.
     Returns (tasks, quality, quality_reason).
     """
     kind = decision.get('kind') or 'build'
+    route = dict(decision, goal=str(goal or ''))
     if decision.get('enforced'):
         try:
             from .team_graph import expand
-            out = expand(tasks, decision, kind)
+            out = expand(tasks, route, kind)
         except Exception as exc:
             _fallback(decision, 'graph_error: ' + (str(exc).strip() or type(exc).__name__)[:200])
             return tasks, quality, quality_reason
@@ -220,7 +223,7 @@ def apply_route(decision, tasks, quality, quality_reason):
     if decision.get('mode') == 'team':
         try:
             from .team_graph import expand
-            out = expand(copy.deepcopy(tasks), dict(decision, enforced=True), kind)
+            out = expand(copy.deepcopy(tasks), dict(route, enforced=True), kind)
             decision['graph_size'] = len(out) if isinstance(out, list) and has_team(out) else None
             if decision['graph_size'] is None:
                 decision['reasons'].append('graph_over_cap (log only)')
@@ -247,14 +250,18 @@ def apply_team_keys(spec, task):
 
 
 def match_created(specs, created):
-    """Map plan task id -> created engine task explicitly (title, prompt, files, acceptance and mapped deps).
+    """Map plan task id -> created engine task: explicitly first (title, prompt, files, acceptance, mapped deps).
 
     _import_plan does not return its id map, so this replaces the old positional zip: tasks are resolved in
     dependency order and each engine task is used once, so equal titles or extra graph tasks cannot shift it.
+    Specs still unmatched after that (for example a prompt the engine changed) are mapped by their position
+    among the remaining created tasks; both lists keep plan order. A spec left without any task is missing
+    from the result, and delegate warns about its id.
     """
     left = list(created)
     out = {}
-    pending = [s for s in specs if isinstance(s, dict)]
+    specs = [s for s in specs if isinstance(s, dict)]
+    pending = list(specs)
     while pending:
         progressed = False
         for spec in list(pending):
@@ -272,6 +279,9 @@ def match_created(specs, created):
             progressed = True
         if not progressed:
             break
+    rest = [s for s in specs if str(s.get('id')) not in out]
+    for spec, task in zip(rest, left):  # positional fallback, only among the tasks no spec claimed
+        out[str(spec.get('id'))] = task
     return out
 
 

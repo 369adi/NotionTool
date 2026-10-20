@@ -213,6 +213,31 @@ def _summary(engine, run, duplicate=False, warnings=None):
                 route=run.get('route'), capacity=run.get('capacity_hint'))
 
 
+def _request_route(route, tasks):
+    """The request's DIRECT/TEAM override and the warnings found while reading it: (route, warnings).
+
+    The top-level route argument wins and a bad value raises ValueError. Otherwise the first valid task
+    'route' field is used; a task-level value that is not auto, direct or team only adds a warning and
+    counts as auto, so one bad field cannot fail the whole delegation.
+    """
+    from .team_route import normal_route
+    if str(route or '').strip():
+        return normal_route(route), []
+    chosen, notes = '', []
+    for task in tasks:
+        value = task.get('route')
+        if not value:
+            continue
+        try:
+            value = normal_route(value)
+        except ValueError:
+            notes.append('Task %s: route %r is not auto, direct or team and was ignored (auto is used)'
+                         % (task.get('id', '?'), value))
+            continue
+        chosen = chosen or value
+    return chosen or 'auto', notes
+
+
 def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality='', route=''):
     """Queue the operator's own plan as executor tasks for the Coworkers; no Main turn is ever sent.
 
@@ -223,6 +248,8 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
     route ('auto' | 'direct' | 'team', also accepted as a task field) overrides the automatic DIRECT/TEAM
     decision of team_route.decide. With the default setting team_route_mode='log_only' the decision is only
     saved on the run (run['route']) and returned; 'enforce' or route='team' expands the plan into a team graph.
+    A bad route argument raises ValueError; a bad task-level route only adds a warning and auto is used.
+    A known request_id returns the stored run without deciding or expanding again.
     """
     store = engine.store
     goal = str(goal or '').strip()
@@ -230,9 +257,9 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         raise ValueError('tasks must be a non-empty list of task objects')
     from .operator_roles import choose_quality, design_prompt, is_ui
     from .team_route import (apply_route, apply_team_keys, capacity_hint, capacity_settings, decide,
-                             match_created, normal_route, setting_mode, stage_role_of)
+                             match_created, setting_mode, stage_role_of)
     quality = quality or next((t['quality'] for t in tasks if t.get('quality')), '')
-    route = normal_route(route or next((t['route'] for t in tasks if t.get('route')), ''))
+    route, notes = _request_route(route, tasks)  # notes: warnings for bad task-level route values
     tasks = [{k: v for k, v in t.items() if k not in ('quality', 'route')} for t in tasks]
     for item in tasks:
         # 'deps' / 'after' are common names for depends_on; silently dropping them ran dependent tasks in parallel.
@@ -244,9 +271,13 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
     settings = store.settings()
     user_tasks = tasks
     decision = None
-    if setting_mode(settings) != 'off' or route != 'auto':
+    request_id = str(request_id or '')[:100]
+    # Duplicates first: a known request_id returns the stored run and its stored route below, so it is never
+    # decided or expanded again (the authoritative check stays inside the lock).
+    repeat = bool(request_id) and any(r.get('request_id') == request_id for r in store.all('runs'))
+    if not repeat and (setting_mode(settings) != 'off' or route != 'auto'):
         decision = decide(goal, tasks, quality, settings, route=route, explicit=quality_reason == 'requested')
-        tasks, quality, quality_reason = apply_route(decision, tasks, quality, quality_reason)
+        tasks, quality, quality_reason = apply_route(decision, tasks, quality, quality_reason, goal=goal)
     plan = {'tasks': [dict(t, use_main=False, **({'prompt': _with_result_line(t['prompt'])} if 'prompt' in t else {}))
                       for t in tasks]}
     validate_plan(plan, max_tasks=MAX_DELEGATED_TASKS)
@@ -262,7 +293,7 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
             if known:
                 if known['chat_id'] != chat['id']:
                     raise ValueError('request_id already belongs to another chat')
-                return _summary(engine, known, duplicate=True, warnings=_warnings(store, chat, tasks))
+                return _summary(engine, known, duplicate=True, warnings=_warnings(store, chat, tasks) + notes)
         operator = store.get('workers', chat.get('main_worker') or '') if chat.get('main_worker') else None
         if not operator or operator.get('purpose') != OPERATOR:
             raise ValueError('The operator chat lost its Notion thread; register it again')
@@ -292,7 +323,8 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         run['worker_budget'] = max(1, min(capacity, startable))
         engine._import_plan(run, plan)  # checks every planned file path before any task is queued
         created = [t for t in engine.tasks(run['id']) if t.get('role') == 'executor']
-        matched = match_created(plan['tasks'], created)  # explicit plan id -> engine task, no positional zip
+        matched = match_created(plan['tasks'], created)  # plan id -> engine task: explicit, then by position
+        unmatched = [str(s['id']) for s in plan['tasks'] if str(s['id']) not in matched]
         for spec in plan['tasks']:
             task = matched.get(str(spec['id']))
             if task is None:
@@ -325,7 +357,10 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         store.put('runs', run)
         store.message(chat['id'], 'user', goal, run['id'])
         store.event('run_created', run['id'], message='Operator delegated %d task(s)' % len(plan['tasks']))
-        warnings = _warnings(store, chat, plan['tasks'])
+        warnings = _warnings(store, chat, plan['tasks']) + notes
+        if unmatched:
+            warnings.append('Plan task(s) %s matched no created Coworker task: their summary, effort and team keys '
+                            'were not applied' % ', '.join(unmatched))
         hint = (run.get('capacity_hint') or {}).get('hint')
         if hint and settings.get('capacity_hint_warn', False):
             warnings.append(hint)  # off by default: log-only keeps today's warnings; the hint is in 'capacity'

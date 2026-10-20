@@ -1,8 +1,10 @@
 """Automatic DIRECT/TEAM routing for operator delegations (team_route + operator_main.delegate).
 
-team_graph.expand belongs to a parallel builder, so every test runs against a stub module.
+team_graph.expand belongs to a parallel builder, so the tests run against a stub module; one round trip
+also runs builder B's merged module and is skipped when that module is missing.
 """
 import copy
+import importlib
 import sys
 import tempfile
 import types
@@ -11,7 +13,7 @@ from unittest import mock
 
 from notiontool import team_route
 from notiontool.engine import Engine
-from notiontool.operator_main import delegate, register_operator
+from notiontool.operator_main import KNOWN_TASK_KEYS, delegate, register_operator
 from notiontool.store import Store
 from notiontool.team_route import capacity_hint, decide, kind_of, match_created
 
@@ -197,6 +199,18 @@ class DecideTest(StubbedGraph):
         out = match_created(specs, created)
         self.assertEqual((out['a']['id'], out['b']['id']), ('E1', 'E2'))
 
+    def test_match_created_positional_fallback(self):
+        specs = [dict(id='a', title='A', prompt='one', acceptance='x', files=[], depends_on=[]),
+                 dict(id='b', title='B', prompt='two', acceptance='x', files=[], depends_on=[]),
+                 dict(id='c', title='C', prompt='three', acceptance='x', files=[], depends_on=['b'])]
+        created = [dict(id='E1', title='A', prompt='one', acceptance='x', files=[], deps=[]),
+                   dict(id='E2', title='B', prompt='two, changed by the engine', acceptance='x', files=[], deps=[]),
+                   dict(id='E3', title='C', prompt='three', acceptance='x', files=[], deps=['E2'])]
+        out = match_created(specs, created)  # b misses explicitly and blocks c: both are mapped by position
+        self.assertEqual({k: v['id'] for k, v in out.items()}, {'a': 'E1', 'b': 'E2', 'c': 'E3'})
+        fewer = match_created(specs, created[:2])
+        self.assertEqual({k: v['id'] for k, v in fewer.items()}, {'a': 'E1', 'b': 'E2'})  # no task left for c
+
 
 class DelegateRouteTest(StubbedGraph):
     def setUp(self):
@@ -306,6 +320,38 @@ class DelegateRouteTest(StubbedGraph):
         self.assertEqual(run['stage'], 'Designing')
         self.assertEqual(self.graph.calls[-1]['kind'], 'build')
         self.assertNotIn('team', ''.join(result['warnings']))  # team/route are known keys
+        self.assertEqual(self.graph.calls[-1]['decision']['goal'], 'Goal')  # expand sees the request goal
+        self.assertNotIn('goal', run['route'])  # ...the stored decision does not repeat it
+
+    def test_enforced_graph_has_no_unknown_team_warning(self):
+        self.assertIn('team', KNOWN_TASK_KEYS)
+        self.setting(team_route_mode='enforce')
+        with base(0.9):
+            result = delegate(self.engine, self.chat_id, 'Goal', tasks('a', 'b'))
+        self.assertTrue(result['route']['enforced'])
+        own = self.engine.tasks(result['run_id'])
+        self.assertEqual(len([t for t in own if t.get('stage_role')]), 5)  # every plan task carried a team key
+        self.assertEqual([w for w in result['warnings'] if 'unknown key' in w], [])
+
+    def test_real_team_graph_round_trip(self):
+        """Builder B's merged team_graph.expand (no stub): an enforced run imports with no unknown-key warning."""
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop('notiontool.team_graph', None)
+            try:
+                real = importlib.import_module('notiontool.team_graph')
+            except ImportError as exc:
+                self.skipTest('team_graph is not merged yet: %s' % exc)
+        self.stub(real)
+        self.setting(team_route_mode='enforce')
+        with base(0.9):
+            result = delegate(self.engine, self.chat_id, 'Ship the export feature', tasks('a', 'b'))
+        own = self.engine.tasks(result['run_id'])
+        self.assertEqual(sorted(t.get('stage_role') or '' for t in own),
+                         ['build', 'build', 'design', 'design_critique', 'integrate'])
+        self.assertEqual([w for w in result['warnings'] if 'unknown key' in w or 'matched no' in w], [])
+        design = next(t for t in own if t.get('stage_role') == 'design')
+        self.assertIn('User goal: Ship the export feature', design['prompt'])
+        self.assertEqual((design['read_only'], result['route']['graph_size']), (True, 5))
 
     def test_alias_dep_kept_with_enforce(self):
         self.setting(team_route_mode='enforce')
@@ -329,6 +375,23 @@ class DelegateRouteTest(StubbedGraph):
             own = [t for t in self.engine.tasks(result['run_id']) if t['title'] == 'Same']
             got = sorted((t['prompt'].split('\n')[0], t.get('summary'), t.get('requested_effort')) for t in own)
             self.assertEqual(got, [('Do one', 'First part', 'low'), ('Do two', 'Second part', 'high')], mode)
+
+    def test_unmatched_plan_ids_warn(self):
+        real = team_route.match_created
+
+        def lossy(specs, created):
+            out = real(specs, created)
+            out.pop('b', None)  # as if no created engine task were left for plan task b
+            return out
+
+        with mock.patch.object(team_route, 'match_created', lossy):
+            result = delegate(self.engine, self.chat_id, 'Goal', tasks('a', 'b', summary='Part one'))
+        self.assertIn('Plan task(s) b matched no created Coworker task: their summary, effort and team keys '
+                      'were not applied', result['warnings'])
+        own = {t['title']: t for t in self.engine.tasks(result['run_id'])}
+        self.assertEqual((own['Task a'].get('summary'), own['Task b'].get('summary')), ('Part one', None))
+        clean = delegate(self.engine, self.chat_id, 'Goal 2', tasks('c', 'd'))
+        self.assertEqual([w for w in clean['warnings'] if 'matched no' in w], [])
 
     def test_over_cap_falls_back(self):
         self.setting(team_route_mode='enforce')
@@ -379,6 +442,23 @@ class DelegateRouteTest(StubbedGraph):
         with self.assertRaisesRegex(ValueError, 'route must be'):
             delegate(self.engine, self.chat_id, 'Goal', tasks('b'), route='sideways')
 
+    def test_bad_task_route_is_a_warning(self):
+        work = tasks('c')
+        work[0]['route'] = 'sideways'
+        with base(0.0):
+            result = delegate(self.engine, self.chat_id, 'Goal', work)
+        self.assertEqual((result['route']['route'], result['route']['mode']), ('auto', 'direct'))
+        self.assertIn("Task c: route 'sideways' is not auto, direct or team and was ignored (auto is used)",
+                      result['warnings'])
+        mixed = tasks('d', 'e')
+        mixed[0]['route'] = 'bogus'
+        mixed[1]['route'] = 'team'  # the first valid task value still wins
+        with base(0.0):
+            forced = delegate(self.engine, self.chat_id, 'Goal 2', mixed)
+        self.assertEqual((forced['route']['route'], forced['route']['enforced']), ('team', True))
+        self.assertEqual([w for w in forced['warnings'] if 'route' in w],
+                         ["Task d: route 'bogus' is not auto, direct or team and was ignored (auto is used)"])
+
     def test_explicit_fast_stays_direct(self):
         self.setting(team_route_mode='enforce')
         with base(0.9):
@@ -409,11 +489,18 @@ class DelegateRouteTest(StubbedGraph):
     def test_duplicate_keeps_route(self):
         with base(0.9):
             first = delegate(self.engine, self.chat_id, 'Goal', tasks('a', 'b'), request_id='req-1')
-        with base(0.0):
+        self.graph.calls.clear()
+        decide_patch = mock.patch.object(team_route, 'decide', side_effect=AssertionError('decide ran again'))
+        apply_patch = mock.patch.object(team_route, 'apply_route', side_effect=AssertionError('apply ran again'))
+        with base(0.0), decide_patch as decided, apply_patch as applied:
             again = delegate(self.engine, self.chat_id, 'Goal', tasks('a', 'b'), request_id='req-1')
         self.assertTrue(again['duplicate'])
         self.assertEqual(again['route'], first['route'])
         self.assertEqual(again['capacity'], first['capacity'])
+        decided.assert_not_called()  # duplicates are checked first: no second decision,
+        applied.assert_not_called()
+        self.assertEqual(self.graph.calls, [])  # no second graph probe
+        self.assertEqual(len([r for r in self.store.all('runs') if r.get('request_id') == 'req-1']), 1)
 
     def test_capacity_hint_in_response_not_warnings(self):
         work = tasks('a')
