@@ -18,6 +18,7 @@ from .vendor.transport import NativeNotionTransport, NotionHttpError
 from .network_budget import NetworkBudget, request_priority
 from .model_verification import verify_execution,ModelVerificationError,turn_status
 from .telemetry import http_class
+from .timeouts import task_limit
 
 
 def pending_tool_label(entity):
@@ -1099,7 +1100,7 @@ class NotionAdapter:
                                  seconds=round(time.monotonic()-started, 3), **extra, **trace)
         try:
             for line in client.transport.stream('runInferenceTranscript',body,client.headers(),timeout=60,cancel=cancel):
-                if cancel.is_set() or time.monotonic()-started>self.store.settings()['task_timeout']:
+                if cancel.is_set() or time.monotonic()-started>task_limit(self.store.settings(), task):
                     raise PendingRemote()
                 if not str(line).strip():
                     continue  # blank keep-alive lines are not output

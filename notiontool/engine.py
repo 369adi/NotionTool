@@ -21,6 +21,7 @@ from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, r
 from . import proof as task_proof
 from . import patch_mode as patch_mod
 import subprocess
+from .timeouts import task_limit
 
 # Patch mode (patch_mode.py): on by default for git projects with a main branch; the setting turns it off.
 PATCH_MODE_DEFAULT = True
@@ -1398,7 +1399,7 @@ class Engine:
                 pass
             elif task.get('submission_phase') == 'inference':
                 # Phase 3 / I5: the inference may already have left; never resend, reconcile instead.
-                overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
+                overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
                 task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue, reconcile_checks=checks,
                             reconcile_at=time.time()+(300 if overdue else max(min(60,5*2**min(checks-1,4)), getattr(exc,'seconds',0))),
@@ -1421,7 +1422,7 @@ class Engine:
             if self._empty_remote_reply(task, info, run):
                 pass
             else:
-                overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
+                overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
                 task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
                             reconcile_checks=checks,reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))), error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
