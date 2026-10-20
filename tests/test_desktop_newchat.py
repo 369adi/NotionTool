@@ -72,8 +72,9 @@ class DesktopNewChatStaticTests(unittest.TestCase):
                      'location.assign', 'location.replace', 'innerHTML', '.remove()', 'removeChild'):
             self.assertNotIn(text, self.part)
             self.assertNotIn(text, self.helpers)
-        self.assertIn('history.pushState', self.part)
-        self.assertIn('target.origin !== location.origin', self.part)
+        # Safety rule (test_desktop_no_lag): no history changes and no row clicks from desktop JS.
+        self.assertNotIn('history.pushState', self.part)
+        self.assertNotIn('.click()', self.part)
 
     def test_english_ui_texts(self):
         for text in ("'Chat name'", "label: 'Main'", "'Main chats can delegate work to coworkers'", "submit: 'Create'",
