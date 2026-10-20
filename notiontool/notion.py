@@ -183,11 +183,35 @@ MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main')
 MODEL_NAMES = {'albuquerque-quinn': 'opus', 'achira-donut': 'sonnet', 'amla-jam': 'haiku'}
 
 
+MAIN_DEFAULT_EFFORT = 'high'
+OWN_CONFIG_IDS = set()
+
+
+def own_config_step(step):
+    """True for 'updated-config' steps NotionTool sent itself (id tail 00aa from new_id, or remembered)."""
+    ident = str(step.get('id') or '')
+    return bool(ident) and (ident in OWN_CONFIG_IDS or ident.rsplit('-', 1)[-1].startswith('00aa'))
+
+
+def main_default_effort(client, model_id):
+    """Main chats never fall back to the automatic (often medium) effort: high, clamped to the model."""
+    from .effort_policy import catalog_efforts, clamp_effort
+    try:
+        supported, _default = catalog_efforts(catalog_entry(client, model_id))
+    except Exception:
+        supported = ()
+    return clamp_effort(MAIN_DEFAULT_EFFORT, supported) or MAIN_DEFAULT_EFFORT
+
+
 def latest_user_config(steps):
-    """(model, effort) of the newest 'updated-config' choice in steps (oldest first); '' when absent."""
+    """(model, effort) of the newest 'updated-config' choice in steps (oldest first); '' when absent.
+
+    Steps NotionTool wrote itself are skipped: they are not a user choice and must not pin an old value."""
     model = effort = ''
     for step in reversed(steps):
         if not isinstance(step, dict) or step.get('type') != 'updated-config':
+            continue
+        if own_config_step(step):
             continue
         value = step.get('value') or {}
         if not model and value.get('model'):
@@ -215,17 +239,20 @@ def inherit_main_config(client, thread_id, limit=60):
         ids = list(thread.get('messages') or [])[-int(limit):]
         messages = records('thread_message', ids)
     except Exception:
-        return None
+        ids, messages = [], {}
     steps = [dict((messages.get(ident) or {}).get('step') or {}) for ident in ids if ident in messages]
     model, effort = latest_user_config(steps)
-    if not model and not effort:
-        return None
+    picked = bool(model or effort)
     if model:
         selected = MODEL_NAMES.get(model, model)
     else:
         selected, model = 'opus', client.model('opus')
-    return selected, model, (effort or None), ('Main chat: kept the user choice (%s / %s)'
-                                                % (selected, effort or 'default'))
+    if not effort:
+        effort = main_default_effort(client, model)
+    if picked:
+        return selected, model, effort, 'Main chat: kept the user choice (%s / %s)' % (selected, effort)
+    return selected, model, effort, ('Main chat: no user choice found, %s / %s (never the automatic effort)'
+                                     % (selected, effort))
 
 
 def own_turn_steps(records, ids, step_id, chunk=20):
@@ -623,8 +650,10 @@ class NotionAdapter:
             update = dict(model=model) if model else {}
             if effort:
                 update['reasoningEffort'] = effort
+            config_id = self.new_id(info['space_id'],'00aa')
+            OWN_CONFIG_IDS.add(config_id)  # never read back as a user choice
             body['transcript'].insert(len(body['transcript'])-1,
-                dict(id=self.new_id(info['space_id'],'00aa'),type='updated-config',value=update))
+                dict(id=config_id,type='updated-config',value=update))
         body.update(spaceId=info['space_id'],threadId=thread_id,traceId=str(uuid.uuid4()),submittedUserStepId=step_id,
                     createThread=create,generateTitle=create)
         if create:
