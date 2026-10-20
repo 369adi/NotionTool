@@ -89,8 +89,10 @@ class DesktopNewChatStaticTests(unittest.TestCase):
         dialog = self.section('function openDialog(opts)', 'function openCreate(opener)')
         for text in ("'aria-modal': 'true'", "'aria-labelledby': 'nt-desk-dlg-title'", "role: 'alert'",
                      "maxlength: CHAT_NAME_MAX", "ev.key === 'Escape'", "ev.key === 'Enter'", "ev.key === 'Tab'",
-                     "'aria-disabled'", 'first.focus()', 'd.opener.focus()'):
+                     "'aria-disabled'", 'first.focus()'):
             self.assertIn(text, dialog)
+        # Focus goes back to the opener when the dialog closes (closeDialog sits before openDialog).
+        self.assertIn('d.opener.focus()', self.section('function closeDialog(', 'function openDialog(opts)'))
         self.assertIn("role: opts.danger ? 'alertdialog' : 'dialog'", dialog)
         menu = self.section('function openMenu(btn)', 'function promote(info, main)')
         for text in ("role: 'menu'", "role: 'menuitem'", 'ArrowDown', 'ArrowUp', 'Home', 'End', 'Escape'):

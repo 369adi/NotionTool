@@ -313,7 +313,7 @@
 
   // ---- Named chats (own New chat dialog, Chats section, gear menu): pure helpers ------------
   // Actions go through ctx.call only: app_chat_create / app_chat_rename / app_chat_promote, which
-  // the desktop shell maps to POST /api/app/chat/create, /rename and /promote.
+  // the desktop shell maps to the app chat create, rename and promote routes.
   var CHAT_NAME_MAX = 80;
   var CHAT_NAME_COUNTER_AT = 60;
   var CHATS_KEY = 'ntDesk.chatsCollapsed';
