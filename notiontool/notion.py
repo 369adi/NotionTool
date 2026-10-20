@@ -547,11 +547,11 @@ class NotionAdapter:
         config['id'] = self.new_id(info['space_id'],'00aa')
         # Notion AI reaches MCP connections (NotionTool, Screen, Roblox, Blender) only with the
         # tool environment enabled; plain text turns stay without it to keep latency low.
-        config['value'].update(model=model,modelFromUser=True,enableComputer=bool(computer),
+        # Do NOT put the requested model/effort into the config step: the server then falls back to the
+        # thread default (Opus). Like the Notion UI, they go only into the 'updated-config' step below.
+        config['value'].update(modelFromUser=True,enableComputer=bool(computer),
                               agentMemorySettings={'useMemories':True,'excludeChatFromMemories':True})
-        if EFFORT_FIELD and effort:
-            config['value'][EFFORT_FIELD] = effort  # per-request reasoning effort (workflow config)
-        elif EFFORT_FIELD:
+        if EFFORT_FIELD:
             config['value'].pop(EFFORT_FIELD, None)
         # Only the real Welcome chat creation (welcome_body) may start onboarding.
         config['value'].pop('agentMessageKey', None)
