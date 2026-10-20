@@ -209,9 +209,9 @@ def expected_wall_time(tasks, count, stats=None):
 # Bench B 2026-10-20 (6 read-only parts, real Edge transport): send -> collected 45-67 s per coworker task even
 # for ~5 s of work; solo the Main did all 6 in 31 s. So a coworker costs a fixed ~45 s before it saves time.
 DELEGATION = {
-    'cw_fixed_s': 45.0,     # measured: coworker turn start + tools + result block, independent of the work size
-    'dispatch_s': 1.2,      # measured: sends are serial, ~1.2 s apart
-    'collect_s': 8.0,       # measured: remote done -> result collected (median 7.6 s)
+    'cw_fixed_s': 60.0,     # measured (heavy6c/6d): send -> first output 45-80 s, independent of the work size
+    'dispatch_s': 4.0,      # measured: 6 sends spread over ~20-40 s (pre-send reads share the network budget)
+    'collect_s': 15.0,      # measured: remote done -> result collected 6-29 s (median ~15 s)
     'review_s': 10.0,       # Main reads and checks the results
     'cw_slowdown': 1.15,    # a coworker re-reads context; assumed until the heavy bench measures it
     'min_save_s': 30.0,     # delegate only when it saves at least this much ...

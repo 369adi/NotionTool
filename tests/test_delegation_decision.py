@@ -29,4 +29,6 @@ def test_single_part_or_one_coworker_is_solo():
 
 def test_break_even_two_parts():
     assert delegation_decision(parts(2, 60), free_young=2)['delegate'] is False
-    assert delegation_decision(parts(2, 200), free_young=2)['delegate'] is True
+    # recalibrated (heavy6c/6d): 2 x 200 s now saves only ~19 %, 2 x 300 s clearly pays off
+    assert delegation_decision(parts(2, 200), free_young=2)['delegate'] is False
+    assert delegation_decision(parts(2, 300), free_young=2)['delegate'] is True
