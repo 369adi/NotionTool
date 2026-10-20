@@ -185,6 +185,36 @@ class TeamRotator:
             self.store.put('workers', worker)
         return len(workers)
 
+    def relink(self, account_id):
+        """Point ledger roles whose chat is unknown at enabled Coworkers that no role tracks.
+
+        Without a role a Coworker never age-rotates; the age guard then hides it and the team shrinks.
+        Only confirmed (non-pending) roles are reused; nothing is created or sent.
+        """
+        account = self.store.get('accounts', account_id) or {}
+        ledger = dict(account.get('team_threads') or {})
+        if not ledger:
+            return 0
+        workers = [w for w in self.store.all('workers') if w.get('account_id') == account_id]
+        known = {w.get('thread_id') for w in workers if w.get('purpose', 'worker') == 'worker' and w.get('state') != 'missing'}
+        tracked = {(item or {}).get('id') for item in ledger.values() if isinstance(item, dict)}
+        free = sorted((role for role, item in ledger.items() if role.startswith('worker') and isinstance(item, dict)
+                       and not item.get('pending') and not item.get('rotates') and item.get('id') not in known),
+                      key=lambda r: (len(r), r))
+        loose = sorted((w for w in workers if w.get('purpose', 'worker') == 'worker' and w.get('enabled')
+                        and w.get('state') == 'ready' and w.get('thread_id') and w['thread_id'] not in tracked),
+                       key=lambda w: epoch(w.get('created_at')) or 0)
+        linked = 0
+        for role, worker in zip(free, loose):
+            ledger[role] = dict(ledger[role], id=worker['thread_id'], pending=False)
+            linked += 1
+            self.store.event('team_role_relinked', message='Role ' + role + ' now tracks ' + str(worker.get('label') or worker['id']),
+                             account_id=account_id, role=role, worker_id=worker['id'])
+        if linked:
+            account['team_threads'] = ledger
+            self.store.put('accounts', account)
+        return linked
+
     # selection --------------------------------------------------------------------------------
 
     def candidate(self, account, now):
@@ -227,6 +257,7 @@ class TeamRotator:
                 if ident in self.rotating or now < self.failed_until.get(ident, 0):
                     continue
             self.backfill(ident, now)
+            self.relink(ident)
             account = self.store.get('accounts', ident) or account
             pending = pending_roles(account)
             ledger = account.get('team_threads') or {}
