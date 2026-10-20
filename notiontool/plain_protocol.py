@@ -258,6 +258,10 @@ def _result_file_hint(task,run,tools_available):
     """Result-file instruction for a coworker part ('' without tools or ids, or if the path is unsafe)."""
     if not tools_available or not run.get('id') or not task.get('id'):
         return ''
+    # Read-only parts answer in the chat: writing a result file contradicts "change and save no files"
+    # and costs an extra tool round trip per coworker.
+    if task.get('read_only') or re.search(r'\bread[- ]only\b', str(task.get('prompt') or ''), re.I):
+        return ''
     try:
         from . import result_files
         path=result_files.path_for(run['id'],task['id'])
