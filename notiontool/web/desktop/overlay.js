@@ -1113,22 +1113,20 @@
     function clickRow(key) {
       if (!key) return false;
       var rows = document.querySelectorAll('[data-nt-desk="chat-row"]');
+      // Safety rule: desktop JS never clicks chat rows itself; it only highlights the new row.
       for (var i = 0; i < rows.length; i++) {
-        if (rows[i].getAttribute('data-nt-desk-thread') === key) { rows[i].click(); return true; }
+        if (rows[i].getAttribute('data-nt-desk-thread') === key) {
+          try { rows[i].scrollIntoView({ block: 'nearest' }); } catch (e) {}
+          ctx.toast('The chat is ready. Click it in the sidebar to open it.', 'info');
+          return true;
+        }
       }
       return false;
     }
 
     function softNavigate(url) {
-      try {
-        var target = new URL(url, location.href);
-        if (target.origin !== location.origin) throw new Error('other origin');
-        if (target.href === location.href) return;
-        history.pushState(history.state, '', target.pathname + target.search + target.hash);
-        window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
-      } catch (e) {
-        ctx.toast('The chat is ready. Open it from the sidebar.', 'info');
-      }
+      // Safety rule: no page loads or history changes from desktop JS.
+      ctx.toast('The chat is ready. Open it from the sidebar.', 'info');
     }
 
     function openChat(key, url) {
