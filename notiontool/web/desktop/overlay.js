@@ -1558,7 +1558,30 @@
       }, { passive: true });
     }
 
+    // The scroller that really holds the visible chat: nearest scrollable ancestor of the newest visible user
+    // message. Random jumps to the top after a switch came from picking another big scroller while the new chat
+    // was still mounting (it was pushed down, the chat itself stayed at the top).
+    function chatScroller() {
+      var nodes = document.querySelectorAll('[data-agent-chat-user-step-id]');
+      for (var i = nodes.length - 1; i >= 0; i--) {
+        var n = nodes[i];
+        if (!n.getClientRects().length) continue;  // hidden (previous chat still in the DOM)
+        var p = n.parentElement;
+        while (p && p !== document.body) {
+          if (p.scrollHeight - p.clientHeight > 20 && p.clientHeight >= 200) {
+            var oy = '';
+            try { oy = window.getComputedStyle(p).overflowY; } catch (e) { oy = ''; }
+            if (oy === 'auto' || oy === 'scroll') return p;
+          }
+          p = p.parentElement;
+        }
+      }
+      return null;
+    }
+
     function findScroller() {
+      var own = chatScroller();
+      if (own) return own;
       var sidebar = sidebarRoot();
       var best = null;
       var all = document.querySelectorAll('main *, [role="main"] *, .notion-frame *, div');
@@ -1602,8 +1625,13 @@
         // Notion anchors a few px above the exact bottom; pushing to the exact bottom fought it
         // every tick (measured 4 px flip each 250 ms = the visible wobble).
         if (el.scrollHeight - el.clientHeight - el.scrollTop > 24) el.scrollTop = el.scrollHeight;
-        if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
+        // Only a scroller that already shows the new chat's messages counts as settled.
+        var real = !!(el.querySelector && el.querySelector('[data-agent-chat-user-step-id]'));
+        if (real && el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
         else { pendingScroll.height = el.scrollHeight; pendingScroll.stable = 0; }
+        var lg = window.__ntSwLog = window.__ntSwLog || [];
+        if (lg.length > 60) lg.splice(0, lg.length - 40);
+        lg.push({ k: String(key).slice(-6), t: age, real: real, top: Math.round(el.scrollTop), h: el.scrollHeight, c: el.clientHeight });
         if (!pendingScroll.revealed && ((pendingScroll.stable >= 2 && age >= 500) || age >= SWITCH_HIDE_MAX_MS)) {
           pendingScroll.revealed = true;
           revealChat();
