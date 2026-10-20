@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import re
 import secrets
 import threading
 import time
@@ -1157,8 +1158,10 @@ class Engine:
         if task.get('files') and not task.get('proof_base'):
             # Proof: base snapshot of the write scope, taken once when the task starts (proof.py).
             task['proof_base'] = task_proof.start(task['id'], task['files'], self._project_root(run))
-        if task['role'] == 'executor' and self._patch_on(run):
-            self._patch_prepare(task, run)  # own git worktree before dispatch (patch_mode.py)
+        read_only = bool(task.get('read_only')) or bool(re.search(r'\bread[- ]only\b', task.get('prompt') or '', re.I))
+        if task['role'] == 'executor' and self._patch_on(run) and not read_only:
+            # own git worktree before dispatch (patch_mode.py); read-only audits skip it (dispatch spread)
+            self._patch_prepare(task, run)
         self.store.put('tasks', task)  # Commit the submission marker BEFORE the API can accept it.
         worker.update(state='busy', lease=task['lease'], last_used=time.time(),
                       prev_task_id=worker.get('last_task_id', ''), last_task_id=task['id'])
