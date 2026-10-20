@@ -174,6 +174,7 @@
     function scan() {
       timer = 0;
       if (stopped) return;
+      scan.lastRun = Date.now();
       if (!enabled()) { release(marked); marked = []; reasons = {}; return; }
       reasons = {};
       var keep = [];
@@ -207,7 +208,7 @@
 
     function schedule() {
       if (stopped || timer) return;
-      timer = setTimeout(scan, THROTTLE_MS);
+      timer = setTimeout(scan, Math.max(THROTTLE_MS, (scan.lastRun || 0) + 3000 - Date.now()));
     }
 
     if (typeof MutationObserver === 'function' && document.body) {

@@ -263,6 +263,7 @@
     function apply() {
       timer = 0;
       if (stopped) return;
+      apply.lastRun = Date.now();
       var allow = appHide();
       var want = [];
       found = {};
@@ -286,7 +287,7 @@
 
     function schedule() {
       if (stopped || timer) return;
-      timer = setTimeout(apply, DEBOUNCE_MS);
+      timer = setTimeout(apply, Math.max(DEBOUNCE_MS, (apply.lastRun || 0) + 3000 - Date.now()));
     }
 
     if (document.documentElement) document.documentElement.classList.add(ROOT_ON);
