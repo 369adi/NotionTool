@@ -223,6 +223,16 @@ def latest_user_config(steps):
     return model, effort
 
 
+def user_effort(client, thread_id):
+    """Effort for a turn NotionTool sends into a Main/user chat (handoff, context checkpoint): the user's
+    last choice in that chat, else high. Without it Notion falls back to the model default (medium)."""
+    try:
+        got = inherit_main_config(client, thread_id)
+        return (got[2] if got else None) or MAIN_DEFAULT_EFFORT
+    except Exception:
+        return MAIN_DEFAULT_EFFORT
+
+
 def inherit_main_config(client, thread_id, limit=60):
     """(selected, model_id, effort, reason) from a Main chat's own newest model/effort pick, or None.
 

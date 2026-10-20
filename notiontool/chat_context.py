@@ -124,7 +124,10 @@ class ChatContext:
             saved.update(sent_at=time.time(), submitted_prompt=prompt)
             self.store.put('tasks', saved)
             try:
-                body = adapter.body(client, worker['thread_id'], saved['step_id'], prompt, saved['assigned_model_id'])
+                from .notion import MAIN_OWN_CONFIG, user_effort
+                effort = user_effort(client, worker['thread_id']) if worker.get('purpose') in MAIN_OWN_CONFIG else None
+                body = adapter.body(client, worker['thread_id'], saved['step_id'], prompt, saved['assigned_model_id'],
+                                    effort=effort)
                 for _ in client.transport.stream('runInferenceTranscript', body, client.headers(), timeout=180, cancel=cancel):
                     pass
             except NotionHttpError as exc:
