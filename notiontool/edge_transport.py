@@ -204,17 +204,31 @@ class EdgeTransport:
         return {'opened': True, 'verified': True, 'account_id': self.account_id, 'transport': 'edge',
                 'tab_id': found.get('id'), 'url': found.get('url', url)}
 
+    def _ready_target(self):
+        # Fast path for every request once the tab is ready: no lock, no /json/version and no extra
+        # DevTools round trip. prepare() held the lock for three round trips per request, so parallel
+        # tasks (collect + verify of 8 coworkers) queued behind each other. The origin check now runs
+        # atomically inside the start script instead.
+        process = getattr(self.browser, 'process', None)
+        if (self.target is not None and process is not None and self.ready_process is process
+                and process.poll() is None):
+            self.wake(self.target)
+            return self.target
+        return self.prepare()
+
     def _start(self, path, body, headers, timeout, cancel):
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', path):
             raise ValueError('Invalid Notion endpoint')
-        target = self.prepare()
+        target = self._ready_target()
         ticket = self.budget.acquire(cancel, source=path)
         key = uuid.uuid4().hex
         # Forbidden browser headers are supplied by Edge itself.
         headers = {k: v for k, v in (headers or {}).items()
                    if k.lower() not in ('origin', 'referer', 'cookie', 'host', 'content-length')}
         headers['Content-Type'] = 'application/json'
-        script = r'''((key, path, body, headers, timeout) => {
+        script = r'''((key, path, body, headers, timeout, origin) => {
+          // Navigation of the transport tab must never forward a request to another origin.
+          if (location.origin !== origin) return 'origin';
           const all = window.__notiontoolRequests ||= {};
           const controller = new AbortController();
           const q = all[key] = {chunks: [], done: false, status: 0, size: 0, controller};
@@ -238,8 +252,20 @@ class EdgeTransport:
           })();
           return true;
         })'''
-        args = json.dumps([key, path, body, headers, timeout], ensure_ascii=True)
-        self.browser.evaluate(target, script + '(...' + args + ')')
+        args = json.dumps([key, path, body, headers, timeout, self._base], ensure_ascii=True)
+        try:
+            started = self.browser.evaluate(target, script + '(...' + args + ')')
+        except BaseException:
+            release = getattr(self.budget, 'release', None)
+            if release is not None:
+                release(ticket, 'failed', account_id=self.account_id)
+            raise
+        if started == 'origin':
+            self.ready_process = None  # next request takes the full prepare() path again
+            release = getattr(self.budget, 'release', None)
+            if release is not None:
+                release(ticket, 'neutral', account_id=self.account_id)
+            raise OSError('Restore the Notion robots.txt transport tab before continuing')
         return target, key, ticket
 
     def _chunks(self, path, body, headers, timeout, cancel=None):

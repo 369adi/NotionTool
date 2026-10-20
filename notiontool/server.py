@@ -1044,7 +1044,19 @@ class Application:
                 return delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), body.get('stats'))
             if path=='/api/operator/delegate':
                 from .operator_main import delegate
-                return delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''), quality=str(body.get('quality') or ''))
+                decision = None
+                if body.get('parts'):
+                    # Small work is faster solo (bench: 30 s alone vs ~60 s fixed cost per coworker).
+                    from .parallel_plan import delegation_decision
+                    from .coworker_age_guard import young
+                    free = [w for w in self.store.all('workers') if w.get('purpose') == 'worker' and w.get('enabled')]
+                    decision = delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), body.get('stats'))
+                    if not decision['delegate'] and not body.get('force'):
+                        raise ValueError('Do it yourself: ' + decision['reason'] + '. Nothing was delegated; send force=true to delegate anyway.')
+                result = delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''), quality=str(body.get('quality') or ''))
+                if decision is not None and isinstance(result, dict):
+                    result['delegation'] = decision
+                return result
             if path=='/api/chat/update':
                 chat = self.store.get('chats',body['id'])
                 if not chat:

@@ -125,6 +125,20 @@ def _open_points(data):
     return (_fix_list(data) or str(data.get('summary') or ''))[:1500]
 
 
+READ_ONLY_TEXT = re.compile(r'\bread[- ]only\b', re.I)
+
+
+def _read_only(chain):
+    """True when every task of the chain was read-only (flag or prompt) and reports no changed file."""
+    for t in chain:
+        if not (t.get('read_only') or READ_ONLY_TEXT.search(str(t.get('prompt') or ''))):
+            return False
+        proof = t.get('proof') or {}
+        if isinstance(proof, dict) and proof.get('files'):  # proof.record: changed files of the write scope
+            return False
+    return True
+
+
 def step(engine, run, tasks):
     """Queue the next review or fix task for every finished build; True when anything changed."""
     from .operator_main import _with_result_line
@@ -141,6 +155,13 @@ def step(engine, run, tasks):
             continue  # Review only after the merge settled: the copy is removed when it merges.
         chain = _chain(task, by_id)
         review = by_id.get(task.get('review_task') or '')
+        if not review and _read_only(chain):
+            # A read-only audit changed no file: there is nothing for a second coworker to review
+            # (bench heavy8b: the review stage cost 30-40 s per audit). The Main checks the report.
+            task.update(review_state='approved', review_skipped='read-only task: no changed files to review')
+            store.put('tasks', task)
+            changed = True
+            continue
         if not review:
             done_by = {t.get('worker_id') for t in chain}
             if not coworkers - done_by:
