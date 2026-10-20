@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 10;
+  var VERSION = 11;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -27,10 +27,13 @@
   var COOLDOWN_MS = 1200;  // min time between two loads
   var ANCHOR_MS = 1500;    // how long the scroll position is held after a load
   var HOLD_MAX_MS = 4000;  // v10: Notion needs up to ~2 s to show the older messages (measured live)
+  var SEND_MS = 4000;      // v11: after a sent message a jump to the top is undone for this long
 
   var live = window.__ntTSLive = window.__ntTSLive || {};
   var expanded = {};       // threadId -> scroller element
-  var gesture = { up: 0, down: 0, drag: 0 };
+  var gesture = { up: 0, down: 0, drag: 0, move: 0 };
+  var lastSend = 0;        // v11: time a new user message appeared in any chat
+  var wasBottom = typeof WeakMap === 'function' ? new WeakMap() : null;
   var lastLoad = 0;
   var lastLen = {};        // v8: threadId -> store count seen last time
   var memo = {};           // v8: threadId -> last capped array (stable identity)
@@ -76,7 +79,10 @@
         try { s2 = all[k] && all[k].getStep && all[k].getStep(); } catch (e) { s2 = null; }
         if (s2 && s2.type === 'user') { newUser = true; break; }
       }
-      if (!newUser) n = Math.max(n, hit.cap + (len - hit.len));
+      // v11: a new user message also keeps the top fixed. Shifting the window to the last 5 turns replaced the
+      // first rendered step, Notion re-mounted the list and the chat jumped up (user report 2026-10-20).
+      var grown = hit.cap + (len - hit.len);
+      if (!newUser || grown <= BASE_MAX) n = Math.max(n, Math.min(grown, BASE_MAX));
     }
     baseCache[id] = { len: len, cap: n };
     return n;
@@ -316,6 +322,17 @@
     if (el === btnEl || el.scrollTop < TOP_PX) updateButton(el);
     var now = Date.now();
     var userDown = now - gesture.down < GESTURE_MS || now - gesture.drag < GESTURE_MS;
+    // v11: right after sending, a jump to the top that the user did not make is undone (back to the bottom).
+    var sendWin = now - lastSend < SEND_MS;
+    if (wasBottom) {
+      if (sendWin && wasBottom.get(el) && el.scrollTop < TOP_PX && el.scrollHeight - el.clientHeight > 600 &&
+          now - gesture.up > GESTURE_MS && now - gesture.move > GESTURE_MS && now - lastLoad > HOLD_MAX_MS + 1000) {
+        el.scrollTop = el.scrollHeight;
+        window.__ntSendFix = (window.__ntSendFix || 0) + 1;
+        return;
+      }
+      if (!sendWin) wasBottom.set(el, el.scrollHeight - el.clientHeight - el.scrollTop < 120);
+    }
     // v8: while older messages are loading Notion briefly re-mounts the list (height drops ~900 px, measured), the
     // scroller clamps to its bottom and the button press counted as a gesture -> this reset sent you to the bottom.
     var loading = now - lastLoad < HOLD_MAX_MS + 1000;
@@ -333,8 +350,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound10) return;
-    window.__ntStepExpBound10 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound11) return;
+    window.__ntStepExpBound11 = true;
     window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');
@@ -350,7 +367,7 @@
       else if (k === 'PageDown' || k === 'ArrowDown' || k === 'End') gesture.down = Date.now();
     }, opt);
     document.addEventListener('mousedown', function () { gesture.drag = Date.now(); }, opt);
-    document.addEventListener('mousemove', function (e) { if (e.buttons & 1) gesture.drag = Date.now(); }, opt);
+    document.addEventListener('mousemove', function (e) { if (e.buttons & 1) gesture.drag = gesture.move = Date.now(); }, opt);
     document.addEventListener('scroll', onScroll, opt);
     setInterval(function () {
       if (window.__ntStepExpV !== VERSION) return;
@@ -391,6 +408,13 @@
       // v8: new tool steps must not push older steps out at the top (that shifted the view = glitch / jump up).
       // Keep the first shown step fixed: a loaded (override) window grows by the new steps.
       var pl = lastLen[id];
+      if (pl && len > pl && len - pl < 50) {  // v11: a new user message = a send
+        for (var q = pl; q < len; q++) {
+          var sq = null;
+          try { sq = all[q] && all[q].getStep && all[q].getStep(); } catch (e) { sq = null; }
+          if (sq && sq.type === 'user') { lastSend = Date.now(); break; }
+        }
+      }
       if (has && co[id] && pl && len > pl && len - pl < 50) co[id] += len - pl;
       lastLen[id] = len;
       var cap = has ? co[id] : baseCap(id, all);

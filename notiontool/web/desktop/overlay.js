@@ -704,6 +704,8 @@
     function applyRows(state, root) {
       if (!root) return;
       var ages = coworkerAges(state);
+      window.__ntDesk.coworkerAges = ages;  // donesound: coworker chats stay silent
+      window.__ntDesk.threadKey = threadKey;
       chatGroups.forEach(function (group) {
         if (!group.getAttribute('data-nt-desk')) group.setAttribute('data-nt-desk', 'chat-group');
         group.classList.add(CLS_GROUP);
