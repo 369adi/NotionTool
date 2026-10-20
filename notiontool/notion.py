@@ -130,6 +130,11 @@ MODEL_CATALOG_TTL = 600  # seconds; a cached model catalog is read again after t
 # in work/effort_field.md. Set to None to stop sending it (selection and persistence stay).
 EFFORT_FIELD = 'reasoningEffort'
 
+# Model kept in the saved config step and in body() config.model (thread default, like the Notion UI).
+# The requested model/effort go only into the 'updated-config' step. A mismatch between the saved
+# config and the body config made the server fall back to Opus (live proof 2026-10-20).
+BASE_CONFIG_MODEL = 'albuquerque-quinn'
+
 
 def catalog_entry(client, model_id):
     """getAvailableModels entry for model_id from the cached catalog, or None (no I/O)."""
@@ -549,7 +554,7 @@ class NotionAdapter:
         # tool environment enabled; plain text turns stay without it to keep latency low.
         # Do NOT put the requested model/effort into the config step: the server then falls back to the
         # thread default (Opus). Like the Notion UI, they go only into the 'updated-config' step below.
-        config['value'].update(modelFromUser=True,enableComputer=bool(computer),
+        config['value'].update(model=BASE_CONFIG_MODEL,modelFromUser=True,enableComputer=bool(computer),
                               agentMemorySettings={'useMemories':True,'excludeChatFromMemories':True})
         if EFFORT_FIELD:
             config['value'].pop(EFFORT_FIELD, None)
@@ -1047,7 +1052,10 @@ class NotionAdapter:
         # The saved chat config changes only through our own confirmed write: check once per chat generation.
         config_key = (worker['thread_id'], worker.get('generation', 0), model)
         if getattr(self, 'confirmed_configs', {}).get(worker['thread_id']) != config_key:
-            self.ensure_thread_model(client, worker['thread_id'], model)
+            # Saved config keeps the thread default model (same as body() config.model); the requested
+            # model/effort travel only in the 'updated-config' step (live proof 2026-10-20).
+            self.ensure_thread_model(client, worker['thread_id'],
+                                     BASE_CONFIG_MODEL)
             self.__dict__.setdefault('confirmed_configs', {})[worker['thread_id']] = config_key
         with self.store.lock:
             saved = self.store.get('tasks',task['id'])
