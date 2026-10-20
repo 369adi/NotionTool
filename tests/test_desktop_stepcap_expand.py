@@ -39,6 +39,13 @@ function El(tid, stepIdx) {
   this.scrollHeight = 2000; this.clientHeight = 600; this.scrollTop = 0; this.nodeType = 1; this.isConnected = true;
   this.querySelectorAll = function () { return stepIdx.map(function (i) { return { getAttribute: function () { return tid + '-s' + i; } }; }); };
 }
+var elT = new El('a', [95, 99]);
+r.offerTop = X.shouldOffer(elT);
+elT.scrollTop = 900; r.offerMiddle = X.shouldOffer(elT); elT.scrollTop = 0;
+X.onScroll({ target: elT });
+r.scrollNoLoad = Object.prototype.hasOwnProperty.call(window.__ntStepCap || {}, 'a') ? window.__ntStepCap.a : 30;
+window.__ntStepCap = window.__ntStepCap || {}; window.__ntStepCap.a = 0; r.offerUncapped = X.shouldOffer(elT); delete window.__ntStepCap.a;
+elT.isConnected = false; r.offerClosed = X.shouldOffer(elT);
 r.next = [X.nextCap(30, 100), X.nextCap(60, 100), X.nextCap(90, 100), X.nextCap(0, 100), X.nextCap(30, 40)];
 var elA = new El('a', [95, 99]);
 r.thread = X.threadForEl(elA);
@@ -90,9 +97,17 @@ class StepCapExpandTest(unittest.TestCase):
             raise AssertionError(out.stderr)
         cls.r = json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_active_v4(self):
+    def test_active_v5(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 4)
+        self.assertEqual(self.r['version'], 5)
+
+    def test_button_offer_rules(self):
+        r = self.r
+        self.assertEqual(r['offerTop'], 'a')     # capped chat, near the top, older messages exist
+        self.assertIsNone(r['offerMiddle'])      # not near the top: no button
+        self.assertIsNone(r['offerUncapped'])    # everything loaded: no button
+        self.assertIsNone(r['offerClosed'])      # chat element gone: no button
+        self.assertEqual(r['scrollNoLoad'], 30)  # scrolling to the top alone loads nothing (click only)
 
     def test_grows_by_user_turns(self):
         self.assertEqual(self.r['turns'], 300)    # user steps at 900, 800, 700 -> 3 more turns visible

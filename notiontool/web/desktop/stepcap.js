@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 4;
+  var VERSION = 5;
   var STEP_CAP = 30;
   var STEP_ADD = 30;       // minimum growth per load
   var TURNS_ADD = 3;       // v4: one load adds this many older user turns (30 steps were often only tool steps)
@@ -143,14 +143,60 @@
     return true;
   }
 
+  // v5: older messages load only on a click of the 'Load older messages' button (user wish 2026-10-20).
+  // The button shows when a capped chat is scrolled near its top and older messages exist.
+  function shouldOffer(el) {
+    if (!el || el.isConnected === false || window.__ntStepCapOff || !(el.scrollTop < TOP_PX)) return null;
+    var id = threadForEl(el);
+    if (!id || !live[id]) return null;
+    var cur = capOf(id);
+    if (!cur || totalOf(live[id]) <= cur + 1) return null;
+    return id;
+  }
+
+  var btn = null;
+  var btnEl = null;
+  function button() {
+    if (btn || typeof document === 'undefined' || !document.body) return btn;
+    btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('data-nt-stepcap-more', '1');
+    btn.textContent = 'Load older messages';
+    btn.style.cssText = 'position:fixed;z-index:2147483000;display:none;padding:6px 14px;border:0;border-radius:14px;' +
+      'background:#2383e2;color:#fff;font:500 13px/1.2 -apple-system,Segoe UI,sans-serif;cursor:pointer;' +
+      'box-shadow:0 2px 8px rgba(0,0,0,.25);transform:translateX(-50%)';
+    btn.addEventListener('click', function (e) {
+      e.preventDefault(); e.stopPropagation();
+      if (!btnEl) return;
+      lastLoad = 0;
+      var r = expand(btnEl, Date.now());
+      btn.textContent = 'Loading\u2026';
+      setTimeout(function () { btn.textContent = 'Load older messages'; updateButton(btnEl); }, ANCHOR_MS + 100);
+      window.__ntExpClick = { result: r, at: Date.now() };
+    });
+    document.body.appendChild(btn);
+    return btn;
+  }
+
+  function updateButton(el) {
+    var b = button();
+    if (!b) return;
+    var id = shouldOffer(el);
+    if (!id) { if (!el || el === btnEl) { b.style.display = 'none'; btnEl = null; } return; }
+    var r = el.getBoundingClientRect();
+    btnEl = el;
+    b.style.top = Math.round(r.top + 10) + 'px';
+    b.style.left = Math.round(r.left + r.width / 2) + 'px';
+    b.style.display = 'block';
+  }
+
   function onScroll(e) {
     if (window.__ntStepExpV !== VERSION || window.__ntStepCapOff) return;
     var el = e && e.target;
     if (!el || el.nodeType !== 1 || !(el.scrollHeight > el.clientHeight)) return;
+    if (el === btnEl || el.scrollTop < TOP_PX) updateButton(el);
     var now = Date.now();
-    var userUp = now - gesture.up < GESTURE_MS || now - gesture.drag < GESTURE_MS;
     var userDown = now - gesture.down < GESTURE_MS || now - gesture.drag < GESTURE_MS;
-    if (userUp && el.scrollTop < TOP_PX) { expand(el, now); return; }
     if (userDown && el.scrollHeight - el.clientHeight - el.scrollTop < BOTTOM_PX) {
       for (var id in expanded) if (expanded[id] === el) reset(id);
     }
@@ -165,8 +211,12 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound4) return;
-    window.__ntStepExpBound4 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound5) return;
+    window.__ntStepExpBound5 = true;
+    try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
+      var old = document.querySelectorAll('[data-nt-stepcap-more]');
+      for (var q = 0; q < old.length; q++) if (old[q] !== btn) old[q].remove();
+    } catch (e) { /* nothing to drop */ }
     var opt = { capture: true, passive: true };
     document.addEventListener('wheel', function (e) {
       if (e.deltaY < 0) gesture.up = Date.now(); else if (e.deltaY > 0) gesture.down = Date.now();
@@ -179,11 +229,15 @@
     document.addEventListener('mousedown', function () { gesture.drag = Date.now(); }, opt);
     document.addEventListener('mousemove', function (e) { if (e.buttons & 1) gesture.drag = Date.now(); }, opt);
     document.addEventListener('scroll', onScroll, opt);
-    setInterval(function () { if (window.__ntStepExpV === VERSION) sweep(); }, 1000);
+    setInterval(function () {
+      if (window.__ntStepExpV !== VERSION) return;
+      sweep();
+      if (btnEl && btnEl.isConnected === false) updateButton(null);  // chat closed or switched
+    }, 1000);
   }
 
   window.__ntStepExp = {
-    nextCap: nextCap, nextCapFor: nextCapFor, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
+    nextCap: nextCap, nextCapFor: nextCapFor, shouldOffer: shouldOffer, updateButton: updateButton, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
     onScroll: onScroll, gesture: gesture, expanded: expanded, version: VERSION,
     _resetCooldown: function () { lastLoad = 0; }
   };
