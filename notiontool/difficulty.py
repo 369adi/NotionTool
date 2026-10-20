@@ -71,7 +71,13 @@ NARROW = (
         r'\b(?:the|den|einen|this|diesen)\s+(?:failing|fehlschlagenden|roten|kaputten)\s+test\b', _I)),
     ('bump version', re.compile(
         r'\bbump\w*\b|\bversion\s+(?:erhöh\w*|auf|to)\b|\berhöh\w*\s+(?:die\s+)?version\b', _I)),
+    ('docs only', re.compile(
+        r'^\s*(?:please\s+|bitte\s+)?(?:update|refresh|aktualisier\w*|ergänz\w*)\s+(?:the\s+|die\s+|das\s+)?'
+        r'(?:docs?|documentation|doku\w*|readme|changelog)\b[^.!?\n]{0,60}$', _I)),
 )
+TESTS_GREEN = re.compile(
+    r'\b(?:mach\w*|make|get|krieg\w*|bring\w*)\s+(?:all\s+|alle\s+)?(?:the\s+|die\s+)?(?:tests?|ci|build)\s+'
+    r'(?:wieder\s+|again\s+)?(?:grün|green|pass(?:ing)?)\b', _I)
 
 
 def _distinct(matches):
@@ -128,7 +134,10 @@ def classify(text, context=None):
         score += 0.2
         reasons.append('many areas: ' + ', '.join(areas))
 
-    files = _files(text, context) + [s for s in _distinct(IDENT.findall(text)) if s not in _files(text, context)]
+    named = _files(text, context)
+    # A symbol that is only part of a named file path (main_switch inside notiontool/main_switch.py) is the same target.
+    files = named + [s for s in _distinct(IDENT.findall(text))
+                     if not any(s.lower() in f.lower() for f in named)]
     lines = LINE.findall(text)
     if len(files) >= 3 and DELETE.search(text):
         score -= 0.2
@@ -152,6 +161,11 @@ def classify(text, context=None):
         reasons.append('ambiguous: no named target file or line')
 
     narrow = [name for name, rx in NARROW if (restart_only if rx is None else rx.search(text))]
+    if TESTS_GREEN.search(text):
+        # "make the tests green" is an open fix with unknown causes, not setting a color value.
+        narrow = [n for n in narrow if n != 'set one value']
+        score += 0.1
+        reasons.append('open fix: make failing tests pass')
     if narrow:
         score -= min(0.5, 0.35 + 0.1 * (len(narrow) - 1))
         reasons.append('narrow change: ' + ', '.join(narrow))
