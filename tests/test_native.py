@@ -223,7 +223,7 @@ class NativeTests(unittest.TestCase):
         from unittest.mock import Mock
         adapter=self.adapter()
         adapter.verify_response_model=Mock(return_value=['verified-opus'])
-        self.client.transcript=lambda thread:{'session':{'status':'idle'},'patches':[
+        self.client.transcript=lambda thread, limit=100:{'session':{'status':'idle'},'patches':[
             {'op':'put','entity':{'kind':'user_message','sequence':10,'client_message_id':'own-step'}},
             {'op':'put','entity':{'kind':'assistant_message','sequence':11,'content':[{'type':'text','text':'Own result'}]}},
             {'op':'put','entity':{'kind':'user_message','sequence':12,'client_message_id':'other-step'}},
@@ -235,7 +235,7 @@ class NativeTests(unittest.TestCase):
         import threading
         from notiontool.engine import PendingRemote
         adapter=self.adapter()
-        self.client.transcript=lambda thread:{'session':{'status':'idle'},'patches':[
+        self.client.transcript=lambda thread, limit=100:{'session':{'status':'idle'},'patches':[
             {'op':'put','entity':{'kind':'user_message','sequence':10,'client_message_id':'own-step'}},
             {'op':'put','entity':{'kind':'user_message','sequence':12,'client_message_id':'other-step'}},
             {'op':'put','entity':{'kind':'assistant_message','sequence':13,'content':[{'type':'text','text':'Other result'}]}}]}
@@ -245,7 +245,7 @@ class NativeTests(unittest.TestCase):
         import threading
         from notiontool.engine import PendingRemote
         adapter=self.adapter()
-        self.client.transcript=lambda thread:{'session':{'status':'idle'},'session_pending':True,'patches':[
+        self.client.transcript=lambda thread, limit=100:{'session':{'status':'idle'},'session_pending':True,'patches':[
             {'op':'put','entity':{'kind':'user_message','sequence':10,'client_message_id':'own-step'}},
             {'op':'put','entity':{'kind':'assistant_message','sequence':11,'content':[{'type':'text','text':'Draft answer'}]}}]}
         with self.assertRaises(PendingRemote):adapter.recover({'account_id':'a','thread_id':'w'},

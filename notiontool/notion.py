@@ -1283,14 +1283,16 @@ class NotionAdapter:
         self.store.event('empty_stream_reconciled', run_id, **(trace or {}))
         return reply
 
-    def recover(self, worker, task, cancel):
+    RECOVER_WINDOW = 30  # newest entries read first after stream end; the full 100 only if our marker is not inside
+
+    def recover(self, worker, task, cancel, limit=None):
         # Only the chat that ran this task may confirm it; never read another chat's transcript.
         thread_id = str(task.get('thread_id') or '')
         if not thread_id:
             raise PendingRemote()
         try:
             with request_priority('verify'):
-                transcript = self.client(worker['account_id']).transcript(thread_id)
+                transcript = self.client(worker['account_id']).transcript(thread_id, limit=limit or self.RECOVER_WINDOW)
         except ThreadMissing:
             raise  # HTTP 404 for the task's own chat: the worker is missing
         except Exception:
@@ -1310,6 +1312,8 @@ class NotionAdapter:
                 hashlib.sha256(text_content(e.get('content',e.get('text',[]))).encode()).hexdigest()==task['request_fingerprint']]
             if len(hashed)==1 and hashed[0].get('sequence',0)>=task.get('before_seq',0):
                 markers=hashed
+        if not markers and (limit or self.RECOVER_WINDOW) < 100:
+            return self.recover(worker, task, cancel, limit=100)  # long turn: the marker is older than the small window
         if not markers:
             if task.get('context_reset') and not_accepted(task, transcript, fresh):
                 raise ResetNotAccepted()
