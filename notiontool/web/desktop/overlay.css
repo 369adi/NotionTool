@@ -262,3 +262,6 @@
   .nt-desk-dialog { animation: nt-desk-fade 160ms ease-out; }
   .nt-desk-icon-btn, .nt-desk-gear, .nt-desk-chat, .nt-desk-btn, .nt-desk-input, .nt-desk-menu-item { transition: none; }
 }
+
+/* chat switch: hidden while rows mount and the view settles at the bottom (no wobble) */
+[data-nt-sw] { opacity: 0 !important; }

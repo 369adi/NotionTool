@@ -1575,7 +1575,12 @@
       return best;
     }
 
-    function cancelScroll() { pendingScroll = null; }
+    var SWITCH_HIDE_MAX_MS = 2500;
+    function revealChat() {
+      var hidden = document.querySelectorAll('[data-nt-sw]');
+      for (var i = 0; i < hidden.length; i++) hidden[i].removeAttribute('data-nt-sw');
+    }
+    function cancelScroll() { pendingScroll = null; revealChat(); }
 
     function applyChatScroll() {
       var key = threadFromHref(location.href);
@@ -1583,20 +1588,27 @@
         lastChatKey = key;
         pendingScroll = key ? { key: key, start: Date.now(), until: Date.now() + SCROLL_WAIT_MS, height: -1, stable: 0 } : null;
         lastSwitchDone = Date.now();
+        revealChat();
       }
       if (!pendingScroll) return;
-      if (pendingScroll.key !== key || Date.now() > pendingScroll.until) { pendingScroll = null; return; }
+      if (pendingScroll.key !== key || Date.now() > pendingScroll.until) { pendingScroll = null; revealChat(); return; }
       // Always search fresh after a chat switch: a cached scroller can belong to the previous chat
       // (still in the DOM, hidden) and the new chat then stayed at the top (regression 17d4482).
       var el = findScroller();
       cachedScroller = el;
       if (el) {
+        var age = Date.now() - pendingScroll.start;
+        if (!pendingScroll.revealed && age < SWITCH_HIDE_MAX_MS) el.setAttribute('data-nt-sw', '1');
         el.scrollTop = el.scrollHeight;
         if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
         else { pendingScroll.height = el.scrollHeight; pendingScroll.stable = 0; }
-        if (pendingScroll.stable >= 3 && Date.now() - pendingScroll.start >= SCROLL_MIN_MS) { pendingScroll = null; lastSwitchDone = Date.now(); return; }
+        if (!pendingScroll.revealed && ((pendingScroll.stable >= 2 && age >= 500) || age >= SWITCH_HIDE_MAX_MS)) {
+          pendingScroll.revealed = true;
+          revealChat();
+        }
+        if (pendingScroll.stable >= 3 && Date.now() - pendingScroll.start >= SCROLL_MIN_MS) { pendingScroll = null; lastSwitchDone = Date.now(); revealChat(); return; }
       }
-      if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { pendingScroll = null; } }, 250);
+      if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { pendingScroll = null; revealChat(); } }, 250);
     }
 
     window.addEventListener('wheel', cancelScroll, { capture: true, passive: true });
