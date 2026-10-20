@@ -1455,7 +1455,8 @@
     // Notion opens a chat at the top of its history. After the chat in the URL changes, scroll the
     // chat's message list to the bottom (view scroll only: no clicks, no navigation, no history).
     // Retries while the messages load; stops at once when the user scrolls or presses a key.
-    var SCROLL_WAIT_MS = 5000;
+    var SCROLL_WAIT_MS = 10000;
+    var SCROLL_MIN_MS = 3000;  // loading state can look stable; keep pushing at least this long
     var lastChatKey = '';
     var pendingScroll = null;
     var scrollTimer = 0;
@@ -1580,7 +1581,7 @@
       var key = threadFromHref(location.href);
       if (key !== lastChatKey) {
         lastChatKey = key;
-        pendingScroll = key ? { key: key, until: Date.now() + SCROLL_WAIT_MS, height: -1, stable: 0 } : null;
+        pendingScroll = key ? { key: key, start: Date.now(), until: Date.now() + SCROLL_WAIT_MS, height: -1, stable: 0 } : null;
         lastSwitchDone = Date.now();
       }
       if (!pendingScroll) return;
@@ -1593,7 +1594,7 @@
         el.scrollTop = el.scrollHeight;
         if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
         else { pendingScroll.height = el.scrollHeight; pendingScroll.stable = 0; }
-        if (pendingScroll.stable >= 3) { pendingScroll = null; lastSwitchDone = Date.now(); return; }
+        if (pendingScroll.stable >= 3 && Date.now() - pendingScroll.start >= SCROLL_MIN_MS) { pendingScroll = null; lastSwitchDone = Date.now(); return; }
       }
       if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { pendingScroll = null; } }, 250);
     }
