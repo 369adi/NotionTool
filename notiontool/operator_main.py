@@ -250,6 +250,7 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
     saved on the run (run['route']) and returned; 'enforce' or route='team' expands the plan into a team graph.
     A bad route argument raises ValueError; a bad task-level route only adds a warning and auto is used.
     A known request_id returns the stored run without deciding or expanding again.
+    Every new run also saves run['capacity_hint'] (returned as 'capacity'), whatever team_route_mode is.
     """
     store = engine.store
     goal = str(goal or '').strip()
@@ -317,13 +318,15 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         startable = parallel_width(plan['tasks'])
         if decision is not None:
             run['route'] = decision  # next to allocation: mode, score, reasons, enforced, setting, kind, graph_size
-            free = len([w for w in coworkers if w.get('state') not in BUSY])
-            run['capacity_hint'] = dict(free=free, startable=startable,
-                                        hint=capacity_hint(free, startable, user_tasks, **capacity_settings(settings)))
+        # The split hint does not depend on routing: every new run gets it, also with team_route_mode='off'.
+        free = len([w for w in coworkers if w.get('state') not in BUSY])
+        run['capacity_hint'] = dict(free=free, startable=startable,
+                                    hint=capacity_hint(free, startable, user_tasks, **capacity_settings(settings)))
         run['worker_budget'] = max(1, min(capacity, startable))
         engine._import_plan(run, plan)  # checks every planned file path before any task is queued
         created = [t for t in engine.tasks(run['id']) if t.get('role') == 'executor']
-        matched = match_created(plan['tasks'], created)  # plan id -> engine task: explicit, then by position
+        # plan id -> engine task: explicit first, then by position; by_position = the ids only the fallback matched
+        matched, by_position = match_created(plan['tasks'], created)
         unmatched = [str(s['id']) for s in plan['tasks'] if str(s['id']) not in matched]
         for spec in plan['tasks']:
             task = matched.get(str(spec['id']))
@@ -340,7 +343,10 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
                 task['requested_effort'] = effort
                 changed = True
             # Team graphs: stage_role / read_only become top-level keys inside this lock, before any dispatch.
-            if apply_team_keys(spec, task) or changed:
+            # A task matched only by position may be the wrong one: it gets summary and effort, never team keys.
+            if str(spec['id']) not in by_position and apply_team_keys(spec, task):
+                changed = True
+            if changed:
                 store.put('tasks', task)
         team_design = any(stage_role_of(t) == 'design' for t in plan['tasks'])
         if quality == 'high' and not team_design:
@@ -361,6 +367,10 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         if unmatched:
             warnings.append('Plan task(s) %s matched no created Coworker task: their summary, effort and team keys '
                             'were not applied' % ', '.join(unmatched))
+        if by_position:
+            warnings.append('Plan task(s) %s were matched to a created Coworker task only by position: their summary '
+                            'and effort were applied, their team keys (stage_role, read_only) were not'
+                            % ', '.join(by_position))
         hint = (run.get('capacity_hint') or {}).get('hint')
         if hint and settings.get('capacity_hint_warn', False):
             warnings.append(hint)  # off by default: log-only keeps today's warnings; the hint is in 'capacity'
