@@ -351,7 +351,10 @@ class MainHandoffOps:
                    path=record['path'], step_id=step_id, state='attempted', acked=False,
                    before_seq=(transcript.get('session') or {}).get('sequence', 0), at=self.now())
         self.store.put(PROMPTS, doc)  # recorded before sending: a crash never leads to a resend
-        body = self.adapter.body(client, chat, step_id, text, client.model(), computer=True)
+        from .notion import user_effort
+        # Main chats keep the user's reasoning (else high), never the model default medium.
+        body = self.adapter.body(client, chat, step_id, text, client.model(), computer=True,
+                                 effort=user_effort(client, chat))
         try:
             for _ in client.transport.stream('runInferenceTranscript', body, client.headers(), timeout=180):
                 pass

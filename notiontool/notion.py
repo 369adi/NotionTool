@@ -179,7 +179,7 @@ def choose_task_effort(client, model_id, purpose='', task=None):
     return choose_effort(client, model_id, purpose, task.get('task_class', ''), task.get('risk', ''))
 
 
-MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main')
+MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main', 'external')  # external = the user's own chats (Test chat)
 MODEL_NAMES = {'albuquerque-quinn': 'opus', 'achira-donut': 'sonnet', 'amla-jam': 'haiku'}
 
 
@@ -221,6 +221,16 @@ def latest_user_config(steps):
         if model and effort:
             break
     return model, effort
+
+
+def user_effort(client, thread_id):
+    """Effort for a turn NotionTool sends into a Main/user chat (handoff, context checkpoint): the user's
+    last choice in that chat, else high. Without it Notion falls back to the model default (medium)."""
+    try:
+        got = inherit_main_config(client, thread_id)
+        return (got[2] if got else None) or MAIN_DEFAULT_EFFORT
+    except Exception:
+        return MAIN_DEFAULT_EFFORT
 
 
 def inherit_main_config(client, thread_id, limit=60):

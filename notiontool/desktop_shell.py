@@ -35,7 +35,7 @@ DATA_DIR = (Path(sys.executable).resolve().parent.parent if getattr(sys, 'frozen
 APP_FILE = 'desktop_app.json'
 DEFAULT_PORT = 9333
 # File stems in load order; overlay.js registers the 'sidebar' part. 'theme' (design system) is first.
-PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'settings', 'extras', 'studio', 'stepcap')
+PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'settings', 'extras', 'studio', 'stepcap', 'donesound')
 MOUNT_ORDER = ('theme', 'chrome', 'declutter', 'sidebar', 'shell', 'live', 'settings', 'extras', 'studio')
 DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_schema', 'app_settings_get',
                                               'app_settings_set', 'main_switch_start')
