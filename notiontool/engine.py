@@ -24,8 +24,12 @@ import subprocess
 # Patch mode (patch_mode.py): on by default for git projects with a main branch; the setting turns it off.
 PATCH_MODE_DEFAULT = True
 # Merge results that are worth one more try later; anything else stays 'failed' for the operator.
-PATCH_RETRY = ('main_moved', 'main_busy')
+# 'main_red': the same tests also fail on clean main, so the task is not to blame. It waits until main
+# moves (a fix landed) and is then merged again; these waits never use up PATCH_RETRY_LIMIT.
+PATCH_RETRY = ('main_moved', 'main_busy', 'main_red')
 PATCH_RETRY_LIMIT = 3
+# Failed merges that /api/task/remerge may put back to 'waiting' (only with an existing worktree).
+REMERGE_STATUSES = ('red', 'main_red')
 PATCH_NOTE = ('\n\nWork only inside this folder: %s\nIt is your own copy of the project (a git worktree on branch %s). '
               'Read and edit files only there, never in the main project folder. Do not commit, merge or push: '
               'NotionTool commits, tests and merges your change when you are done.')
@@ -767,12 +771,24 @@ class Engine:
 
     def _start_merges_locked(self):
         merging = self.__dict__.setdefault('_patch_merging', set())
+        heads = {}  # project root -> current main commit (only asked when a task waits for a red main)
         for task in self.store.all('tasks'):
             if task.get('patch_state') != 'waiting' or task['id'] in merging or not task.get('patch_worktree'):
                 continue
             run = self.store.get('runs', task['run_id'])
             if not run:
                 continue
+            red_at = task.get('patch_main_red')
+            if red_at:
+                root = str(self._project_root(run))
+                if root not in heads:
+                    try:
+                        patcher = self._patcher(run)
+                        heads[root] = patcher.rev(getattr(patcher, 'base', patch_mod.BASE))
+                    except Exception:
+                        heads[root] = None
+                if heads[root] == red_at:
+                    continue  # main is still the red commit: wait for a fix before merging again
             merging.add(task['id'])
             try:
                 future = self._patcher(run).submit(dict(task))
@@ -799,18 +815,35 @@ class Engine:
                 merging.discard(task_id)
                 return
             status = str(result.get('status') or 'error')
-            tries = task.get('patch_tries', 0) + 1
+            main_red = status == 'main_red'
+            # A red main is not the task's fault: waiting for it never uses up the retry limit.
+            tries = task.get('patch_tries', 0) + (0 if main_red else 1)
             if status in ('merged', 'nothing'):
                 state = 'merged'
             elif status == 'conflict':
                 state = 'conflict'
+            elif main_red:
+                state = 'waiting'
             elif status in PATCH_RETRY and tries < PATCH_RETRY_LIMIT:
                 state = 'waiting'
             else:
                 state = 'failed'
             task.update(patch_state=state, patch_tries=tries,
                         patch_result=dict(status=status, message=str(result.get('message') or '')[:600], at=time.time(),
-                                          main_after=str(result.get('main_after') or ''), pushed=bool(result.get('pushed'))))
+                                          main_after=str(result.get('main_after') or ''), pushed=bool(result.get('pushed')),
+                                          failing=[str(n) for n in (result.get('failing') or [])][:20],
+                                          tests=patch_mod.test_tail(result)))
+            if main_red:
+                red_at = str(result.get('main_red_commit') or result.get('main_before') or '')
+                task['patch_main_red'] = red_at
+                seen = self.__dict__.setdefault('_main_red_seen', set())
+                # One operator event per red main commit, not one per task; the stored events keep this across restarts.
+                if red_at not in seen and not self._main_red_reported(red_at):
+                    seen.add(red_at)
+                    self.store.event('main_red', task['run_id'], commit=False, task_id=task_id, main_commit=red_at,
+                                     failing=task['patch_result']['failing'], message=task['patch_result']['message'][:300])
+            else:
+                task.pop('patch_main_red', None)
             run = self.store.get('runs', task['run_id'])
             if state == 'conflict' and run and not task.get('patch_follow_up'):
                 follow = result.get('follow_up') or {}
@@ -842,6 +875,74 @@ class Engine:
                     conflicts_waiting=sum(1 for t in tasks if t.get('patch_state') == 'conflict'),
                     waiting_to_merge=sum(1 for t in tasks if t.get('patch_state') == 'waiting'),
                     labels={t['id']: PATCH_LABELS[t['patch_state']] for t in tasks if t.get('patch_state') in PATCH_LABELS})
+
+    def _main_red_reported(self, main_commit):
+        """True when the store already holds a 'main_red' event for this main commit (survives restarts)."""
+        db = getattr(self.store, 'db', None)
+        if not main_commit or db is None:
+            return False
+        try:
+            with self.store.lock:
+                row = db.execute("SELECT 1 FROM events WHERE kind='main_red' AND json_extract(doc,'$.main_commit')=? "
+                                 "LIMIT 1", (main_commit,)).fetchone()
+        except Exception:
+            return False
+        return row is not None
+
+    def _remerge_refusal(self, task):
+        """Why a task may not be merged again, or None. Tasks without their worktree are never touched."""
+        if task.get('state') != 'done':
+            return 'The task is not done'
+        if task.get('patch_state') != 'failed':
+            return 'The merge of this task did not fail'
+        status = (task.get('patch_result') or {}).get('status')
+        if status not in REMERGE_STATUSES:
+            return 'The merge failed with status %r, not red or main_red' % status
+        folder = task.get('patch_worktree')
+        if not folder or not (Path(folder) / '.git').exists():
+            return 'The task has no worktree any more; nothing to merge again'
+        return None
+
+    def remerge(self, task_id=None, since=None):
+        """Put merges rejected as red/main_red back to 'waiting' (tries reset); tick() merges them again.
+
+        task_id: one task (refusal raises ValueError). since: all such tasks whose merge failed at or after
+        this unix time; refused candidates are listed in 'skipped'. The task itself is never re-run (I5).
+        """
+        if task_id is None and since is None:
+            raise ValueError('Give a task id or since (unix time)')
+        with self.lock:
+            skipped = []
+            if task_id is not None:
+                task = self.store.get('tasks', str(task_id))
+                if not task:
+                    raise ValueError('Task not found')
+                reason = self._remerge_refusal(task)
+                if reason:
+                    raise ValueError(reason)
+                picked = [task]
+            else:
+                since = float(since)
+                picked = []
+                for task in self.store.all('tasks'):
+                    result = task.get('patch_result') or {}
+                    if task.get('patch_state') != 'failed' or result.get('status') not in REMERGE_STATUSES \
+                            or float(result.get('at') or 0) < since:
+                        continue
+                    reason = self._remerge_refusal(task)
+                    if reason:
+                        skipped.append(dict(id=task['id'], reason=reason))
+                    else:
+                        picked.append(task)
+            ids = []
+            for task in picked:
+                old = (task.get('patch_result') or {}).get('status')
+                task.update(patch_state='waiting', patch_tries=0, patch_remerged_at=time.time())
+                task.pop('patch_main_red', None)
+                self.store.put('tasks', task)
+                self.store.event('patch_remerge', task['run_id'], commit=False, task_id=task['id'], status=old)
+                ids.append(task['id'])
+            return dict(tasks=ids, count=len(ids), skipped=skipped)
 
     def claim_file(self, task_id, lease, relative):
         with self.lock:
