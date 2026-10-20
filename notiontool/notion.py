@@ -1085,15 +1085,20 @@ class NotionAdapter:
         client = self.client(account['id'])
         _phase['client'] = time.monotonic() - _t0
         # Fetch head before sending so recovery cannot mistake old responses for this attempt.
-        transcript = client.transcript(worker['thread_id'])
-        _phase['transcript'] = time.monotonic() - _t0
+        import concurrent.futures as _cf
+        # The busy check is an independent read: run it while the head loads instead of after it.
+        with _cf.ThreadPoolExecutor(1) as _pool:
+            _busy_future = _pool.submit(self.thread_busy, client, worker['thread_id'])
+            transcript = client.transcript(worker['thread_id'])
+            _phase['transcript'] = time.monotonic() - _t0
+            _busy_now = _busy_future.result()
         session = transcript.get('session') or {}
         if session.get('status') not in (None,'idle','completed') or transcript.get('session_pending'):
             # Nothing was submitted. An externally busy thread (e.g. the operator's own turn in this chat) is not a
             # rate limit: no attempt is used and the account is not cooled down (Phase 4 fix).
             raise RateLimited(10, 'This chat is busy with another turn (session ' + str(session.get('status') or 'pending') +
                               '); nothing was sent yet', free=True, scope='thread')
-        if self.thread_busy(client, worker['thread_id']):
+        if _busy_now:
             raise RateLimited(5, 'Notion is still finishing the previous turn in this chat; nothing was sent yet',
                               free=True, scope='thread')
         _phase['busy'] = time.monotonic() - _t0
