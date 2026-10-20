@@ -179,6 +179,55 @@ def choose_task_effort(client, model_id, purpose='', task=None):
     return choose_effort(client, model_id, purpose, task.get('task_class', ''), task.get('risk', ''))
 
 
+MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main')
+MODEL_NAMES = {'albuquerque-quinn': 'opus', 'achira-donut': 'sonnet', 'amla-jam': 'haiku'}
+
+
+def latest_user_config(steps):
+    """(model, effort) of the newest 'updated-config' choice in steps (oldest first); '' when absent."""
+    model = effort = ''
+    for step in reversed(steps):
+        if not isinstance(step, dict) or step.get('type') != 'updated-config':
+            continue
+        value = step.get('value') or {}
+        if not model and value.get('model'):
+            model = str(value['model'])
+        if not effort and value.get('reasoningEffort'):
+            effort = str(value['reasoningEffort']).strip().lower()
+        if model and effort:
+            break
+    return model, effort
+
+
+def inherit_main_config(client, thread_id, limit=60):
+    """(selected, model_id, effort, reason) from a Main chat's own newest model/effort pick, or None.
+
+    Main chats keep what the user chose in the Notion menu; only coworkers get the automatic choice."""
+    space = client.info['space_id']
+    def records(table, ids):
+        if not ids:
+            return {}
+        result = client.call('syncRecordValuesSpaceInitial', {'requests': [
+            {'pointer': {'table': table, 'id': ident, 'spaceId': space}, 'version': -1} for ident in ids]})
+        return {ident: unwrap(value) for ident, value in result.get('recordMap', {}).get(table, {}).items()}
+    try:
+        thread = records('thread', [thread_id]).get(thread_id, {})
+        ids = list(thread.get('messages') or [])[-int(limit):]
+        messages = records('thread_message', ids)
+    except Exception:
+        return None
+    steps = [dict((messages.get(ident) or {}).get('step') or {}) for ident in ids if ident in messages]
+    model, effort = latest_user_config(steps)
+    if not model and not effort:
+        return None
+    if model:
+        selected = MODEL_NAMES.get(model, model)
+    else:
+        selected, model = 'opus', client.model('opus')
+    return selected, model, (effort or None), ('Main chat: kept the user choice (%s / %s)'
+                                                % (selected, effort or 'default'))
+
+
 def own_turn_steps(records, ids, step_id, chunk=20):
     # Read thread messages newest first until our own user step is loaded. Only the
     # own turn is checked, so older history is skipped; without a match all is read.
@@ -1045,11 +1094,17 @@ class NotionAdapter:
             note = '' if worker.get('context_reset') else ('\n\nEarlier messages in this chat are superseded by '
                                                           'this checkpoint; use them only as reference history.')
             prompt = worker['handoff'] + note + '\n\nCurrent assignment (continue from the checkpoint):\n' + prompt
-        selected = 'opus' if worker.get('purpose') == 'main' else task.get('model', 'opus')
-        model = client.model(selected)
-        # Rule I38: a per-task effort set by the Main wins (clamped to the model); else the automatic choice.
-        effort, effort_reason = choose_task_effort(client, model, worker.get('purpose', ''),
-                                                   task)
+        inherited = (inherit_main_config(client, worker['thread_id'])
+                     if worker.get('purpose') in MAIN_OWN_CONFIG else None)
+        if inherited is not None:
+            # Main chats keep the model + reasoning the user picked in the Notion menu (no override).
+            selected, model, effort, effort_reason = inherited
+        else:
+            selected = 'opus' if worker.get('purpose') == 'main' else task.get('model', 'opus')
+            model = client.model(selected)
+            # Rule I38: a per-task effort set by the Main wins (clamped to the model); else the automatic choice.
+            effort, effort_reason = choose_task_effort(client, model, worker.get('purpose', ''),
+                                                       task)
         # The saved chat config changes only through our own confirmed write: check once per chat generation.
         config_key = (worker['thread_id'], worker.get('generation', 0), model)
         if getattr(self, 'confirmed_configs', {}).get(worker['thread_id']) != config_key:
@@ -1069,7 +1124,9 @@ class NotionAdapter:
             saved['sent_at'] = time.time()
             saved['request_fingerprint'] = hashlib.sha256(prompt.encode()).hexdigest()
             saved.update(model=selected, assigned_model_id=model, effort=effort, effort_reason=effort_reason)
-            if worker.get('purpose') == 'main':
+            if inherited is not None:
+                saved['model_reason'] = effort_reason
+            elif worker.get('purpose') == 'main':
                 saved['model_reason'] = 'Main chat: Opus 5.5 is the default model for the Main chat'
             saved['submission_phase'] = 'inference'
             self.store.put('tasks',saved)
@@ -1326,6 +1383,10 @@ class NotionAdapter:
         if not effort and task:
             effort = choose_effort(client, model, worker.get('purpose', ''), task.get('task_class', ''),
                                    task.get('risk', ''))[0]
+        if worker.get('purpose') in MAIN_OWN_CONFIG:
+            inherited = inherit_main_config(client, worker['thread_id'])
+            if inherited is not None:
+                model, effort = inherited[1], inherited[2]
         body = self.body(client, worker['thread_id'], step_id, text, model, computer=True, effort=effort)
         timeout = float(self.store.settings().get('task_timeout') or 1800)
         try:
