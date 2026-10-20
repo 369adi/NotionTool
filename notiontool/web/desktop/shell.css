@@ -1,0 +1,194 @@
+/* NotionTool desktop overlay part: shell (Studio v3 tab bar, view layer, compact brand header).
+ * Styles only own elements (data-nt-desk) and hides Notion nodes only by the class shell.js adds. */
+
+/* Notion's top icon row (Home, Chat, Meetings, Inbox, Search), replaced by our tab bar. */
+.nt-shell-hide { display: none !important; }
+
+/* Notion header wrapper around that row: no leftover padding/height (no gap under the brand). */
+html.nt-shell-on .nt-shell-tight {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  margin-top: 0 !important;
+  min-height: 0 !important;
+  height: auto !important;
+  gap: 0 !important;
+}
+
+/* ---- tab bar ---- */
+.nt-shell-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 8px 8px;
+  padding: 4px;
+  border-radius: var(--nt-radius, 12px);
+  background: var(--nt-surface, #12151d);
+  border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.06));
+  box-sizing: border-box;
+}
+
+.nt-shell-tab {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 2px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--nt-muted, #9aa3b8);
+  font: 600 11px/1.1 var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.nt-shell-tab:hover { background: var(--nt-raised, #181c26); color: var(--nt-text, #e8eaf2); }
+.nt-shell-tab:focus-visible { outline: 2px solid var(--nt-accent, #7c5cff); outline-offset: 1px; }
+
+/* Active tab: one solid accent, no glow. */
+.nt-shell-tab.nt-shell-tab-active,
+.nt-shell-tab.nt-shell-tab-active:hover {
+  background: var(--nt-accent, #7c5cff);
+  color: #ffffff;
+  box-shadow: none;
+}
+
+.nt-shell-tab-icon svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nt-shell-tab-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+
+.nt-shell-tab-badge {
+  display: none;
+  position: absolute;
+  top: 1px;
+  right: 4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  box-sizing: border-box;
+  background: var(--nt-accent, #7c5cff);
+  color: #ffffff;
+  font: 700 10px/16px var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
+  text-align: center;
+}
+
+.nt-shell-tab.nt-shell-has-badge .nt-shell-tab-badge { display: block; }
+.nt-shell-tab.nt-shell-tab-active .nt-shell-tab-badge { background: #ffffff; color: var(--nt-accent, #7c5cff); }
+
+/* ---- view layer: covers the main Notion frame (left is set to the sidebar width), not a modal ---- */
+.nt-shell-layer {
+  display: none;
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 270px;
+  z-index: 90;
+  overflow: auto;
+  background: var(--nt-bg, #0b0d12);
+  color: var(--nt-text, #e8eaf2);
+  font: 14px/1.45 var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
+}
+
+html.nt-shell-view-open .nt-shell-layer { display: block; }
+
+.nt-shell-view { min-height: 100%; padding: 28px 32px; box-sizing: border-box; }
+
+.nt-shell-empty-title { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+.nt-shell-empty-text { color: var(--nt-muted, #9aa3b8); max-width: 520px; margin-bottom: 16px; }
+
+.nt-shell-btn {
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--nt-accent, #7c5cff);
+  color: #ffffff;
+  font: 600 13px/1.2 var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
+  cursor: pointer;
+}
+
+/* ---- compact brand header: logo mark + wordmark + connection dot, no box ---- */
+html.nt-shell-on .nt-desk-brand.nt-shell-brand {
+  margin: 8px 8px 8px;
+  padding: 0 8px;
+  gap: 8px;
+  min-height: 32px;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+html.nt-shell-on .nt-shell-brand .nt-desk-brand-mark {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  box-shadow: none;
+}
+
+html.nt-shell-on .nt-shell-brand .nt-desk-brand-name { font-size: 13.5px; font-weight: 700; letter-spacing: 0.01em; }
+
+.nt-shell-conn {
+  position: relative;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6b7280;
+  cursor: help;
+  outline: none;
+}
+
+.nt-shell-conn[data-level="on"] { background: #22c55e; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18); }
+.nt-shell-conn[data-level="off"] { background: #ef4444; box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2); }
+.nt-shell-conn[data-level="wait"] { background: #f59e0b; }
+
+/* Plain status text, shown on hover / keyboard focus. */
+.nt-shell-conn-text {
+  display: none;
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  padding: 5px 9px;
+  border-radius: 8px;
+  white-space: nowrap;
+  background: var(--nt-raised, #181c26);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--nt-text, #e8eaf2);
+  font: 500 12px/1.3 var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
+  pointer-events: none;
+}
+
+.nt-shell-conn:hover .nt-shell-conn-text,
+.nt-shell-conn:focus .nt-shell-conn-text { display: block; }
+
+/* ---- composer: no 'NotionTool' label above the chat input ---- */
+html.nt-shell-on .nt-desk-composer::after,
+html.nt-shell-on .nt-desk-composer::before,
+html.nt-shell-on .nt-desk-composer-empty::after {
+  content: none !important;
+  display: none !important;
+}
+
+/* ---- sidebar: the whole 'Coworkers' header row is one toggle with a rotating chevron ---- */
+.nt-desk-coworkers .nt-desk-coworkers-head { width: 100%; text-align: left; cursor: pointer; user-select: none; }
+.nt-desk-coworkers .nt-desk-coworkers-head > * { pointer-events: none; }
+.nt-desk-coworkers .nt-desk-coworkers-head:focus-visible { outline: 2px solid rgba(124, 92, 255, 0.8); outline-offset: 1px; border-radius: 6px; }
+.nt-desk-coworkers .nt-desk-chevron { display: inline-block; transition: transform 0.15s ease; }
+.nt-desk-coworkers .nt-desk-chevron::before,
+.nt-desk-coworkers.nt-desk-collapsed .nt-desk-chevron::before { content: '\25BE'; }
+.nt-desk-coworkers.nt-desk-collapsed .nt-desk-chevron { transform: rotate(-90deg); }
+.nt-desk-coworkers.nt-desk-collapsed .nt-desk-coworker-list { display: none; }

@@ -1,0 +1,568 @@
+/* NotionTool desktop overlay part: theme. Design tokens (--nt-*) and a global restyle of the
+ * Notion surfaces. Every restyle rule is scoped to html.nt-theme (added by theme.js) and is off
+ * when the kill switch class nt-desk-off is set. Notion nodes are only restyled, never removed. */
+:root {
+  --nt-bg: #0b0d12;
+  --nt-surface: #12151d;
+  --nt-raised: #181c26;
+  --nt-border: rgba(255, 255, 255, .07);
+  --nt-border-strong: rgba(255, 255, 255, .12);
+  --nt-text: #e8eaf0;
+  --nt-muted: #8a90a2;
+  --nt-accent-from: #7c5cff;
+  --nt-accent-to: #22d3ee;
+  --nt-accent: #7c5cff;
+  --nt-accent-gradient: linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%);
+  --nt-accent-soft: rgba(124, 92, 255, .16);
+  --nt-success: #22c55e;
+  --nt-warning: #f59e0b;
+  --nt-danger: #ef4444;
+  --nt-radius: 12px;
+  --nt-radius-sm: 8px;
+  --nt-font: Inter, "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --nt-shadow: 0 8px 28px rgba(0, 0, 0, .45), 0 0 0 1px rgba(255, 255, 255, .04);
+  --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .35), 0 6px 24px rgba(124, 92, 255, .22), 0 0 32px rgba(34, 211, 238, .10);
+  --nt-ring: 0 0 0 2px rgba(124, 92, 255, .55), 0 0 18px rgba(34, 211, 238, .25);
+  --nt-glass: rgba(18, 21, 29, .72);
+  --nt-hover: rgba(255, 255, 255, .05);
+  --nt-active: rgba(124, 92, 255, .14);
+  --nt-transition: 150ms ease;
+  /* Aliases used by individual parts; they all follow the tokens above. */
+  --nt-accent-1: var(--nt-accent-from);
+  --nt-accent-2: var(--nt-accent-to);
+  --nt-accent-start: var(--nt-accent-from);
+  --nt-accent-end: var(--nt-accent-to);
+  --nt-fg: var(--nt-text);
+  --nt-line: var(--nt-border);
+  /* Round 3: premium surfaces. */
+  --nt-sidebar: #10131b;
+  --nt-sidebar-border: rgba(255, 255, 255, .06);
+  --nt-glow-a: rgba(124, 92, 255, .13);
+  --nt-glow-b: rgba(34, 211, 238, .08);
+  --nt-bg-glow: radial-gradient(1100px 700px at 0% 0%, var(--nt-glow-a), transparent 62%),
+    radial-gradient(1000px 680px at 100% 100%, var(--nt-glow-b), transparent 60%), var(--nt-bg);
+}
+
+/* ---- Notion's own color variables (live DOM: getComputedStyle(document.body), dark theme) ----
+ * Overriding them recolors every Notion surface that uses them, so no per-node rules are needed.
+ * Set on body and .notion-dark-theme because Notion defines them there (body.notion-dark-theme). */
+html.nt-theme:not(.nt-desk-off) body,
+html.nt-theme:not(.nt-desk-off) .notion-dark-theme {
+  --c-bacPri: #0b0d12;                       /* was #191919: main area, .layout-chat, cursor listener */
+  --ca-bacPriTra: rgba(11, 13, 18, 0);       /* was rgba(25,25,25,0): fades to the main area */
+  --c-bacSec: #10131b;                       /* was #202020 */
+  --c-bacEle: #181c26;                       /* was #202020: raised elements */
+  --c-bacTer: #252b3a;                       /* was #383836 */
+  --c-bacInt: #1a1f2b;                       /* was #262626 */
+  --c-bacAccPri: #1f2433;                    /* was #2c2c2b */
+  --ca-bacSecTra: rgba(124, 92, 255, .05);   /* was rgba(252,252,252,.03) */
+  --ca-bacIntTra: rgba(124, 92, 255, .12);   /* was rgba(255,255,255,.055): inline code background */
+  --c-popBac: #181c26;                       /* was #252525: menus and popovers */
+  --ca-popWaxPapBac: rgba(16, 19, 27, .92);  /* was rgba(32,32,32,.9) */
+  --ca-modUndBac: rgba(5, 6, 10, .78);       /* was rgba(15,15,15,.8) */
+  --c-borPri: #262b38;                       /* was #383836 */
+  --c-borSec: #1c2130;                       /* was #2c2c2b */
+  --ca-borPriTra: rgba(255, 255, 255, .08);  /* was rgba(255,255,235,.1) */
+  --ca-borSecTra: rgba(255, 255, 255, .06);  /* was rgba(255,255,243,.082) */
+  --c-texPri: #eef0f6;                       /* was #f0efed: cooler, high contrast */
+  --c-texSec: #a9afc2;                       /* was #ada9a3 */
+  --c-texTer: #8c93a8;                       /* was #7d7a75: readable secondary text */
+  --ca-sidIteSelBac: rgba(124, 92, 255, .18);/* was rgba(255,255,255,.055): selected sidebar item */
+  --ca-sidSecBac: transparent;               /* was rgba(0,0,0,.024) */
+  --ca-butHovBac: rgba(124, 92, 255, .12);   /* was rgba(255,255,255,.055) */
+  --ca-outButHovBac: rgba(124, 92, 255, .12);/* was rgba(255,255,255,.055) */
+  --ca-ligGraButHovBac: rgba(124, 92, 255, .12); /* was rgba(255,255,255,.055) */
+  --ca-tabRowHovBac: rgba(124, 92, 255, .07);/* was rgba(255,255,255,.055) */
+  --c-whiButBac: #181c26;                    /* was #252525 */
+  --c-whiButHovBac: #232838;                 /* was #2f2f2f */
+  --c-butGroBac: #232838;                    /* was #2f2f2f */
+  --cl-hovDisBac: #181c26;                   /* was #202020 */
+  --c-hovMarDisBac: #181c26;                 /* was #202020 */
+  --c-selMarDisBac: #1f2433;                 /* was #252525 */
+  --cd-codBloBac: rgba(124, 92, 255, .06);   /* was rgba(255,255,255,.03): code blocks */
+  --c-timBac: #0b0d12;                       /* was #191919 */
+  --c-peeTimBac: #10131b;                    /* was #202020 */
+}
+
+/* ---- app background and base text ---------------------------------------------------- */
+html.nt-theme:not(.nt-desk-off) { color-scheme: dark; }
+html.nt-theme:not(.nt-desk-off) body,
+html.nt-theme:not(.nt-desk-off) #notion-app {
+  background: var(--nt-bg) !important;
+  color: var(--nt-text);
+  font-family: var(--nt-font) !important;
+  -webkit-font-smoothing: antialiased;
+}
+/* The glow lives on the app root; the big Notion surfaces above it are made transparent. */
+html.nt-theme:not(.nt-desk-off) .notion-app-inner {
+  background: var(--nt-bg-glow) !important;
+  background-attachment: fixed !important;
+  color: var(--nt-text);
+  font-family: var(--nt-font) !important;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- sidebar: glass surface ------------------------------------------------------------ */
+html.nt-theme:not(.nt-desk-off) .notion-sidebar-container,
+html.nt-theme:not(.nt-desk-off) .notion-sidebar,
+html.nt-theme:not(.nt-desk-off) nav[aria-label],
+html.nt-theme:not(.nt-desk-off) [role="navigation"] {
+  background: var(--nt-sidebar) !important;
+  border-right: 1px solid var(--nt-sidebar-border) !important;
+  box-shadow: none !important;
+  color: var(--nt-text);
+}
+html.nt-theme:not(.nt-desk-off) .notion-sidebar [role="treeitem"],
+html.nt-theme:not(.nt-desk-off) .notion-sidebar [role="button"],
+html.nt-theme:not(.nt-desk-off) .notion-sidebar a {
+  border-radius: var(--nt-radius-sm);
+  transition: background-color var(--nt-transition), color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) .notion-sidebar [role="treeitem"]:hover,
+html.nt-theme:not(.nt-desk-off) .notion-sidebar [role="button"]:hover,
+html.nt-theme:not(.nt-desk-off) .notion-sidebar a:hover {
+  background: var(--nt-hover) !important;
+}
+html.nt-theme:not(.nt-desk-off) .notion-sidebar [aria-selected="true"],
+html.nt-theme:not(.nt-desk-off) .notion-sidebar [aria-current="page"] {
+  background: var(--nt-active) !important;
+  box-shadow: inset 2px 0 0 var(--nt-accent);
+}
+
+/* ---- main content, top bar, panels ----------------------------------------------------- */
+html.nt-theme:not(.nt-desk-off) .notion-cursor-listener,
+html.nt-theme:not(.nt-desk-off) .layout-chat,
+html.nt-theme:not(.nt-desk-off) .notion-frame,
+html.nt-theme:not(.nt-desk-off) main,
+html.nt-theme:not(.nt-desk-off) [role="main"],
+html.nt-theme:not(.nt-desk-off) .notion-scroller {
+  background: transparent !important;
+  color: var(--nt-text);
+}
+/* Inner sidebars keep the sidebar surface even though the frame above is transparent. */
+html.nt-theme:not(.nt-desk-off) .notion-sidebar-container .notion-scroller { background: transparent !important; }
+
+/* ---- chat: user message bubbles on the raised surface ---------------------------------- */
+html.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] > div > div > div > div[style*="min-height: 40px"] {
+  background: var(--nt-raised) !important;
+  border: 1px solid var(--nt-border) !important;
+  border-radius: var(--nt-radius) !important;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .35), inset 0 1px 0 rgba(255, 255, 255, .03);
+}
+html.nt-theme:not(.nt-desk-off) .notion-topbar,
+html.nt-theme:not(.nt-desk-off) .notion-topbar-container,
+html.nt-theme:not(.nt-desk-off) header[role="banner"] {
+  background: rgba(11, 13, 18, .35) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  border-bottom: 1px solid var(--nt-border) !important;
+  box-shadow: none !important;
+}
+html.nt-theme:not(.nt-desk-off) [role="dialog"],
+html.nt-theme:not(.nt-desk-off) [role="menu"],
+html.nt-theme:not(.nt-desk-off) [role="listbox"],
+html.nt-theme:not(.nt-desk-off) .notion-overlay-container [role="dialog"] {
+  background: var(--nt-raised) !important;
+  color: var(--nt-text);
+  border: 1px solid var(--nt-border) !important;
+  border-radius: var(--nt-radius) !important;
+  box-shadow: var(--nt-shadow) !important;
+}
+html.nt-theme:not(.nt-desk-off) [role="tooltip"] {
+  background: var(--nt-raised) !important;
+  color: var(--nt-text) !important;
+  border: 1px solid var(--nt-border-strong);
+  border-radius: var(--nt-radius-sm) !important;
+}
+html.nt-theme:not(.nt-desk-off) hr,
+html.nt-theme:not(.nt-desk-off) [role="separator"] {
+  border-color: var(--nt-border) !important;
+}
+
+/* ---- chat composer: rounded, accent focus ring ----------------------------------------- */
+html.nt-theme:not(.nt-desk-off) [class*="chat"] [role="textbox"][contenteditable="true"],
+html.nt-theme:not(.nt-desk-off) [class*="composer"] [role="textbox"][contenteditable="true"],
+html.nt-theme:not(.nt-desk-off) [class*="ai-input"] [contenteditable="true"],
+html.nt-theme:not(.nt-desk-off) [aria-label*="Ask" i][contenteditable="true"],
+html.nt-theme:not(.nt-desk-off) [aria-label*="message" i][contenteditable="true"],
+html.nt-theme:not(.nt-desk-off) textarea {
+  background: var(--nt-surface) !important;
+  color: var(--nt-text) !important;
+  border: 1px solid var(--nt-border-strong) !important;
+  border-radius: var(--nt-radius) !important;
+  caret-color: var(--nt-accent-to);
+  transition: box-shadow var(--nt-transition), border-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) [class*="chat"] [role="textbox"][contenteditable="true"]:focus,
+html.nt-theme:not(.nt-desk-off) [class*="composer"] [role="textbox"][contenteditable="true"]:focus,
+html.nt-theme:not(.nt-desk-off) [class*="ai-input"] [contenteditable="true"]:focus,
+html.nt-theme:not(.nt-desk-off) [aria-label*="Ask" i][contenteditable="true"]:focus,
+html.nt-theme:not(.nt-desk-off) [aria-label*="message" i][contenteditable="true"]:focus,
+html.nt-theme:not(.nt-desk-off) textarea:focus {
+  outline: none !important;
+  border-color: transparent !important;
+  box-shadow: var(--nt-ring) !important;
+}
+html.nt-theme:not(.nt-desk-off) [class*="composer"],
+html.nt-theme:not(.nt-desk-off) [class*="chat-input"] {
+  border-radius: var(--nt-radius) !important;
+}
+html.nt-theme:not(.nt-desk-off) [class*="composer"]:focus-within,
+html.nt-theme:not(.nt-desk-off) [class*="chat-input"]:focus-within {
+  box-shadow: var(--nt-shadow-glow) !important;
+}
+
+/* ---- inputs, buttons and hover states -------------------------------------------------- */
+html.nt-theme:not(.nt-desk-off) input[type="text"],
+html.nt-theme:not(.nt-desk-off) input[type="search"],
+html.nt-theme:not(.nt-desk-off) input[type="email"],
+html.nt-theme:not(.nt-desk-off) input[type="number"],
+html.nt-theme:not(.nt-desk-off) select {
+  background: var(--nt-surface) !important;
+  color: var(--nt-text) !important;
+  border: 1px solid var(--nt-border-strong) !important;
+  border-radius: var(--nt-radius-sm) !important;
+  transition: box-shadow var(--nt-transition), border-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) input:focus,
+html.nt-theme:not(.nt-desk-off) select:focus {
+  outline: none !important;
+  box-shadow: var(--nt-ring) !important;
+}
+html.nt-theme:not(.nt-desk-off) [role="button"],
+html.nt-theme:not(.nt-desk-off) button,
+html.nt-theme:not(.nt-desk-off) [role="menuitem"],
+html.nt-theme:not(.nt-desk-off) [role="option"],
+html.nt-theme:not(.nt-desk-off) [role="tab"] {
+  transition: background-color var(--nt-transition), box-shadow var(--nt-transition), color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) [role="button"]:hover,
+html.nt-theme:not(.nt-desk-off) [role="menuitem"]:hover,
+html.nt-theme:not(.nt-desk-off) [role="option"]:hover,
+html.nt-theme:not(.nt-desk-off) [role="tab"]:hover {
+  background-color: var(--nt-hover);
+}
+html.nt-theme:not(.nt-desk-off) [role="option"][aria-selected="true"],
+html.nt-theme:not(.nt-desk-off) [role="tab"][aria-selected="true"],
+html.nt-theme:not(.nt-desk-off) [role="menuitem"][aria-checked="true"] {
+  background-color: var(--nt-active) !important;
+  color: var(--nt-text) !important;
+}
+html.nt-theme:not(.nt-desk-off) [role="button"]:focus-visible,
+html.nt-theme:not(.nt-desk-off) button:focus-visible,
+html.nt-theme:not(.nt-desk-off) a:focus-visible {
+  outline: none !important;
+  box-shadow: var(--nt-ring) !important;
+  border-radius: var(--nt-radius-sm);
+}
+/* Primary (filled blue) Notion buttons get the accent gradient. */
+html.nt-theme:not(.nt-desk-off) [role="button"][style*="rgb(35, 131, 226)"],
+html.nt-theme:not(.nt-desk-off) button[style*="rgb(35, 131, 226)"] {
+  background: var(--nt-accent-gradient) !important;
+  color: #ffffff !important;
+  border-radius: var(--nt-radius-sm) !important;
+  box-shadow: var(--nt-shadow-glow) !important;
+}
+html.nt-theme:not(.nt-desk-off) a:not([role]) { color: var(--nt-accent-to); }
+/* Chat/page links are .notion-link-token (live DOM); inline code is the monospace span
+ * inside .notion-inline-code-container (Notion colors it red via inline style). */
+html.nt-theme:not(.nt-desk-off) a.notion-link-token {
+  color: #a996ff !important;
+  text-decoration-color: rgba(124, 92, 255, .55) !important;
+}
+html.nt-theme:not(.nt-desk-off) a.notion-link-token:hover { color: var(--nt-accent-to) !important; }
+html.nt-theme:not(.nt-desk-off) .notion-inline-code-container > span {
+  color: #7ee8fa !important;
+  background: rgba(124, 92, 255, .14) !important;
+  border: 1px solid rgba(124, 92, 255, .22);
+  border-radius: 5px !important;
+}
+
+/* ---- scrollbars: thin, rounded ---------------------------------------------------------- */
+html.nt-theme:not(.nt-desk-off) * {
+  scrollbar-width: thin;
+  scrollbar-color: #262b38 transparent;
+}
+html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar { width: 8px; height: 8px; background: transparent; }
+html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-track { background: transparent; }
+html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-thumb {
+  background: #262b38;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-thumb:hover { background-color: rgba(124, 92, 255, .55); }
+html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-corner { background: transparent; }
+
+/* ---- selection --------------------------------------------------------------------------- */
+html.nt-theme:not(.nt-desk-off) ::selection {
+  background: rgba(124, 92, 255, .45);
+  color: #ffffff;
+}
+
+/* ---- our own overlay surfaces follow the tokens too -------------------------------------- */
+html.nt-theme:not(.nt-desk-off) .nt-desk-toast {
+  background: var(--nt-raised);
+  color: var(--nt-text);
+  border: 1px solid var(--nt-border);
+  border-radius: var(--nt-radius-sm);
+  box-shadow: var(--nt-shadow);
+  font-family: var(--nt-font);
+}
+html.nt-theme:not(.nt-desk-off) .nt-desk-toast-error { border-color: rgba(239, 68, 68, .55); box-shadow: 0 0 0 1px rgba(239, 68, 68, .25), var(--nt-shadow); }
+html.nt-theme:not(.nt-desk-off) .nt-desk-toast-ok,
+html.nt-theme:not(.nt-desk-off) .nt-desk-toast-success { border-color: rgba(34, 197, 94, .55); }
+
+@media (prefers-reduced-motion: reduce) {
+  html.nt-theme:not(.nt-desk-off) * { transition: none !important; }
+}
+
+/* =====================================================================================
+ * Studio v2: a different product. Values come from the live DOM (getComputedStyle on body,
+ * dark theme); the "was" comments are Notion's values before the override.
+ * ===================================================================================== */
+html.nt-theme:not(.nt-desk-off) body,
+html.nt-theme:not(.nt-desk-off) .notion-dark-theme {
+  --c-graBacPri: #161a24;                    /* was #202020: gray tags and grey fills */
+  --c-graBacSec: #232838;                    /* was #383836 */
+  --c-graBacTer: #343b4f;                    /* was #5f5e59 */
+  --ca-graBacSecTra: rgba(124, 92, 255, .10);/* was rgba(255,255,235,.1) */
+  --ca-graBacTerTra: rgba(124, 92, 255, .22);/* was rgba(255,252,235,.306) */
+  --c-graBorPri: #262b38;                    /* was #383836 */
+  --c-sidSecCol: #8a90a2;                    /* was #9b9b9b: sidebar section labels */
+  --ca-oveSmo: rgba(5, 6, 10, .78);          /* was rgba(15,15,15,.8) */
+  --ca-popOveBac: rgba(5, 6, 10, .6);        /* was rgba(15,15,15,.6) */
+  --ca-tokInpMenIteBac: rgba(124, 92, 255, .08); /* was rgba(255,255,255,.03) */
+  --c-shaCol: #05060a;                       /* was #0f0f0f */
+  --c-focSha: rgba(124, 92, 255, .6) 0px 0px 0px 1px inset, rgba(34, 211, 238, .35) 0px 0px 0px 2px; /* was blue */
+  --c-shaSMThiOut: 0 0 0 1px rgba(255, 255, 255, .07), 0px 4px 12px -2px rgba(0, 0, 0, .4);  /* was #383836 ring */
+  --c-shaMDThiOut: 0 0 0 1px rgba(255, 255, 255, .07), 0px 14px 28px -6px rgba(0, 0, 0, .5), 0px 2px 4px -1px rgba(0, 0, 0, .3);
+  --c-shaMDPriOut: inset 0 0 0 1px rgba(255, 255, 255, .07), 0px 14px 28px -6px rgba(0, 0, 0, .5), 0px 2px 4px -1px rgba(0, 0, 0, .3);
+  --c-shaOutSm: 0px 0px 0px 1px rgba(255, 255, 255, .07), 0px 2px 4px 0px rgba(0, 0, 0, .3);  /* was #383836 ring */
+  --c-shaOutMd: 0px 0px 0px 1px rgba(255, 255, 255, .07), 0px 4px 12px -2px rgba(0, 0, 0, .4);
+  --c-shaOutLg: 0px 0px 0px 1px rgba(255, 255, 255, .07), 0px 14px 28px -6px rgba(0, 0, 0, .5), 0px 2px 4px -1px rgba(0, 0, 0, .3);
+  --c-shaOutDif: 0px 0px 0px 1px rgba(255, 255, 255, .07), 0px 12px 32px 0px rgba(0, 0, 0, .55);
+  --c-shaOutScr: 0px 0px 0px 1px rgba(255, 255, 255, .07), 0px 24px 48px 0px rgba(0, 0, 0, .64), 0px 4px 12px 0px rgba(0, 0, 0, .56);
+}
+
+/* ---- (1) typography: Inter / Segoe UI Variable, tight bold headings, gradient titles --- */
+html.nt-theme:not(.nt-desk-off) .layout-content h1,
+html.nt-theme:not(.nt-desk-off) .layout-content h2,
+html.nt-theme:not(.nt-desk-off) .layout-content h3,
+html.nt-theme:not(.nt-desk-off) .notion-header-block,
+html.nt-theme:not(.nt-desk-off) .notion-sub_header-block,
+html.nt-theme:not(.nt-desk-off) .notion-sub_sub_header-block {
+  font-family: var(--nt-font) !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.022em !important;
+}
+html.nt-theme:not(.nt-desk-off) .layout-content strong,
+html.nt-theme:not(.nt-desk-off) .layout-content b { font-weight: 650; }
+/* Page titles (the big h1 of a page) and the chat title in the top bar (marked by theme.js). */
+html.nt-theme:not(.nt-desk-off) .notion-page-block h1,
+html.nt-theme:not(.nt-desk-off) .notion-frame h1[contenteditable],
+html.nt-theme:not(.nt-desk-off) .nt-desk-chat-title > div {
+  background: var(--nt-accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--nt-accent-to);
+  font-weight: 750 !important;
+  letter-spacing: -0.025em;
+}
+html.nt-theme:not(.nt-desk-off) .nt-desk-chat-title > div { font-weight: 650 !important; letter-spacing: -0.01em; }
+
+/* ---- (2) glass: top bar, popovers/menus (incl. the effort menu), composer -------------- */
+html.nt-theme:not(.nt-desk-off) .layout-content > .autolayout-col > div:first-child {
+  background: rgba(11, 13, 18, .55) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  border-bottom: 1px solid rgba(255, 255, 255, .07);
+}
+html.nt-theme:not(.nt-desk-off) .notion-overlay [role="menu"],
+html.nt-theme:not(.nt-desk-off) .notion-overlay [role="listbox"],
+html.nt-theme:not(.nt-desk-off) .notion-overlay [role="dialog"],
+html.nt-theme:not(.nt-desk-off) .notion-overlay [role="tooltip"] {
+  background: rgba(24, 28, 38, .86) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, .07) !important;
+}
+html.nt-theme:not(.nt-desk-off) .notion-overlay [role="tooltip"] {
+  background: rgba(24, 28, 38, .94) !important;
+  color: var(--nt-text) !important;
+  font-weight: 500;
+}
+/* Composer: [data-notion-chat-input-container] (live DOM [424,698,1166,800]) with an animated glow. */
+html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] {
+  position: relative;
+  isolation: isolate;
+}
+html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container]::before {
+  content: '';
+  position: absolute;
+  inset: 4px 16px 2px 16px;              /* stays inside the composer box: no bleed */
+  z-index: -1;
+  border-radius: 22px;
+  background: linear-gradient(120deg, rgba(124, 92, 255, .32), rgba(34, 211, 238, .22), rgba(124, 92, 255, .32));
+  background-size: 220% 220%;
+  filter: blur(14px);
+  opacity: .35;
+  pointer-events: none;
+  animation: nt-desk-composer-glow 9s ease-in-out infinite;
+}
+html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] > div {
+  background: rgba(18, 21, 29, .72) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 16px;
+  transition: box-shadow var(--nt-transition), border-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] > div:focus-within {
+  border-color: rgba(124, 92, 255, .45);
+  box-shadow: var(--nt-shadow-glow);
+}
+html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] [role="textbox"] { background: transparent !important; }
+@keyframes nt-desk-composer-glow {
+  0%, 100% { background-position: 0% 50%; opacity: .25; }
+  50% { background-position: 100% 50%; opacity: .4; }
+}
+
+/* ---- (3) rebrand: breadcrumb 'Notion AI' -> 'NotionTool', workspace switcher chip ------ */
+/* theme.js marks the breadcrumb button (.nt-desk-crumb-host) and its text (.nt-desk-crumb-src);
+ * the text stays in the DOM for screen readers and is only hidden visually. */
+html.nt-theme:not(.nt-desk-off) .nt-desk-crumb-host { position: relative; }
+html.nt-theme:not(.nt-desk-off) .nt-desk-crumb-src {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+}
+html.nt-theme:not(.nt-desk-off) .nt-desk-crumb-host::after {
+  content: 'NotionTool';
+  font-weight: 750;
+  letter-spacing: -0.015em;
+  background: var(--nt-accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+html.nt-theme:not(.nt-desk-off) .notion-sidebar-switcher {
+  margin: 4px 10px !important;
+  padding: 0 8px !important;
+  min-height: 30px;
+  border-radius: 999px !important;
+  background: var(--nt-raised) !important;
+  border: 1px solid rgba(255, 255, 255, .07);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: border-color var(--nt-transition), box-shadow var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) .notion-sidebar-switcher:hover {
+  border-color: rgba(124, 92, 255, .45);
+  box-shadow: 0 0 0 1px rgba(124, 92, 255, .2);
+}
+
+/* ---- (4) focus rings, hover lift on cards and rows ---------------------------------------- */
+html.nt-theme:not(.nt-desk-off) :focus-visible {
+  outline: 2px solid rgba(124, 92, 255, .75) !important;
+  outline-offset: 2px;
+}
+html.nt-theme:not(.nt-desk-off) .notion-collection-item,
+html.nt-theme:not(.nt-desk-off) .notion-selectable.notion-page-block,
+html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"] {
+  transition: transform var(--nt-transition), box-shadow var(--nt-transition), background-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) .notion-collection-item:hover,
+html.nt-theme:not(.nt-desk-off) .notion-selectable.notion-page-block:hover,
+html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"]:hover {
+  background-color: var(--nt-hover);
+}
+
+/* ---- (5) messages ------------------------------------------------------------------------- */
+/* User message bubble (live DOM: bg #181c26, 1px border): calm raised surface, faint accent edge. */
+html.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] > div > div > div > div[style*="min-height: 40px"] {
+  border: 1px solid rgba(124, 92, 255, .22) !important;
+  background: var(--nt-raised) !important;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .28) !important;
+}
+/* Assistant answer (content root wrapper [data-active-edit-reference-id]): raised panel, accent line. */
+html.nt-theme:not(.nt-desk-off) .layout-chat [data-active-edit-reference-id] {
+  background: rgba(24, 28, 38, .38);
+  border: 1px solid rgba(255, 255, 255, .05);
+  border-image: none;
+  border-radius: var(--nt-radius);
+  box-shadow: none;
+  padding: 8px 14px;
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .notion-inline-code-container > span {
+  color: #9ff0ff !important;
+  background: rgba(124, 92, 255, .18) !important;
+  border: 1px solid rgba(124, 92, 255, .32);
+  padding: 0 5px;
+  font-weight: 500;
+}
+/* Step indicator 'N Schritte' (marked .nt-desk-steps by theme.js) as a pill. */
+html.nt-theme:not(.nt-desk-off) .nt-desk-steps {
+  display: inline-flex !important;
+  align-items: center;
+  padding: 1px 10px !important;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .05);
+  border: 1px solid rgba(255, 255, 255, .08);
+  color: var(--c-texSec) !important;
+  font-size: 12px !important;
+  font-weight: 600;
+  letter-spacing: .01em;
+  transition: background-color var(--nt-transition), border-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) [role="button"]:hover > .nt-desk-steps {
+  background: rgba(124, 92, 255, .14);
+  border-color: rgba(124, 92, 255, .3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container]::before { animation: none; }
+  html.nt-theme:not(.nt-desk-off) .notion-collection-item:hover,
+  html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"]:hover { transform: none; }
+}
+/* ---- (6) tool groups: consecutive tool-call rows of one answer folded into 'N tool steps' -----
+ * theme.js marks the first row .nt-desk-toolgroup-head (count in data-nt-tool-count) and the other
+ * rows .nt-desk-toolgroup-member; .nt-desk-toolgroup-open shows all rows. Rows are hidden by
+ * class only, never removed. */
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-member:not(.nt-desk-toolgroup-open) {
+  display: none !important;
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head:not(.nt-desk-toolgroup-open) > * {
+  display: none !important;
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head::before {
+  content: '\25B8\00a0\00a0' attr(data-nt-tool-count) ' tool steps';
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  width: max-content;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .04);
+  border: 1px solid rgba(255, 255, 255, .07);
+  color: var(--c-texSec);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 26px;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--nt-transition), border-color var(--nt-transition);
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head:hover::before {
+  background: rgba(124, 92, 255, .10);
+  border-color: rgba(124, 92, 255, .25);
+}
+html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head.nt-desk-toolgroup-open::before {
+  content: '\25BE\00a0\00a0' attr(data-nt-tool-count) ' tool steps';
+  margin-bottom: 4px;
+}

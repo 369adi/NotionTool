@@ -1,0 +1,44 @@
+/* NotionTool desktop part 'progress' (progress.js): Team progress cards in the Live view and sidebar coworker bars. */
+.nt-desk-pg-team { margin: 12px 0 0; }
+.nt-desk-pg-head { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; }
+.nt-desk-pg-title { margin: 0; font-size: 13px; font-weight: 600; }
+.nt-desk-pg-count { font-size: 12px; opacity: 0.65; }
+.nt-desk-pg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.nt-desk-pg-empty { font-size: 12px; opacity: 0.65; }
+.nt-desk-pg-empty[hidden], .nt-desk-pg-warn[hidden] { display: none; }
+.nt-desk-pg-card {
+  display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--nt-desk-border, rgba(127, 127, 127, 0.25)); background: var(--nt-desk-surface, transparent);
+  color: inherit; text-decoration: none; cursor: pointer;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+}
+.nt-desk-pg-card:hover { box-shadow: 0 2px 10px rgba(15, 15, 15, 0.08); }
+.nt-desk-pg-card:focus-visible { outline: 2px solid var(--nt-desk-accent, #2383e2); outline-offset: 2px; }
+.nt-desk-pg-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.nt-desk-pg-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-desk-pg-label { font-size: 12px; opacity: 0.75; white-space: nowrap; }
+.nt-desk-pg-task, .nt-desk-pg-step { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-desk-pg-task { opacity: 0.85; }
+.nt-desk-pg-track { height: 6px; border-radius: 3px; background: rgba(127, 127, 127, 0.2); overflow: hidden; }
+.nt-desk-pg-fill {
+  width: 0; height: 100%; border-radius: 3px; background: var(--nt-desk-accent, #2383e2);
+  transition: width 0.6s cubic-bezier(0.2, 0.8, 0.2, 1), background-color 0.3s ease;
+}
+.nt-desk-pg-meta { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; opacity: 0.65; }
+.nt-desk-pg-warn { font-size: 12px; font-weight: 500; color: var(--nt-desk-amber, #b45309); }
+.nt-desk-pg-card.nt-desk-pg-stalled { border-color: var(--nt-desk-amber, #d97706); background: rgba(217, 119, 6, 0.07); }
+.nt-desk-pg-stalled .nt-desk-pg-fill { background: var(--nt-desk-amber, #d97706); }
+.nt-desk-pg-card.nt-desk-pg-idle { opacity: 0.7; }
+.nt-desk-coworker.nt-desk-pg-row { position: relative; }
+.nt-desk-pg-side {
+  position: absolute; left: 10px; right: 10px; bottom: 1px; height: 2px; border-radius: 1px;
+  background: rgba(127, 127, 127, 0.2); overflow: hidden; pointer-events: none;
+}
+.nt-desk-pg-side-fill { display: block; width: 0; height: 100%; background: var(--nt-desk-accent, #2383e2);
+  transition: width 0.6s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.nt-desk-pg-side.nt-desk-pg-stalled .nt-desk-pg-side-fill { background: var(--nt-desk-amber, #d97706); }
+.nt-desk-pg-phase { flex: none; margin-left: 4px; font-size: 11px; opacity: 0.7; white-space: nowrap; }
+.nt-desk-pg-phase.nt-desk-pg-stalled { color: var(--nt-desk-amber, #b45309); opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .nt-desk-pg-card, .nt-desk-pg-fill, .nt-desk-pg-side-fill { transition: none; }
+}

@@ -1,0 +1,404 @@
+/* NotionTool desktop overlay part: extras. All selectors use the nt-desk- prefix.
+ * Colors come from the design tokens (--nt-*) with fallbacks, so the part also works alone. */
+.nt-desk-brand-dot,
+.nt-desk-banners,
+.nt-desk-toasts,
+.nt-desk-pal-backdrop {
+  --nt-desk-bg: var(--nt-surface, #12151d);
+  --nt-desk-surface: var(--nt-raised, #181c26);
+  --nt-desk-glass: rgba(24, 28, 38, .78);
+  --nt-desk-border: var(--nt-border, rgba(255, 255, 255, .07));
+  --nt-desk-text: var(--nt-text, #e8eaf0);
+  --nt-desk-muted: var(--nt-muted, #8a90a2);
+  --nt-desk-accent: var(--nt-accent, #7c5cff);
+  --nt-desk-gradient: var(--nt-accent-gradient, linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%));
+  --nt-desk-ok: var(--nt-success, #22c55e);
+  --nt-desk-warn: var(--nt-warning, #f59e0b);
+  --nt-desk-bad: var(--nt-danger, #ef4444);
+  --nt-desk-info: var(--nt-accent-to, #22d3ee);
+  --nt-desk-warn-bg: rgba(245, 158, 11, .12);
+  --nt-desk-off-bg: rgba(239, 68, 68, .14);
+  --nt-desk-radius: var(--nt-radius, 12px);
+  --nt-desk-radius-sm: var(--nt-radius-sm, 8px);
+  --nt-desk-shadow: 0 10px 30px rgba(0, 0, 0, .45), 0 0 0 1px rgba(255, 255, 255, .04);
+  --nt-desk-glow: 0 0 0 1px rgba(124, 92, 255, .35), 0 8px 28px rgba(124, 92, 255, .22);
+  --nt-desk-ease: var(--nt-transition, 150ms ease);
+  font: 13px/1.45 var(--nt-font, Inter, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif);
+  color: var(--nt-desk-text);
+}
+
+@media (prefers-color-scheme: dark) {
+  .nt-desk-banners,
+  .nt-desk-toasts,
+  .nt-desk-pal-backdrop {
+    --nt-desk-glass: rgba(18, 21, 29, .80);
+  }
+}
+
+.nt-desk-banner .nt-desk-btn {
+  font: inherit;
+  color: var(--nt-desk-text);
+  background: var(--nt-desk-surface);
+  border: 1px solid var(--nt-desk-border);
+  border-radius: var(--nt-desk-radius-sm);
+  padding: 3px 12px;
+  cursor: pointer;
+  transition: border-color var(--nt-desk-ease), box-shadow var(--nt-desk-ease), background var(--nt-desk-ease);
+}
+
+.nt-desk-banner .nt-desk-btn:hover {
+  border-color: var(--nt-desk-accent);
+  box-shadow: var(--nt-desk-glow);
+}
+
+.nt-desk-banner .nt-desk-btn-primary {
+  color: #ffffff;
+  background: var(--nt-desk-gradient);
+  border-color: transparent;
+}
+
+.nt-desk-banner .nt-desk-btn[disabled] {
+  opacity: 0.6;
+  cursor: default;
+  box-shadow: none;
+}
+
+/* ---- harness status dot (right after the 'NotionTool' brand name) --------------------- */
+.nt-desk-brand-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--nt-desk-muted);
+  vertical-align: middle;
+}
+
+.nt-desk-brand-dot.nt-desk-brand-dot-ok {
+  background: var(--nt-desk-ok);
+  box-shadow: 0 0 6px rgba(34, 197, 94, .5);
+}
+
+/* The Live tab in the tab bar is the only Live entry point: the old header pill stays hidden. */
+[data-nt-desk="live-pill"] { display: none !important; }
+
+.nt-desk-banner[hidden],
+.nt-desk-banner-actions[hidden],
+.nt-desk-pal-backdrop[hidden],
+.nt-desk-pal-empty[hidden] {
+  display: none !important;
+}
+
+/* ---- banners: bottom right, above the composer area (never over the page header) --------- */
+.nt-desk-banners {
+  position: fixed;
+  top: auto;
+  left: auto;
+  right: 16px;
+  bottom: var(--nt-desk-stack-bottom, 132px);
+  transform: none;
+  z-index: 2147482000;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: min(420px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.nt-desk-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 14px;
+  border: 1px solid var(--nt-desk-border);
+  border-left: 3px solid var(--nt-desk-warn);
+  border-radius: var(--nt-desk-radius);
+  background: var(--nt-desk-glass);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--nt-desk-shadow);
+  pointer-events: auto;
+}
+
+.nt-desk-banner-off {
+  border-left-color: var(--nt-desk-bad);
+  background: linear-gradient(var(--nt-desk-off-bg), var(--nt-desk-off-bg)), var(--nt-desk-glass);
+}
+
+.nt-desk-banner-switch {
+  border-left-color: var(--nt-desk-accent);
+}
+
+.nt-desk-banner-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ---- toasts: glass cards, bottom right above the composer and any banner ----------------- */
+html .nt-desk-toasts {
+  top: auto;
+  left: auto;
+  right: 16px;
+  bottom: calc(var(--nt-desk-stack-bottom, 132px) + var(--nt-desk-banner-h, 0px));
+  gap: 10px;
+  width: min(380px, calc(100vw - 32px));
+  align-items: stretch;
+}
+
+html .nt-desk-toasts > .nt-desk-toast {
+  position: relative;
+  max-width: none;
+  box-sizing: border-box;
+  padding: 11px 12px 11px 16px;
+  color: var(--nt-desk-text) !important;
+  background: var(--nt-desk-glass) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid var(--nt-desk-border) !important;
+  border-radius: var(--nt-desk-radius) !important;
+  box-shadow: var(--nt-desk-shadow) !important;
+  font: 13px/1.45 var(--nt-font, Inter, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif) !important;
+  overflow: hidden;
+  animation: nt-desk-toast-in 220ms cubic-bezier(.2, .8, .2, 1) both;
+}
+
+html .nt-desk-toasts > .nt-desk-tcard {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.nt-desk-tcard-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--nt-desk-tcard-color, var(--nt-desk-info));
+}
+
+.nt-desk-tcard-icon {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #0b0d12;
+  background: var(--nt-desk-tcard-color, var(--nt-desk-info));
+  box-shadow: 0 0 10px var(--nt-desk-tcard-color, var(--nt-desk-info));
+}
+
+.nt-desk-tcard-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-top: 1px;
+  overflow-wrap: anywhere;
+}
+
+.nt-desk-tcard-close {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin: -2px -2px 0 0;
+  padding: 0;
+  font: inherit;
+  font-size: 16px;
+  line-height: 20px;
+  color: var(--nt-desk-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color var(--nt-desk-ease), background var(--nt-desk-ease);
+}
+
+.nt-desk-tcard-close:hover {
+  color: var(--nt-desk-text);
+  background: rgba(255, 255, 255, .08);
+}
+
+.nt-desk-tcard-info { --nt-desk-tcard-color: var(--nt-desk-info); }
+.nt-desk-tcard-success { --nt-desk-tcard-color: var(--nt-desk-ok); }
+.nt-desk-tcard-warning { --nt-desk-tcard-color: var(--nt-desk-warn); }
+html .nt-desk-toasts > .nt-desk-tcard.nt-desk-tcard-error {
+  --nt-desk-tcard-color: var(--nt-desk-bad);
+  border-color: rgba(239, 68, 68, .35) !important;
+}
+
+html .nt-desk-toasts > .nt-desk-tcard.nt-desk-tcard-out {
+  animation: nt-desk-toast-out 200ms ease both;
+}
+
+@keyframes nt-desk-toast-in {
+  from { opacity: 0; transform: translateX(28px) scale(.98); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes nt-desk-toast-out {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translateX(28px); }
+}
+
+/* ---- command palette (Ctrl+K) ------------------------------------------------------------ */
+.nt-desk-pal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483100;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 14vh;
+  background: rgba(5, 6, 10, .55);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  animation: nt-desk-fade-in 150ms ease both;
+}
+
+.nt-desk-pal {
+  width: min(620px, calc(100vw - 32px));
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--nt-desk-glass);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  backdrop-filter: blur(22px) saturate(150%);
+  border: 1px solid var(--nt-desk-border);
+  border-radius: 16px;
+  box-shadow: var(--nt-desk-shadow), 0 0 60px rgba(124, 92, 255, .18);
+  overflow: hidden;
+  animation: nt-desk-pop-in 160ms cubic-bezier(.2, .8, .2, 1) both;
+}
+
+.nt-desk-pal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--nt-desk-border);
+}
+
+.nt-desk-pal-mark {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: #ffffff;
+  background: var(--nt-desk-gradient);
+}
+
+.nt-desk-pal-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 15px;
+  color: var(--nt-desk-text);
+  background: transparent;
+  border: 0;
+  outline: none;
+  caret-color: var(--nt-desk-info);
+}
+
+.nt-desk-pal-input::placeholder {
+  color: var(--nt-desk-muted);
+}
+
+.nt-desk-pal-list {
+  overflow-y: auto;
+  padding: 6px;
+  scrollbar-width: thin;
+}
+
+.nt-desk-pal-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: var(--nt-desk-radius-sm);
+  cursor: pointer;
+  transition: background var(--nt-desk-ease), box-shadow var(--nt-desk-ease);
+}
+
+.nt-desk-pal-item.nt-desk-pal-active {
+  background: rgba(124, 92, 255, .16);
+  box-shadow: inset 2px 0 0 var(--nt-desk-accent);
+}
+
+.nt-desk-pal-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.nt-desk-pal-title {
+  color: var(--nt-desk-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nt-desk-pal-hint {
+  color: var(--nt-desk-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nt-desk-pal-danger .nt-desk-pal-title {
+  color: var(--nt-desk-bad);
+}
+
+.nt-desk-pal-keys {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  font-size: 11px;
+  color: var(--nt-desk-muted);
+  background: rgba(255, 255, 255, .05);
+  border: 1px solid var(--nt-desk-border);
+  border-radius: 6px;
+}
+
+.nt-desk-pal-empty {
+  padding: 18px;
+  text-align: center;
+  color: var(--nt-desk-muted);
+}
+
+.nt-desk-pal-foot {
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--nt-desk-muted);
+  border-top: 1px solid var(--nt-desk-border);
+}
+
+@keyframes nt-desk-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes nt-desk-pop-in {
+  from { opacity: 0; transform: translateY(-6px) scale(.985); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html .nt-desk-toasts > .nt-desk-toast,
+  .nt-desk-pal-backdrop,
+  .nt-desk-pal {
+    animation: none !important;
+  }
+}
+
+/* Kill switch (Ctrl+Alt+Shift+N): show everything Notion had and hide our layer. */
+html.nt-desk-off .nt-desk-hidden { display: revert !important; }
+html.nt-desk-off .nt-desk-brand-dot, html.nt-desk-off .nt-desk-banner { display: none !important; }
