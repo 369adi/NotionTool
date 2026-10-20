@@ -250,6 +250,7 @@
 /* Long chats: the browser skips layout + paint of off-screen messages (overlay.js applyRenderSkip). */
 [data-nt-cv] > div { content-visibility: auto; contain-intrinsic-size: auto 300px; }
 /* Tail mode (overlay.js): older messages leave style/layout until the user scrolls to the top. */
+[data-nt-cv][data-nt-tail="1"] > div:nth-last-child(n+9),
 [data-nt-cv][data-nt-tail="8"] > div:nth-last-child(n+9),
 [data-nt-cv][data-nt-tail="20"] > div:nth-last-child(n+21),
 [data-nt-cv][data-nt-tail="40"] > div:nth-last-child(n+41),
