@@ -1599,7 +1599,9 @@
       if (el) {
         var age = Date.now() - pendingScroll.start;
         if (!pendingScroll.revealed && age < SWITCH_HIDE_MAX_MS) el.setAttribute('data-nt-sw', '1');
-        el.scrollTop = el.scrollHeight;
+        // Notion anchors a few px above the exact bottom; pushing to the exact bottom fought it
+        // every tick (measured 4 px flip each 250 ms = the visible wobble).
+        if (el.scrollHeight - el.clientHeight - el.scrollTop > 24) el.scrollTop = el.scrollHeight;
         if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
         else { pendingScroll.height = el.scrollHeight; pendingScroll.stable = 0; }
         if (!pendingScroll.revealed && ((pendingScroll.stable >= 2 && age >= 500) || age >= SWITCH_HIDE_MAX_MS)) {
