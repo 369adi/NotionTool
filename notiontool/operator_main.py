@@ -42,10 +42,19 @@ def result_done(result):
     return 'result: done' in marks
 
 
+# Read-only audits once copied stale numbers from the brief instead of counting again.
+AUDIT_TEXT = re.compile(r'\b(?:read[- ]only|audit\w*)\b', re.I)
+AUDIT_LINE = ('Read-only audit: recount every number fresh from the files and data right now; never copy numbers '
+              'from earlier reports, memory or this prompt. Name the command or file behind each number.')
+
+
 def _with_result_line(prompt):
     if not isinstance(prompt, str) or not prompt.strip():
         return prompt  # validate_plan reports the missing prompt
-    return prompt.rstrip() + '\n\n' + RESULT_LINE
+    text = prompt.rstrip()
+    if AUDIT_TEXT.search(text) and AUDIT_LINE not in text:
+        text += '\n\n' + AUDIT_LINE
+    return text + '\n\n' + RESULT_LINE
 
 
 KNOWN_TASK_KEYS = frozenset(('id', 'title', 'prompt', 'acceptance', 'depends_on', 'deps', 'after', 'files', 'model',
