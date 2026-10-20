@@ -6,7 +6,9 @@ Levels are ordered low < standard < high < max. Each level maps to four
 settings that never go down from one level to the next:
 decomposition_depth, context_budget_tokens, review_rounds, max_fix_rounds.
 
-Not wired into engine.py yet.
+route_for_request() decides direct vs. role-team run from difficulty.classify();
+it is not yet called by operator_roles.choose_quality(), so it does not change
+real routing yet. The effort levels are not wired into engine.py yet.
 """
 
 from __future__ import annotations
@@ -182,3 +184,41 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
     if effort != target:
         reason += " (clamped from %s)" % target
     return effort, reason + "; supported: " + ", ".join(supported)
+
+
+# ---- Request difficulty -> route ----------------------------------------------------------
+# route_for_request() decides whether a request goes to the full role-team run
+# (plan/critique/review) or directly to single coworkers, from the CONTENT of the request
+# (notiontool.difficulty.classify), never from its length. A 'team' result only ever raises
+# the route; a route that is already 'team' is never lowered. Not yet called by
+# operator_roles.choose_quality(): until that wiring lands, real routing is unchanged.
+ROUTES = ("direct", "team")
+
+
+def route_for_request(text, context=None, current=None):
+    """Return {'route', 'raised', 'score', 'reasons', 'reason'} for one operator request.
+
+    current is the route decided so far ('direct', 'team' or None = 'direct').
+    - classify -> team: the route becomes 'team' (raised is True if it was 'direct').
+    - classify -> direct: the route stays as current.
+    Unknown current values raise EffortPolicyError; bad text/context raise TypeError.
+    """
+    from . import difficulty
+
+    if current is not None and current not in ROUTES:
+        raise EffortPolicyError(
+            "unknown route %r; expected one of %s" % (current, ", ".join(ROUTES))
+        )
+    base = current or "direct"
+    verdict = difficulty.classify(text, context)
+    to_team = verdict["route"] == "team"
+    route = "team" if to_team else base
+    raised = to_team and base != "team"
+    if raised:
+        reason = "difficulty %.3f -> team: raised %s -> team" % (verdict["score"], base)
+    elif route == "team" and not to_team:
+        reason = "route already team, kept (difficulty %.3f -> direct)" % verdict["score"]
+    else:
+        reason = "difficulty %.3f -> %s: route %s" % (verdict["score"], verdict["route"], route)
+    return {"route": route, "raised": raised, "score": verdict["score"],
+            "reasons": list(verdict["reasons"]), "reason": reason}

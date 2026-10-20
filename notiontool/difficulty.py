@@ -10,6 +10,9 @@ import re
 
 TEAM_THRESHOLD = 0.55
 BASE_SCORE = 0.3
+AMBIGUOUS_WEIGHT = 0.25
+# Plain deletion of named files: many files, still one narrow change.
+DELETE = re.compile(r'\b(lösch\w*|delete\w*|remove\w*|entfern\w*)\b', re.IGNORECASE)
 
 _I = re.IGNORECASE
 
@@ -43,6 +46,8 @@ FILE = re.compile(
 FRAMEWORKS = frozenset(('node.js', 'next.js', 'vue.js', 'three.js', 'express.js', 'chart.js',
                         'nuxt.js', 'react.js', 'angular.js', 'd3.js', 'ember.js', 'backbone.js'))
 _FRAMEWORK_NAME = re.compile(r'^[A-Z][\w-]*\.js$')
+# Code symbols such as engine._restore or test_prompt_once are concrete targets.
+IDENT = re.compile(r'\b(?:[a-z]\w*\._?[a-z]\w*(?!\.(?:py|js|ts|md|json))|[a-z]+(?:_[a-z0-9]+)+|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b')
 LINE = re.compile(r'\b(?:line|zeile)\s+\d+\b|\.\w{1,5}:\d+\b', _I)
 # Narrow change kinds.
 NARROW = (
@@ -55,6 +60,15 @@ NARROW = (
         r'(?:(?:one|a\s+single|a|an|another|ein|einen|einzelnen?|noch\s+einen)\s+)?'
         r'(?:unit\s*)?test(?:fall)?\b'
         r'(?![\s-]*(?:framework|suite|harness|plan|infrastructure|infrastruktur|system|setup))', _I)),
+    ('restart only', None),
+    ('set one value', re.compile(
+        r'\b(?:setz\w*|set|erhöh\w*|senk\w*|raise|lower|increase|decrease|change|änder\w*|mach\w*)\b'
+        r'[^.!?\n]{0,60}?(?:\b(?:auf|to)\s+(?:\d[\d_.]*|\'[^\']+\'|"[^"]+")|'
+        r'\b(?:grün|rot|blau|gelb|schwarz|weiß|green|red|blue|yellow|black|white)\b)', _I)),
+    ('run or report only', re.compile(
+        r'\b(?:run|führ\w*|lass\w*)\b[^.!?\n]{0,50}\btests?\b[^.!?\n]{0,40}\b(?:tell|sag\w*|report|zeig\w*|melde?)\b', _I)),
+    ('one failing test', re.compile(
+        r'\b(?:the|den|einen|this|diesen)\s+(?:failing|fehlschlagenden|roten|kaputten)\s+test\b', _I)),
     ('bump version', re.compile(
         r'\bbump\w*\b|\bversion\s+(?:erhöh\w*|auf|to)\b|\berhöh\w*\s+(?:die\s+)?version\b', _I)),
 )
@@ -101,6 +115,7 @@ def classify(text, context=None):
     if scope_text != text:
         reasons.append('restart/reload phrasing: its "neu" is not counted as scope')
     scope = _distinct(m.group(0) for m in SCOPE.finditer(scope_text))
+    restart_only = scope_text != text and not scope
     if scope:
         score += min(0.55, 0.35 + 0.1 * (len(scope) - 1))
         reasons.append('scope: ' + ', '.join(scope))
@@ -113,9 +128,13 @@ def classify(text, context=None):
         score += 0.2
         reasons.append('many areas: ' + ', '.join(areas))
 
-    files = _files(text, context)
+    files = _files(text, context) + [s for s in _distinct(IDENT.findall(text)) if s not in _files(text, context)]
     lines = LINE.findall(text)
-    if len(files) >= 3:
+    if len(files) >= 3 and DELETE.search(text):
+        score -= 0.2
+        reasons.append('only deleting named files: %d' % len(files))
+        scope = []
+    elif len(files) >= 3:
         score += 0.3
         reasons.append('many files: %d' % len(files))
     elif files:
@@ -128,10 +147,11 @@ def classify(text, context=None):
         score -= 0.1
         reasons.append('concrete line reference')
     if not files and not lines:
-        score += 0.1
+        # An open request with no named target needs planning: the team decides what to touch.
+        score += AMBIGUOUS_WEIGHT
         reasons.append('ambiguous: no named target file or line')
 
-    narrow = [name for name, rx in NARROW if rx.search(text)]
+    narrow = [name for name, rx in NARROW if (restart_only if rx is None else rx.search(text))]
     if narrow:
         score -= min(0.5, 0.35 + 0.1 * (len(narrow) - 1))
         reasons.append('narrow change: ' + ', '.join(narrow))
