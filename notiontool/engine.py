@@ -566,9 +566,64 @@ class Engine:
         run['needs_main_reasons'], run['machine_check_failed'] = reasons, machine
         return list(reasons)
 
+    def _record_outcomes(self, run, tasks):
+        """Honest result counts. Sets task['outcome'] on every finished task and run['outcomes'], run['fixes'],
+        run['reviews']; no state value changes. Operator executors are 'not_done' without a final RESULT: DONE line.
+        Stage roles (reviewer, architect, ...) answer in JSON, so they are 'accepted' when finished.
+        'not_done' wins over 'check_failed' (the task itself said it did not finish)."""
+        from .operator_main import result_done
+        machine = run.get('machine_check_failed') or {}
+        counts = dict(accepted=0, not_done=0, check_failed=0)
+        for t in tasks:
+            if t['state'] != 'done':
+                continue
+            if t['role'] != 'executor':
+                outcome = 'accepted'
+            elif run.get('operator') and not result_done(t.get('result', '')):
+                outcome = 'not_done'
+            elif t['id'] in machine or t.get('agent_red_flag'):
+                outcome = 'check_failed'
+            else:
+                outcome = 'accepted'
+            if t.get('outcome') != outcome:
+                t['outcome'] = outcome
+                self.store.put('tasks', t)
+            if t['role'] == 'executor' and not t.get('fixed_by'):  # the same tasks the run summary counts
+                counts[outcome] += 1
+        reviews = dict(approved=0, changes_requested=0, skipped=0)
+        for t in tasks:
+            if t['role'] == 'executor':
+                if t.get('review_skipped'):  # marker set by operator_roles.step; never counted as approved
+                    reviews['skipped'] += 1
+                elif t.get('review_state') == 'approved':
+                    reviews['approved'] += 1
+            elif t['role'] == 'reviewer' and t['state'] == 'done':
+                try:
+                    data = json.loads(t.get('result') or '{}')
+                except ValueError:
+                    data = {}
+                if isinstance(data, dict) and data.get('passed') is False:
+                    reviews['changes_requested'] += 1
+        fixes = sum(1 for t in tasks if t.get('fix_of'))
+        run['outcomes'], run['reviews'] = counts, reviews
+        # max(): the non-operator fix-round counter (run['fixes'] < max_fix_rounds) must never go backwards.
+        run['fixes'] = max(int(run.get('fixes') or 0), fixes)
+
+    @staticmethod
+    def _outcome_text(run):
+        """Plain English counts for the run summary; empty when everything is accepted with no fix and no review."""
+        o, r, fixes = run.get('outcomes') or {}, run.get('reviews') or {}, run.get('fixes') or 0
+        if not (o.get('not_done') or o.get('check_failed') or fixes or any(r.values())):
+            return ''
+        return ('; outcomes: %d accepted, %d not done, %d check failed; fixes: %d; reviews: %d approved, '
+                '%d changes requested, %d skipped') % (
+            o.get('accepted', 0), o.get('not_done', 0), o.get('check_failed', 0), fixes,
+            r.get('approved', 0), r.get('changes_requested', 0), r.get('skipped', 0))
+
     def _finish(self, run, tasks):
         # Three-stage acceptance: machine check -> Main -> done. Fully passing runs finish at once.
         needs = self._main_decisions(run, tasks)
+        self._record_outcomes(run, tasks)
         for task_id, reason in run['machine_check_failed'].items():
             self.store.event('machine_check_failed', run['id'], task_id=task_id, message=reason)
         if needs:
@@ -1684,6 +1739,7 @@ class Engine:
                     if unaccepted:
                         summary += '; not accepted: ' + ', '.join('%s (%s)' % (t['id'], t.get('title', '')) for t in unaccepted)
                     self._finish(run, tasks)
+                    summary += self._outcome_text(run)  # plain counts: outcomes, fixes, reviews
                     if run.get('state') == 'awaiting_main':
                         # Nobody reads the reports yet: the run waits for the Main's confirmation.
                         run['summary'] = summary + '; waiting for the Main: ' + ', '.join(run.get('needs_main') or [])
