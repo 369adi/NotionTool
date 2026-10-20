@@ -1247,7 +1247,7 @@ class NotionAdapter:
             remote_done('stream_end')
             # Streaming steps can contain stale text or provider placeholders.
             # Only the committed answer to our own turn can finish an assignment.
-            return self.recover(worker,task,cancel)
+            return self.recover(worker,task,cancel,prefetch=True)
         except NotionHttpError as exc:
             remote_done('http_'+str(exc.status), http_class(exc.status))
             if exc.status==429:
@@ -1286,11 +1286,32 @@ class NotionAdapter:
 
     RECOVER_WINDOW = 30  # newest entries read first after stream end; the full 100 only if our marker is not inside
 
-    def recover(self, worker, task, cancel, limit=None):
+    def _prefetch_thread(self, worker):
+        # Stream end only: read the thread record for the model check while the transcript loads.
+        client = self.client(worker['account_id'])
+        thread_id = worker['thread_id']
+        def load():
+            try:
+                with request_priority('verify'):
+                    result = client.call('syncRecordValuesSpaceInitial', {'requests': [
+                        {'pointer': {'table': 'thread', 'id': thread_id, 'spaceId': client.info['space_id']}, 'version': -1}]})
+                value = result.get('recordMap', {}).get('thread', {}).get(thread_id)
+                return unwrap(value) if value else None
+            except Exception:
+                return None  # the check then reads the record itself
+        pool = getattr(self, '_prefetch_pool', None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = self._prefetch_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='verify-prefetch')
+        return pool.submit(load)
+
+    def recover(self, worker, task, cancel, limit=None, prefetch=None):
         # Only the chat that ran this task may confirm it; never read another chat's transcript.
         thread_id = str(task.get('thread_id') or '')
         if not thread_id:
             raise PendingRemote()
+        if prefetch is True:
+            prefetch = self._prefetch_thread(worker) if worker.get('thread_id') == thread_id and worker.get('account_id') else None
         try:
             with request_priority('verify'):
                 transcript = self.client(worker['account_id']).transcript(thread_id, limit=limit or self.RECOVER_WINDOW)
@@ -1314,7 +1335,7 @@ class NotionAdapter:
             if len(hashed)==1 and hashed[0].get('sequence',0)>=task.get('before_seq',0):
                 markers=hashed
         if not markers and (limit or self.RECOVER_WINDOW) < 100:
-            return self.recover(worker, task, cancel, limit=100)  # long turn: the marker is older than the small window
+            return self.recover(worker, task, cancel, limit=100, prefetch=prefetch)  # long turn: the marker is older than the small window
         if not markers:
             if task.get('context_reset') and not_accepted(task, transcript, fresh):
                 raise ResetNotAccepted()
@@ -1330,7 +1351,7 @@ class NotionAdapter:
                          if e.get('kind')=='assistant_message')
         if completed and text:
             with request_priority('verify'):
-                self.verify_response_model(worker,task)
+                self.verify_response_model(worker,task,**({'prefetch':prefetch} if prefetch else {}))
             if (task.get('handoff_included') or task.get('context_reset')) and worker.get('id'):
                 with self.store.lock:
                     fresh_worker = self.store.get('workers', worker['id'])
@@ -1522,13 +1543,13 @@ class NotionAdapter:
         self.store.event('stop_turn_sent', thread_id=thread_id)
         return dict(ok=True, reason='sent')
 
-    def verify_response_model(self,worker,task):
+    def verify_response_model(self,worker,task,prefetch=None):
         # Check the committed own turn, framed by verify_started / verify_done events.
         trace=dict(task_id=task['id'],worker_id=worker.get('id',''),attempt=task.get('attempts',0))
         began=time.monotonic();outcome='error'
         self.store.event('verify_started',task.get('run_id',''),**trace)
         try:
-            result=self.check_response_model(worker,task)
+            result=self.check_response_model(worker,task,**({'prefetch':prefetch} if prefetch else {}))
             outcome=(self.store.get('tasks',task['id']) or {}).get('model_verification') or 'verified'
             return result
         except PendingRemote:
@@ -1557,7 +1578,7 @@ class NotionAdapter:
             pass
         return found
 
-    def check_response_model(self,worker,task):
+    def check_response_model(self,worker,task,prefetch=None):
         client=self.client(worker['account_id'])
         def records(table,ids):
             result=client.call('syncRecordValuesSpaceInitial',{'requests':[
@@ -1565,7 +1586,7 @@ class NotionAdapter:
             return {ident:unwrap(value) for ident,value in result.get('recordMap',{}).get(table,{}).items()}
         steps=None;thread={}
         try:
-            thread=records('thread',[worker['thread_id']]).get(worker['thread_id'],{})
+            thread=(prefetch.result(timeout=30) if prefetch else None) or records('thread',[worker['thread_id']]).get(worker['thread_id'],{})
             if thread.get('space_id')!=client.info['space_id'] or thread.get('alive') is False:
                 raise ModelVerificationError(task.get('assigned_model_id'),[],'missing')
             steps,read=own_turn_steps(records,thread.get('messages',[]),task.get('step_id'))
