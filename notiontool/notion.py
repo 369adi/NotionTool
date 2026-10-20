@@ -1323,7 +1323,17 @@ class NotionAdapter:
         from .chat_context import ChatContext
         observed_worker = dict(worker, thread_id=thread_id)
         _rt1 = time.monotonic()
-        ChatContext(self.store).observe(observed_worker, transcript)
+        pool = getattr(self, '_prefetch_pool', None)
+        if prefetch is not None and pool is not None:
+            # Stream end: token bookkeeping only, so it must not delay the finish.
+            def _observe(store=self.store, w=observed_worker, t=transcript, run=task.get('run_id', '')):
+                try:
+                    ChatContext(store).observe(w, t)
+                except Exception as exc:
+                    store.event('context_observe_failed', run, message=str(exc)[:160])
+            pool.submit(_observe)
+        else:
+            ChatContext(self.store).observe(observed_worker, transcript)
         try:
             self.store.event('recover_timing', task.get('run_id', ''), task_id=task.get('id', ''), started=round(_rt_wall, 3),
                              transcript_s=round(_rt1 - _rt0, 3), observe_s=round(time.monotonic() - _rt1, 3), window=limit or self.RECOVER_WINDOW)
