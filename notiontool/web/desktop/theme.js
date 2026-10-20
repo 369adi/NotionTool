@@ -261,12 +261,12 @@
     try {
       apply();
       if (root && typeof MutationObserver === 'function') {
-        observer = new MutationObserver(schedule);
+        observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0; return function idleRun() { var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun(); }, wait + 20); return; } fn.apply(this, arguments); }; }))(schedule));
         observer.observe(root, { attributes: true, attributeFilter: ['class'] });
       }
       scan();
       if (document.body && typeof MutationObserver === 'function') {
-        bodyObserver = new MutationObserver(scheduleScan);
+        bodyObserver = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0; return function idleRun() { var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun(); }, wait + 20); return; } fn.apply(this, arguments); }; }))(scheduleScan));
         bodyObserver.observe(document.body, { childList: true, subtree: true });
       }
       if (typeof document.addEventListener === 'function') {

@@ -1076,7 +1076,7 @@
       window.addEventListener('resize', onResize);
       if (typeof MutationObserver === 'function' && document.documentElement) {
         // childList only: our own class and style changes do not trigger it.
-        observer = new MutationObserver(schedule);
+        observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0; return function idleRun() { var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun(); }, wait + 20); return; } fn.apply(this, arguments); }; }))(schedule));
         observer.observe(document.documentElement, { childList: true, subtree: true });
       }
       if (typeof ctx.onState === 'function') unsubscribe = ctx.onState(schedule);

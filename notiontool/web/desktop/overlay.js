@@ -1548,7 +1548,7 @@
     document.addEventListener('mousedown', onPress, true);
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKey, true);
-    observer = new MutationObserver(schedule);
+    observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0; return function idleRun() { var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun(); }, wait + 20); return; } fn.apply(this, arguments); }; }))(schedule));
     // aria-selected / aria-current / href: the active row follows navigation. Our own class
     // and data-nt-desk changes are not observed, so run() never re-triggers itself.
     observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true,
