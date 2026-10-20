@@ -1389,6 +1389,10 @@ class Application:
             return main_switch.start(self.store, chat_id,
                 lambda b: delegate(self.engine, b['chat_id'], b['goal'], b['tasks'], b['request_id']), request_id,
                 brief_text=body.get('brief_text'))
+        if path=='/api/main/switch/rollback':
+            # Undo a switched operator switch whose new Main broke: the old chat is the Main again.
+            from .main_handoff_ops import rollback_switch
+            return rollback_switch(self.store, self.adapter, str(body.get('id') or ''))
         if path=='/api/main/switch/advance':
             from . import main_switch
             from .main_handoff_ops import switch_ops

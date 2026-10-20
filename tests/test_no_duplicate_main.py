@@ -140,7 +140,7 @@ F = _switch_fakes()
 class SwitchRuleTests(F.Base):
     def test_old_title_format(self):
         ts = time.mktime((2026, 10, 19, 14, 5, 0, 0, 0, -1))
-        self.assertEqual(ms._archive_title(ts), 'Main (old, 2026-10-19 14:05)')
+        self.assertEqual(ms._archive_title(ts), 'Main (old, Archive 2026-10-19 14:05)')
 
     def test_need_reasons_tokens_turns_and_lag(self):
         settings = dict(main_context_ask_tokens=100, main_context_ask_turns=10, main_context_lag_ms=5000)
@@ -181,7 +181,7 @@ class SwitchRuleTests(F.Base):
         self.assertEqual(out['state'], 'switched')
         self.assertEqual(ops.renamed[0], ('thread-new', 'Main'))
         self.assertEqual(ops.renamed[1][0], 'thread-old')
-        self.assertRegex(ops.renamed[1][1], r'^Main \(old, \d{4}-\d{2}-\d{2} \d{2}:\d{2}\)$')
+        self.assertRegex(ops.renamed[1][1], r'^Main \(old, Archive \d{4}-\d{2}-\d{2} \d{2}:\d{2}\)$')
         self.assertEqual(ops.deleted, [])
 
 

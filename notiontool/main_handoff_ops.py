@@ -336,8 +336,24 @@ class MainHandoffOps:
         doc = self.store.get(PROMPTS, fingerprint)
         return bool(doc and doc.get('chat_id') == chat)
 
+    def chat_busy(self, chat, transcript=None):
+        """True while Notion still runs a turn in the chat (same idle test as notion.py)."""
+        if transcript is None:
+            transcript = self._client().transcript(chat) or {}
+        session = transcript.get('session') or {}
+        return bool(transcript.get('session_pending')) or session.get('status') not in (None, 'idle', 'completed')
+
+    def welcome_settled(self, chat):
+        """The fresh Welcome chat finished its own onboarding turn ."""
+        # Busy test only: Notion reports the running onboarding turn as a pending session.
+        return not self.chat_busy(chat)
+
     def send_prompt(self, chat, text, fingerprint):
         if self.has_prompt(chat, fingerprint):
+            return False
+        if self.operator and not self.welcome_settled(chat):
+            self._event('main_switch_wait_welcome', 'New chat still runs its welcome turn; brief not sent yet',
+                        chat=chat)
             return False
         record = handoff_files.write_handoff(self.folder(), self.file_id(), dict(
             kind='main_handoff', account_id=self.account_id, handoff={}, old_thread=self.old_chat_id,
@@ -397,8 +413,9 @@ class MainHandoffOps:
         return self.adapter.delete_thread(self._client(), chat_id)
 
     # ---- ack gate --------------------------------------------------------
-    def _reply_text(self, chat, prompt):
-        transcript = self._client().transcript(chat) or {}
+    def _reply_text(self, chat, prompt, transcript=None):
+        if transcript is None:
+            transcript = self._client().transcript(chat) or {}
         entities = [p.get('entity', {}) for p in transcript.get('patches', []) if p.get('op') == 'put']
         fresh = sorted((e for e in entities if e.get('sequence', 0) > prompt.get('before_seq', 0)),
                        key=lambda e: e.get('sequence', 0))
@@ -412,7 +429,14 @@ class MainHandoffOps:
             return False
         if prompt.get('acked'):
             return True
-        if not handoff_files.verify_ack(self._reply_text(handoff['new_chat_id'], prompt), prompt['token']):
+        transcript = self._client().transcript(handoff['new_chat_id']) or {}
+        if self.operator and self.chat_busy(handoff['new_chat_id'], transcript):
+            # The ack counts only after the new Main's turn ended: on 2026-10-20 the switch completed while
+            # the new Main was still mid-turn, and that turn never finished.
+            self._event('main_handoff_ack_wait', 'New Main is still answering; old Main stays active',
+                        handoff_id=handoff['id'])
+            return False
+        if not handoff_files.verify_ack(self._reply_text(handoff['new_chat_id'], prompt, transcript), prompt['token']):
             self._event('main_handoff_ack_missing', 'New Main did not send the ack token; old Main stays active',
                         handoff_id=handoff['id'])
             return False
@@ -548,6 +572,40 @@ def _current_main(store, account_id):
 def _created_only(chats, worker_id):
     mine = [c for c in chats if c.get('main_worker') == worker_id]
     return bool(mine) and all(str(c.get('id', '')).startswith(CREATED_CHAT_PREFIX) for c in mine)
+
+
+def rollback_switch(store, adapter, switch_id):
+    """Undo a 'switched' operator switch whose new Main is broken or gone: the old chat is the Main again."""
+    record = store.get(SWITCHES, str(switch_id or ''))
+    if not record or record.get('state') != 'switched':
+        raise ValueError('Only a switched Main switch can be rolled back')
+    account = record.get('account_id', '')
+    workers = {w.get('thread_id'): w for w in store.all('workers') if w.get('account_id') == account}
+    old, new = workers.get(record.get('operator_thread')), workers.get(record.get('new_chat_id'))
+    chat = store.get('chats', record.get('operator_chat_id', ''))
+    if not old or not chat or not chat.get('operator'):
+        raise ValueError('Old operator worker or operator chat record not found')
+    old.update(purpose=OPERATOR, enabled=False, state='ready')
+    records = [('workers', old)]
+    if new and new['id'] != old['id']:
+        new.update(purpose=ARCHIVED_OPERATOR, enabled=False)
+        records.append(('workers', new))
+    chat.update(main_worker=old['id'], predecessor_worker=chat.get('main_worker', ''), operator=True)
+    if 'thread_id' in chat:
+        chat['thread_id'] = record['operator_thread']
+    records.append(('chats', chat))
+    record.update(state='rolled_back', updated=time.time(),
+                  reason='rolled back: the old operator Main is active again')
+    records.append((SWITCHES, record))
+    store.batch(records, [])
+    renamed = False
+    try:
+        adapter.rename_thread(adapter.client(account), record['operator_thread'], 'Main')
+        renamed = True
+    except Exception as exc:
+        store.event('main_switch_rollback_rename_failed', message=str(exc)[:200], switch_id=record['id'])
+    store.event('main_switch_rolled_back', message='Old operator Main is active again', switch_id=record['id'])
+    return dict(record, ok=True, renamed=renamed)
 
 
 def switch_ops(store, adapter, record, clock=None, mains=None):

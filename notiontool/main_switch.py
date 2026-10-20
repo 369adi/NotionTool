@@ -29,6 +29,7 @@ Safety rules:
 """
 import os
 import re
+import threading
 import time
 
 from . import handoff_files
@@ -45,6 +46,9 @@ OLD_TITLE = 'Main (old, Archive %s)'
 BRIEF_MAX_CHARS = 8000
 ASK_TEXT = 'The Main chat is getting long. Ask the user whether to switch to a fresh Main chat.'
 ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
+ACK_TIMEOUT = 900  # seconds after the brief: no finished ack answer -> failed, the old operator Main stays
+_ADVANCE_GUARD = threading.Lock()
+_ADVANCE_LOCKS = {}
 RUN_DONE = ('done',)
 RUN_FAILED = ('failed', 'cancelled')
 OPS_GAP_REASON = ('Brief is ready, but the handoff ops cannot repoint an operator Main yet '
@@ -613,7 +617,23 @@ def _archive_title(ts):
 
 
 def advance(store, record, ops, now=None):
-    """Move one switch record forward as far as possible. Never raises."""
+    """Move one switch record forward as far as possible. Never raises.
+
+    One step per switch at a time: the background sweep and /api/main/switch/advance once ran the
+    same switch together (2026-10-20 20:40: the chat was created twice and a stale step counted the ack).
+    """
+    key = str((record or {}).get('id', ''))
+    with _ADVANCE_GUARD:
+        lock = _ADVANCE_LOCKS.setdefault(key, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return dict(store.get(KIND, key) or record or {}, busy=True)
+    try:
+        return _advance_once(store, record, ops, now)
+    finally:
+        lock.release()
+
+
+def _advance_once(store, record, ops, now=None):
     try:
         return _advance(store, record, ops, now)
     except Exception as exc:
@@ -684,13 +704,25 @@ def _advance(store, record, ops, now):
             kind='main_switch', account_id=record['account_id'], handoff={},
             old_thread=record.get('operator_thread', ''), new_thread=chat, resume_brief=text,
             resume_instructions=RESUME_INSTRUCTIONS), ops.now())
-        ops.send_prompt(chat, handoff_files.first_message(handoff), record['handoff_id'] + ':prompt')
-        record = _move(store, record, 'prompt_sent', stamp, new_chat_id=chat, reason='brief sent; waiting for ack')
+        fingerprint = record['handoff_id'] + ':prompt'
+        sent = ops.send_prompt(chat, handoff_files.first_message(handoff), fingerprint)
+        has_prompt = getattr(ops, 'has_prompt', None)
+        if sent is False and callable(has_prompt) and not has_prompt(chat, fingerprint):
+            # The fresh Welcome chat still runs its own onboarding turn: a brief sent into it broke the
+            # new Main on 2026-10-20 (stuck thinking). Try again on the next step.
+            return _note(store, record, stamp, new_chat_id=chat,
+                         reason='waiting until the new chat finished its welcome turn')
+        record = _move(store, record, 'prompt_sent', stamp, new_chat_id=chat, prompt_at=stamp,
+                       reason='brief sent; waiting for ack')
     if record['state'] == 'prompt_sent':
         acked = ops.confirm_ack(dict(id=record['handoff_id'], account_id=record['account_id'],
                                      old_chat_id=record.get('operator_thread', ''),
                                      new_chat_id=record['new_chat_id']))
         if not acked:
+            if stamp - float(record.get('prompt_at') or record.get('updated') or stamp) > ACK_TIMEOUT:
+                return _move(store, record, 'failed', stamp,
+                             reason='the new Main gave no finished answer with the ack token in %d minutes; '
+                                    'the old operator Main stays active' % (ACK_TIMEOUT // 60))
             return _note(store, record, stamp, reason='waiting for the ack; old operator Main stays active')
         renamed = False
         if record.get('operator_thread'):
