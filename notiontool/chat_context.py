@@ -31,13 +31,21 @@ class ChatContext:
         ident = worker['account_id'] + ':' + worker['thread_id']
         record = self.store.get('thread_context', ident, dict(id=ident, observations=0, entities={}))
         entities = record['entities']
+        # 'latest' duplicated the whole transcript (up to ~28 MB per chat) and was never read.
+        changed = record.pop('latest', None) is not None or 'estimated_tokens' not in record
         for patch in transcript.get('patches', []):
             entity = patch.get('entity') or {}
             if patch.get('op') == 'put' and entity:
                 key = entity.get('id') or str(entity.get('sequence', '')) or hashlib.sha256(
                     json.dumps(entity, sort_keys=True).encode()).hexdigest()
-                entities[key] = entity
-        record.update(observations=record['observations'] + 1, latest=transcript, updated=time.time())
+                if entities.get(key) != entity:
+                    entities[key] = entity
+                    changed = True
+        record['observations'] = record['observations'] + 1
+        if not changed:
+            # Same transcript as last time (e.g. presend after recover): skip the multi-MB rewrite.
+            return record
+        record['updated'] = time.time()
         # Deduplicate snapshots but keep every observed entity and its latest version.
         record['estimated_tokens'] = max(estimate_tokens(entities), estimate_tokens(transcript))
         self.store.put('thread_context', record)
