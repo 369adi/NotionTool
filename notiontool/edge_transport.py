@@ -188,6 +188,7 @@ class EdgeTransport:
         # Phase 3: every started request reports its outcome to the shared coordinator.
         begun, status, latency, outcome = time.monotonic(), 0, None, 'neutral'
         progress_at, last_seen = begun, None
+        idle = 0
         try:
             while time.monotonic() < deadline:
                 if cancel is not None and cancel.is_set():
@@ -227,7 +228,10 @@ class EdgeTransport:
                     outcome = 'ok'
                     self._save_cookies(target)
                     return
-                time.sleep(.1)
+                # Adaptive polling: fast while bytes flow, slower while the model thinks. Every poll is a
+                # DevTools round trip on the shared robots.txt tab, so idle streams must not crowd it out.
+                idle = 0 if (result.get('text') or result.get('remaining')) else idle + 1
+                time.sleep(.1 if idle < 3 else min(.5, .1 * 1.5 ** (idle - 2)))
             outcome = 'failed'
             raise NotionStreamError('Edge request timed out; reconcile before reuse')
         finally:

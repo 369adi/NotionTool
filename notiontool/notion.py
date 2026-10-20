@@ -1072,9 +1072,13 @@ class NotionAdapter:
         account = self.store.get('accounts',worker['account_id'])
         if not account.get('model'):
             raise ValueError('Opus 5.5 is unavailable; refresh the account')
+        _t0 = time.monotonic()
+        _phase = {}
         client = self.client(account['id'])
+        _phase['client'] = time.monotonic() - _t0
         # Fetch head before sending so recovery cannot mistake old responses for this attempt.
         transcript = client.transcript(worker['thread_id'])
+        _phase['transcript'] = time.monotonic() - _t0
         session = transcript.get('session') or {}
         if session.get('status') not in (None,'idle','completed') or transcript.get('session_pending'):
             # Nothing was submitted. An externally busy thread (e.g. the operator's own turn in this chat) is not a
@@ -1084,10 +1088,12 @@ class NotionAdapter:
         if self.thread_busy(client, worker['thread_id']):
             raise RateLimited(5, 'Notion is still finishing the previous turn in this chat; nothing was sent yet',
                               free=True, scope='thread')
+        _phase['busy'] = time.monotonic() - _t0
         from .chat_context import ChatContext
         original_thread, original_generation = worker['thread_id'], worker.get('generation', 0)
         if worker.get('id'):
             worker = ChatContext(self.store).rotate(self, client, worker, task, transcript, cancel)
+        _phase['rotate'] = time.monotonic() - _t0
         # A new generation may have run a checkpoint turn. Read the current head before sending.
         if worker['thread_id'] != original_thread or worker.get('generation', 0) != original_generation:
             transcript = client.transcript(worker['thread_id'])
@@ -1152,6 +1158,7 @@ class NotionAdapter:
             self.ensure_thread_model(client, worker['thread_id'],
                                      BASE_CONFIG_MODEL)
             self.__dict__.setdefault('confirmed_configs', {})[worker['thread_id']] = config_key
+        _phase['config'] = time.monotonic() - _t0
         with self.store.lock:
             saved = self.store.get('tasks',task['id'])
             saved['before_seq'] = session.get('sequence',0)
@@ -1186,6 +1193,8 @@ class NotionAdapter:
         started,last_update = time.monotonic(),0
         trace = dict(task_id=task['id'], worker_id=worker.get('id', ''), attempt=task.get('attempts', 0))
         run_id = task.get('run_id', '')
+        _phase['body'] = time.monotonic() - _t0
+        self.store.event('presend_timing', run_id, commit=False, **trace, **{k: round(v, 2) for k, v in _phase.items()})
         self.store.event('remote_sent', run_id, prompt_chars=len(prompt), **trace)
         seen_output, lines, reported = False, 0, []
         def remote_done(outcome, error_class='', detail=''):

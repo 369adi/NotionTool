@@ -5,6 +5,7 @@ system agent. Machine contracts are normalized outside the model.
 """
 from html import unescape
 from html.parser import HTMLParser
+import json
 import re
 
 from .protocol import ContractError,validate_plan
@@ -96,6 +97,20 @@ def table_plan(text):
     return plan
 
 
+def _reported_object(text):
+    """The coworker's own JSON report ({status, summary}) inside the answer, or None."""
+    decoder=json.JSONDecoder()
+    for match in re.finditer(r'\{', str(text or '')):
+        try:
+            value,_=decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if (isinstance(value,dict) and isinstance(value.get('summary'),str)
+                and str(value.get('status')).lower() in ('done','partial','blocked','failed')):
+            return value
+    return None
+
+
 def normalize(task,text):
     if provider_error(text):raise ProviderReplyError('Notion returned a provider error instead of an answer')
     failure_line=inference_error(text)
@@ -120,6 +135,17 @@ def normalize(task,text):
         passed=match.group(1).lower() in ('approved','pass','all checks passed')
         return dict(passed=passed,summary=readable,fixes=[] if passed else table_plan(text)['tasks'])
     if task['role']=='executor':
+        inner=_reported_object(text)
+        if inner:
+            # The coworker answered with its own (often fenced) JSON report: keep its status and summary
+            # instead of nesting the whole block inside a summary string. 'partial' is a finished turn
+            # with incomplete coverage: done, but marked for the Main's review.
+            state=str(inner.get('status')).lower()
+            summary=inner['summary'].strip() or readable
+            extra={k:inner[k] for k in ('files','tests','evidence','artifacts','result_file') if k in inner}
+            return dict(extra,status='done' if state=='partial' else state,summary=summary,
+                        evidence=inner.get('evidence') or [],artifacts=inner.get('artifacts') or [],
+                        context=readable[:6000],requires_review=candidate or state=='partial',partial=state=='partial')
         match=re.search(r'(?im)^\s*(?:#+\s*)?(DONE|BLOCKED|FAILED)\b',readable)
         if not readable:raise ContractError('Empty execution response')
         # A contribution is reported here, not globally verified. The separate
