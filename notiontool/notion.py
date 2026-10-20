@@ -1068,6 +1068,14 @@ class NotionAdapter:
         return {'account_id':account_id,'welcome_chats':len(managed)+1,'workers':joined,'pending_workers':len(managed)-joined,
                 'main_chats':1,'verified':status['complete'],'chat_verified':True,'setup':status,'team_size':len(roles)}
 
+    def _config_saved(self, thread_id, config_key):
+        # A config check confirmed before a restart stays valid: only our own confirmed write changes it.
+        saved = (self.store.get('thread_configs', thread_id) if hasattr(self.store, 'get') else None) or {}
+        if list(saved.get('key') or []) == list(config_key):
+            self.__dict__.setdefault('confirmed_configs', {})[thread_id] = config_key
+            return True
+        return False
+
     def run(self, worker, task, prompt, cancel, update):
         account = self.store.get('accounts',worker['account_id'])
         if not account.get('model'):
@@ -1152,12 +1160,14 @@ class NotionAdapter:
                                                        task)
         # The saved chat config changes only through our own confirmed write: check once per chat generation.
         config_key = (worker['thread_id'], worker.get('generation', 0), model)
-        if getattr(self, 'confirmed_configs', {}).get(worker['thread_id']) != config_key:
+        if getattr(self, 'confirmed_configs', {}).get(worker['thread_id']) != config_key and not self._config_saved(worker['thread_id'], config_key):
             # Saved config keeps the thread default model (same as body() config.model); the requested
             # model/effort travel only in the 'updated-config' step (live proof 2026-10-20).
             self.ensure_thread_model(client, worker['thread_id'],
                                      BASE_CONFIG_MODEL)
             self.__dict__.setdefault('confirmed_configs', {})[worker['thread_id']] = config_key
+            if hasattr(self.store, 'put'):
+                self.store.put('thread_configs', dict(id=worker['thread_id'], key=list(config_key), at=time.time()))
         _phase['config'] = time.monotonic() - _t0
         with self.store.lock:
             saved = self.store.get('tasks',task['id'])
@@ -1427,6 +1437,8 @@ class NotionAdapter:
         # The resume message can change the chat's saved model (modelFromUser): make the next send in this
         # chat check and set its model again instead of trusting the in-memory config entry.
         getattr(self, 'confirmed_configs', {}).pop(worker['thread_id'], None)
+        if hasattr(self.store, 'delete'):
+            self.store.delete('thread_configs', worker['thread_id'])
         effort = (task or {}).get('effort')
         if not effort and task:
             effort = choose_effort(client, model, worker.get('purpose', ''), task.get('task_class', ''),
