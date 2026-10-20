@@ -103,9 +103,9 @@ class StepCapExpandTest(unittest.TestCase):
             raise AssertionError(out.stderr)
         cls.r = json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_active_v9(self):
+    def test_active_v10(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 9)
+        self.assertEqual(self.r['version'], 10)
 
     def test_default_last_five_messages(self):
         r = self.r

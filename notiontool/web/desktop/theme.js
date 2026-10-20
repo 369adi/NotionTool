@@ -159,7 +159,8 @@
       var inRun = {};
       var open = openSet(parent, false) || {};
       runs.forEach(function (run) {
-        var start = run[0], len = run[1];
+        var start = run[0], len = run[1] - 1;  // the last row of the run stays visible (not folded)
+        if (len < TOOL_MIN_GROUP - 1) return;
         var isOpen = !!open[start];
         for (var k = start; k < start + len; k++) {
           inRun[k] = true;

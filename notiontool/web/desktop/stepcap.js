@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 9;
+  var VERSION = 10;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -26,6 +26,7 @@
   var GESTURE_MS = 900;    // a scroll counts as the user's only this long after a wheel/key/scrollbar gesture
   var COOLDOWN_MS = 1200;  // min time between two loads
   var ANCHOR_MS = 1500;    // how long the scroll position is held after a load
+  var HOLD_MAX_MS = 4000;  // v10: Notion needs up to ~2 s to show the older messages (measured live)
 
   var live = window.__ntTSLive = window.__ntTSLive || {};
   var expanded = {};       // threadId -> scroller element
@@ -180,19 +181,42 @@
     setTimeout(function () { try { c.remove(); } catch (e) { /* gone */ } }, 140);
   }
 
+  // v10: anchor on the message the user is looking at (not on the height: Notion re-mounts the list and the
+  // older messages arrive only after ~2 s, measured). The cover stays until they are really there.
+  function stepAttr(n) { return n ? n.getAttribute('data-agent-chat-user-step-id') || '' : ''; }
+  function firstVisibleStep(el) {
+    var top = el.getBoundingClientRect().top;
+    var nodes = el.querySelectorAll('[data-agent-chat-user-step-id]');
+    for (var i = 0; i < nodes.length; i++) {
+      var r = nodes[i].getBoundingClientRect();
+      if (r.bottom > top) return { id: stepAttr(nodes[i]), off: r.top - top };
+    }
+    return null;
+  }
   function hold(el, prevH, prevTop, shield) {
     var t0 = Date.now();
     var raf = window.requestAnimationFrame || function (f) { return setTimeout(f, 16); };
-    var lastH = -1, still = 0, grown = false;
+    var anchor = null, first0 = '';
+    try { anchor = firstVisibleStep(el); first0 = stepAttr(el.querySelector('[data-agent-chat-user-step-id]')); } catch (e) { anchor = null; }
+    var lastH = -1, still = 0, arrived = false, doneAt = 0;
     function tick() {
+      var now = Date.now();
       var h = el.scrollHeight;
-      if (h !== prevH) el.scrollTop = prevTop + (h - prevH);
-      if (h > prevH) grown = true;
+      var n = null;
+      try { n = anchor && anchor.id ? el.querySelector('[data-agent-chat-user-step-id="' + anchor.id + '"]') : null; } catch (e) { n = null; }
+      if (n) {
+        var d = n.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.off;
+        if (Math.abs(d) > 1) el.scrollTop += d;
+      } else if (!anchor && h !== prevH) el.scrollTop = prevTop + (h - prevH);
+      if (!arrived) {
+        try { arrived = !!n && stepAttr(el.querySelector('[data-agent-chat-user-step-id]')) !== first0; } catch (e) { arrived = false; }
+      }
       still = h === lastH ? still + 1 : 0;
       lastH = h;
-      // The new list is in place once it is taller than before and stopped changing for a few frames.
-      if (shield && ((grown && still >= 4) || Date.now() - t0 > ANCHOR_MS)) { uncover(shield); shield = null; }
-      if (Date.now() - t0 < ANCHOR_MS && el.isConnected !== false) raf(tick);
+      if (arrived && still >= 4 && !doneAt) doneAt = now;
+      if (shield && (doneAt || now - t0 > HOLD_MAX_MS)) { uncover(shield); shield = null; }
+      var end = doneAt ? now - doneAt > 400 : now - t0 > HOLD_MAX_MS;
+      if (!end && el.isConnected !== false) raf(tick);
       else if (shield) { uncover(shield); shield = null; }
     }
     raf(tick);
@@ -263,7 +287,7 @@
       lastLoad = 0;
       var r = expand(btnEl, now);
       btn.textContent = 'Loading\u2026';
-      setTimeout(function () { btn.textContent = 'Load older messages'; updateButton(btnEl); }, ANCHOR_MS + 100);
+      setTimeout(function () { btn.textContent = 'Load older messages'; updateButton(btnEl); }, HOLD_MAX_MS);
       window.__ntExpClick = { result: r, at: now, via: e.type };
     }
     window.addEventListener('pointerdown', press, true);
@@ -294,7 +318,7 @@
     var userDown = now - gesture.down < GESTURE_MS || now - gesture.drag < GESTURE_MS;
     // v8: while older messages are loading Notion briefly re-mounts the list (height drops ~900 px, measured), the
     // scroller clamps to its bottom and the button press counted as a gesture -> this reset sent you to the bottom.
-    var loading = now - lastLoad < ANCHOR_MS + 1500;
+    var loading = now - lastLoad < HOLD_MAX_MS + 1000;
     if (userDown && !loading && el.scrollHeight - el.clientHeight - el.scrollTop < BOTTOM_PX) {
       for (var id in expanded) if (expanded[id] === el) reset(id);
     }
@@ -309,8 +333,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound9) return;
-    window.__ntStepExpBound9 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound10) return;
+    window.__ntStepExpBound10 = true;
     window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');

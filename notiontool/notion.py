@@ -179,7 +179,7 @@ def choose_task_effort(client, model_id, purpose='', task=None):
     return choose_effort(client, model_id, purpose, task.get('task_class', ''), task.get('risk', ''))
 
 
-MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main')
+MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main', 'external')  # external = the user's own chats (Test chat)
 MODEL_NAMES = {'albuquerque-quinn': 'opus', 'achira-donut': 'sonnet', 'amla-jam': 'haiku'}
 
 

@@ -736,6 +736,34 @@
         styleAge(row, main ? null : (ages[key] || null));
         styleGear(row, main);
       }
+      try { stableOrder(root); } catch (err) { /* never throw */ }
+    }
+
+    // Fixed chat order (user request 2026-10-20): Notion re-sorts the sidebar chats by last activity, so they
+    // jumped whenever another chat got a new step. The first-seen order is pinned with CSS order (no Notion
+    // node is moved). A chat seen for the first time at the top (new chat) goes to the top, others below.
+    var orderOf = {}, nextTop = 0, nextLow = 100000;
+    function stableOrder(root) {
+      var rows = root.querySelectorAll('[data-nt-desk="chat-row"]');
+      var parents = [];
+      for (var i = 0; i < rows.length; i++) {
+        var p = rows[i].parentElement;
+        if (p && parents.indexOf(p) < 0) parents.push(p);
+      }
+      var first = !Object.keys(orderOf).length;
+      parents.forEach(function (parent) {
+        var kids = parent.children;
+        for (var k = 0; k < kids.length; k++) {
+          var kid = kids[k];
+          var key = kid.getAttribute('data-nt-desk') === 'chat-row' ? kid.getAttribute('data-nt-desk-thread') : '';
+          var want = k * 10;  // headers and 'more' keep their place
+          if (key) {
+            if (!(key in orderOf)) orderOf[key] = first ? k * 10 + 5 : (k === 0 ? (nextTop -= 1) : (nextLow += 10));
+            want = orderOf[key];
+          }
+          if (kid.style && kid.style.order !== String(want)) kid.style.order = String(want);
+        }
+      });
     }
 
     // ---- Sidebar v2: Main cards, Coworkers, offline chip -------------------------------------
