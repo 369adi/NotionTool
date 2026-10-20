@@ -252,12 +252,12 @@
 /* Tail mode (overlay.js): older messages leave style/layout until the user scrolls to the top. */
 /* The few visible tail rows are near the viewport anyway; content-visibility placeholders
    (300px) resolving to real heights made the chat wobble up and down after a switch. */
-[data-nt-cv][data-nt-tail] > div { content-visibility: visible; contain-intrinsic-size: none; }
-[data-nt-cv][data-nt-tail="1"] > div:nth-last-child(n+9),
-[data-nt-cv][data-nt-tail="8"] > div:nth-last-child(n+9),
-[data-nt-cv][data-nt-tail="20"] > div:nth-last-child(n+21),
-[data-nt-cv][data-nt-tail="40"] > div:nth-last-child(n+41),
-[data-nt-cv][data-nt-tail="80"] > div:nth-last-child(n+81) { display: none !important; }
+[data-nt-cv][data-nt-tl2] > div { content-visibility: visible; contain-intrinsic-size: none; }
+[data-nt-cv][data-nt-tl2="1"] > div:nth-last-child(n+9),
+[data-nt-cv][data-nt-tl2="8"] > div:nth-last-child(n+9),
+[data-nt-cv][data-nt-tl2="20"] > div:nth-last-child(n+21),
+[data-nt-cv][data-nt-tl2="40"] > div:nth-last-child(n+41),
+[data-nt-cv][data-nt-tl2="80"] > div:nth-last-child(n+81) { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .nt-desk-dialog { animation: nt-desk-fade 160ms ease-out; }
   .nt-desk-icon-btn, .nt-desk-gear, .nt-desk-chat, .nt-desk-btn, .nt-desk-input, .nt-desk-menu-item { transition: none; }

@@ -1512,10 +1512,10 @@
       if (tailKey !== key || tailList !== marked) {
         tailKey = key;
         tailList = marked;
-        if (marked.children.length > TAIL_ROWS) marked.setAttribute('data-nt-tail', '1');
+        if (marked.children.length > TAIL_ROWS) marked.setAttribute('data-nt-tl2', '1');
       }
-      var tv = marked.getAttribute('data-nt-tail');
-      if (tv && ['8', '20', '40', '80'].indexOf(tv) < 0) marked.setAttribute('data-nt-tail', '8');  // stale value from an older build
+      var tv = marked.getAttribute('data-nt-tl2');
+      if (tv && ['8', '20', '40', '80'].indexOf(tv) < 0) marked.setAttribute('data-nt-tl2', '8');  // stale value from an older build
       bindTail(scroller);
     }
 
@@ -1523,28 +1523,37 @@
     var tailKey = null;
     var tailList = null;
 
+    var lastSwitchDone = 0;
     function expandTail(scroller) {
-      var list = scroller.querySelector('[data-nt-tail]');
+      var list = scroller.querySelector('[data-nt-tl2]');
       if (!list) return;
       var before = scroller.scrollHeight;
       var top = scroller.scrollTop;
       // Reveal in steps (8 -> 20 -> 40 -> 80 -> all): showing ~90 rows at once froze the page for
       // up to 9 s (measured), each step only lays out the next batch.
-      var cur = parseInt(list.getAttribute('data-nt-tail'), 10) || 8;
+      var cur = parseInt(list.getAttribute('data-nt-tl2'), 10) || 8;
       var next = cur < 20 ? 20 : cur < 40 ? 40 : cur < 80 ? 80 : 0;
-      if (next && list.children.length > next) list.setAttribute('data-nt-tail', String(next));
-      else list.removeAttribute('data-nt-tail');
+      if (next && list.children.length > next) list.setAttribute('data-nt-tl2', String(next));
+      else list.removeAttribute('data-nt-tl2');
       scroller.scrollTop = top + (scroller.scrollHeight - before);  // keep the visible message in place
     }
 
     function bindTail(scroller) {
-      if (scroller.__ntTailBound) return;
-      scroller.__ntTailBound = true;
+      if (scroller.__ntTailBound2) return;
+      scroller.__ntTailBound2 = true;
+      // Expand only on a real upward user gesture (wheel up / scrollbar drag), never while or right
+      // after the switch scroll-to-bottom runs: programmatic scrolls during mount revealed rows and
+      // jumped the view up, then the scroll-to-bottom pulled it down again (wobble).
+      function userUp() {
+        return Date.now() < (scroller.__ntUserUp || 0) && !pendingScroll && Date.now() - lastSwitchDone > 1200;
+      }
+      scroller.addEventListener('mousedown', function () { scroller.__ntUserUp = Date.now() + 4000; }, { passive: true });
       scroller.addEventListener('scroll', function () {
-        if (scroller.scrollTop < 250) expandTail(scroller);
+        if (scroller.scrollTop < 250 && userUp()) expandTail(scroller);
       }, { passive: true });
       scroller.addEventListener('wheel', function (ev) {
-        if (ev.deltaY < 0 && scroller.scrollTop < 250) expandTail(scroller);
+        if (ev.deltaY < 0) scroller.__ntUserUp = Date.now() + 900;
+        if (ev.deltaY < 0 && scroller.scrollTop < 250 && userUp()) expandTail(scroller);
       }, { passive: true });
     }
 
@@ -1572,6 +1581,7 @@
       if (key !== lastChatKey) {
         lastChatKey = key;
         pendingScroll = key ? { key: key, until: Date.now() + SCROLL_WAIT_MS, height: -1, stable: 0 } : null;
+        lastSwitchDone = Date.now();
       }
       if (!pendingScroll) return;
       if (pendingScroll.key !== key || Date.now() > pendingScroll.until) { pendingScroll = null; return; }
@@ -1583,7 +1593,7 @@
         el.scrollTop = el.scrollHeight;
         if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
         else { pendingScroll.height = el.scrollHeight; pendingScroll.stable = 0; }
-        if (pendingScroll.stable >= 3) { pendingScroll = null; return; }
+        if (pendingScroll.stable >= 3) { pendingScroll = null; lastSwitchDone = Date.now(); return; }
       }
       if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { pendingScroll = null; } }, 250);
     }
