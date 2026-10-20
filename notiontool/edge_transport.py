@@ -3,6 +3,7 @@
 Streams are drained incrementally. An interrupted POST is never retried here.
 """
 import json
+import queue
 import re
 import threading
 import time
@@ -26,6 +27,65 @@ class EdgeTransport:
         self.woken_at = 0.0
         self.wake_logged_at = 0.0
         self.stall_wake_after = 8.0
+        # Shared stream poller: one DevTools call per tick for all active streams instead of one per stream.
+        self._watch_cv = threading.Condition()
+        self._watched = {}
+        self._poller = None
+
+    def _watch(self, target, key):
+        inbox = queue.Queue()
+        with self._watch_cv:
+            self._watched[key] = (target, inbox)
+            if self._poller is None or not self._poller.is_alive():
+                self._poller = threading.Thread(target=self._poll_loop, name='edge-poller', daemon=True)
+                self._poller.start()
+            self._watch_cv.notify_all()
+        return inbox
+
+    def _unwatch(self, key):
+        with self._watch_cv:
+            self._watched.pop(key, None)
+
+    def _poll_loop(self):
+        idle = 0
+        while True:
+            with self._watch_cv:
+                if not self._watched:
+                    self._watch_cv.wait(5)
+                    if not self._watched:
+                        self._poller = None
+                        return
+                groups = {}
+                for key, (target, inbox) in self._watched.items():
+                    tid = target.get('id') if isinstance(target, dict) else target
+                    groups.setdefault(tid or id(target), (target, []))[1].append((key, inbox))
+            flowing = False
+            for target, items in groups.values():
+                keys = [key for key, _ in items]
+                try:
+                    results = self.browser.evaluate(target, '''(keys => {
+                      const all = window.__notiontoolRequests || {}, out = {};
+                      for (const key of keys) {
+                        const q = all[key];
+                        out[key] = q ? {status:q.status, retry:q.retry, done:q.done, error:q.error,
+                          text:q.chunks.splice(0, 128).join(''), remaining:q.chunks.length} : null;
+                      }
+                      return out;
+                    })(''' + json.dumps(keys) + ')') or {}
+                    if len(keys) == 1 and keys[0] not in results and ('done' in results or 'status' in results):
+                        results = {keys[0]: results}
+                except Exception:
+                    for _, inbox in items:
+                        inbox.put({'_poll_error': True})
+                    continue
+                for key, inbox in items:
+                    result = results.get(key)
+                    if result and (result.get('text') or result.get('remaining')):
+                        flowing = True
+                    inbox.put(result)
+            # Fast while bytes flow, slower while the models think; the tab stays free for new sends.
+            idle = 0 if flowing else idle + 1
+            time.sleep(.1 if idle < 3 else min(.4, .1 * 1.5 ** (idle - 2)))
 
     @property
     def retry_after(self):
@@ -188,17 +248,22 @@ class EdgeTransport:
         # Phase 3: every started request reports its outcome to the shared coordinator.
         begun, status, latency, outcome = time.monotonic(), 0, None, 'neutral'
         progress_at, last_seen = begun, None
-        idle = 0
+        inbox = self._watch(target, key)
         try:
             while time.monotonic() < deadline:
                 if cancel is not None and cancel.is_set():
                     raise NotionStreamError('Edge request interrupted; reconcile before reuse')
-                result = self.browser.evaluate(target, '''(key => {
-                  const q = window.__notiontoolRequests?.[key];
-                  if (!q) return null;
-                  return {status:q.status, retry:q.retry, done:q.done, error:q.error,
-                          text:q.chunks.splice(0, 128).join(''), remaining:q.chunks.length};
-                })(''' + json.dumps(key) + ')')
+                # One shared poller reads every active stream of this tab in a single DevTools call.
+                try:
+                    result = inbox.get(timeout=1.0)
+                except queue.Empty:
+                    if time.monotonic() - progress_at > self.stall_wake_after:
+                        self.wake(target, force=True, reason='stalled ' + path)
+                        progress_at = time.monotonic()
+                    continue
+                if isinstance(result, dict) and result.get('_poll_error'):
+                    outcome = 'failed'
+                    raise NotionStreamError('Edge request polling failed; reconcile before reuse')
                 if not result:
                     outcome = 'failed'
                     raise NotionStreamError('Edge request state lost; reconcile before reuse')
@@ -228,13 +293,10 @@ class EdgeTransport:
                     outcome = 'ok'
                     self._save_cookies(target)
                     return
-                # Adaptive polling: fast while bytes flow, slower while the model thinks. Every poll is a
-                # DevTools round trip on the shared robots.txt tab, so idle streams must not crowd it out.
-                idle = 0 if (result.get('text') or result.get('remaining')) else idle + 1
-                time.sleep(.1 if idle < 3 else min(.5, .1 * 1.5 ** (idle - 2)))
             outcome = 'failed'
             raise NotionStreamError('Edge request timed out; reconcile before reuse')
         finally:
+            self._unwatch(key)
             release = getattr(self.budget, 'release', None)
             if release is not None:
                 release(ticket, outcome, status=status, latency=latency, account_id=self.account_id)
