@@ -1463,7 +1463,8 @@
     var cachedScroller = null;
 
     function chatScroller() {
-      if (cachedScroller && cachedScroller.isConnected && cachedScroller.scrollHeight - cachedScroller.clientHeight >= 80) return cachedScroller;
+      if (cachedScroller && cachedScroller.isConnected && cachedScroller.getClientRects().length &&
+          cachedScroller.scrollHeight - cachedScroller.clientHeight >= 80) return cachedScroller;
       cachedScroller = findScroller();
       return cachedScroller;
     }
@@ -1523,7 +1524,10 @@
       }
       if (!pendingScroll) return;
       if (pendingScroll.key !== key || Date.now() > pendingScroll.until) { pendingScroll = null; return; }
-      var el = chatScroller();
+      // Always search fresh after a chat switch: a cached scroller can belong to the previous chat
+      // (still in the DOM, hidden) and the new chat then stayed at the top (regression 17d4482).
+      var el = findScroller();
+      cachedScroller = el;
       if (el) {
         el.scrollTop = el.scrollHeight;
         if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
