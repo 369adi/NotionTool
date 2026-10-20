@@ -1460,7 +1460,43 @@
     var pendingScroll = null;
     var scrollTimer = 0;
 
+    var cachedScroller = null;
+
     function chatScroller() {
+      if (cachedScroller && cachedScroller.isConnected && cachedScroller.scrollHeight - cachedScroller.clientHeight >= 80) return cachedScroller;
+      cachedScroller = findScroller();
+      return cachedScroller;
+    }
+
+    // ---- render only the visible chat messages ----------------------------------------------
+    // Notion keeps every message of a chat in the DOM (live: 76 rows, 6400+ nodes, 38k px) and
+    // paints all of them on every scroll frame. Marking the row list lets our CSS give each row
+    // content-visibility:auto: off-screen messages are skipped by the browser (layout + paint)
+    // and rendered again the moment they scroll into view. Attribute only; Notion's DOM is untouched.
+    function messageList(scroller) {
+      var c = scroller;
+      for (var d = 0; d < 14 && c; d++) {
+        var total = c.getElementsByTagName('*').length, big = null, most = -1;
+        for (var k = 0; k < c.children.length; k++) {
+          var n = c.children[k].getElementsByTagName('*').length;
+          if (n > most) { most = n; big = c.children[k]; }
+        }
+        if (c.children.length >= 6 && most < total * 0.5) return c;
+        c = big;
+      }
+      return null;
+    }
+
+    function applyRenderSkip() {
+      var scroller = chatScroller();
+      if (!scroller) return;
+      var marked = scroller.querySelector('[data-nt-cv]');
+      if (marked) return;
+      var listNode = messageList(scroller);
+      if (listNode && listNode.children.length >= 6) listNode.setAttribute('data-nt-cv', '1');
+    }
+
+    function findScroller() {
       var sidebar = sidebarRoot();
       var best = null;
       var all = document.querySelectorAll('main *, [role="main"] *, .notion-frame *, div');
@@ -1538,6 +1574,7 @@
       } catch (e) { /* branding is cosmetic; never break the filter or the New chat routing */ }
       try { applyPendingOpen(); } catch (e) { pendingOpen = null; }
       try { applyChatScroll(); } catch (e) { pendingScroll = null; }
+      try { applyRenderSkip(); } catch (e) { /* performance only */ }
     }
 
     function schedule() {
