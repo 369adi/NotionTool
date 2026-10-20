@@ -1450,6 +1450,56 @@
       createWelcome(node);
     }
 
+    // ---- jump to the newest message after switching chats ------------------------------------
+    // Notion opens a chat at the top of its history. After the chat in the URL changes, scroll the
+    // chat's message list to the bottom (view scroll only: no clicks, no navigation, no history).
+    // Retries while the messages load; stops at once when the user scrolls or presses a key.
+    var SCROLL_WAIT_MS = 5000;
+    var lastChatKey = '';
+    var pendingScroll = null;
+    var scrollTimer = 0;
+
+    function chatScroller() {
+      var sidebar = sidebarRoot();
+      var best = null;
+      var all = document.querySelectorAll('main *, [role="main"] *, .notion-frame *, div');
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (el.scrollHeight - el.clientHeight < 80 || el.clientHeight < 200) continue;
+        if (sidebar && (sidebar === el || sidebar.contains(el))) continue;
+        if (el.closest && el.closest('[data-nt-desk]')) continue;
+        var oy = '';
+        try { oy = window.getComputedStyle(el).overflowY; } catch (e) { continue; }
+        if (oy !== 'auto' && oy !== 'scroll') continue;
+        if (!best || el.clientWidth * el.clientHeight > best.clientWidth * best.clientHeight) best = el;
+      }
+      return best;
+    }
+
+    function cancelScroll() { pendingScroll = null; }
+
+    function applyChatScroll() {
+      var key = threadFromHref(location.href);
+      if (key !== lastChatKey) {
+        lastChatKey = key;
+        pendingScroll = key ? { key: key, until: Date.now() + SCROLL_WAIT_MS, height: -1, stable: 0 } : null;
+      }
+      if (!pendingScroll) return;
+      if (pendingScroll.key !== key || Date.now() > pendingScroll.until) { pendingScroll = null; return; }
+      var el = chatScroller();
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+        if (el.scrollHeight === pendingScroll.height) pendingScroll.stable += 1;
+        else { pendingScroll.height = el.scrollHeight; pendingScroll.stable = 0; }
+        if (pendingScroll.stable >= 3) { pendingScroll = null; return; }
+      }
+      if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { pendingScroll = null; } }, 250);
+    }
+
+    window.addEventListener('wheel', cancelScroll, { capture: true, passive: true });
+    window.addEventListener('touchmove', cancelScroll, { capture: true, passive: true });
+    document.addEventListener('keydown', cancelScroll, true);
+
     // ---- scheduling ----------------------------------------------------------------------
     function run() {
       timer = 0;
@@ -1486,6 +1536,7 @@
         collapseEmpty(root);
       } catch (e) { /* branding is cosmetic; never break the filter or the New chat routing */ }
       try { applyPendingOpen(); } catch (e) { pendingOpen = null; }
+      try { applyChatScroll(); } catch (e) { pendingScroll = null; }
     }
 
     function schedule() {
