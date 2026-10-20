@@ -58,7 +58,8 @@ def _with_result_line(prompt):
 
 
 KNOWN_TASK_KEYS = frozenset(('id', 'title', 'prompt', 'acceptance', 'depends_on', 'deps', 'after', 'files', 'model',
-                             'role', 'task_class', 'summary', 'quality', 'use_main', 'effort', 'risk'))
+                             'role', 'task_class', 'summary', 'quality', 'use_main', 'effort', 'risk',
+                             'route', 'team'))
 # Notion reasoning effort names a task may set (Rule I38); notion.choose_task_effort clamps them per model.
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
 
@@ -207,25 +208,45 @@ def _summary(engine, run, duplicate=False, warnings=None):
              for t in own]
     return dict(ok=True, run_id=run['id'], state=run.get('state', ''), chat_id=run['chat_id'], tasks=tasks,
                 quality=run.get('quality', 'fast'), stage=run.get('stage') or run_stage(own),
-                duplicate=duplicate, warnings=list(warnings or []))
+                duplicate=duplicate, warnings=list(warnings or []),
+                # team_route: the DIRECT/TEAM decision and the split hint, stored on the run (None for older runs).
+                route=run.get('route'), capacity=run.get('capacity_hint'))
 
 
-def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality=''):
+def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality='', route=''):
     """Queue the operator's own plan as executor tasks for the Coworkers; no Main turn is ever sent.
 
     tasks use the planner contract: id, title, prompt, acceptance, optional depends_on, files,
     model, role (specialty) and task_class, plus an optional plain-language 'summary' sentence per task
     and for the whole request (shown in the Live view). use_main is always forced off.
     quality ('fast' | 'standard' | 'high', also accepted as a task field) is chosen automatically when empty.
+    route ('auto' | 'direct' | 'team', also accepted as a task field) overrides the automatic DIRECT/TEAM
+    decision of team_route.decide. With the default setting team_route_mode='log_only' the decision is only
+    saved on the run (run['route']) and returned; 'enforce' or route='team' expands the plan into a team graph.
     """
     store = engine.store
     goal = str(goal or '').strip()
     if not isinstance(tasks, list) or not tasks or not all(isinstance(t, dict) for t in tasks):
         raise ValueError('tasks must be a non-empty list of task objects')
     from .operator_roles import choose_quality, design_prompt, is_ui
+    from .team_route import (apply_route, apply_team_keys, capacity_hint, capacity_settings, decide,
+                             match_created, normal_route, setting_mode, stage_role_of)
     quality = quality or next((t['quality'] for t in tasks if t.get('quality')), '')
-    tasks = [{k: v for k, v in t.items() if k != 'quality'} for t in tasks]
+    route = normal_route(route or next((t['route'] for t in tasks if t.get('route')), ''))
+    tasks = [{k: v for k, v in t.items() if k not in ('quality', 'route')} for t in tasks]
+    for item in tasks:
+        # 'deps' / 'after' are common names for depends_on; silently dropping them ran dependent tasks in parallel.
+        # Converted before the route decision so decide, team_graph.expand and validate_plan see the real deps.
+        for alias in ('deps', 'after'):
+            if alias in item and not item.get('depends_on'):
+                item['depends_on'] = list(item.pop(alias) or [])
     quality, quality_reason = choose_quality(goal, tasks, quality)
+    settings = store.settings()
+    user_tasks = tasks
+    decision = None
+    if setting_mode(settings) != 'off' or route != 'auto':
+        decision = decide(goal, tasks, quality, settings, route=route, explicit=quality_reason == 'requested')
+        tasks, quality, quality_reason = apply_route(decision, tasks, quality, quality_reason)
     plan = {'tasks': [dict(t, use_main=False, **({'prompt': _with_result_line(t['prompt'])} if 'prompt' in t else {}))
                       for t in tasks]}
     validate_plan(plan, max_tasks=MAX_DELEGATED_TASKS)
@@ -262,25 +283,35 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
                    allocation=dict(mode='operator', budget=capacity, advisers=0,
                                    reason='Operator Main delegates directly to Coworkers'),
                    quality=quality, quality_reason=quality_reason)
-        for item in plan['tasks']:
-            # 'deps' / 'after' are common names for depends_on; silently dropping them ran dependent tasks in parallel.
-            for alias in ('deps', 'after'):
-                if isinstance(item, dict) and alias in item and not item.get('depends_on'):
-                    item['depends_on'] = list(item.pop(alias) or [])
-        run['worker_budget'] = max(1, min(capacity, parallel_width(plan['tasks'])))
+        startable = parallel_width(plan['tasks'])
+        if decision is not None:
+            run['route'] = decision  # next to allocation: mode, score, reasons, enforced, setting, kind, graph_size
+            free = len([w for w in coworkers if w.get('state') not in BUSY])
+            run['capacity_hint'] = dict(free=free, startable=startable,
+                                        hint=capacity_hint(free, startable, user_tasks, **capacity_settings(settings)))
+        run['worker_budget'] = max(1, min(capacity, startable))
         engine._import_plan(run, plan)  # checks every planned file path before any task is queued
         created = [t for t in engine.tasks(run['id']) if t.get('role') == 'executor']
-        for spec, task in zip(plan['tasks'], created):
+        matched = match_created(plan['tasks'], created)  # explicit plan id -> engine task, no positional zip
+        for spec in plan['tasks']:
+            task = matched.get(str(spec['id']))
+            if task is None:
+                continue
+            changed = False
             text = clean_summary(spec.get('summary'))
-            if text and task.get('title') == spec['title']:
+            if text:
                 task['summary'] = text
-                store.put('tasks', task)
+                changed = True
             effort = task_effort(spec)
-            if effort and task.get('title') == spec['title']:
+            if effort:
                 # Rule I38: the Main's effort; notion.choose_task_effort sends it (clamped) instead of the automatic one.
                 task['requested_effort'] = effort
+                changed = True
+            # Team graphs: stage_role / read_only become top-level keys inside this lock, before any dispatch.
+            if apply_team_keys(spec, task) or changed:
                 store.put('tasks', task)
-        if quality == 'high':
+        team_design = any(stage_role_of(t) == 'design' for t in plan['tasks'])
+        if quality == 'high' and not team_design:
             ui = is_ui(goal, plan['tasks'])
             design = engine.add_task(run, 'architect', design_prompt(goal, plan['tasks'], ui),
                                      'Design: visual spec' if ui else 'Design: approach',
@@ -290,8 +321,12 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
             for task in created:
                 task['deps'] = list(task['deps']) + [design['id']]  # its result is injected via the deps context
                 store.put('tasks', task)
-        run['stage'] = 'Designing' if quality == 'high' else 'Building'
+        run['stage'] = 'Designing' if quality == 'high' or team_design else 'Building'
         store.put('runs', run)
         store.message(chat['id'], 'user', goal, run['id'])
         store.event('run_created', run['id'], message='Operator delegated %d task(s)' % len(plan['tasks']))
-        return _summary(engine, run, warnings=_warnings(store, chat, plan['tasks']))
+        warnings = _warnings(store, chat, plan['tasks'])
+        hint = (run.get('capacity_hint') or {}).get('hint')
+        if hint and settings.get('capacity_hint_warn', False):
+            warnings.append(hint)  # off by default: log-only keeps today's warnings; the hint is in 'capacity'
+        return _summary(engine, run, warnings=warnings)
