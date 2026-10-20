@@ -1290,6 +1290,19 @@ class Application:
             if account_id != selected_account(self.store):
                 raise ValueError('Select this account for the harness first')
             return self.job('Open signed-in Notion in Edge', lambda:self.adapter.edge_transport(account_id).open_app(), account_id)
+        if path=='/api/account/adopt-app-session':
+            def adopt():
+                from .harness_account import selected_account
+                from .app_session import adopt_app_session
+                target = account_id or selected_account(self.store)
+                result = adopt_app_session(self.adapter, target)
+                resumed = self.resume_after_sign_in(target)
+                if resumed is not None:
+                    result['coordination'] = resumed
+                if target == selected_account(self.store):
+                    result.update(self.prepare_account(target))
+                return result
+            return self.job('Use the NotionTool sign-in in Edge', adopt, account_id or 'login')
         if path=='/api/account/browser-login':
             def login():
                 from .harness_account import selected_account

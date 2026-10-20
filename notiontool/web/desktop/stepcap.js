@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 11;
+  var VERSION = 12;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -42,13 +42,27 @@
     if (!cap || !all || all.length <= cap) return all;
     var tail = all.slice(-cap);
     var cfg = null;
+    // v12: the user's model/reasoning picks are 'updated-config' steps. When they fell out of the cap, Notion
+    // no longer saw them and sent the next turn with the model default (Medium). The newest pick with a
+    // reasoning effort and the newest with a model are kept (in their original order) next to 'config'.
+    var effortStep = null, modelStep = null;
     for (var i = 0; i < all.length - cap; i++) {
       var st = null;
       try { st = all[i] && all[i].getStep && all[i].getStep(); } catch (e) { st = null; }
-      if (st && st.type === 'config') { cfg = all[i]; break; }
+      if (!st) continue;
+      if (st.type === 'config' && !cfg) cfg = all[i];
+      else if (st.type === 'updated-config') {
+        var v = st.value || {};
+        if (v.reasoningEffort) effortStep = all[i];
+        if (v.model) modelStep = all[i];
+      }
     }
     window.__ntCapHits = (window.__ntCapHits || 0) + 1;
-    return cfg ? [cfg].concat(tail) : tail;
+    var keep = [];
+    for (var j = 0; j < all.length - cap; j++) {
+      if (all[j] === cfg || all[j] === effortStep || all[j] === modelStep) keep.push(all[j]);
+    }
+    return keep.length ? keep.concat(tail) : tail;
   }
   window.__ntCapStores = capStores;
 
