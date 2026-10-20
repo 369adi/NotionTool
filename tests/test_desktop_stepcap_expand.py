@@ -1,4 +1,4 @@
-"""Backtest of the stepcap v3 scroll-up loading with a fake ThreadStore and fake scroller (runs the real JS in node)."""
+﻿"""Backtest of the stepcap v3 scroll-up loading with a fake ThreadStore and fake scroller (runs the real JS in node)."""
 import json
 import shutil
 import subprocess
@@ -63,7 +63,7 @@ r.exp4 = X.expand(elA, 1009000);
 r.capB = Object.prototype.hasOwnProperty.call(window.__ntStepCap, 'b');
 r.emitsAfterExpand = emits.slice();
 r.reset = X.reset('a');
-r.capReset = window.__ntStepCap.a;
+r.capReset = window.__ntStepCap.a ?? null;
 r.lenReset = a.getMessageStores().length;
 r.resetAgain = X.reset('a');
 var elB = new El('b', [45]);
@@ -71,9 +71,12 @@ X._resetCooldown();
 r.expB = X.expand(elB, 2000000);
 elB.isConnected = false;
 X.sweep();
-r.capBSwept = window.__ntStepCap.b;
+r.capBSwept = window.__ntStepCap.b ?? null;
 r.expandedLeft = Object.keys(X.expanded);
 r.emitsTotal = emits.length;
+r.baseLen = new Sparse('f', 1000, 50).getMessageStores().length;
+r.baseMax = new Sparse('g', 1000, 100000).getMessageStores().length;
+r.baseShort = new Sparse('h', 20, 50).getMessageStores().length;
 r.turns = X.nextCapFor(new Sparse('c', 1000, 100), 30);
 r.bounded = X.nextCapFor(new Sparse('d', 1000, 100000), 30);
 r.dense = X.nextCapFor(new ThreadStore('e', 1000), 30);
@@ -97,9 +100,15 @@ class StepCapExpandTest(unittest.TestCase):
             raise AssertionError(out.stderr)
         cls.r = json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_active_v5(self):
+    def test_active_v6(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 5)
+        self.assertEqual(self.r['version'], 6)
+
+    def test_default_last_five_messages(self):
+        r = self.r
+        self.assertEqual(r['baseLen'], 251)    # user steps every 50: last 5 turns = 250 steps + kept config step
+        self.assertEqual(r['baseMax'], 401)    # very long turns: at most 400 steps + config
+        self.assertEqual(r['baseShort'], 20)   # short chat: everything
 
     def test_button_offer_rules(self):
         r = self.r
@@ -141,14 +150,14 @@ class StepCapExpandTest(unittest.TestCase):
     def test_reset_back_to_30(self):
         r = self.r
         self.assertTrue(r['reset'])
-        self.assertEqual(r['capReset'], 30)
+        self.assertIsNone(r['capReset'])
         self.assertEqual(r['lenReset'], 31)
         self.assertFalse(r['resetAgain'])
 
     def test_sweep_on_closed_chat(self):
         r = self.r
         self.assertEqual(r['expB'], 0)  # 50 stores: 30 + 30 >= 50 -> uncapped
-        self.assertEqual(r['capBSwept'], 30)
+        self.assertIsNone(r['capBSwept'])
         self.assertEqual(r['expandedLeft'], [])
         self.assertEqual(r['emitsTotal'], 5)  # 3 expands a + reset a + expand b (sweep does not emit)
 

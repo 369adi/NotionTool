@@ -13,7 +13,9 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 5;
+  var VERSION = 6;
+  var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
+  var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
   var STEP_ADD = 30;       // minimum growth per load
   var TURNS_ADD = 3;       // v4: one load adds this many older user turns (30 steps were often only tool steps)
@@ -45,7 +47,36 @@
   window.__ntCapStores = capStores;
 
   function caps() { return (window.__ntStepCap = window.__ntStepCap || {}); }
-  function capOf(id) { var c = caps(); return Object.prototype.hasOwnProperty.call(c, id) ? c[id] : STEP_CAP; }
+  // v6: by default a chat shows its last BASE_TURNS user messages with their answers (at least STEP_CAP, at most
+  // BASE_MAX steps). window.__ntStepCap[id] holds only explicit overrides (button loads, 0 = everything).
+  var baseCache = {};
+  function baseCap(id, all) {
+    var len = all ? all.length : 0;
+    var hit = baseCache[id];
+    if (hit && hit.len === len) return hit.cap;
+    var users = 0;
+    var stop = len - BASE_MAX;
+    var i = len - 1;
+    for (; i >= 0 && i >= stop; i--) {
+      var st = null;
+      try { st = all[i] && all[i].getStep && all[i].getStep(); } catch (e) { st = null; }
+      if (st && st.type === 'user' && ++users >= BASE_TURNS) break;
+    }
+    var n = len - Math.max(i, 0);
+    if (n < STEP_CAP) n = STEP_CAP;
+    if (n > BASE_MAX) n = BASE_MAX;
+    baseCache[id] = { len: len, cap: n };
+    return n;
+  }
+  function origAll(ts) {
+    var f = ts && ts.getMessageStores;
+    try { return ((f && f.__orig) ? f.__orig.call(ts) : f.call(ts)) || []; } catch (e) { return []; }
+  }
+  function capOf(id) {
+    var c = caps();
+    if (Object.prototype.hasOwnProperty.call(c, id)) return c[id];
+    return live[id] ? baseCap(id, origAll(live[id])) : STEP_CAP;
+  }
 
   function nextCap(cur, total) {
     if (!cur) return 0;                    // already uncapped
@@ -138,7 +169,7 @@
     if (!expanded[id]) return false;
     var el = expanded[id];
     delete expanded[id];
-    caps()[id] = STEP_CAP;
+    delete caps()[id];
     if (el && el.isConnected !== false && live[id]) emit(live[id]);
     return true;
   }
@@ -205,14 +236,15 @@
   function sweep() {
     for (var id in expanded) {
       var el = expanded[id];
-      if (!el || el.isConnected === false) { delete expanded[id]; caps()[id] = STEP_CAP; }
+      if (!el || el.isConnected === false) { delete expanded[id]; delete caps()[id]; }
     }
   }
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound5) return;
-    window.__ntStepExpBound5 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound6) return;
+    window.__ntStepExpBound6 = true;
+    window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');
       for (var q = 0; q < old.length; q++) if (old[q] !== btn) old[q].remove();
@@ -237,7 +269,7 @@
   }
 
   window.__ntStepExp = {
-    nextCap: nextCap, nextCapFor: nextCapFor, shouldOffer: shouldOffer, updateButton: updateButton, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
+    nextCap: nextCap, nextCapFor: nextCapFor, capOf: capOf, baseCap: baseCap, shouldOffer: shouldOffer, updateButton: updateButton, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
     onScroll: onScroll, gesture: gesture, expanded: expanded, version: VERSION,
     _resetCooldown: function () { lastLoad = 0; }
   };
@@ -261,7 +293,8 @@
       var all = orig.call(this);
       if (this && this.id) live[this.id] = this;
       if (window.__ntStepCapOff) return all;
-      return capStores(all, capOf(this.id));
+      var co = caps();
+      return capStores(all, Object.prototype.hasOwnProperty.call(co, this.id) ? co[this.id] : baseCap(this.id, all));
     };
     capped.__nt = true;
     capped.__ntv = VERSION;
