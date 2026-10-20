@@ -562,6 +562,14 @@ class NotionAdapter:
             userId=info['user_id'],spaceId=info['space_id'],surface='full_page_chat',timezone='Europe/Berlin',
             userName=info.get('user_name',''),userEmail=info['email'],spaceViewId=view,currentDatetime=now)),
             dict(id=step_id,type='user',userId=info['user_id'],value=[[prompt]],createdAt=now)]
+        # The Notion UI (CDP capture 2026-10-20) keeps the config step and sends model/effort as an
+        # 'updated-config' step right before the user step; config.model alone is ignored by the server.
+        if model or effort:
+            update = dict(model=model) if model else {}
+            if effort:
+                update['reasoningEffort'] = effort
+            body['transcript'].insert(len(body['transcript'])-1,
+                dict(id=self.new_id(info['space_id'],'00aa'),type='updated-config',value=update))
         body.update(spaceId=info['space_id'],threadId=thread_id,traceId=str(uuid.uuid4()),submittedUserStepId=step_id,
                     createThread=create,generateTitle=create)
         if create:
