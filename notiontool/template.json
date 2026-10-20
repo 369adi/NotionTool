@@ -66,7 +66,7 @@
         "enableScriptAgentSlack": true,
         "isAgentResearchRequest": false,
         "isThreadStartedByAdmin": true,
-        "onboardingAgentVersion": "work_with_core_dbs",
+        "onboardingAgentVersion": "work",
         "databaseAgentConfigMode": false,
         "enableAgentIntegrations": true,
         "canAccessAllAgentThreads": false,
