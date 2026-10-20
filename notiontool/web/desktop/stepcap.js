@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 7;
+  var VERSION = 8;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -31,6 +31,8 @@
   var expanded = {};       // threadId -> scroller element
   var gesture = { up: 0, down: 0, drag: 0 };
   var lastLoad = 0;
+  var lastLen = {};        // v8: threadId -> store count seen last time
+  var memo = {};           // v8: threadId -> last capped array (stable identity)
 
   function capStores(all, cap) {
     if (!cap || !all || all.length <= cap) return all;
@@ -65,6 +67,16 @@
     var n = len - Math.max(i, 0);
     if (n < STEP_CAP) n = STEP_CAP;
     if (n > BASE_MAX) n = BASE_MAX;
+    // v8: while the agent adds tool steps (no new user message) keep the top fixed and just grow the window.
+    if (hit && len > hit.len && len - hit.len < 50) {
+      var newUser = false;
+      for (var k = hit.len; k < len; k++) {
+        var s2 = null;
+        try { s2 = all[k] && all[k].getStep && all[k].getStep(); } catch (e) { s2 = null; }
+        if (s2 && s2.type === 'user') { newUser = true; break; }
+      }
+      if (!newUser) n = Math.max(n, hit.cap + (len - hit.len));
+    }
     baseCache[id] = { len: len, cap: n };
     return n;
   }
@@ -238,7 +250,10 @@
     if (el === btnEl || el.scrollTop < TOP_PX) updateButton(el);
     var now = Date.now();
     var userDown = now - gesture.down < GESTURE_MS || now - gesture.drag < GESTURE_MS;
-    if (userDown && el.scrollHeight - el.clientHeight - el.scrollTop < BOTTOM_PX) {
+    // v8: while older messages are loading Notion briefly re-mounts the list (height drops ~900 px, measured), the
+    // scroller clamps to its bottom and the button press counted as a gesture -> this reset sent you to the bottom.
+    var loading = now - lastLoad < ANCHOR_MS + 1500;
+    if (userDown && !loading && el.scrollHeight - el.clientHeight - el.scrollTop < BOTTOM_PX) {
       for (var id in expanded) if (expanded[id] === el) reset(id);
     }
   }
@@ -252,8 +267,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound7) return;
-    window.__ntStepExpBound7 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound8) return;
+    window.__ntStepExpBound8 = true;
     window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');
@@ -304,7 +319,21 @@
       if (this && this.id) live[this.id] = this;
       if (window.__ntStepCapOff) return all;
       var co = caps();
-      return capStores(all, Object.prototype.hasOwnProperty.call(co, this.id) ? co[this.id] : baseCap(this.id, all));
+      var id = this.id;
+      var has = Object.prototype.hasOwnProperty.call(co, id);
+      var len = all ? all.length : 0;
+      // v8: new tool steps must not push older steps out at the top (that shifted the view = glitch / jump up).
+      // Keep the first shown step fixed: a loaded (override) window grows by the new steps.
+      var pl = lastLen[id];
+      if (has && co[id] && pl && len > pl && len - pl < 50) co[id] += len - pl;
+      lastLen[id] = len;
+      var cap = has ? co[id] : baseCap(id, all);
+      // v8: same array while nothing changed, so Notion does not re-render the whole list on every update.
+      var m = memo[id];
+      if (m && m.len === len && m.cap === cap && m.last === all[len - 1] && m.first === all[0]) return m.out;
+      var out = capStores(all, cap);
+      memo[id] = { len: len, cap: cap, last: all[len - 1], first: all[0], out: out };
+      return out;
     };
     capped.__nt = true;
     capped.__ntv = VERSION;

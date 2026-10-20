@@ -21,8 +21,10 @@ function ThreadStore(id, n) {
 }
 ThreadStore.keyName = 'ThreadStore';
 ThreadStore.prototype.getMessageStores = function () {
+  if (this.stable && this._c) return this._c;
   var out = [];
   for (var i = 0; i < this.n; i++) out.push(new Store(i, i === 0 ? 'config' : (this.every ? (i % this.every === 0 ? 'user' : 'tool') : 'user'), this.id));
+  if (this.stable) this._c = out;
   return out;
 };
 function Sparse(id, n, every) { ThreadStore.call(this, id, n); this.every = every; }
@@ -75,6 +77,7 @@ r.capBSwept = window.__ntStepCap.b ?? null;
 r.expandedLeft = Object.keys(X.expanded);
 r.emitsTotal = emits.length;
 r.baseLen = new Sparse('f', 1000, 50).getMessageStores().length;
+var sm = new Sparse('m', 1000, 50); sm.stable = true; r.memoSame = sm.getMessageStores() === sm.getMessageStores();
 r.baseMax = new Sparse('g', 1000, 100000).getMessageStores().length;
 r.baseShort = new Sparse('h', 20, 50).getMessageStores().length;
 r.turns = X.nextCapFor(new Sparse('c', 1000, 100), 30);
@@ -100,15 +103,18 @@ class StepCapExpandTest(unittest.TestCase):
             raise AssertionError(out.stderr)
         cls.r = json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_active_v7(self):
+    def test_active_v8(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 7)
+        self.assertEqual(self.r['version'], 8)
 
     def test_default_last_five_messages(self):
         r = self.r
         self.assertEqual(r['baseLen'], 251)    # user steps every 50: last 5 turns = 250 steps + kept config step
         self.assertEqual(r['baseMax'], 401)    # very long turns: at most 400 steps + config
         self.assertEqual(r['baseShort'], 20)   # short chat: everything
+
+    def test_same_array_while_unchanged(self):
+        self.assertTrue(self.r['memoSame'])
 
     def test_button_offer_rules(self):
         r = self.r
