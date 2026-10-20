@@ -143,6 +143,8 @@ class CoworkerUpkeep:
             with self.store.lock:
                 self.store.db.commit()
                 self.store.db.execute('VACUUM')
+                # In WAL mode VACUUM only writes the WAL; the checkpoint makes the file itself shrink.
+                self.store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         self.last_vacuum, self.pending_mb = now, 0.0
         return True
 
