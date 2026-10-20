@@ -79,6 +79,9 @@ HARNESS_SETTINGS = [
     _bool('app_declutter', 'Hide Notion extras', 'App', True,
           'Hide feedback buttons, upgrade offers, tips, help and other Notion extras the app does not use.',
           app_local=True),
+    _bool('app_done_sound', 'Done sound', 'App', True,
+          'Play a soft chime when a Main chat, the Test chat or your own chat finishes. Coworker chats stay silent.',
+          app_local=True),
     # Models & effort, App look, Notifications (app-local, Studio v3 Settings tab)
     _choice('app_effort_override', 'Effort', 'App', ('auto',) + tuple(REASONING_ORDER), 'auto',
             'Automatic is best for most people. Pick a level to use it for every task.', app_local=True),

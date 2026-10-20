@@ -17,6 +17,7 @@
   var ctx = null;
 
   function off() {
+    if (window.__ntDesk && window.__ntDesk.doneSound === false) return true;  // Settings > App > Done sound
     try { return window.localStorage.getItem('ntDesk.doneSound') === 'off'; } catch (e) { return false; }
   }
   function coworker(id) {

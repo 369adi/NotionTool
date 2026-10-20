@@ -607,6 +607,7 @@ def desktop_state(server, app_settings=None, now=None):
                 mains=mains, hidden_threads=sorted(hidden),
                 app_chat_filter=app.get('app_chat_filter') or 'mains_only', app_hide=hide,
                 declutter=app.get('app_declutter', True) is not False,
+                done_sound=app.get('app_done_sound', True) is not False,
                 workers=worker_rows, runs=run_rows, tasks=task_rows, attention=_attention(base),
                 events=events[-50:], context_ask=ask,
                 switches=[dict(id=s.get('id', ''), state=s.get('state', ''), reason=str(s.get('reason') or '')[:160])
