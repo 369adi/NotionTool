@@ -52,9 +52,9 @@ class ExpandTest(unittest.TestCase):
         self.assertEqual([b['id'] for b in builds], ['A', 'B'])
         self.assertEqual(design['depends_on'], [])
         self.assertEqual(crit['depends_on'], [design['id']])
-        self.assertEqual(builds[0]['depends_on'], [crit['id']])
-        self.assertEqual(builds[1]['depends_on'], ['A', crit['id']])  # user dependency kept
-        self.assertEqual(integ['depends_on'], ['A', 'B'])
+        self.assertEqual(builds[0]['depends_on'], [design['id'], crit['id']])  # builds see the design
+        self.assertEqual(builds[1]['depends_on'], ['A', design['id'], crit['id']])  # user dependency kept
+        self.assertEqual(integ['depends_on'], ['A', 'B', design['id'], crit['id']])  # integrator sees the design
         for t in (design, crit, integ):
             self.assertEqual((t['files'], t['team']['read_only']), ([], True))
         self.assertEqual(builds[0]['team'], {'stage_role': 'build', 'read_only': False})
@@ -76,6 +76,13 @@ class ExpandTest(unittest.TestCase):
         self.assertEqual([c['depends_on'] for c in crits], [['P1'], ['P2'], ['P3']])  # only its own part
         self.assertEqual(set(synth['depends_on']), {'P1', 'P2', 'P3'} | {c['id'] for c in crits})
         self.assertEqual(len(out), graph_size(3, 'analysis'))
+
+    def test_analysis_part_with_files_is_not_read_only(self):
+        out = expand([spec('P1'), spec('P2', files=['x.py']), spec('P3', files=['y.py'], read_only=True)], {}, 'analysis')
+        self.check_plan(out)
+        parts = {p['id']: p['team']['read_only'] for p in by_role(out, 'part')}
+        self.assertEqual(parts, {'P1': True, 'P2': False, 'P3': True})
+        self.assertTrue(all(t['team']['read_only'] for t in out if t['team']['stage_role'] != 'part'))
 
     def test_same_titles_and_bad_or_long_ids_stay_unique_and_valid(self):
         long = 'x' * 48
@@ -166,7 +173,8 @@ class TeamStepTest(unittest.TestCase):
         self.assertEqual(self.out['quality'], 'standard')
         (build,) = [t for t in self.tasks() if t['role'] == 'executor']
         design = self.engine.add_task(self.run_(), 'executor', 'Design it. You are read-only.', 'Design: approach')
-        design.update(stage_role='design', read_only=True, state='done', worker_id=CO2, result=DONE)
+        spec_result = json.dumps(dict(status='done', summary='Spec: round half up in calc.txt\nRESULT: DONE'))
+        design.update(stage_role='design', read_only=True, state='done', worker_id=CO2, result=spec_result)
         self.store.put('tasks', design)
         build['deps'] = list(build['deps']) + [design['id']]
         build['stage_role'] = 'build'
@@ -184,6 +192,8 @@ class TeamStepTest(unittest.TestCase):
         (review,) = self.reviewers()
         self.assertEqual(review['deps'], [build, design])
         self.assertEqual(review['review_scope'], [design, build])
+        scope = [t for t in self.tasks() if t['state'] == 'done' and t['id'] in review['review_scope']]
+        self.assertIn('round half up', self.engine._context(scope))  # the reviewer's context holds the design result
         self.assertIn('follows them', review['prompt'])
         gate = self.get(integ)
         self.assertIn(review['id'], gate['deps'])
