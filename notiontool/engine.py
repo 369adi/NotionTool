@@ -24,6 +24,39 @@ from . import patch_mode as patch_mod
 import subprocess
 from .timeouts import task_limit
 
+# Late done detection (done_dig / crit_done): Notion often closes or breaks the reply stream minutes before
+# the coworker turn really ends. With the old backoff (5, 10, 20, 40, 60, 60 s) the real end was seen
+# 60-80 s late. After this attempt's stream has closed or broken, a task is now re-checked at least every
+# DONE_POLL_SECONDS. The old backoff stays for approval waits, restart recovery (no stream in this attempt),
+# cancelled or over-limit attempts, overdue tasks (300 s) and tasks beyond the slot cap.
+# Rate limit: at most DONE_POLL_MAX_TASKS x 60/DONE_POLL_SECONDS = 24 checks per minute (1-3 transcript
+# reads each, so <= 72 requests/min) inside network_budget.HARD_LIMIT_PER_MINUTE = 180, which still caps all.
+DONE_POLL_SECONDS = 15
+DONE_POLL_MAX_TASKS = 6
+DONE_POLL_WINDOW_SECONDS = 1200  # turns of 14-19 min exist (see _empty_remote_reply); later the old backoff applies
+
+
+def _setting_number(settings, key, default, low, high):
+    try:
+        value = float((settings or {}).get(key, default))
+    except (TypeError, ValueError, AttributeError):
+        return default
+    return max(low, min(high, value))
+
+
+def reconcile_backoff(checks):
+    """The unchanged backoff: 5, 10, 20, 40, 60, 60 ... seconds for check 1, 2, 3 ..."""
+    return min(60, 5 * 2 ** min(max(int(checks), 1) - 1, 4))
+
+
+def reconcile_delay(checks, now, done_poll_since=0, approval=False, slot_free=True, settings=None):
+    """Seconds until the next reconcile check of an unconfirmed task (never longer than the old backoff)."""
+    base = reconcile_backoff(checks)
+    window = _setting_number(settings, 'done_poll_window_seconds', DONE_POLL_WINDOW_SECONDS, 0, 7200)
+    if approval or not done_poll_since or not slot_free or now - float(done_poll_since) > window:
+        return base
+    return min(base, _setting_number(settings, 'done_poll_seconds', DONE_POLL_SECONDS, 5, 60))
+
 # Patch mode (patch_mode.py): on by default for git projects with a main branch; the setting turns it off.
 PATCH_MODE_DEFAULT = True
 # Merge results that are worth one more try later; anything else stays 'failed' for the operator.
@@ -412,6 +445,34 @@ class Engine:
         self.store.event('empty_reply_retry', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
                          message='Notion finished with an empty reply; the task is retried')
         return True
+
+    def _done_poll_since(self, task, info, now, settings):
+        """When this attempt's reply stream closed or broke; 0 keeps the old backoff.
+
+        Case (a) stream_end sets remote_done_at; case (b) a broken stream leaves first_output and
+        remote_done at 0. Both reach this point from the attempt itself (recovery=False), so neither
+        timestamp is needed and remote_done_at is never written here (the empty-reply retry stays as before).
+        """
+        since = float(task.get('done_poll_since') or 0)
+        if since and since >= float(task.get('sent_at') or task.get('started') or 0):
+            return since  # still the same attempt
+        cancel = info.get('cancel')
+        if info.get('recovery') or (cancel is not None and cancel.is_set()):
+            return 0  # restart recovery or a cancel: no stream close in this attempt
+        if now - float(task.get('started') or now) > task_limit(settings, task):
+            return 0  # stopped at the task time limit, not by a stream close
+        return now
+
+    def _done_poll_slot_free(self, task_id, now, settings):
+        """Cap the fast done poll to DONE_POLL_MAX_TASKS tasks so it stays far below 180 requests/min."""
+        limit = int(_setting_number(settings, 'done_poll_max_tasks', DONE_POLL_MAX_TASKS, 0, DONE_POLL_MAX_TASKS))
+        window = _setting_number(settings, 'done_poll_window_seconds', DONE_POLL_WINDOW_SECONDS, 0, 7200)
+        busy = 0
+        for other in self.store.all('tasks'):
+            if (other.get('id') != task_id and other.get('state') == 'uncertain' and other.get('done_poll_fast')
+                    and now - float(other.get('done_poll_since') or 0) <= window):
+                busy += 1
+        return busy < limit
 
     def _main_compressing(self, run):
         # Phase 4 Fix P: a Main with a requested compress waits for its rotation; its tasks go to coworkers.
@@ -1243,7 +1304,7 @@ class Engine:
                     thread_id=worker['thread_id'], submission_phase='preparing')
         # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
         task.update(reconcile_checks=0, remote_done_at=0, reconcile_at=0, approval_seen=None, awaiting_approval='',
-                    approval_evidence=False, turn_state='', turn_state_reason='')
+                    approval_evidence=False, turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False)
         # Every attempt keeps its own timing record for the metrics.
         task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
             dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
@@ -1522,12 +1583,19 @@ class Engine:
                 pass
             else:
                 # The task limit only slows the checks down; it never blocks, resends or abandons (no time-based stop).
-                overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
+                now = time.time()
+                settings = self.store.settings()
+                overdue = now-task['started'] > task_limit(settings, task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='uncertain', reconcile_checks=checks,
-                            reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))),
-                            error='Awaiting confirmation from Notion; request will not be resent')
+                # crit_done: read the approval state before the delay is chosen; approval waits keep the old backoff.
                 stored = self.store.get('tasks', task['id'], {}) or {}
+                approval = bool(stored.get('awaiting_approval') or stored.get('approval_seen'))
+                since = 0 if overdue else self._done_poll_since(task, info, now, settings)
+                slot_free = bool(since) and not approval and self._done_poll_slot_free(task['id'], now, settings)
+                delay = 300 if overdue else reconcile_delay(checks, now, since, approval, slot_free, settings)
+                task.update(state='uncertain', reconcile_checks=checks, reconcile_at=now+delay,
+                            done_poll_since=since, done_poll_fast=slot_free,
+                            error='Awaiting confirmation from Notion; request will not be resent')
                 if stored.get('awaiting_approval'):
                     # Honest label (H5): 'approval' only with explicit evidence from the transcript entry.
                     label = stored['awaiting_approval']
