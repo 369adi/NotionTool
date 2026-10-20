@@ -301,7 +301,10 @@ class DesktopSidebarTests(unittest.TestCase):
         run = self.section('function run()', 'function schedule')
         gate = run.index('if (!online(state)) {')
         offline = run[gate:run.index('applied = true;')]
-        self.assertIn('if (applied) resetMarks();', offline)
+        # Offline undoes earlier marks (the New chat dialog also closes its menu/dialog there).
+        self.assertIn('if (applied) {', offline)
+        undo = offline[offline.index('if (applied) {'):]
+        self.assertIn('resetMarks();', undo[:undo.index('}')])
         self.assertIn('return;', offline)
         for text in ('applyFilter', 'applyHeading', 'applyBrand', 'applyRows', 'CLS_HIDDEN', 'Mains'):
             self.assertNotIn(text, offline)
