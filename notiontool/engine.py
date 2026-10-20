@@ -169,11 +169,26 @@ class Engine:
             self.store.put('workers', worker)
 
     def start(self):
+        self.wake_event = getattr(self, 'wake_event', None) or threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True, name='coordinator')
         self.thread.start()
 
+    def _wake(self):
+        """Run the next tick now instead of after the 0.25 s poll."""
+        event = getattr(self, 'wake_event', None)
+        if event is not None:
+            event.set()
+
+    def _watch(self, future, info):
+        """A finished remote call wakes the coordinator; done_at measures the wait until _complete."""
+        def done(_future, info=info):
+            info['done_at'] = time.time()
+            self._wake()
+        future.add_done_callback(done)
+
     def close(self):
         self.stop_event.set()
+        self._wake()
         with self.lock:
             for future, info in list(self.inflight.items()):
                 info['cancel'].set()
@@ -182,7 +197,12 @@ class Engine:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _loop(self):
-        while not self.stop_event.wait(0.25):
+        wake = getattr(self, 'wake_event', None) or threading.Event()
+        while not self.stop_event.is_set():
+            if wake.wait(0.25):
+                wake.clear()  # a finished remote call: tick right away
+            if self.stop_event.is_set():
+                break
             try:
                 self.tick()
             except Exception as exc:
@@ -1007,6 +1027,9 @@ class Engine:
             for future, info in list(self.inflight.items()):
                 if future.done():
                     del self.inflight[future]
+                    if info.get('done_at'):
+                        # Seconds from the finished remote call to its completion here (lock wait + tick start).
+                        info['complete_wait_s'] = round(max(0.0, time.time() - info['done_at']), 3)
                     self._complete(future, info)
             self._start_merges()
             self._reconcile()
@@ -1206,6 +1229,7 @@ class Engine:
                                   lambda text: self._partial(task['id'], task['lease'], text))
         self.inflight[future] = dict(task_id=task['id'], lease=task['lease'], worker_id=worker['id'],
                                     run_id=run['id'], cancel=cancel, recovery=False)
+        self._watch(future, self.inflight[future])
         self.store.event('task_started', run['id'], task_id=task['id'], worker=worker['label'], worker_id=worker['id'],attempt=task['attempts'],role=task['role'], message=task['title'])
 
     def _context(self, tasks):
@@ -1319,7 +1343,8 @@ class Engine:
             task['proof'] = task_proof.record(task, text, self._project_root(run)) if task.get('proof_base') else task_proof.record(dict(task, id=''), text, None)
             if task.get('patch_worktree') and task['state'] == 'done':
                 task['patch_state'] = 'waiting'  # tick() starts collect -> verify -> merge
-            self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'])
+            self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'],
+                             complete_wait_s=info.get('complete_wait_s'))
         except ModelVerificationError as exc:
             failure=exc
             self._release(info['worker_id'],info['lease'])
@@ -1573,6 +1598,7 @@ class Engine:
             self.store.put('tasks', task)
             self.inflight[future] = dict(task_id=task['id'], lease=task['lease'], worker_id=worker['id'],
                                         run_id=task['run_id'], cancel=cancel, recovery=True)
+            self._watch(future, self.inflight[future])
 
     def _import_plan(self, run, plan, prefix=''):
         tasks = validate_plan(plan)
