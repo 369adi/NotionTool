@@ -6,6 +6,7 @@ from unittest.mock import patch
 import urllib.error
 
 from notiontool.store import Store
+from notiontool import notion
 from notiontool.notion import NotionAdapter,NotionClient,apply_patch,stream_text
 from notiontool.vendor.transport import NativeNotionTransport
 from notiontool.server import Application
@@ -85,10 +86,16 @@ class NativeTests(unittest.TestCase):
         adapter=self.adapter()
         normal=adapter.body(self.client,'thread','step','Question','verified-opus-codename')
         welcome=adapter.welcome_body(self.client,'thread','verified-opus-codename')
-        for body in (normal,welcome):
-            config=body['transcript'][0]['value']
-            self.assertEqual(config['model'],'verified-opus-codename')
-            self.assertIs(config['modelFromUser'],True)
+        # Normal turns: config step keeps the base model, the requested model rides in 'updated-config'
+        # (live proof 2026-10-20). The Welcome creation body still names the model in its config step.
+        config=normal['transcript'][0]['value']
+        self.assertEqual(config['model'],notion.BASE_CONFIG_MODEL)
+        self.assertIs(config['modelFromUser'],True)
+        update=[s for s in normal['transcript'] if s.get('type')=='updated-config']
+        self.assertEqual(update[0]['value']['model'],'verified-opus-codename')
+        config=welcome['transcript'][0]['value']
+        self.assertEqual(config['model'],'verified-opus-codename')
+        self.assertIs(config['modelFromUser'],True)
 
     def test_mcp_connection_attaches_enabled_workspace_module_without_touching_other_modules(self):
         adapter=self.adapter();calls=[]
