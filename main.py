@@ -17,7 +17,14 @@ def instance_lock(directory):
     name='Local\\NotionTool-'+hashlib.sha256(str(Path(directory).resolve()).casefold().encode()).hexdigest()[:24]
     handle=library.CreateMutexW(None,False,name)
     if ctypes.get_last_error()==183:
-        ctypes.windll.user32.MessageBoxW(None,'NotionTool is already running for this data folder.','NotionTool',0)
+        # Second start (e.g. the Documents shortcut): bring the running window to the front instead of an error box.
+        user32=ctypes.windll.user32
+        window=user32.FindWindowW(None,'NotionTool')
+        if window:
+            user32.ShowWindow(window,9)  # SW_RESTORE
+            user32.SetForegroundWindow(window)
+        else:
+            user32.MessageBoxW(None,'NotionTool is already running. Use the open NotionTool window.','NotionTool',0x40)
         return False
     return handle
 

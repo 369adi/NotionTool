@@ -9,8 +9,10 @@
  *   or when it is not a Main and app_chat_filter !== 'hide_coworkers'.
  *   Notion AI chat rows are menu items without a link: their thread id is read (read only) from
  *   the row's React props (threadStore.id, rowThread) and filtered by the same rule (applyRows).
- *   Titles are never used: state.mains[].title is the harness label ('Operator Main'), not the
- *   Notion chat title ('Main'). A spaceId=<uuid> in a link is never taken as a thread id.
+ *   Every Main in state.mains is always shown (I33), even if its thread is in hidden_threads;
+ *   several Mains and user-renamed Mains ('Roblox') included. state.mains[].title (the user's own
+ *   title when renamed) is only displayed (card tooltip 'Main: <title>'), never used for matching.
+ *   A spaceId=<uuid> in a link is never taken as a thread id.
  *   No state, or state.connected === false (harness offline): nothing is hidden or re-labelled and
  *   marks from earlier runs are undone (resetMarks).
  * - The sidebar New chat control ('New chat' / 'Neuer Chat') never starts a normal New Chat; it asks
@@ -641,6 +643,8 @@
 
     function decide(state, key) {
       if (!state || !key) return false;
+      // I33: every Main is always shown (also user-renamed ones like 'Roblox', several at once).
+      if (mainOf(state, key)) return false;
       var hidden = list(state.hidden_threads).map(threadKey);
       if (hidden.indexOf(key) >= 0) return true;
       var mains = list(state.mains).map(function (m) { return threadKey(m && m.thread_id); });
@@ -762,6 +766,9 @@
       }
       var labels = { running: 'Running', waiting: 'Waiting for you', idle: 'Idle' };
       setCls(card, 'nt-desk-card nt-desk-card-' + info.status + (info.total ? '' : ' nt-desk-no-run'));
+      var tip = 'Main: ' + String(main.title || 'Main');
+      if (card.getAttribute('title') !== tip) card.setAttribute('title', tip);
+      if (card.getAttribute('data-nt-role') !== 'main') card.setAttribute('data-nt-role', 'main');
       var dot = part(card, 'dot');
       setCls(dot, 'nt-desk-dot nt-desk-dot-' + info.status);
       if (dot && dot.getAttribute('title') !== labels[info.status]) dot.setAttribute('title', labels[info.status]);

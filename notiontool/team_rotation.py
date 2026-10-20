@@ -108,10 +108,38 @@ class TeamRotator:
             return []
         self.next_check = now + CHECK_S
         try:
-            return self.check()
+            started = self.check()
         except Exception as exc:
             self.store.event('team_rotation_failed', message='Rotation check failed: ' + type(exc).__name__)
-            return []
+            started = []
+        self.name_pass()
+        return started
+
+    def name_pass(self):
+        """Periodic naming (rule I41): idle joined Coworkers of every ready account get 'Coworker N'.
+
+        Skipped while the network budget is paused or cooling down. Never raises; a failed
+        account records coworker_rename_failed and is tried again at the next check.
+        """
+        if self.budget_reason():
+            return 0
+        from .chat_pool import name_coworkers
+        renamed = 0
+        for account in self.store.all('accounts'):
+            ident = account.get('id')
+            if account.get('state') != 'ready' or not ident:
+                continue
+            with self.lock:
+                if ident in self.rotating:
+                    continue
+            try:
+                client = self.adapter.client(ident)
+                result = name_coworkers(self.adapter, client, ident, None, self.clock(), self.store)
+                renamed += len(result.get('renamed') or [])
+            except Exception as exc:
+                self.store.event('coworker_rename_failed', message='Coworker naming failed: ' + type(exc).__name__,
+                                 account_id=ident)
+        return renamed
 
     def budget_reason(self):
         budget = getattr(self.adapter, 'network_budget', None)
@@ -329,6 +357,12 @@ class TeamRotator:
                               created_at=now, created_at_source='created')
                 self.store.put('workers', worker)
         adapter.apply_chat_pool(ident, client)
+        try:
+            # Rule I41: the replacement keeps the slot number (ledger role workerK -> 'Coworker K') once joined.
+            from .chat_pool import name_coworkers
+            name_coworkers(adapter, client, ident, None, now, self.store)
+        except Exception as exc:
+            self.store.event('coworker_rename_failed', message='Coworker naming failed: ' + str(exc)[:200], account_id=ident)
         return {'role': role, 'thread_id': new_key, 'retired': worker_id}
 
     def public(self, account_id=''):
