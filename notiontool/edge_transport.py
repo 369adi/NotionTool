@@ -65,10 +65,12 @@ class EdgeTransport:
                 try:
                     results = self.browser.evaluate(target, '''(keys => {
                       const all = window.__notiontoolRequests || {}, out = {};
+                      // Up to ~2 MB per poll: 128 small chunks made multi-MB transcripts take many rounds.
+                      const take = c => { let n = 0, s = 0; while (n < c.length && n < 2048 && s < 2097152) s += c[n++].length; return c.splice(0, n).join(''); };
                       for (const key of keys) {
                         const q = all[key];
                         out[key] = q ? {status:q.status, retry:q.retry, done:q.done, error:q.error,
-                          text:q.chunks.splice(0, 128).join(''), remaining:q.chunks.length} : null;
+                          text:take(q.chunks), remaining:q.chunks.length} : null;
                       }
                       return out;
                     })(''' + json.dumps(keys) + ')') or {}

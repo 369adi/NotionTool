@@ -1089,7 +1089,8 @@ class NotionAdapter:
         # The busy check is an independent read: run it while the head loads instead of after it.
         with _cf.ThreadPoolExecutor(1) as _pool:
             _busy_future = _pool.submit(self.thread_busy, client, worker['thread_id'])
-            transcript = client.transcript(worker['thread_id'])
+            # 30 entries are enough for the head (session + sequence); 100 made multi-MB reads per send.
+            transcript = client.transcript(worker['thread_id'], limit=30)
             _phase['transcript'] = time.monotonic() - _t0
             _busy_now = _busy_future.result()
         session = transcript.get('session') or {}
