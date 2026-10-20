@@ -1461,10 +1461,18 @@
     var scrollTimer = 0;
 
     var cachedScroller = null;
+    var lastFindAt = 0;
+    var lastFindHref = '';
 
     function chatScroller() {
       if (cachedScroller && cachedScroller.isConnected && cachedScroller.getClientRects().length &&
           cachedScroller.scrollHeight - cachedScroller.clientHeight >= 80) return cachedScroller;
+      // findScroller walks every div with getComputedStyle (profiled: ~600 ms per 9 s while a reply
+      // streams). Search at most every 2 s for the same chat; a chat switch searches immediately.
+      var href = location.href;
+      if (href === lastFindHref && Date.now() - lastFindAt < 2000) return cachedScroller;
+      lastFindHref = href;
+      lastFindAt = Date.now();
       cachedScroller = findScroller();
       return cachedScroller;
     }
