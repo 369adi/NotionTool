@@ -1312,6 +1312,7 @@ class NotionAdapter:
             raise PendingRemote()
         if prefetch is True:
             prefetch = self._prefetch_thread(worker) if worker.get('thread_id') == thread_id and worker.get('account_id') else None
+        _rt_wall, _rt0 = time.time(), time.monotonic()
         try:
             with request_priority('verify'):
                 transcript = self.client(worker['account_id']).transcript(thread_id, limit=limit or self.RECOVER_WINDOW)
@@ -1321,7 +1322,13 @@ class NotionAdapter:
             raise PendingRemote() from None
         from .chat_context import ChatContext
         observed_worker = dict(worker, thread_id=thread_id)
+        _rt1 = time.monotonic()
         ChatContext(self.store).observe(observed_worker, transcript)
+        try:
+            self.store.event('recover_timing', task.get('run_id', ''), task_id=task.get('id', ''), started=round(_rt_wall, 3),
+                             transcript_s=round(_rt1 - _rt0, 3), observe_s=round(time.monotonic() - _rt1, 3), window=limit or self.RECOVER_WINDOW)
+        except Exception:
+            pass
         entities = [p.get('entity',{}) for p in transcript.get('patches',[]) if p.get('op')=='put']
         fresh = [e for e in entities if e.get('sequence',0)>task.get('before_seq',0)]
         session=transcript.get('session') or {}
