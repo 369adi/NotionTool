@@ -143,7 +143,14 @@
       quotaHits = [];
       var body = document.body;
       if (!body) return hits;
-      var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null);
+      // The chat message list (overlay.js marks it data-nt-cv) holds thousands of text nodes and
+      // never contains menu rows or quota banners: skip it, so scans stay cheap while a reply streams.
+      var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+        acceptNode: function (n) {
+          if (n.nodeType === 1) return n.hasAttribute('data-nt-cv') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
       var node;
       while ((node = walker.nextNode())) {
         var text = node.nodeValue;
@@ -286,7 +293,7 @@
     if (typeof MutationObserver === 'function' && document.documentElement) {
       // childList/characterData only: our own class changes do not trigger it. Title text
       // changes (Notion navigation) arrive here too, so the branding is re-applied.
-      observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0; return function idleRun() { var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun(); }, wait + 20); return; } fn.apply(this, arguments); }; }))(schedule));
+      observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 1500 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
       observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
     }
     if (typeof ctx.onState === 'function') unsubscribe = ctx.onState(schedule);
