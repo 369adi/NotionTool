@@ -2,10 +2,11 @@
 
 expand(tasks, route, kind) turns the operator's flat task list into a role graph:
 
-- build:    design -> design critique -> builds -> (per-build review, queued at run time by
-            operator_roles.step with the design in its deps and review scope) -> integrator
-- analysis: parts in parallel -> one critique per part that depends only on its own part
-            (streaming: it starts as soon as that part is done) -> lead synthesis
+- build:    design -> design critique -> builds (each depends on the design and its critique) ->
+            (per-build review, queued at run time by operator_roles.step with the design in its deps
+            and review scope) -> integrator (depends on every build, the design and its critique)
+- analysis: parts in parallel (read-only unless a part names files) -> one critique per part that
+            depends only on its own part (streaming: it starts as soon as that part is done) -> lead synthesis
 
 Every generated task carries team = {'stage_role', 'read_only'}. Builder A copies these two
 values to the top-level task keys stage_role / read_only after the import; everything downstream
@@ -133,16 +134,18 @@ def _build(builds, used, goal):
                     depends_on=[design_id], files=[], role='reviewer', team=_team('design_critique', True))
     out = [design, critique]
     for b in builds:
-        b['depends_on'] = list(dict.fromkeys(list(b['depends_on']) + [critique_id]))
+        # The design and its critique are direct deps, so both are in the build's context (engine: context = deps).
+        b['depends_on'] = list(dict.fromkeys(list(b['depends_on']) + [design_id, critique_id]))
         b['team'] = _team('build', bool(b.get('read_only')))
         out.append(b)
     integrate = dict(id=integrate_id, title='Integrate: check the combined result',
                      prompt=_clip('You are read-only: do not edit any file. All parts below were built and reviewed; '
-                                  'their results are in your context. Check that together they meet the user goal: %s\n'
+                                  'their results, the design and its critique are in your context. Check that together '
+                                  'they meet the user goal and follow the design: %s\n'
                                   'Run the tests the parts name, report every gap with file and fix, and state what you '
                                   'actually checked. Parts:\n%s' % (goal, _parts_list(builds))),
                      acceptance='The combined result is checked against the goal with the actual tests named.',
-                     depends_on=[b['id'] for b in builds], files=[], role='integrator',
+                     depends_on=[b['id'] for b in builds] + [design_id, critique_id], files=[], role='integrator',
                      team=_team('integrate', True))
     out.append(integrate)
     return out
@@ -151,7 +154,7 @@ def _build(builds, used, goal):
 def _analysis(parts, used, goal):
     out, critiques = [], []
     for p in parts:
-        p['team'] = _team('part', True)
+        p['team'] = _team('part', bool(p.get('read_only')) or not p.get('files'))  # a part that names files may edit them
         out.append(p)
     for p in parts:
         cid = _safe_id('crit-' + p['id'], used)
