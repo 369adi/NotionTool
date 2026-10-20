@@ -1526,7 +1526,12 @@
       if (!list) return;
       var before = scroller.scrollHeight;
       var top = scroller.scrollTop;
-      list.removeAttribute('data-nt-tail');
+      // Reveal in steps (8 -> 20 -> 40 -> 80 -> all): showing ~90 rows at once froze the page for
+      // up to 9 s (measured), each step only lays out the next batch.
+      var cur = parseInt(list.getAttribute('data-nt-tail'), 10) || 8;
+      var next = cur < 20 ? 20 : cur < 40 ? 40 : cur < 80 ? 80 : 0;
+      if (next && list.children.length > next) list.setAttribute('data-nt-tail', String(next));
+      else list.removeAttribute('data-nt-tail');
       scroller.scrollTop = top + (scroller.scrollHeight - before);  // keep the visible message in place
     }
 
@@ -1633,7 +1638,7 @@
     document.addEventListener('mousedown', onPress, true);
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKey, true);
-    observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = (w.__ntLastScroll || 0) + 400 - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 1500 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
+    observer = new MutationObserver((window.__ntIdle || (window.__ntIdle = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); w.addEventListener('keydown', function () { w.__ntLastKey = Date.now(); }, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = Math.max((w.__ntLastScroll || 0) + 400, (w.__ntLastKey || 0) + 1200) - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 4000 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
     // aria-selected / aria-current / href: the active row follows navigation. Our own class
     // and data-nt-desk changes are not observed, so run() never re-triggers itself.
     observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true,
