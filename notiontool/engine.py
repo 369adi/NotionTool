@@ -360,6 +360,17 @@ class Engine:
         if self._attempt_side_effects(task):
             self._hold_for_reconcile(task, info)
             return False
+        # Live bug t41585b6a7 (effort max): Notion closed the stream after a few minutes while the
+        # model kept thinking for 14-19 min. The 'empty' turn was resent 6 times to other coworkers.
+        # A turn Notion has not finished yet is never empty: keep reconciling instead of resending.
+        running = getattr(self.adapter, 'turn_running', None)
+        worker = self.store.get('workers', info['worker_id'])
+        if running and worker:
+            try:
+                if running(worker):
+                    return False
+            except Exception:
+                return False  # unknown is not empty; never resend on a failed check
         self._release(info['worker_id'], info['lease'])
         task.pop('remote_unknown', None)
         task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry', next_at=time.time() + 5,

@@ -1336,7 +1336,7 @@ class NotionAdapter:
             raise
         return True
 
-    def thread_busy(self, client, thread_id):
+    def thread_busy(self, client, thread_id, window=None):
         """True while Notion has not written the outcome of the latest turn in this chat."""
         try:
             result = client.call('syncRecordValuesSpaceInitial', {'requests': [
@@ -1348,7 +1348,18 @@ class NotionAdapter:
         except Exception:
             return False  # The session checks still apply when the record cannot be read.
         # A turn without an outcome for longer than the task timeout counts as abandoned.
-        return latest > done and time.time() * 1000 - latest < self.store.settings()['task_timeout'] * 1000
+        limit = window if window is not None else self.store.settings()['task_timeout']
+        return latest > done and time.time() * 1000 - latest < limit * 1000
+
+    def turn_running(self, worker):
+        """True while Notion has not finished the latest turn in this worker chat (up to 1 h).
+
+        Effort max/xhigh turns think far longer than task_timeout (live: 819 s and 1157 s), and
+        Notion may close the stream early. Used before an 'empty reply' is resent.
+        """
+        if not worker.get('account_id') or not worker.get('thread_id'):
+            return False
+        return self.thread_busy(self.client(worker['account_id']), worker['thread_id'], window=3600)
 
     def stop_turn(self, thread_id, worker=None):
         """Ask Notion to stop the running turn in a worker chat (used by stall_watch).
