@@ -1,4 +1,4 @@
-﻿"""Backtest of the stepcap v3 scroll-up loading with a fake ThreadStore and fake scroller (runs the real JS in node)."""
+"""Backtest of the stepcap v3 scroll-up loading with a fake ThreadStore and fake scroller (runs the real JS in node)."""
 import json
 import shutil
 import subprocess
@@ -100,9 +100,9 @@ class StepCapExpandTest(unittest.TestCase):
             raise AssertionError(out.stderr)
         cls.r = json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_active_v6(self):
+    def test_active_v7(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 6)
+        self.assertEqual(self.r['version'], 7)
 
     def test_default_last_five_messages(self):
         r = self.r

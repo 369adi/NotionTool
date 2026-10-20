@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 6;
+  var VERSION = 7;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -196,15 +196,25 @@
     btn.style.cssText = 'position:fixed;z-index:2147483000;display:none;padding:6px 14px;border:0;border-radius:14px;' +
       'background:#2383e2;color:#fff;font:500 13px/1.2 -apple-system,Segoe UI,sans-serif;cursor:pointer;' +
       'box-shadow:0 2px 8px rgba(0,0,0,.25);transform:translateX(-50%)';
-    btn.addEventListener('click', function (e) {
+    // v7: the first click was eaten by Notion's own document listeners (only the 2nd click arrived, seen live).
+    // Handle the press on window in the capture phase, before Notion sees it; 'click' stays as a deduped fallback.
+    var lastPress = 0;
+    function press(e) {
+      if (!btn || (e.target !== btn && !btn.contains(e.target))) return;
       e.preventDefault(); e.stopPropagation();
-      if (!btnEl) return;
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      var now = Date.now();
+      if (now - lastPress < 700 || !btnEl) return;
+      lastPress = now;
       lastLoad = 0;
-      var r = expand(btnEl, Date.now());
+      var r = expand(btnEl, now);
       btn.textContent = 'Loading\u2026';
       setTimeout(function () { btn.textContent = 'Load older messages'; updateButton(btnEl); }, ANCHOR_MS + 100);
-      window.__ntExpClick = { result: r, at: Date.now() };
-    });
+      window.__ntExpClick = { result: r, at: now, via: e.type };
+    }
+    window.addEventListener('pointerdown', press, true);
+    window.addEventListener('mousedown', press, true);
+    window.addEventListener('click', press, true);
     document.body.appendChild(btn);
     return btn;
   }
@@ -242,8 +252,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound6) return;
-    window.__ntStepExpBound6 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound7) return;
+    window.__ntStepExpBound7 = true;
     window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');
