@@ -15,7 +15,7 @@ from notiontool import team_route
 from notiontool.engine import Engine
 from notiontool.operator_main import KNOWN_TASK_KEYS, delegate, register_operator
 from notiontool.store import Store
-from notiontool.team_route import capacity_hint, decide, kind_of, match_created
+from notiontool.team_route import capacity_hint, capacity_settings, decide, kind_of, match_created
 
 ACC = 'acc1'
 OP = ACC + ':op-thread'
@@ -196,8 +196,8 @@ class DecideTest(StubbedGraph):
                  dict(id='b', title='Same', prompt='two', acceptance='x', files=[], depends_on=['a'])]
         created = [dict(id='E2', title='Same', prompt='two', acceptance='x', files=[], deps=['E1']),
                    dict(id='E1', title='Same', prompt='one', acceptance='x', files=[], deps=[])]
-        out = match_created(specs, created)
-        self.assertEqual((out['a']['id'], out['b']['id']), ('E1', 'E2'))
+        out, by_position = match_created(specs, created)
+        self.assertEqual((out['a']['id'], out['b']['id'], by_position), ('E1', 'E2', []))
 
     def test_match_created_positional_fallback(self):
         specs = [dict(id='a', title='A', prompt='one', acceptance='x', files=[], depends_on=[]),
@@ -206,10 +206,24 @@ class DecideTest(StubbedGraph):
         created = [dict(id='E1', title='A', prompt='one', acceptance='x', files=[], deps=[]),
                    dict(id='E2', title='B', prompt='two, changed by the engine', acceptance='x', files=[], deps=[]),
                    dict(id='E3', title='C', prompt='three', acceptance='x', files=[], deps=['E2'])]
-        out = match_created(specs, created)  # b misses explicitly and blocks c: both are mapped by position
+        out, by_position = match_created(specs, created)  # b misses explicitly and blocks c: both by position
         self.assertEqual({k: v['id'] for k, v in out.items()}, {'a': 'E1', 'b': 'E2', 'c': 'E3'})
-        fewer = match_created(specs, created[:2])
+        self.assertEqual(by_position, ['b', 'c'])  # returned, so delegate can withhold their team keys
+        fewer, short = match_created(specs, created[:2])
         self.assertEqual({k: v['id'] for k, v in fewer.items()}, {'a': 'E1', 'b': 'E2'})  # no task left for c
+        self.assertEqual(short, ['b'])
+
+    def test_capacity_settings_read_all_limits(self):
+        self.assertEqual(capacity_settings({}), dict(files=3, chars=1500, acceptance_lines=4))
+        limits = capacity_settings({'capacity_hint_files': 5, 'capacity_hint_chars': '900',
+                                    'capacity_hint_acceptance_lines': 6})
+        self.assertEqual(limits, dict(files=5, chars=900, acceptance_lines=6))
+        self.assertEqual(capacity_settings({'capacity_hint_acceptance_lines': 'x'})['acceptance_lines'], 4)
+        many = tasks('d')
+        many[0]['acceptance'] = '1\n2\n3\n4\n5'
+        self.assertIsNone(capacity_hint(2, 1, many, **limits))  # 5 lines stay below the configured 6
+        many[0]['acceptance'] += '\n6'
+        self.assertIn('Task d looks big', capacity_hint(2, 1, many, **limits))
 
 
 class DelegateRouteTest(StubbedGraph):
@@ -380,9 +394,9 @@ class DelegateRouteTest(StubbedGraph):
         real = team_route.match_created
 
         def lossy(specs, created):
-            out = real(specs, created)
+            out, by_position = real(specs, created)
             out.pop('b', None)  # as if no created engine task were left for plan task b
-            return out
+            return out, by_position
 
         with mock.patch.object(team_route, 'match_created', lossy):
             result = delegate(self.engine, self.chat_id, 'Goal', tasks('a', 'b', summary='Part one'))
@@ -391,7 +405,28 @@ class DelegateRouteTest(StubbedGraph):
         own = {t['title']: t for t in self.engine.tasks(result['run_id'])}
         self.assertEqual((own['Task a'].get('summary'), own['Task b'].get('summary')), ('Part one', None))
         clean = delegate(self.engine, self.chat_id, 'Goal 2', tasks('c', 'd'))
-        self.assertEqual([w for w in clean['warnings'] if 'matched no' in w], [])
+        self.assertEqual([w for w in clean['warnings'] if 'matched no' in w or 'by position' in w], [])
+
+    def test_positional_match_gets_no_team_keys(self):
+        self.setting(team_route_mode='enforce')
+        real_add = self.engine.add_task
+
+        def add(run, role, prompt, *args, **kwargs):
+            if prompt.startswith('Do b'):
+                prompt = 'Normalized. ' + prompt  # the engine changed it: plan task b has no explicit match
+            return real_add(run, role, prompt, *args, **kwargs)
+
+        with base(0.9), mock.patch.object(self.engine, 'add_task', add):
+            result = delegate(self.engine, self.chat_id, 'Goal', tasks('a', 'b', summary='Part', effort='low'))
+        own = {t['title']: t for t in self.engine.tasks(result['run_id'])}
+        roles = [own[k].get('stage_role') for k in ('Team design', 'Team design critique', 'Task a', 'Task b',
+                                                     'Team integrate')]
+        self.assertEqual(roles, ['design', 'design_critique', 'build', None, None])  # b blocks integrate: both by position
+        self.assertEqual((own['Task b'].get('summary'), own['Task b'].get('requested_effort')), ('Part', 'low'))
+        self.assertIn('Plan task(s) b, team-integrate were matched to a created Coworker task only by position: '
+                      'their summary and effort were applied, their team keys (stage_role, read_only) were not',
+                      result['warnings'])
+        self.assertEqual([w for w in result['warnings'] if 'matched no' in w], [])
 
     def test_over_cap_falls_back(self):
         self.setting(team_route_mode='enforce')
@@ -515,6 +550,23 @@ class DelegateRouteTest(StubbedGraph):
         self.setting(capacity_hint_files=5)
         quiet = delegate(self.engine, self.chat_id, 'Goal 3', tasks('c', files=['1.txt', '2.txt', '3.txt']))
         self.assertIsNone(quiet['capacity']['hint'])
+
+    def test_capacity_hint_without_routing(self):
+        self.setting(team_route_mode='off')
+        result = delegate(self.engine, self.chat_id, 'Goal', tasks('a', files=['one.txt', 'two.txt', 'three.txt']))
+        run = self.run_of(result)
+        self.assertIsNone(result['route'])  # no decision with the mode off...
+        self.assertNotIn('route', run)
+        self.assertEqual(result['capacity'], run['capacity_hint'])  # ...but every new run still gets the hint
+        self.assertEqual(result['capacity'], dict(free=2, startable=1, hint='Task a looks big and 1 coworker(s) are '
+                                                  'idle: consider splitting it into independent parts.'))
+        many = tasks('b')
+        many[0]['acceptance'] = '1\n2\n3\n4'
+        self.assertIn('Task b looks big', delegate(self.engine, self.chat_id, 'Goal 2', many)['capacity']['hint'])
+        self.setting(capacity_hint_acceptance_lines=5)  # the new setting reaches capacity_hint through delegate
+        quiet = tasks('c')
+        quiet[0]['acceptance'] = '1\n2\n3\n4'
+        self.assertIsNone(delegate(self.engine, self.chat_id, 'Goal 3', quiet)['capacity']['hint'])
 
 
 if __name__ == '__main__':

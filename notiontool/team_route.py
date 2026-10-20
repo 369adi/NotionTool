@@ -7,7 +7,7 @@ The setting team_route_mode decides what happens with that decision:
   and returned in the delegate response.
 - 'enforce': a TEAM decision expands the plan with team_graph.expand() (design -> critique -> builds ->
   integrate, or analysis parts with one critique each plus a synthesis).
-- 'off': no decision is computed at all.
+- 'off': no decision is computed at all (the capacity hint is still saved on every new run).
 
 A request can override the automatic decision with route='direct' | 'team' ('auto' is the default).
 decide() never raises: on any error it returns a DIRECT decision with a route_error reason.
@@ -257,6 +257,9 @@ def match_created(specs, created):
     Specs still unmatched after that (for example a prompt the engine changed) are mapped by their position
     among the remaining created tasks; both lists keep plan order. A spec left without any task is missing
     from the result, and delegate warns about its id.
+    Returns (matched, by_position): the plan id -> engine task map, and the plan ids (plan order) that only the
+    positional fallback matched. A positional match may be the wrong task, so delegate gives those tasks only
+    their summary and effort, never team keys, and warns about their ids.
     """
     left = list(created)
     out = {}
@@ -280,9 +283,11 @@ def match_created(specs, created):
         if not progressed:
             break
     rest = [s for s in specs if str(s.get('id')) not in out]
+    by_position = []
     for spec, task in zip(rest, left):  # positional fallback, only among the tasks no spec claimed
         out[str(spec.get('id'))] = task
-    return out
+        by_position.append(str(spec.get('id')))
+    return out, by_position
 
 
 def _big(task, files, chars, lines):
@@ -315,5 +320,8 @@ def capacity_hint(free, startable, tasks, files=CAPACITY_FILES, chars=CAPACITY_C
 
 
 def capacity_settings(settings):
+    """capacity_hint limits from the settings capacity_hint_files, capacity_hint_chars and
+    capacity_hint_acceptance_lines; a missing, bad or non-positive value uses the default (3, 1500, 4)."""
     return dict(files=_int_setting(settings, 'capacity_hint_files', CAPACITY_FILES),
-                chars=_int_setting(settings, 'capacity_hint_chars', CAPACITY_CHARS))
+                chars=_int_setting(settings, 'capacity_hint_chars', CAPACITY_CHARS),
+                acceptance_lines=_int_setting(settings, 'capacity_hint_acceptance_lines', CAPACITY_ACCEPTANCE_LINES))
