@@ -267,13 +267,13 @@ def choose_task_effort(client, model_id, purpose='', task=None):
     The effort the Main set on the task (requested_effort, from operator_main.delegate) wins, clamped to
     the model's supportedReasoningEfforts; otherwise the automatic choose_effort. Turns of the Main chat
     itself (purpose 'main') always keep the automatic choice."""
-    from .effort_policy import REASONING_ORDER, catalog_efforts, clamp_effort
+    from .effort_policy import REASONING_ORDER, cap_coworker, catalog_efforts, clamp_effort
     task = task if isinstance(task, dict) else {}
     asked = task.get('requested_effort')
     asked = asked.strip().lower() if isinstance(asked, str) else ''
     if purpose != 'main' and asked in REASONING_ORDER:
         supported, _default = catalog_efforts(catalog_entry(client, model_id))
-        effort = clamp_effort(asked, supported)
+        effort = clamp_effort(cap_coworker(asked, purpose), supported)
         if effort is None:
             return None, ('set by Main: %s; not sent: no supportedReasoningEfforts for this model '
                           'in the cached catalog' % asked)

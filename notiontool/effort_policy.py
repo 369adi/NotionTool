@@ -111,6 +111,21 @@ def escalate(level, failure, reason):
 # Evidence for the names and the request field: work/effort_field.md.
 REASONING_ORDER = ("low", "medium", "high", "xhigh", "max")
 
+# Rule I47 (user 2026-10-21): no Coworker request ever runs on 'max'; their top level is 'xhigh'.
+# Only Main chats (the user's own pick) keep the full range.
+COWORKER_TOP_EFFORT = "xhigh"
+MAIN_PURPOSES = ("main", "operator", "spare_main", "external")
+
+
+def cap_coworker(effort, purpose=""):
+    """Levels above COWORKER_TOP_EFFORT become COWORKER_TOP_EFFORT for every non-Main request."""
+    if purpose in MAIN_PURPOSES or not isinstance(effort, str):
+        return effort
+    level = effort.strip().lower()
+    if level in REASONING_ORDER and REASONING_ORDER.index(level) > REASONING_ORDER.index(COWORKER_TOP_EFFORT):
+        return COWORKER_TOP_EFFORT
+    return effort
+
 # task_class groups for the reasoning effort rule (task_router class names).
 TOP_EFFORT_CLASSES = ("review",)
 LIGHT_EFFORT_CLASSES = ("routine", "docs", "test")
@@ -179,7 +194,7 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
     else:
         rule, target = "%s, risk %s: high effort" % ("task_class " + cls if cls else "no task_class",
                                                     rk or "medium"), "high"
-    effort = clamp_effort(target, supported)
+    effort = clamp_effort(cap_coworker(target, purpose), supported)
     reason = rule + " -> " + effort
     if effort != target:
         reason += " (clamped from %s)" % target

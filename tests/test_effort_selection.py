@@ -51,8 +51,8 @@ class RuleTest(unittest.TestCase):
 
     def test_main_review_and_high_risk_get_highest(self):
         self.assertEqual(self.pick('main')[0], 'max')
-        self.assertEqual(self.pick(cls='review', risk='low')[0], 'max')
-        self.assertEqual(self.pick(cls='code', risk='high')[0], 'max')
+        self.assertEqual(self.pick(cls='review', risk='low')[0], 'xhigh')  # Rule I47: Coworkers top out at xhigh
+        self.assertEqual(self.pick(cls='code', risk='high')[0], 'xhigh')
         self.assertEqual(self.pick('main', sup=('low', 'medium', 'high'))[0], 'high')
 
     def test_code_research_medium_get_high(self):
