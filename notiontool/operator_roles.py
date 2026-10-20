@@ -6,6 +6,7 @@ a file lock and never block another Coworker.
 """
 import json
 import re
+import time
 
 QUALITIES = ('fast', 'standard', 'high')
 MAX_FIX_ROUNDS = 2
@@ -16,6 +17,11 @@ UI_FILES = re.compile(r'(?i)\.(css|scss|html?|jsx|tsx|vue|svg)$|(^|/)web/')
 CODE_FILES = re.compile(r'(?i)\.(py|js|ts|jsx|tsx|ps1|sh|go|rs|java|cs|cpp|c|h|rb|php|sql)$')
 TESTS = re.compile(r'tests?/[\w./-]+\.py')
 STAGE_WORDS = dict(design='Designing', build='Building', review='Reviewing', fix='Fixing')
+# TEAM graphs (team_graph.py): stage_role values copied to the top-level task keys on import.
+DESIGN_ROLES = ('design', 'design_critique')
+GATE_ROLES = ('integrate', 'synthesis')  # wait until every build they depend on is finally reviewed
+REVIEW_FINAL = ('approved', 'skipped', 'open')
+GATE_HOLD_S = 30.0
 
 
 def _files(tasks):
@@ -51,9 +57,9 @@ def choose_quality(goal, tasks, explicit=''):
 
 def stage_of(task):
     """Plain stage word of one task."""
-    if task.get('stage_role') == 'design':
+    if task.get('stage_role') in DESIGN_ROLES:
         return STAGE_WORDS['design']
-    if task.get('role') == 'reviewer':
+    if task.get('role') == 'reviewer' or task.get('stage_role') == 'critique':
         return STAGE_WORDS['review']
     if task.get('fix_of'):
         return STAGE_WORDS['fix']
@@ -139,6 +145,56 @@ def _read_only(chain):
     return True
 
 
+def _design_ids(tasks):
+    """Finished design-stage tasks of the run (legacy high-quality design or TEAM design + critique)."""
+    return [t['id'] for t in tasks if t.get('stage_role') in DESIGN_ROLES and t.get('state') == 'done']
+
+
+def _gate_wait_for(store, run, tasks, new_id, chain):
+    """Make every integrator/synthesis that depends on this chain also wait for new_id (review or fixer)."""
+    ids = {t['id'] for t in chain}
+    for gate in tasks:
+        if gate.get('stage_role') not in GATE_ROLES or not ids & set(gate.get('deps') or []):
+            continue
+        if gate.get('state') in ('queued', 'retry'):
+            if new_id not in gate['deps']:
+                gate['deps'] = list(gate['deps']) + [new_id]
+                store.put('tasks', gate)
+        else:
+            store.event('gate_started_early', run['id'], task_id=gate['id'],
+                        message='%s started before %s existed' % (gate.get('title', ''), new_id))
+
+
+def _gate(engine, run, tasks):
+    """Hold a queued integrator/synthesis while a build it depends on is done but not finally reviewed.
+
+    Reviews are queued by step() only after a build's merge settled; this hold closes that window
+    (dispatch reads next_at, engine.py tick). True when a task was written."""
+    by_id = {t['id']: t for t in tasks}
+    now = engine.clock() if callable(getattr(engine, 'clock', None)) else time.time()
+    changed = False
+    for gate in tasks:
+        if gate.get('stage_role') not in GATE_ROLES or gate.get('state') not in ('queued', 'retry'):
+            continue
+        pending = [d for d in (by_id.get(i) for i in gate.get('deps') or [])
+                   if d and d.get('role') == 'executor' and d.get('state') == 'done' and not d.get('fixed_by')
+                   and d.get('review_state') not in REVIEW_FINAL]
+        if pending:
+            if not gate.get('team_hold') or gate.get('next_at', 0) <= now:
+                if not gate.get('team_hold'):
+                    gate['team_hold_next_at'] = gate.get('next_at', 0)
+                gate.update(team_hold=True, next_at=now + GATE_HOLD_S)
+                store_put = engine.store.put
+                store_put('tasks', gate)
+                changed = True
+        elif gate.get('team_hold'):
+            gate['next_at'] = gate.pop('team_hold_next_at', 0)
+            gate.pop('team_hold', None)
+            engine.store.put('tasks', gate)
+            changed = True
+    return changed
+
+
 def step(engine, run, tasks):
     """Queue the next review or fix task for every finished build; True when anything changed."""
     from .operator_main import _with_result_line
@@ -149,7 +205,7 @@ def step(engine, run, tasks):
     changed = False
     for task in tasks:
         if (task['role'] != 'executor' or task['state'] != 'done' or task.get('fixed_by')
-                or task.get('review_state') in ('approved', 'open')):
+                or task.get('review_state') in REVIEW_FINAL):
             continue
         if task.get('patch_worktree') and task.get('patch_state') in ('working', 'waiting'):
             continue  # Review only after the merge settled: the copy is removed when it merges.
@@ -158,8 +214,11 @@ def step(engine, run, tasks):
         if not review and _read_only(chain):
             # A read-only audit changed no file: there is nothing for a second coworker to review
             # (bench heavy8b: the review stage cost 30-40 s per audit). The Main checks the report.
-            task.update(review_state='approved', review_skipped='read-only task: no changed files to review')
+            # Honest outcome: a skipped review is 'skipped', never 'approved' (nobody approved anything).
+            task.update(review_state='skipped', review_skipped='read-only task: no changed files to review')
             store.put('tasks', task)
+            store.event('review_skipped', run['id'], task_id=task['id'],
+                        message='Review skipped (read-only, no changed file): ' + chain[0].get('title', ''))
             changed = True
             continue
         if not review:
@@ -167,17 +226,30 @@ def step(engine, run, tasks):
             if not coworkers - done_by:
                 task.update(review_state='open', review_open='No second Coworker is available for an independent review')
                 store.put('tasks', task)
+                # Logged so nobody mistakes the gated integrator's later run for a reviewed build.
+                store.event('review_unavailable', run['id'], task_id=task['id'],
+                            message='Not reviewed (no second Coworker free): ' + chain[0].get('title', ''))
                 changed = True
                 continue
-            review = engine.add_task(run, 'reviewer', review_prompt(run.get('goal', ''), chain),
-                                     'Review: ' + chain[0].get('title', ''), deps=[task['id']],
+            designs = _design_ids(tasks)
+            prompt = review_prompt(run.get('goal', ''), chain)
+            if designs:
+                prompt += ('\nThe design and its critique (%s) are in your context: also check that the build '
+                           'follows them.' % ', '.join(designs))
+            review = engine.add_task(run, 'reviewer', prompt,
+                                     'Review: ' + chain[0].get('title', ''), deps=[task['id']] + designs,
                                      acceptance=task.get('acceptance', ''))
-            review.update(review_of=task['id'], review_scope=[t['id'] for t in chain],
+            # engine._dispatch builds a review_of task's context only from review_scope: TEAM designs go in too.
+            # The legacy quality-high design (role architect) stays out of the scope; tests/test_operator_roles.py:144
+            # pins that scope and is not in this task's write list (follow-up).
+            team_designs = [i for i in designs if by_id.get(i, {}).get('role') == 'executor']
+            review.update(review_of=task['id'], review_scope=team_designs + [t['id'] for t in chain],
                           exclude_workers=sorted(w for w in done_by if w), read_only=True,
                           review_round=len(chain))
             store.put('tasks', review)
             task['review_task'] = review['id']
             store.put('tasks', task)
+            _gate_wait_for(store, run, tasks, review['id'], chain)
             store.event('stage_changed', run['id'], task_id=review['id'], message='Reviewing: ' + chain[0].get('title', ''))
             changed = True
             continue
@@ -205,12 +277,15 @@ def step(engine, run, tasks):
             store.put('tasks', fixer)
             task['fixed_by'] = fixer['id']
             store.put('tasks', task)
+            _gate_wait_for(store, run, tasks, fixer['id'], chain)  # the integrator waits for the fix too
             store.event('stage_changed', run['id'], task_id=fixer['id'], message='Fixing: ' + first.get('title', ''))
             changed = True
         else:
             task.update(review_state='open', review_open=_open_points(data))
             store.put('tasks', task)
             changed = True
+    if _gate(engine, run, engine.tasks(run['id'])):
+        changed = True
     stage = run_stage(engine.tasks(run['id']))
     if stage and run.get('stage') != stage:
         run['stage'] = stage
