@@ -807,13 +807,13 @@
 
     // Navigation stays Notion's: the click goes to Notion's own (hidden) sidebar row of that thread;
     // without one the link is followed.
+    // Coworker chats are never opened in the app: Notion loads the whole (very long) history on
+    // open and the app starts to lag. The row is status-only; progress lives in the Live panel.
     function openThread(ev, row) {
-      var target = row.thread ? document.querySelector('[data-nt-desk="chat-row"][data-nt-desk-thread="' + row.thread + '"]') : null;
-      if (!target) return;
       ev.preventDefault();
       ev.stopPropagation();
-      var link = target.matches('a[href]') ? target : target.querySelector('a[href]');
-      (link || target).click();
+      ctx.toast((row.label || 'Coworker') + ': ' + (row.task || (row.busy ? 'working' : 'idle')) +
+        '. Coworker chats are not opened here (keeps the app fast).', 'info');
     }
 
     function coworkerRow(row) {
@@ -828,8 +828,9 @@
       if (row.model) kids.push(el('span', { cls: 'nt-desk-chip nt-desk-model', text: row.model }));
       if (row.age) kids.push(el('span', { cls: 'nt-desk-chip nt-desk-age nt-desk-age-' + (row.ageCls || 'ok') + (row.rotating ? ' nt-desk-age-rotating' : ''), text: row.age, title: row.ageTitle || 'Chat age' }));
       var props = { cls: 'nt-desk-coworker', 'data-nt-desk': 'coworker', 'data-nt-desk-thread': row.thread, title: row.task };
-      if (row.url) props.href = row.url;
-      var node = el(row.url ? 'a' : 'div', props, kids);
+      props.role = 'button';
+      props.tabindex = '0';
+      var node = el('div', props, kids);
       node.addEventListener('click', function (ev) { openThread(ev, row); });
       return node;
     }
