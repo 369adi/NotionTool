@@ -1284,7 +1284,7 @@ class NotionAdapter:
         self.store.event('empty_stream_reconciled', run_id, **(trace or {}))
         return reply
 
-    RECOVER_WINDOW = 30  # newest entries read first after stream end; the full 100 only if our marker is not inside
+    RECOVER_WINDOW = 12  # newest entries read first after stream end; then 30, then the full 100, only if our marker is not inside
 
     def _prefetch_thread(self, worker):
         # Stream end only: read the thread record for the model check while the transcript loads.
@@ -1352,7 +1352,8 @@ class NotionAdapter:
             if len(hashed)==1 and hashed[0].get('sequence',0)>=task.get('before_seq',0):
                 markers=hashed
         if not markers and (limit or self.RECOVER_WINDOW) < 100:
-            return self.recover(worker, task, cancel, limit=100, prefetch=prefetch)  # long turn: the marker is older than the small window
+            wider = 30 if (limit or self.RECOVER_WINDOW) < 30 else 100
+            return self.recover(worker, task, cancel, limit=wider, prefetch=prefetch)  # long turn: the marker is older than the small window
         if not markers:
             if task.get('context_reset') and not_accepted(task, transcript, fresh):
                 raise ResetNotAccepted()
