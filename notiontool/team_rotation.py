@@ -113,7 +113,19 @@ class TeamRotator:
             self.store.event('team_rotation_failed', message='Rotation check failed: ' + type(exc).__name__)
             started = []
         self.name_pass()
+        self.cleanup_pass()
         return started
+
+    def cleanup_pass(self):
+        """Periodically delete retired Coworker chats (setting coworker_delete_old_chat, default on). Never raises."""
+        if not self.store.settings().get('coworker_delete_old_chat', True) or self.budget_reason():
+            return 0
+        try:
+            from . import retired_chats
+            return len(retired_chats.delete_retired(self.store, self.adapter, limit=10).get('deleted') or [])
+        except Exception as exc:
+            self.store.event('coworker_old_chat_delete_failed', message='Cleanup failed: ' + type(exc).__name__)
+            return 0
 
     def name_pass(self):
         """Periodic naming (rule I41): idle joined Coworkers of every ready account get 'Coworker N'.
@@ -311,11 +323,14 @@ class TeamRotator:
             self.last_error.pop(ident, None)
         if result.get('postponed'):
             return result
-        self.store.event('team_rotation_done', message=role + ' moved to a fresh Welcome chat; the old chat is retired and kept',
+        delete_old = self.store.settings().get('coworker_delete_old_chat', True)
+        self.store.event('team_rotation_done', message=role + ' moved to a fresh Welcome chat; the old chat is retired and '
+                         + ('deleted' if delete_old else 'kept'),
                          account_id=ident, role=role, worker_id=worker_id, thread_id=result.get('thread_id', ''))
         try:
             from . import retired_chats
-            retired_chats.delete_retired(self.store, self.adapter)
+            if delete_old:
+                retired_chats.delete_retired(self.store, self.adapter)
         except Exception as exc:
             self.store.event('coworker_old_chat_delete_failed', message=str(exc)[:200], account_id=ident)
         return result
