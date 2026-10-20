@@ -249,6 +249,8 @@
 .nt-desk-menu-item[aria-disabled="true"] { color: var(--nt-disabled, #555c6e); background: transparent; cursor: not-allowed; }
 /* Long chats: the browser skips layout + paint of off-screen messages (overlay.js applyRenderSkip). */
 [data-nt-cv] > div { content-visibility: auto; contain-intrinsic-size: auto 300px; }
+/* Tail mode (overlay.js): older messages leave style/layout until the user scrolls to the top. */
+[data-nt-cv][data-nt-tail] > div:nth-last-child(n+9) { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .nt-desk-dialog { animation: nt-desk-fade 160ms ease-out; }
   .nt-desk-icon-btn, .nt-desk-gear, .nt-desk-chat, .nt-desk-btn, .nt-desk-input, .nt-desk-menu-item { transition: none; }

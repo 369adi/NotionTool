@@ -1500,9 +1500,45 @@
       var scroller = chatScroller();
       if (!scroller) return;
       var marked = scroller.querySelector('[data-nt-cv]');
-      if (marked) return;
-      var listNode = messageList(scroller);
-      if (listNode && listNode.children.length >= 6) listNode.setAttribute('data-nt-cv', '1');
+      if (!marked) {
+        var listNode = messageList(scroller);
+        if (listNode && listNode.children.length >= 6) { listNode.setAttribute('data-nt-cv', '1'); marked = listNode; }
+      }
+      if (!marked) return;
+      // Tail mode: only the newest TAIL_ROWS messages take part in style/layout (profiled: Notion's
+      // style+layout of a long chat was ~25% of the main thread while a reply streamed, 3.4 s on a
+      // switch to an 86-row chat). Scrolling up to the top shows the full history again.
+      var key = threadFromHref(location.href) || '';
+      if (tailKey !== key || tailList !== marked) {
+        tailKey = key;
+        tailList = marked;
+        if (marked.children.length > TAIL_ROWS) marked.setAttribute('data-nt-tail', '1');
+      }
+      bindTail(scroller);
+    }
+
+    var TAIL_ROWS = 8;
+    var tailKey = null;
+    var tailList = null;
+
+    function expandTail(scroller) {
+      var list = scroller.querySelector('[data-nt-tail]');
+      if (!list) return;
+      var before = scroller.scrollHeight;
+      var top = scroller.scrollTop;
+      list.removeAttribute('data-nt-tail');
+      scroller.scrollTop = top + (scroller.scrollHeight - before);  // keep the visible message in place
+    }
+
+    function bindTail(scroller) {
+      if (scroller.__ntTailBound) return;
+      scroller.__ntTailBound = true;
+      scroller.addEventListener('scroll', function () {
+        if (scroller.scrollTop < 250) expandTail(scroller);
+      }, { passive: true });
+      scroller.addEventListener('wheel', function (ev) {
+        if (ev.deltaY < 0 && scroller.scrollTop < 250) expandTail(scroller);
+      }, { passive: true });
     }
 
     function findScroller() {
