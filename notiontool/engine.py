@@ -85,7 +85,13 @@ LIVE_TASK_STATES = ('running', 'uncertain')
 TELEMETRY_SECONDS = 5
 
 class PendingRemote(Exception):
-    """Upstream acceptance/completion is unknown. Never automatically resend."""
+    """Upstream acceptance/completion is unknown. Never automatically resend.
+
+    state/reason come from notion.turn_state of the same transcript read. Only state 'done_empty'
+    (own turn provably finished, no reply text) may lead to a retry; '' means no proof either way."""
+    def __init__(self, *args, state='', reason=''):
+        super().__init__(*args)
+        self.state, self.reason = state, reason
 
 
 class ResetNotAccepted(Exception):
@@ -372,12 +378,16 @@ class Engine:
                               "AND kind IN ('tool_started','file_claimed') AND ts>=?", (task['id'], begun)).fetchall()
         return any(name is None or str(name) not in READ_ONLY_TOOLS for (name,) in rows)
 
-    def _empty_remote_reply(self, task, info, run):
-        """Hang fix: Notion finished the turn but no text reached the harness. After 3 checks and 60 s, retry."""
-        done_at = float(task.get('remote_done_at') or 0)
-        if not done_at or str(task.get('result') or '').strip() or str(task.get('partial') or '').strip():
+    def _empty_remote_reply(self, task, info, run, exc=None):
+        """Retry only when ONE transcript read proved the own turn finished without reply text.
+
+        False-empty fix (t3ec11e437, 2026-10-20 22:41:57): the old rule retried after 3 checks and 60 s
+        when a second signal (the thread record) said 'not busy', although recover had just said the turn
+        was not finished. Now only exc.state == 'done_empty' from notion.turn_state may retry; elapsed
+        time and check counts never decide (they only set the next check time)."""
+        if getattr(exc, 'state', '') != 'done_empty':
             return False
-        if int(task.get('reconcile_checks') or 0) < 3 or time.time() - done_at < 60:
+        if str(task.get('result') or '').strip() or str(task.get('partial') or '').strip():
             return False
         if self._attempt_side_effects(task):
             self._hold_for_reconcile(task, info)
@@ -388,8 +398,9 @@ class Engine:
         running = getattr(self.adapter, 'turn_running', None)
         worker = self.store.get('workers', info['worker_id'])
         if running and worker:
+            # Veto only: True (busy) or None (unknown) keeps reconciling; it can never turn 'running' into 'empty'.
             try:
-                if running(worker):
+                if running(worker) is not False:
                     return False
             except Exception:
                 return False  # unknown is not empty; never resend on a failed check
@@ -1175,6 +1186,9 @@ class Engine:
         task.update(state='running', worker_id=worker['id'], lease=secrets.token_urlsafe(32),
                     step_id=uid(), started=time.time(), attempts=task['attempts']+1, error='', partial='',
                     thread_id=worker['thread_id'], submission_phase='preparing')
+        # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
+        task.update(reconcile_checks=0, remote_done_at=0, reconcile_at=0, approval_seen=None, awaiting_approval='',
+                    approval_evidence=False, turn_state='', turn_state_reason='')
         # Every attempt keeps its own timing record for the metrics.
         task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
             dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
@@ -1423,15 +1437,16 @@ class Engine:
             info['verified_fallback'] = True
         except (CircuitOpen, RemotePaused) as exc:
             failure=exc
-            if task.get('submission_phase') == 'inference' and self._empty_remote_reply(task, info, run):
-                pass
+            if task.get('submission_phase') == 'inference' and self._empty_remote_reply(task, info, run, exc):
+                pass  # never true: a circuit/pause error carries no done_empty proof
             elif task.get('submission_phase') == 'inference':
                 # Phase 3 / I5: the inference may already have left; never resend, reconcile instead.
+                # The task limit only slows the checks down; it never blocks, resends or abandons.
                 overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue, reconcile_checks=checks,
+                task.update(state='uncertain', reconcile_checks=checks,
                             reconcile_at=time.time()+(300 if overdue else max(min(60,5*2**min(checks-1,4)), getattr(exc,'seconds',0))),
-                            error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                            error='Awaiting confirmation from Notion; request will not be resent')
                 worker = self.store.get('workers', info['worker_id'])
                 worker['state'] = 'recovering'
                 self.store.put('workers', worker)
@@ -1447,19 +1462,25 @@ class Engine:
                             attempts=max(0, task['attempts']-1), paused_by='account_blocked', error=str(exc)[:400])
         except PendingRemote as exc:
             failure=exc
-            if self._empty_remote_reply(task, info, run):
+            task.update(turn_state=getattr(exc, 'state', '') or 'unknown', turn_state_reason=getattr(exc, 'reason', ''))
+            if self._empty_remote_reply(task, info, run, exc):
                 pass
             else:
+                # The task limit only slows the checks down; it never blocks, resends or abandons (no time-based stop).
                 overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
-                            reconcile_checks=checks,reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))), error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                task.update(state='uncertain', reconcile_checks=checks,
+                            reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))),
+                            error='Awaiting confirmation from Notion; request will not be resent')
                 stored = self.store.get('tasks', task['id'], {}) or {}
                 if stored.get('awaiting_approval'):
-                    # Known cause: the turn is paused on an approval click, not lost. Say so plainly.
-                    task.update(awaiting_approval=stored['awaiting_approval'],
-                                error='Waiting for approval of ' + stored['awaiting_approval'] +
-                                      ' in the coworker chat; the request is not resent')
+                    # Honest label (H5): 'approval' only with explicit evidence from the transcript entry.
+                    label = stored['awaiting_approval']
+                    task.update(awaiting_approval=label, approval_evidence=bool(stored.get('approval_evidence')),
+                                error=('Waiting for approval of ' + label + ' in the coworker chat; the request is not resent'
+                                       if stored.get('approval_evidence') else
+                                       'A tool call in the coworker chat has not finished yet (' + label +
+                                       '); the request is not resent'))
                 worker = self.store.get('workers', info['worker_id'])
                 worker['state'] = 'recovering'
                 self.store.put('workers', worker)

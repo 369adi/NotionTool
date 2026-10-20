@@ -70,6 +70,110 @@ def text_content(value):
     return ''
 
 
+# Shared 'turn finished / session idle' rules (false-empty fix, t3ec11e437). recover, the send checks,
+# thread_busy/turn_running and turn_watch all use these; no other code decides 'finished' by itself.
+FINISHED_STATUSES = ('idle', 'completed')  # a missing status is 'unknown', never 'finished'
+EMPTY_PROOF_STATUSES = ('idle',)  # 'completed' is unproven as a session status (H1): it may accept a reply, never prove 'empty'
+APPROVAL_STATUSES = ('awaiting_approval', 'needs_approval', 'requires_approval', 'waiting_for_approval',
+                     'awaiting_confirmation', 'needs_confirmation', 'requires_confirmation')
+PENDING_TOOL_TEXT = 'A tool call in the coworker chat has not finished yet'
+
+
+def session_state(transcript):
+    """'finished', 'running' or 'unknown' for one transcript read."""
+    transcript = transcript or {}
+    if transcript.get('session_pending'):
+        return 'running'
+    status = (transcript.get('session') or {}).get('status')
+    if status is None:
+        return 'unknown'
+    return 'finished' if status in FINISHED_STATUSES else 'running'
+
+
+def record_state(thread):
+    """Same vocabulary for a thread record: 'running', 'finished' or 'unknown' (no record)."""
+    if not isinstance(thread, dict) or not thread:
+        return 'unknown'
+    latest = thread.get('latest_user_or_trigger_time') or 0
+    done = (thread.get('last_turn_outcome') or {}).get('completed_time') or 0
+    return 'running' if latest > done else 'finished'
+
+
+def entity_text(entity):
+    """Reply text of one transcript entry: 'content' first, then 'text'."""
+    text = text_content(entity.get('content'))
+    return text if text.strip() else text_content(entity.get('text'))
+
+
+def approval_evidence(entity):
+    """True only when the entry itself says it waits for an approval click (H5: never guessed from time)."""
+    payload = entity.get('payload') if isinstance(entity.get('payload'), dict) else {}
+    if str(entity.get('interaction_status') or '').lower() in APPROVAL_STATUSES:
+        return True
+    keys = ('requires_approval', 'needs_approval', 'awaiting_approval', 'requires_confirmation')
+    return any(src.get(key) is True for src in (entity, payload) for key in keys)
+
+
+def turn_state(transcript, task, resumes=()):
+    """State of the task's own turn from ONE transcript read.
+
+    done_reply, done_empty, done_error, tool_pending, running, unknown or not_found. Only done_empty may
+    lead to a retry: own entries exist, no reply text, no pending tool, no error step, and either a
+    turn_completed entry or session status 'idle' whose session sequence covers the own turn.
+    """
+    transcript = transcript or {}
+    entities = [p.get('entity') or {} for p in transcript.get('patches') or [] if p.get('op') == 'put']
+    before = task.get('before_seq', 0) or 0
+    fresh = [e for e in entities if (e.get('sequence') or 0) > before]
+    session = transcript.get('session') or {}
+    step = task.get('step_id')
+    markers = [e for e in fresh if e.get('kind') == 'user_message' and step and
+               (e.get('id') == step or e.get('client_message_id') == step)]
+    if not markers and task.get('request_fingerprint'):
+        # Text-hash fallback: only one exact match at or after before_seq counts; otherwise reconcile, never resend.
+        hashed = [e for e in entities if e.get('kind') == 'user_message' and
+                  hashlib.sha256(text_content(e.get('content', e.get('text', []))).encode()).hexdigest() == task['request_fingerprint']]
+        if len(hashed) == 1 and (hashed[0].get('sequence') or 0) >= before:
+            markers = hashed
+    sess = session_state(transcript)
+    seq = session.get('sequence')
+    known_seq = isinstance(seq, (int, float)) and not isinstance(seq, bool)
+    out = dict(state='not_found', reason='own user message is not in this read', text='', fresh=fresh, own_turn=[],
+               finished=False, session=sess, status=session.get('status'), session_seq=seq, own_seq=None, last_seq=None)
+    if not markers:
+        return out
+    after = min(e.get('sequence') or 0 for e in markers)
+    resumes = set(resumes or ())  # automatic continue messages stay inside this turn
+    until = min([e.get('sequence') or 0 for e in fresh if e.get('kind') == 'user_message' and (e.get('sequence') or 0) > after
+                 and not ({e.get('id'), e.get('client_message_id')} & resumes)], default=float('inf'))
+    own_turn = sorted([e for e in fresh if after < (e.get('sequence') or 0) < until], key=lambda e: e.get('sequence') or 0)
+    text = '\n'.join(t for t in (entity_text(e) for e in own_turn if e.get('kind') == 'assistant_message') if t.strip())
+    turn_done = any(e.get('kind') == 'turn_completed' for e in own_turn)
+    last_seq = max([after] + [e.get('sequence') or 0 for e in own_turn])
+    stale = not turn_done and known_seq and seq < last_seq
+    finished = turn_done or (sess == 'finished' and not stale)
+    out.update(own_turn=own_turn, text=text, own_seq=after, last_seq=last_seq, finished=finished)
+    if finished and text:
+        return dict(out, state='done_reply', reason='own turn finished with reply text')
+    if not finished:
+        if stale:
+            return dict(out, state='running', reason='session sequence %s is below the own turn (%s)' % (seq, last_seq))
+        if sess == 'unknown':
+            return dict(out, state='unknown', reason='session status missing')
+        return dict(out, state='running', reason='session pending' if transcript.get('session_pending') else
+                    'session status %s' % session.get('status'))
+    if any(e.get('interaction_status') == 'pending' for e in own_turn):
+        return dict(out, state='tool_pending', reason=PENDING_TOOL_TEXT)
+    if any('error' in str(e.get('kind') or e.get('type') or '').lower() for e in own_turn):
+        return dict(out, state='done_error', reason='own turn has an error step and no reply')
+    if not own_turn:
+        return dict(out, state='unknown', reason='no entries after the own user message yet')
+    if not turn_done and (session.get('status') not in EMPTY_PROOF_STATUSES or not known_seq):
+        return dict(out, state='unknown', reason='finished status %s / sequence %s does not prove an empty turn'
+                    % (session.get('status'), seq))
+    return dict(out, state='done_empty', reason='own turn finished without reply text')
+
+
 def apply_patch(steps, operations):
     root = {'s':steps}
     for op in operations or []:
