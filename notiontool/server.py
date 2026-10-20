@@ -1036,6 +1036,12 @@ class Application:
                 # The operator's own Notion AI chat becomes the Main that delegates; the harness never writes into it.
                 from .operator_main import register_operator
                 return register_operator(self.store, str(body.get('worker_id') or ''), str(body.get('project_path') or ''))
+            if path=='/api/operator/plan':
+                # Ask before delegating: does calling Coworkers save time for these parts (measured costs)?
+                from .parallel_plan import delegation_decision
+                from .coworker_age_guard import young
+                free = [w for w in self.store.all('workers') if w.get('purpose') == 'worker' and w.get('enabled')]
+                return delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), body.get('stats'))
             if path=='/api/operator/delegate':
                 from .operator_main import delegate
                 return delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''), quality=str(body.get('quality') or ''))

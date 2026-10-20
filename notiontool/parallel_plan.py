@@ -206,6 +206,55 @@ def expected_wall_time(tasks, count, stats=None):
     return clock + float(st['fixed_s'])
 
 
+# Bench B 2026-10-20 (6 read-only parts, real Edge transport): send -> collected 45-67 s per coworker task even
+# for ~5 s of work; solo the Main did all 6 in 31 s. So a coworker costs a fixed ~45 s before it saves time.
+DELEGATION = {
+    'cw_fixed_s': 45.0,     # measured: coworker turn start + tools + result block, independent of the work size
+    'dispatch_s': 1.2,      # measured: sends are serial, ~1.2 s apart
+    'collect_s': 8.0,       # measured: remote done -> result collected (median 7.6 s)
+    'review_s': 10.0,       # Main reads and checks the results
+    'cw_slowdown': 1.15,    # a coworker re-reads context; assumed until the heavy bench measures it
+    'min_save_s': 30.0,     # delegate only when it saves at least this much ...
+    'min_save_ratio': 0.2,  # ... and at least 20 % of the solo time
+}
+
+
+def delegation_decision(parts, free_young=10, stats=None):
+    """Should the Main call coworkers for these parts, and how many?
+
+    parts: dicts with est_s (the Main's solo seconds for that part), optional id, depends_on, files.
+    Returns dict(delegate, count, solo_s, parallel_s, saved_s, reason). Solo = sum of the parts.
+    Parallel = dispatch + fixed coworker cost + list-scheduled work (slowed down) + collect + review.
+    """
+    st = dict(DELEGATION)
+    st.update({k: v for k, v in (stats or {}).items() if k in DELEGATION and v is not None})
+    parts = [p for p in (parts or []) if isinstance(p, dict)]
+    est = [float(p.get('est_s') or 0) for p in parts]
+    solo = sum(est)
+    if len(parts) < 2 or free_young < 2:
+        return dict(delegate=False, count=0, solo_s=round(solo, 1), parallel_s=None, saved_s=0.0,
+                    reason='fewer than 2 independent parts or free coworkers: do it alone')
+    sched = [dict(p, est_s=e * st['cw_slowdown'] + st['cw_fixed_s']) for p, e in zip(parts, est)]
+    dag_w, file_w = independent_parts(sched)
+    cap = max(1, min(int(free_young), dag_w, file_w))
+    best = None
+    for n in range(1, cap + 1):
+        wall = expected_wall_time(sched, n, {'overhead_s': 0.0, 'fixed_s': 0.0})
+        wall += st['dispatch_s'] * min(n, len(parts)) + st['collect_s'] + st['review_s']
+        if best is None or wall < best[1] - 1.0:
+            best = (n, wall)
+    n, wall = best
+    saved = solo - wall
+    ok = saved >= st['min_save_s'] and saved >= st['min_save_ratio'] * solo
+    if ok:
+        reason = '%d coworkers: %.0f s instead of %.0f s alone (saves %.0f s)' % (n, wall, solo, saved)
+    else:
+        reason = 'alone is faster or equal: %.0f s alone vs %.0f s with %d coworkers (fixed cost ~%.0f s each)' % (
+            solo, wall, n, st['cw_fixed_s'])
+    return dict(delegate=ok, count=n if ok else 0, solo_s=round(solo, 1), parallel_s=round(wall, 1),
+                saved_s=round(saved, 1), reason=reason)
+
+
 def choose_coworkers(tasks, free_coworkers, stats=None):
     """Return (count, reason). count is 0 only when no young coworker is free or there is no task."""
     st = _stats(stats)
