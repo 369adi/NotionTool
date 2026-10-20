@@ -22,9 +22,11 @@ function ThreadStore(id, n) {
 ThreadStore.keyName = 'ThreadStore';
 ThreadStore.prototype.getMessageStores = function () {
   var out = [];
-  for (var i = 0; i < this.n; i++) out.push(new Store(i, i === 0 ? 'config' : 'user', this.id));
+  for (var i = 0; i < this.n; i++) out.push(new Store(i, i === 0 ? 'config' : (this.every ? (i % this.every === 0 ? 'user' : 'tool') : 'user'), this.id));
   return out;
 };
+function Sparse(id, n, every) { ThreadStore.call(this, id, n); this.every = every; }
+Sparse.prototype = ThreadStore.prototype;
 window.rspackChunknotion_next = { push: function (c) { c[2](function (id) { if (id !== 174148) throw new Error('no'); return { E: ThreadStore }; }); } };
 window.setTimeout = function () {};
 window.requestAnimationFrame = function () {};
@@ -65,6 +67,9 @@ X.sweep();
 r.capBSwept = window.__ntStepCap.b;
 r.expandedLeft = Object.keys(X.expanded);
 r.emitsTotal = emits.length;
+r.turns = X.nextCapFor(new Sparse('c', 1000, 100), 30);
+r.bounded = X.nextCapFor(new Sparse('d', 1000, 100000), 30);
+r.dense = X.nextCapFor(new ThreadStore('e', 1000), 30);
 window.__ntStepCapOff = true;
 r.offLen = a.getMessageStores().length;
 console.log(JSON.stringify(r));
@@ -85,9 +90,14 @@ class StepCapExpandTest(unittest.TestCase):
             raise AssertionError(out.stderr)
         cls.r = json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_active_v3(self):
+    def test_active_v4(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 3)
+        self.assertEqual(self.r['version'], 4)
+
+    def test_grows_by_user_turns(self):
+        self.assertEqual(self.r['turns'], 300)    # user steps at 900, 800, 700 -> 3 more turns visible
+        self.assertEqual(self.r['bounded'], 431)  # no user step: at most MAX_ADD (400) more steps
+        self.assertEqual(self.r['dense'], 60)     # many short turns: at least STEP_ADD more steps
 
     def test_next_cap(self):
         self.assertEqual(self.r['next'], [60, 90, 0, 0, 0])

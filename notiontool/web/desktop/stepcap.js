@@ -13,9 +13,11 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 3;
+  var VERSION = 4;
   var STEP_CAP = 30;
-  var STEP_ADD = 30;
+  var STEP_ADD = 30;       // minimum growth per load
+  var TURNS_ADD = 3;       // v4: one load adds this many older user turns (30 steps were often only tool steps)
+  var MAX_ADD = 400;       // v4: upper bound per load so one load cannot bring the freeze back
   var MODULE_ID = 174148;  // RecordStore bundle, export E = ThreadStore (Notion desktop 7.39)
   var TOP_PX = 150;        // distance from the top that loads older messages
   var BOTTOM_PX = 40;      // distance from the bottom that resets the cap
@@ -54,6 +56,25 @@
   function totalOf(ts) {
     var f = ts && ts.getMessageStores;
     try { return ((f && f.__orig) ? f.__orig.call(ts) : f.call(ts)).length; } catch (e) { return 0; }
+  }
+
+  // v4: grow the cap until TURNS_ADD more user messages are included (at least STEP_ADD, at most MAX_ADD steps).
+  function nextCapFor(ts, cur) {
+    if (!cur) return 0;
+    var all = [];
+    try { var f = ts.getMessageStores; all = ((f && f.__orig) ? f.__orig.call(ts) : f.call(ts)) || []; } catch (e) { return cur; }
+    var total = all.length;
+    var users = 0;
+    var limit = total - cur - MAX_ADD;
+    var i = total - cur - 1;
+    for (; i >= 0 && i >= limit; i--) {
+      var st = null;
+      try { st = all[i].getStep(); } catch (e) { st = null; }
+      if (st && st.type === 'user' && ++users >= TURNS_ADD) break;
+    }
+    var n = total - Math.max(i, 0);
+    if (n < cur + STEP_ADD) n = cur + STEP_ADD;
+    return n >= total ? 0 : n;
   }
 
   function emit(ts) {
@@ -100,8 +121,9 @@
     if (!id) return 'no-thread';
     var ts = live[id];
     var cur = capOf(id);
-    var n = nextCap(cur, totalOf(ts));
+    var n = nextCapFor(ts, cur);
     if (n === cur) return 'all-loaded';
+    window.__ntExpLast = { id: id, from: cur, to: n, at: now };
     lastLoad = now;
     caps()[id] = n;
     expanded[id] = el;
@@ -143,8 +165,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound3) return;
-    window.__ntStepExpBound3 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound4) return;
+    window.__ntStepExpBound4 = true;
     var opt = { capture: true, passive: true };
     document.addEventListener('wheel', function (e) {
       if (e.deltaY < 0) gesture.up = Date.now(); else if (e.deltaY > 0) gesture.down = Date.now();
@@ -161,7 +183,7 @@
   }
 
   window.__ntStepExp = {
-    nextCap: nextCap, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
+    nextCap: nextCap, nextCapFor: nextCapFor, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
     onScroll: onScroll, gesture: gesture, expanded: expanded, version: VERSION,
     _resetCooldown: function () { lastLoad = 0; }
   };
