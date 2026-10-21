@@ -289,12 +289,63 @@ MODEL_NAMES = {'albuquerque-quinn': 'opus', 'achira-donut': 'sonnet', 'amla-jam'
 
 MAIN_DEFAULT_EFFORT = 'high'
 OWN_CONFIG_IDS = set()
+OWN_ID_TAIL = '00aa'
+OWN_ID_SALT = b'notiontool-own-id-v1'
+OWN_ID_LEGACY_LAST_DAY = 1024  # 2026-10-21: older NotionTool ids carried only the 00aa tail
+OWN_ID_FILE = [None]
+OWN_ID_KEEP = 5000
+
+
+def own_id_sign(head):
+    return hashlib.sha256(OWN_ID_SALT + head.encode('ascii', 'ignore')).hexdigest()[:4]
+
+
+def load_own_config_ids(path):
+    """I46: own 'updated-config' ids survive restarts (legacy spaces have no 00aa tail at all)."""
+    OWN_ID_FILE[0] = Path(path)
+    try:
+        known = OWN_ID_FILE[0].read_text(encoding='utf-8').split()
+    except OSError:
+        return 0
+    OWN_CONFIG_IDS.update(known[-OWN_ID_KEEP:])
+    if len(known) > OWN_ID_KEEP:
+        try:
+            OWN_ID_FILE[0].write_text('\n'.join(known[-OWN_ID_KEEP:]) + '\n', encoding='utf-8')
+        except OSError:
+            pass
+    return len(OWN_CONFIG_IDS)
+
+
+def remember_own_config_id(ident):
+    OWN_CONFIG_IDS.add(ident)
+    if OWN_ID_FILE[0] is not None:
+        try:
+            with open(OWN_ID_FILE[0], 'a', encoding='utf-8') as handle:
+                handle.write(ident + '\n')
+        except OSError:
+            pass
 
 
 def own_config_step(step):
-    """True for 'updated-config' steps NotionTool sent itself (id tail 00aa from new_id, or remembered)."""
+    """True for 'updated-config' steps NotionTool sent itself.
+
+    I46: the 00aa tail alone is no proof (Notion's IdCreator may emit it too). New ids carry a
+    signature in the last 4 hex digits; unsigned 00aa ids only count up to OWN_ID_LEGACY_LAST_DAY.
+    Remembered ids (persisted across restarts) always count."""
     ident = str(step.get('id') or '')
-    return bool(ident) and (ident in OWN_CONFIG_IDS or ident.rsplit('-', 1)[-1].startswith('00aa'))
+    if not ident:
+        return False
+    if ident in OWN_CONFIG_IDS:
+        return True
+    last = ident.rsplit('-', 1)[-1]
+    if len(last) != 12 or not last.startswith(OWN_ID_TAIL):
+        return False
+    if last[8:] == own_id_sign(ident[:-4]):
+        return True
+    try:
+        return int(ident[:3], 16) <= OWN_ID_LEGACY_LAST_DAY
+    except ValueError:
+        return False
 
 
 def main_default_effort(client, model_id):
@@ -335,6 +386,18 @@ def user_effort(client, thread_id):
         return (got[2] if got else None) or MAIN_DEFAULT_EFFORT
     except Exception:
         return MAIN_DEFAULT_EFFORT
+
+
+def user_config(client, thread_id):
+    """(model, effort) for a turn NotionTool sends into a Main/user chat (wake notice, handoff):
+    the user's own last model and reasoning in that chat. Never the model default and never Auto."""
+    try:
+        got = inherit_main_config(client, thread_id)
+    except Exception:
+        got = None
+    if got and got[1]:
+        return got[1], got[2] or MAIN_DEFAULT_EFFORT
+    return client.model('opus'), MAIN_DEFAULT_EFFORT
 
 
 def inherit_main_config(client, thread_id, limit=60):
@@ -507,6 +570,10 @@ class NotionAdapter:
     task_model_routing=True
     def __init__(self, store):
         self.store = store
+        try:
+            load_own_config_ids(Path(store.directory) / 'own_config_ids.txt')
+        except Exception:
+            pass
         self.sessions = SessionStore(data_dir=str(store.directory / 'sessions'))
         self.transports = {}
         self.edge_transports = {}
@@ -518,11 +585,24 @@ class NotionAdapter:
         self.clear_account_pause()
         self.confirmed_configs = {}  # thread_id -> (thread_id, generation, model) after a confirmed config check
 
-    def clear_account_pause(self, authenticated_account_id=''):
-        """Release only an orphaned pause or the freshly authenticated account's pause."""
+    def clear_account_pause(self, authenticated_account_id='', verified=False):
+        """Release an orphaned pause, the freshly authenticated account's pause, or - after a verified
+        sign-in (Notion just answered the identity call) of a DIFFERENT account - the other account's pause.
+
+        In the last case the blocked account itself stays out: a ready one is set to 'signin' (the engine only
+        uses ready accounts) and its paused tasks stay blocked until it signs in again or is resumed by hand."""
         pause = self.network_budget.status().get('pause') or {}
         blocked = pause.get('account_id')
         if blocked and (blocked == authenticated_account_id or not self.store.get('accounts', blocked)):
+            return self.network_budget.resume()
+        if blocked and verified and authenticated_account_id and self.store.get('accounts', authenticated_account_id):
+            other = self.store.get('accounts', blocked)
+            if other.get('state') == 'ready':
+                other.update(state='signin', error='Notion blocked this account; sign in again.')
+                self.store.put('accounts', other)
+            self.store.event('account_pause_released', message='Remote calls resumed after a sign-in of another '
+                             'account; the blocked account %s stays out until it signs in again' % other.get('email', blocked),
+                             account_id=authenticated_account_id, blocked_account=blocked)
             return self.network_budget.resume()
         return False
 
@@ -654,39 +734,27 @@ class NotionAdapter:
     NOTION_COOKIE_DOMAINS=('notion.so','notion.com')
 
     def browser_login(self, timeout=1200):
-        """Open the real Notion login page in an owned Edge window and keep the session the user signs in with."""
-        from .browser import Browser
-        import shutil
+        """Open the Notion login page in a plain Edge window and keep the session the user signs in with.
+
+        No DevTools port on the visible window: Google refuses or breaks sign-in in a browser started
+        with --remote-debugging-port, so the Google login never reached the app. The cookies are read
+        afterwards from the closed profile (window_login.capture_browser_cookies).
+        """
+        from .window_login import capture_browser_cookies
         if getattr(self,'_browser_login_active',False):raise ValueError('A Notion sign-in window is already open')
         self._browser_login_active=True
-        browser=Browser(self.store,profile_name='login-'+uuid.uuid4().hex[:12],start_url='https://www.notion.so/login',edge_only=True)
-        cookies=[]
         try:
-            browser.ensure()
-            deadline=time.time()+timeout
-            while time.time()<deadline:
-                if browser.process is None or browser.process.poll() is not None:break
-                try:
-                    if not [t for t in browser.http('/json/list') if t.get('type')=='page']:break
-                    found=browser.send(browser.http('/json/version'),'Storage.getCookies',{},timeout=10).get('cookies',[])
-                except Exception:
-                    break
-                notion=[c for c in found if str(c.get('domain','')).lstrip('.').lower().endswith(self.NOTION_COOKIE_DOMAINS)]
-                if any(c.get('name')=='token_v2' and c.get('value') for c in notion):
-                    cookies=notion
-                    try:
-                        NotionClient(NativeNotionTransport({'cookies':notion})).identity()
-                        break  # signed in: finish without waiting for the user to close the window
-                    except Exception:
-                        pass
-                time.sleep(1.5)
+            cookies=capture_browser_cookies(self.store, timeout=timeout)
         finally:
             self._browser_login_active=False
-            profile=getattr(browser,'profile',None)
-            browser.close()
-            if profile:shutil.rmtree(profile,ignore_errors=True)
         if not cookies:raise ValueError('No Notion sign-in was detected. Sign in completely before closing the window.')
-        session={'cookies':cookies,'source':'browser_login','created':time.time()}
+        return self.adopt_session_cookies(cookies,'browser_login')
+
+    def adopt_session_cookies(self, cookies, source='browser_login', select=False):
+        """Save a signed-in Notion cookie set as an account session (browser login or NotionTool window login)."""
+        if not any(c.get('name')=='token_v2' and c.get('value') for c in cookies or []):
+            raise ValueError('No Notion sign-in was detected')
+        session={'cookies':cookies,'source':source,'created':time.time()}
         info=NotionClient(NativeNotionTransport(session)).identity()
         email=info['email'].lower()
         existing=next((a for a in self.store.all('accounts') if a['email'].lower()==email),None)
@@ -701,12 +769,12 @@ class NotionAdapter:
         account=self.store.get('accounts',account['id'])
         account.update(identity=info,state='signed_in',error='')
         self.store.put('accounts',account)
-        self.clear_account_pause(account['id'])
+        self.clear_account_pause(account['id'], verified=True)  # identity() above just succeeded
         try:self.refresh(account['id'])
         except Exception as exc:
             account=self.store.get('accounts',account['id']);account['error']=str(exc)[:200];self.store.put('accounts',account)
         from .harness_account import select_account
-        if not had_accounts or existing:
+        if select or not had_accounts or existing:
             try:select_account(self.store,account['id'])
             except Exception:pass
         return {'account_id':account['id'],'email':email,'state':self.store.get('accounts',account['id']).get('state')}
@@ -765,7 +833,7 @@ class NotionAdapter:
             if effort:
                 update['reasoningEffort'] = effort
             config_id = self.new_id(info['space_id'],'00aa')
-            OWN_CONFIG_IDS.add(config_id)  # never read back as a user choice
+            remember_own_config_id(config_id)  # never read back as a user choice (persisted, I46)
             body['transcript'].insert(len(body['transcript'])-1,
                 dict(id=config_id,type='updated-config',value=update))
         body.update(spaceId=info['space_id'],threadId=thread_id,traceId=str(uuid.uuid4()),submittedUserStepId=step_id,
@@ -787,7 +855,8 @@ class NotionAdapter:
         if not 0 <= day < 4096:
             raise ValueError('Current time is outside the supported Notion ID date range')
         parts = str(space).split('-')
-        return f'{day:03x}{parts[0][3:]}-{parts[1]}-80{secrets.token_hex(1)}-{secrets.choice("89ab")}{secrets.token_hex(2)[:3]}-{tail}{secrets.token_hex(4)}'
+        head = f'{day:03x}{parts[0][3:]}-{parts[1]}-80{secrets.token_hex(1)}-{secrets.choice("89ab")}{secrets.token_hex(2)[:3]}-{tail}{secrets.token_hex(2)}'
+        return head + (own_id_sign(head) if tail == OWN_ID_TAIL else secrets.token_hex(2))
 
     @staticmethod
     def thread_key(thread):
@@ -834,6 +903,11 @@ class NotionAdapter:
             if worker.get('label') in MAIN_TITLES or not is_pool_title(worker.get('label') or ''):
                 # Named chats (anything not titled like the Welcome chat) are never coworkers.
                 changes, rename, event = dict(enabled=False, named=True), None, None
+                label = (worker.get('label') or '').strip()
+                if (label and label not in MAIN_TITLES and 'retired' not in label.lower() and not worker.get('retired')
+                        and worker.get('state') not in ('missing', 'retired')):
+                    # A chat the user renamed himself is his own chat: listed in NotionTool's Chats.
+                    changes.update(purpose='private', user_set_title=True, app_chat=True)
             else:
                 changes, rename, event = pool_decision(worker, records.get(worker['thread_id']))
             if rename:
@@ -887,6 +961,28 @@ class NotionAdapter:
             listed = False  # unreadable list: creation stays unconfirmed and is never resent
         clean = not failed and not any(isinstance(s, dict) and s.get('type') == 'error' for s in steps)
         return listed, clean
+
+    def regreet_welcome(self, account_id, tid):
+        """Send the Welcome greeting again into an existing Welcome Coworker that never joined.
+
+        Never creates a chat: the thread must already be in Notion's chat list. Counts regreets."""
+        worker = next((w for w in self.store.all('workers') if w.get('account_id') == account_id
+                       and w.get('thread_id') == tid), None)
+        if not worker or worker.get('join_state') != 'pending':
+            return False
+        client = self.client(account_id)
+        known = {self.thread_key(t) for t in client.threads() if self.thread_key(t)}
+        if str(uuid.UUID(tid)) not in known:
+            raise ValueError('Welcome chat is not in the chat list; nothing was sent')
+        worker['regreets'] = int(worker.get('regreets') or 0) + 1
+        worker['regreet_at'] = time.time() + 300
+        self.store.put('workers', worker)
+        _listed, clean = self.create_welcome(client, tid, client.model())
+        slot = (self.store.get('accounts', account_id) or {}).get('slot')
+        self.store.event('welcome_resent' if clean else 'welcome_warning',
+                         message=('Welcome greeting resent ' if clean else 'Resent greeting returned an upstream error ') + tid,
+                         slot=slot)
+        return clean
 
     def ensure_main(self, account_id, create=True):
         """Load the account's Main (title Main or Main Chat); create one Welcome chat named Main only if none exists.
@@ -1141,6 +1237,8 @@ class NotionAdapter:
                 raise ValueError('A managed Welcome chat is missing; existing chats were preserved')
             if item:
                 continue
+            if new_ids:
+                time.sleep(float(getattr(self,'welcome_gap_s',3.0)))  # paced: rapid creations lose greetings
             tid=self.new_id(client.info['space_id'],'00a9')
             item={'id':tid,'pending':True}
             ledger[role]=item
@@ -1159,7 +1257,8 @@ class NotionAdapter:
         self.refresh(account_id)
         for worker in self.store.all('workers'):
             if worker['account_id']==account_id and worker['thread_id'] in new_ids:
-                worker.update(join_state='pending',enabled=False,welcome=True,purpose='worker',pool_admitted=True)
+                worker.update(join_state='pending',enabled=False,welcome=True,purpose='worker',pool_admitted=True,
+                              welcome_at=time.time())
                 self.store.put('workers',worker)
         self.apply_chat_pool(account_id,client)
         managed={ledger[r]['id'] for r in roles}
@@ -1279,6 +1378,10 @@ class NotionAdapter:
             if hasattr(self.store, 'put'):
                 self.store.put('thread_configs', dict(id=worker['thread_id'], key=list(config_key), at=time.time()))
         _phase['config'] = time.monotonic() - _t0
+        # 6-hour token budget (token_budget.py): nothing is sent while the window is used up.
+        from .token_budget import refuse_if_exhausted, refuse_if_burst, charge_send, charge_reply
+        refuse_if_exhausted(self.store)
+        refuse_if_burst(self.store, worker)  # short-term burst guard: slows coworkers only
         with self.store.lock:
             saved = self.store.get('tasks',task['id'])
             saved['before_seq'] = session.get('sequence',0)
@@ -1316,6 +1419,7 @@ class NotionAdapter:
         _phase['body'] = time.monotonic() - _t0
         self.store.event('presend_timing', run_id, commit=False, **trace, **{k: round(v, 2) for k, v in _phase.items()})
         self.store.event('remote_sent', run_id, prompt_chars=len(prompt), **trace)
+        charge_send(self.store, worker, prompt)  # counted even if the chat is deleted later
         seen_output, lines, reported = False, 0, []
         def remote_done(outcome, error_class='', detail=''):
             if not reported:
@@ -1344,6 +1448,7 @@ class NotionAdapter:
                     last_update = time.monotonic()
             errors = [s for s in steps if isinstance(s,dict) and s.get('type')=='error']
             text = stream_text(steps)
+            charge_reply(self.store, worker, text)
             from .chat_pool import script_mode_failure
             if script_mode_failure(steps):
                 self.note_worker_mcp_failure(worker)
@@ -1548,7 +1653,9 @@ class NotionAdapter:
         budget = getattr(self, 'network_budget', None)
         if isinstance(budget, NetworkBudget):
             budget.turn_failed(source='inference', sub_type=sub_type)
-        raise RateLimited(20, message, confirmed=True)
+        from .account_health import account_of, turn_error_cooldown
+        seconds = turn_error_cooldown(self.store, account_of(self.store, saved.get('worker_id') or task.get('worker_id')))
+        raise RateLimited(seconds, message, confirmed=True)
 
     def confirm_turn_error(self, worker, task):
         """Best effort for a finished turn without a reply; unreadable records keep it pending."""

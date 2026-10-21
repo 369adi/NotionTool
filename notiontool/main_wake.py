@@ -183,6 +183,7 @@ WAKE_HEAD = "NotionTool (automatic): Cowork run finished."
 WAKE_HEAD_MANY = "NotionTool (automatic): Cowork runs finished."
 WAKE_NEXT = ("Next for the Main: read GET /api/run?id=%s, check diffs and reviews, run tests, commit, "
              "restart, live test, confirm awaiting_main runs.")
+WAKE_CANCELLED = "Nothing to do for the Main: the run was cancelled; no review, commit or restart is needed."
 
 
 def wake_run_line(run, tasks):
@@ -203,7 +204,10 @@ def build_wake_message(items):
     lines = [WAKE_HEAD if len(items) == 1 else WAKE_HEAD_MANY] + [wake_run_line(r, t) for r, t in shown]
     if len(items) > len(shown):
         lines.append("... and %d more runs" % (len(items) - len(shown)))
-    lines.append(WAKE_NEXT % (items[0][0].get("id", "<run id>") if len(items) == 1 else "<run id>"))
+    if all(str(r.get("state")) == "cancelled" for r, _ in items):
+        lines.append(WAKE_CANCELLED)  # a cancelled run has nothing to review, commit or restart
+    else:
+        lines.append(WAKE_NEXT % (items[0][0].get("id", "<run id>") if len(items) == 1 else "<run id>"))
     return "\n".join(lines)
 
 
@@ -350,11 +354,11 @@ class MainWake:
 
     def _send(self, client, thread, text):
         """Own small sender, same steps as main_handoff_ops.send_prompt."""
-        from .notion import user_effort
+        from .notion import user_config
         step_id = self.adapter.new_id(client.info["space_id"])
-        # Main chats keep the user's reasoning (else high), never the model default.
-        body = self.adapter.body(client, thread, step_id, text, client.model(), computer=True,
-                                 effort=user_effort(client, thread))
+        # Main chats keep the user's own model and reasoning; never Auto, never the model default.
+        model, effort = user_config(client, thread)
+        body = self.adapter.body(client, thread, step_id, text, model, computer=True, effort=effort)
         try:
             for _ in client.transport.stream("runInferenceTranscript", body, client.headers(), timeout=180):
                 pass
