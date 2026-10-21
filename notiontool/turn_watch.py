@@ -23,8 +23,18 @@ import re
 import threading
 import time
 
+# Shared 'session finished' rule with recover and the send checks. No import cycle: notion.py never imports turn_watch.
+from .notion import FINISHED_STATUSES, session_state
+
 RESUME_TEXT = ('Continue: your previous turn was interrupted before it finished (automatic resume by NotionTool). '
                'Pick up exactly where you stopped and finish the task.')
+# Idle mode (setting idle_mode, default on, button in the status strip): a Main chat whose turn ended
+# shortly before NotionTool restarted (e.g. a build swap) gets one automatic 'continue' after the restart,
+# so the user never has to type 'weiter' after an update.
+RESTART_TEXT = ('Weiter (automatisch nach dem Neustart von NotionTool, Idle-Modus): '
+                'mach mit den offenen Punkten weiter, ohne nachzufragen.')
+RESTART_WINDOW = 900  # the turn ended at most 15 min before the restart
+RESTART_SETTLE = 20   # seconds after the start before the first restart continue
 CHECK_SECONDS = 30
 GRACE_SECONDS = 150  # a Main often thinks or waits on a slow tool for more than a minute between steps
 PENDING_TOOL_SECONDS = 420  # newest step is a tool call without result; every NotionTool tool times out well before this
@@ -36,7 +46,7 @@ WINDOW = 40           # newest transcript entries read per check
 USAGE_SECONDS = 300   # default of main_context_check_seconds
 USAGE_FIRST_WINDOW = 1000  # one larger read per thread, so the old history counts
 USAGE_ERROR_SECONDS = 3600  # at most one operator_usage_failed event per thread per hour
-IDLE = (None, 'idle', 'completed')
+IDLE = FINISHED_STATUSES  # same constant as notion.session_state: a missing status is 'unknown', never idle
 EXCLUDED_STATES = ('missing', 'disabled', 'retired')
 ACTIVE_TASK_STATES = ('running', 'uncertain')
 OPERATOR = 'operator'
@@ -130,11 +140,13 @@ def _pending_tool(last, entities):
 
 def interrupted_turn(transcript, now=None):
     """{'key', 'kind', 'stamp', 'user_ids', 'user_text'} when the newest turn ended without a reply, else None."""
-    session = transcript.get('session') or {}
-    entities = sorted((p.get('entity') or {} for p in transcript.get('patches', []) if p.get('op') == 'put'),
-                      key=lambda e: e.get('sequence', 0))
+    state = session_state(transcript)  # shared rule with recover and the send checks (notion.py)
+    if state == 'unknown':
+        return None  # no session status: unknown is never 'interrupted', so no automatic continue is sent
+    entities = sorted((p.get('entity') or {} for p in (transcript.get('patches') or []) if p.get('op') == 'put'),
+                      key=lambda e: e.get('sequence') or 0)  # None sequences broke sorting (TypeError since 18:03)
     stalled = False
-    if transcript.get('session_pending') or session.get('status') not in IDLE:
+    if state == 'running':
         # A turn that still says 'running' but wrote nothing for STALL_SECONDS is hung, not working.
         newest_any = max([stamp(e) for e in entities] or [0])
         if now is None or not newest_any or now - newest_any < STALL_SECONDS:
@@ -159,6 +171,80 @@ def interrupted_turn(transcript, now=None):
                 user_text=user_text)
 
 
+def restart_continue(transcript, started):
+    """{'key', 'user_text'} when the newest turn finished with a reply shortly before the app start, else None."""
+    if session_state(transcript) != 'finished':
+        return None
+    entities = sorted((p.get('entity') or {} for p in (transcript.get('patches') or []) if p.get('op') == 'put'),
+                      key=lambda e: e.get('sequence') or 0)
+    relevant = [e for e in entities if _role(e)]
+    if not relevant or _role(relevant[-1]) != 'assistant_message':
+        return None
+    last = relevant[-1]
+    when = stamp(last)
+    if not when or when >= started or started - when > RESTART_WINDOW:  # strictly before the start
+        return None
+    key = str(last.get('id') or last.get('sequence') or '')
+    if not key:
+        return None
+    visible = [e for e in relevant if _role(e) == 'user_message' and not _is_resume(e)]
+    user_text = text_of(visible[-1].get('content', visible[-1].get('text', ''))) if visible else ''
+    return dict(key='restart:' + key, user_text=user_text)
+
+
+# A person types at most a few messages between two context checks; more means a counting artefact.
+MAX_MAIN_TURNS_PER_CHECK = 3
+
+
+def charge_main_usage(store, worker, before, after, now=None):
+    """Charge the Main's own turns to the 6-hour token budget (token_budget.py). Never raises.
+
+    The Main is typed in the desktop window, so NotionTool never sends its turns itself. Each new user
+    turn makes Notion read the whole chat again (the context before it) and the chat grew by the new
+    text. The first observation of a thread only sets the baseline (old history is not charged).
+    """
+    try:
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return 0
+        b_tokens, a_tokens = int(before.get('estimated_tokens') or 0), int(after.get('estimated_tokens') or 0)
+        b_turns, a_turns = int(before.get('turns') or 0), int(after.get('turns') or 0)
+        if a_turns < b_turns or a_tokens < b_tokens:
+            # The transcript window shifted (restart, compression, shorter read): a new baseline, never a charge.
+            # Before this, every drop and rise again was charged as dozens of new turns (live: 44.7M for 9 turns).
+            return 0
+        grown = a_tokens - b_tokens
+        turns = min(a_turns - b_turns, MAX_MAIN_TURNS_PER_CHECK)
+        from .token_budget import context_cap
+        cap = context_cap(store)  # a turn reads at most one model context window
+        tokens = min(grown, cap) + turns * min(int(before.get('estimated_tokens') or 0), cap)
+        if not tokens:
+            return 0
+        from .token_budget import charge
+        charge(store, dict(worker, purpose=worker.get('purpose') or OPERATOR), tokens, 0, turn=bool(turns), now=now)
+        return tokens
+    except Exception:
+        return 0
+
+
+def budget_used_up(store, now=None):
+    try:
+        from .token_budget import exhausted
+        return bool(exhausted(store, now))
+    except Exception:
+        return False
+
+
+def _where(exc):
+    """Short 'file:line Error: text' of an exception for the event log."""
+    try:
+        import traceback
+        frame = traceback.extract_tb(exc.__traceback__)[-1]
+        name = frame.filename.replace(chr(92), '/').rsplit('/', 1)[-1]
+        return '%s:%d %s: %s' % (name, frame.lineno, type(exc).__name__, str(exc)[:160])
+    except Exception:
+        return type(exc).__name__
+
+
 def stop_requested(text):
     return bool(STOP_WORDS.search(text or ''))
 
@@ -181,6 +267,7 @@ class TurnWatch:
         self.first_seen, self.sending, self.blocked = {}, set(), False
         self.usage_at, self.usage_failed, self.full_read = {}, {}, set()
         self.spawn = lambda fn, *args: threading.Thread(target=fn, args=args, daemon=True, name='turn-resume').start()
+        self.started = clock()
 
     def operator_workers(self, account_id):
         """Worker ids of the account's operator Main chats that are not released."""
@@ -192,17 +279,31 @@ class TurnWatch:
                 if w.get('account_id') == account_id and w.get('purpose') == OPERATOR and w['id'] in chats}
 
     def workers(self):
-        from .harness_account import main_chat, selected_account
-        account_id = selected_account(self.store)
-        if not account_id or self.store.get('accounts', account_id, {}).get('state') != 'ready':
+        """Watched chats over ALL ready accounts (not only the selected one): every Main chat that is
+        not released, the operator Mains (setting main_auto_continue) and coworkers with an active task.
+        A hung Main on any account is resumed; nothing is tied to one account."""
+        from .harness_account import main_chat
+        ready = {a['id'] for a in self.store.all('accounts') if a.get('state') == 'ready'}
+        if not ready:
             return []
-        main = (main_chat(self.store, account_id) or {}).get('main_worker')
+        auto = self.store.settings().get('main_auto_continue', True)
+        mains = set()
+        for chat in self.store.all('chats'):
+            if chat.get('state') == 'released' or not chat.get('main_worker'):
+                continue
+            if chat.get('operator') and not auto:
+                continue
+            mains.add(chat['main_worker'])
+        operators = set()
+        for account_id in ready:
+            mains.add((main_chat(self.store, account_id) or {}).get('main_worker'))
+            operators |= self.operator_workers(account_id)
+        mains.discard(None)
         busy = {t.get('worker_id') for t in self.store.all('tasks') if _active(t)}
-        operators = self.operator_workers(account_id)
         return [w for w in self.store.all('workers')
-                if w.get('account_id') == account_id and w.get('thread_id')
+                if w.get('account_id') in ready and w.get('thread_id')
                 and w.get('state') not in EXCLUDED_STATES and w.get('join_state') != 'pending'
-                and (w['id'] == main or w['id'] in busy or w['id'] in operators)]
+                and (w['id'] in mains or w['id'] in busy or w['id'] in operators)]
 
     def loop(self):
         from .network_budget import set_thread_priority
@@ -226,14 +327,14 @@ class TurnWatch:
                 self.blocked = True
                 from .telemetry import classify
                 self.store.event('turn_watch_waiting', error=type(failed).__name__, error_class=classify(failed),
-                                 message='Interrupted-turn watch deferred; it retries automatically')
+                                 detail=_where(failed), message='Interrupted-turn watch deferred; it retries automatically')
             elif not failed and self.blocked:
                 self.blocked = False
                 self.store.event('turn_watch_resumed', message='Interrupted-turn watch works again')
 
     def measure_usage(self, worker, client, transcript):
         """Operator workers only, throttled: store context_usage and run main_switch.check(). Never raises."""
-        if worker.get('purpose') != OPERATOR:
+        if worker.get('purpose') not in (OPERATOR, 'main'):  # the selected account's Main counts for the 6 h budget
             return None
         now = self.clock()
         ident = str(worker.get('account_id', '')) + ':' + str(worker.get('thread_id', ''))
@@ -261,10 +362,20 @@ class TurnWatch:
                 if not fresh or fresh.get('thread_id') != worker.get('thread_id'):
                     return None
                 previous = fresh.get('context_ask')
+                try:
+                    charge_main_usage(self.store, fresh, fresh.get('context_usage'), usage, now)
+                except Exception as exc:  # the 6 h budget never blocks the context measurement
+                    if now - getattr(self, 'budget_failed_at', float('-inf')) >= USAGE_ERROR_SECONDS:
+                        self.budget_failed_at = now
+                        try:
+                            self.store.event('token_budget_failed', worker_id=worker.get('id', ''), error=type(exc).__name__,
+                                             message='Token budget charge failed; measurement continues: ' + str(exc)[:200])
+                        except Exception:
+                            pass
                 if fresh.get('context_usage') != usage:
                     fresh['context_usage'] = usage
                     self.store.put('workers', fresh)
-                notice = main_switch.check(self.store, fresh, usage, settings, now=now)
+                notice = main_switch.check(self.store, fresh, usage, settings, now=now) if fresh.get('purpose') == OPERATOR else None
             if notice and not previous:
                 self.store.event('main_context_ask', worker_id=worker['id'], thread_id=worker['thread_id'],
                                  tokens=usage['estimated_tokens'], turns=usage['turns'],
@@ -290,16 +401,20 @@ class TurnWatch:
         self.measure_usage(worker, client, transcript)
         found = interrupted_turn(transcript, now=self.clock())
         if not found:
-            return None
+            return self.check_restart(worker, transcript)
         if (self.store.get('workers', worker['id'], {}).get('resume') or {}).get('key') == found['key']:
             return None  # already handled, also across restarts
-        operator = worker.get('purpose') == OPERATOR
+        # Idle mode: every Main chat (purpose 'main' or the operator Main) may keep working on its own
+        # for hours; coworker turns keep the short chain. Not tied to one account.
+        operator = worker.get('purpose') in (OPERATOR, 'main')
         limit = MAX_CHAIN_OPERATOR if operator else MAX_CHAIN
         now = self.clock()
         since = found['stamp'] or self.first_seen.setdefault(worker['id'] + ':' + found['key'], now)
         need = PENDING_TOOL_SECONDS if found.get('pending') else GRACE_SECONDS
         if now - since < need:
             return None
+        if budget_used_up(self.store, now):
+            return None  # 6-hour token budget used up: no automatic continue until the reset
         with self.engine.lock:
             fresh = self.store.get('workers', worker['id'])
             if not fresh or fresh.get('thread_id') != worker['thread_id']:
@@ -345,16 +460,46 @@ class TurnWatch:
         self.spawn(self.send, worker, step, found['key'])
         return step
 
-    def send(self, worker, step, key):
+    def check_restart(self, worker, transcript):
+        """Idle mode: one automatic continue for a Main whose turn ended shortly before the restart."""
+        if worker.get('purpose') not in (OPERATOR, 'main'):
+            return None
+        if not self.store.settings().get('idle_mode', True):
+            return None
+        now = self.clock()
+        if now - self.started < RESTART_SETTLE:
+            return None
+        hit = restart_continue(transcript, self.started)
+        if not hit or stop_requested(hit.get('user_text', '')):
+            return None
+        if budget_used_up(self.store, now):
+            return None
+        client = self.adapter.client(worker['account_id'])
+        with self.engine.lock:
+            fresh = self.store.get('workers', worker['id'])
+            if not fresh or fresh.get('thread_id') != worker['thread_id']:
+                return None
+            if fresh.get('restart_resume') == hit['key']:
+                return None
+            fresh['restart_resume'] = hit['key']
+            self.store.put('workers', fresh)
+            step = self.adapter.new_id(client.info['space_id'], '00aa')
+            self.sending.add(worker['id'])
+        self.store.event('turn_restart_continue', worker_id=worker['id'], thread_id=worker['thread_id'],
+                         message='Idle mode: NotionTool restarted after this Main finished; it continues automatically')
+        self.spawn(self.send, worker, step, hit['key'], RESTART_TEXT)
+        return step
+
+    def send(self, worker, step, key, text=RESUME_TEXT):
         from .network_budget import request_priority
         try:
             # The resume uses the task's own model when the adapter supports it (notion.py continue_turn).
             task = next((t for t in self.store.all('tasks') if t.get('worker_id') == worker['id'] and _active(t)), None)
             with request_priority('rest'):
                 if task is not None and self.resume_takes_task():
-                    sent = self.adapter.continue_turn(worker, RESUME_TEXT, step, task=task)
+                    sent = self.adapter.continue_turn(worker, text, step, task=task)
                 else:
-                    sent = self.adapter.continue_turn(worker, RESUME_TEXT, step)
+                    sent = self.adapter.continue_turn(worker, text, step)
             if not sent:
                 self.revert(worker, key, 'turn_resume_skipped', 'The chat became busy again; nothing was sent')
         except Exception as exc:
