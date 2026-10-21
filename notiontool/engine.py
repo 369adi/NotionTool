@@ -117,10 +117,14 @@ LIVE_TASK_STATES = ('running', 'uncertain')
 # Streaming telemetry (Engine._partial): at most one task store write per task in this window.
 TELEMETRY_SECONDS = 5
 
+# notion.turn_state states that prove 'own turn finished without reply text' from ONE transcript read.
+EMPTY_PROOF_STATES = ('done_empty', 'done_error')
+
+
 class PendingRemote(Exception):
     """Upstream acceptance/completion is unknown. Never automatically resend.
 
-    state/reason come from notion.turn_state of the same transcript read. Only state 'done_empty'
+    state/reason come from notion.turn_state of the same transcript read. Only EMPTY_PROOF_STATES
     (own turn provably finished, no reply text) may lead to a retry; '' means no proof either way."""
     def __init__(self, *args, state='', reason=''):
         super().__init__(*args)
@@ -416,9 +420,9 @@ class Engine:
 
         False-empty fix (t3ec11e437, 2026-10-20 22:41:57): the old rule retried after 3 checks and 60 s
         when a second signal (the thread record) said 'not busy', although recover had just said the turn
-        was not finished. Now only exc.state == 'done_empty' from notion.turn_state may retry; elapsed
+        was not finished. Now only exc.state in EMPTY_PROOF_STATES from notion.turn_state may retry; elapsed
         time and check counts never decide (they only set the next check time)."""
-        if getattr(exc, 'state', '') != 'done_empty':
+        if getattr(exc, 'state', '') not in EMPTY_PROOF_STATES:
             return False
         if str(task.get('result') or '').strip() or str(task.get('partial') or '').strip():
             return False
@@ -535,10 +539,29 @@ class Engine:
                 elif task['state'] == 'running':
                     task['state'] = 'cancelling'
                     self.store.put('tasks', task)
+                elif task['state'] in ('blocked', 'uncertain') and self._worker_ai_disabled(task):
+                    # Notion AI is off on the worker account, so Notion can never confirm this turn.
+                    # Nothing is resent (I5); the task just ends with its cancelled run.
+                    if task.get('worker_id'):
+                        self._release(task['worker_id'], task.get('lease', ''))
+                    for key in ('remote_unknown', 'side_effect_hold', 'reconcile_at'):
+                        task.pop(key, None)
+                    task.update(state='cancelled', error='Cancelled with its run: the worker account has Notion AI '
+                                'disabled, so Notion can never confirm this turn. Nothing was resent.')
+                    self.store.put('tasks', task)
             for info in self.inflight.values():
                 if info['run_id'] == run_id:
                     info['cancel'].set()
             self.store.event('run_cancelled', run_id, message='Local work stopped; upstream chats are reconciled before reuse')
+
+    def _worker_ai_disabled(self, task):
+        worker_id = task.get('worker_id', '') or ''
+        worker = self.store.get('workers', worker_id, {}) if worker_id else {}
+        account_id = (worker or {}).get('account_id') or worker_id.split(':')[0]
+        if not account_id:
+            return False
+        account = self.store.get('accounts', account_id, {}) or {}
+        return account.get('state') == 'ai_disabled' or (account.get('ai_access') or {}).get('state') == 'disabled'
 
     def pause(self, run_id, paused=True):
         with self.lock:
@@ -1161,12 +1184,17 @@ class Engine:
             self._start_merges()
             self._reconcile()
             self._heal_workers()
+            try:
+                from .account_failover import rehome_runs
+                rehome_runs(self.store)  # B41: runs of dead/AI-disabled accounts move to a working Main
+            except Exception as exc:  # never let failover stop dispatch
+                self.store.event('run_rehome_failed', '', error=str(exc)[:300])
             runs = self.store.all('runs')
             if getattr(self.adapter, 'single_account_harness', False):
-                from .harness_account import selected_account, main_chat
-                selected = selected_account(self.store)
-                # Every Main of the selected harness account may run; each chat stays strictly ordered.
-                runs = [r for r in runs if selected and self.store.get('workers', r.get('main_worker'), {}).get('account_id') == selected]
+                from .harness_account import runnable_accounts
+                # B39: every Main of every account may run while at least one account is ready (its executor
+                # tasks go to coworkers of ready accounts); each chat stays strictly ordered.
+                runs = runs if runnable_accounts(self.store) else []
             for run in runs:
                 if run['state'] == 'queued' and self._run_slot_free(run, runs):
                     run['state'] = 'approach'
@@ -1220,14 +1248,17 @@ class Engine:
     def _choose_worker(self, task, run, settings):
         workers = self.store.all('workers')
         if getattr(self.adapter, 'single_account_harness', False):
-            from .harness_account import selected_account
-            selected = selected_account(self.store)
-            workers = [w for w in workers if w['account_id'] == selected]
+            from .harness_account import runnable_accounts
+            usable = runnable_accounts(self.store)
+            workers = [w for w in workers if w['account_id'] in usable]  # B39: coworkers of every ready account
         main_role = task['role'] in ('planner', 'integrator') or task.get('use_main', False)
         # A Main that was just found busy (usually the operator's own chat) hands Main tasks to a free joined coworker.
         main_busy = main_role and (task.get('main_busy_at', 0) > time.time() - MAIN_BUSY_FALLBACK_S
                                    or self._main_compressing(run))
         main_account = self.store.get('workers', run['main_worker'], {}).get('account_id')
+        if main_account:
+            # B45: Coworkers only on the account the Main is logged in with; never borrowed from other accounts.
+            workers = [w for w in workers if w.get('account_id') == main_account]
         choices = [w for w in workers if w.get('enabled') and w['state'] == 'ready'
                    and w.get('cooldown_until', 0) <= time.time()
                    and (w['id'] == run['main_worker'] if main_role and not main_busy else
@@ -1304,7 +1335,7 @@ class Engine:
                     thread_id=worker['thread_id'], submission_phase='preparing')
         # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
         task.update(reconcile_checks=0, remote_done_at=0, reconcile_at=0, approval_seen=None, awaiting_approval='',
-                    approval_evidence=False, turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False)
+                    approval_evidence=False, pending_tool='', pending_tool_state='', turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False)
         # Every attempt keeps its own timing record for the metrics.
         task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
             dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
@@ -1560,7 +1591,7 @@ class Engine:
                 # The task limit only slows the checks down; it never blocks, resends or abandons.
                 overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='uncertain', reconcile_checks=checks,
+                task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks,
                             reconcile_at=time.time()+(300 if overdue else max(min(60,5*2**min(checks-1,4)), getattr(exc,'seconds',0))),
                             error='Awaiting confirmation from Notion; request will not be resent')
                 worker = self.store.get('workers', info['worker_id'])
@@ -1593,17 +1624,22 @@ class Engine:
                 since = 0 if overdue else self._done_poll_since(task, info, now, settings)
                 slot_free = bool(since) and not approval and self._done_poll_slot_free(task['id'], now, settings)
                 delay = 300 if overdue else reconcile_delay(checks, now, since, approval, slot_free, settings)
-                task.update(state='uncertain', reconcile_checks=checks, reconcile_at=now+delay,
+                task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks, reconcile_at=now+delay,
                             done_poll_since=since, done_poll_fast=slot_free,
                             error='Awaiting confirmation from Notion; request will not be resent')
-                if stored.get('awaiting_approval'):
-                    # Honest label (H5): 'approval' only with explicit evidence from the transcript entry.
-                    label = stored['awaiting_approval']
-                    task.update(awaiting_approval=label, approval_evidence=bool(stored.get('approval_evidence')),
-                                error=('Waiting for approval of ' + label + ' in the coworker chat; the request is not resent'
-                                       if stored.get('approval_evidence') else
-                                       'A tool call in the coworker chat has not finished yet (' + label +
-                                       '); the request is not resent'))
+                tool = stored.get('awaiting_approval') or stored.get('pending_tool')
+                if tool:
+                    # Honest label (H5): 'approval' only with explicit evidence in the transcript entry
+                    # (notion.approval_evidence); otherwise the neutral 'tool running / not started' label.
+                    evidence = bool(stored.get('approval_evidence') and stored.get('awaiting_approval'))
+                    detail = stored.get('pending_tool_state') or ''
+                    task.update(awaiting_approval=stored.get('awaiting_approval') or '', approval_evidence=evidence,
+                                pending_tool=stored.get('pending_tool') or tool, pending_tool_state=detail,
+                                approval_seen=stored.get('approval_seen'),
+                                error=('Waiting for approval of ' + tool + ' in the coworker chat; the request is not resent'
+                                       if evidence else
+                                       'A tool call in the coworker chat has not finished yet (' + tool +
+                                       (': ' + detail if detail else '') + '); the request is not resent'))
                 worker = self.store.get('workers', info['worker_id'])
                 worker['state'] = 'recovering'
                 self.store.put('workers', worker)

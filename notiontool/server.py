@@ -19,6 +19,7 @@ from .bridge import Bridge
 from .engine import Engine, ACTIVE, TERMINAL
 from .notion import NotionAdapter
 from .store import Store, uid
+from .token_budget import public as token_budget_public
 from .setup_status import account_setup
 from .bridge import READ_ONLY_ROLES
 from . import role_policy, role_split
@@ -330,6 +331,18 @@ class Application:
         self.port = self.http.server_port
         self.adapter.sessions.save('runtime',{'port':self.port,'token':self.token})
         threading.Thread(target=self.http.serve_forever,daemon=True,name='local-http').start()
+        if __import__('os').environ.get('NOTIONTOOL_TEST_INSTANCE')=='1':
+            # B40 test app (test_app.py): local API, engine and desk actions on its own port and empty data
+            # folder. No Notion window, gateway, tunnel, updater, backups, coworker upkeep or wake, so it can
+            # never touch the real app or the accounts; it only proves the current code boots and serves.
+            self.test_instance=True
+            self.engine.start()
+            from .turn_watch import TurnWatch
+            self.turn_watch=TurnWatch(self.store,self.adapter,self.engine)
+            from . import ai_disable_detector, restart_guard, problems, templates
+            restart_guard.install_desk_actions(); problems.install_desk_actions(); templates.install_desk_actions()
+            self.store.event('test_instance_started', message=f'Test app serving on port {self.port}')
+            return f'http://127.0.0.1:{self.port}/#'+self.token
         if self.store.settings().get('remote_mcp_enabled', False):
             try:self.ensure_mcp_listener()
             except Exception as exc:self.store.event('mcp_listener_failed',message=str(exc)[:200])
@@ -355,6 +368,8 @@ class Application:
         threading.Thread(target=self.main_wake.loop,daemon=True,name='main-wake').start()
         from .backup import daily_loop  # one backup per day in data/backups (backup.py)
         threading.Thread(target=daily_loop,args=(self.data_dir or self.store.directory,self.store,self.engine.stop_event),daemon=True,name='daily-backup').start()
+        from . import ai_disable_detector  # always on from startup, not only after an /api/state call
+        ai_disable_detector.start(self.store)
         self.updater = Updater(self)
         self.updater.start()
         if self.store.settings().get('ui_mode','classic')=='notion':
@@ -592,6 +607,9 @@ class Application:
 
     def snapshot(self):
         from .harness_account import selected_account, main_chat
+        from . import ai_disable_detector
+        ai_disable_detector.start(self.store)  # always-on detector for 'Notion AI is disabled'
+        ai_disable_detector.scan(self.store)
         selected = selected_account(self.store)
         canonical = main_chat(self.store, selected) if selected else None
         accounts = [{k:v for k,v in a.items() if k!='identity'} for a in self.store.all('accounts')]
@@ -605,6 +623,8 @@ class Application:
         return dict(name='NotionTool',mcp_servers=self.mcp_servers.public(),accounts=accounts,workers=workers,folders=self.store.all('folders'),
             chats=self.chat_list(),operations=[self.mains.public(o) for o in self.store.all('operations')][-30:],host_api=dict(port=self.port,bind=getattr(self,'bind','127.0.0.1')),limits=self.limits(),runs=runs,tasks=tasks,stalled=stalled,
             main_context_usage=Application.main_context_usage(self, workers),
+            token_budget=token_budget_public(self.store),
+            ai_disable_reports=ai_disable_detector.reports(self.store, 5),
             team=Application.team_state(self, selected),  # automatic team growth (team_grow.py)
             roles=role_state(self.store.settings()),  # P4b-1: built-in + custom role definitions
             stale_context_tasks=Application.stale_context(self),  # report only (stale_tasks.py)
@@ -908,6 +928,58 @@ class Application:
             self.store.event('mcp_auto_setup_failed', message=str(exc)[:250])
         return result
 
+    def first_login_setup(self, account_id):
+        """First sign-in of an account: NotionTool MCP (read and write tools run automatically) if it is not
+        connected yet, then one Main and the Welcome Coworkers (team_size: 10 by default), all as Welcome chats.
+
+        Runs once per account (first_setup_done); ensure_team is idempotent, so nothing is created twice."""
+        account = self.store.get('accounts', account_id, {}) or {}
+        result = {'account_id': account_id}
+        if account.get('state') != 'ready':
+            return {**result, 'skipped': 'account state ' + str(account.get('state'))}
+        if account.get('first_setup_done'):
+            return {**result, 'skipped': 'already set up'}
+        if not account.get('bridge_connected'):
+            try:
+                url = self.store.settings().get('public_mcp_url')
+                if not url:
+                    self.start_tunnel()
+                    url = self.store.settings().get('public_mcp_url')
+                if not (self.store.get('accounts', account_id, {}) or {}).get('bridge_connected'):
+                    if not url:
+                        raise ValueError('No public MCP URL for NotionTool yet')
+                    self.adapter.connect_bridge(account_id, url, self.bridge_token, read_auto=True, write_auto=True)
+                result['mcp'] = 'connected'
+                self.store.event('mcp_auto_setup', message='First sign-in: NotionTool MCP added (tools run automatically)')
+            except Exception as exc:  # noqa: BLE001
+                result['mcp_error'] = str(exc)[:250]
+                self.store.event('mcp_auto_setup_failed', message='First sign-in: ' + str(exc)[:230])
+        try:
+            result['team'] = self.adapter.ensure_team(account_id, create_main=True)
+        except Exception as exc:  # noqa: BLE001
+            result['team_error'] = str(exc)[:250]
+            self.store.event('first_login_setup_failed', message='Main/Coworkers: ' + str(exc)[:220])
+            return result
+        if 'mcp_error' not in result:
+            fresh = self.store.get('accounts', account_id, {}) or {}
+            fresh['first_setup_done'] = True
+            self.store.put('accounts', fresh)
+        self.store.event('first_login_setup', message='First sign-in setup: MCP %s, Main + Welcome Coworkers ready'
+                         % ('connected' if 'mcp_error' not in result else 'failed'))
+        return result
+
+    def window_signed_in(self, cookies):
+        """The NotionTool window signed in (window_login): use the same account in the harness, then the first-login setup."""
+        def adopt():
+            result = self.adapter.adopt_session_cookies(cookies, 'window_login', select=True)
+            ident = result.get('account_id', '')
+            resumed = self.resume_after_sign_in(ident)
+            if resumed is not None:
+                result['coordination'] = resumed
+            result['first_setup'] = self.first_login_setup(ident)
+            return result
+        return self.job('Use the NotionTool window sign-in', adopt, 'login')
+
     def resume_after_sign_in(self, account_id):
         """Lift an auth pause once the account that caused it signed in successfully."""
         coordination = self.engine.coordination()
@@ -1175,6 +1247,12 @@ class Application:
                     if key in body:
                         # When the operator Main reaches this size, it asks the user about a switch (main_switch.py).
                         settings[key] = max(low, min(high, int(body[key])))
+                for key, low, high in (('token_budget_6h', 1000000, 500000000), ('burst_soft_15m', 100000, 100000000),
+                                       ('burst_hard_15m', 100000, 200000000), ('burst_hard_60m', 100000, 500000000),
+                                       ('burst_turns_5m', 5, 1000), ('burst_spacing_s', 1, 600)):
+                    if key in body:
+                        # Token budget (6 h) and burst guard (token_budget.py): slows coworkers on short peaks.
+                        settings[key] = max(low, min(high, int(body[key])))
                 if 'dynamic_roles' in body:
                     settings['dynamic_roles'] = str(body['dynamic_roles']).lower() in ('true','1','on','yes')
                 if 'role_definitions' in body:
@@ -1186,7 +1264,7 @@ class Application:
                 for key in ('harness_enabled', 'mcp_full_access', 'mcp_browser_access',
                             'automatic_setup', 'background_remote', 'bridge_auto',
                             'remote_mcp_enabled', 'advertise_project_tools',
-                            'turn_watch', 'main_auto_continue') + LOCAL_SETTINGS:
+                            'turn_watch', 'main_auto_continue', 'idle_mode') + LOCAL_SETTINGS:
                     if key in body:
                         settings[key] = str(body[key]).lower() in ('true', '1', 'on', 'yes')
                 if 'browser_path' in body:
@@ -1234,6 +1312,15 @@ class Application:
                 values = body.get('values') if isinstance(body.get('values'), dict) else {}
                 return desktop_shell.save_app_settings(values) if values else desktop_shell.load_app_settings()
             return self.desktop.status()
+        if path.startswith('/api/app/chat/'):
+            # Own New chat dialog: create (Welcome chat + user's name), rename, promote.
+            from . import own_chats
+            return own_chats.handle_app_route(self, path, body)
+        if path=='/api/main/refresh':
+            # Settings 'Refresh Main': new Welcome Main first, the old Main is retired only after it exists.
+            from .harness_account import selected_account
+            from . import main_refresh
+            return main_refresh.start(self, selected_account(self.store), body.get('request_id'))
         if path=='/api/main/create':
             from .harness_account import selected_account
             op, new = self.mains.request_create(selected_account(self.store), body.get('request_id'),
@@ -1311,6 +1398,10 @@ class Application:
             if account_id != selected_account(self.store):
                 raise ValueError('Select this account for the harness first')
             return self.job('Open signed-in Notion in Edge', lambda:self.adapter.edge_transport(account_id).open_app(), account_id)
+        if path=='/api/account/adopt-window':
+            # Use the account the NotionTool window is signed in with, then the first-login setup.
+            from .window_login import window_cookies
+            return self.window_signed_in(window_cookies(getattr(getattr(self, 'desktop', None), 'port', 0) or 9333))
         if path=='/api/account/adopt-app-session':
             def adopt():
                 from .harness_account import selected_account
@@ -1322,6 +1413,7 @@ class Application:
                     result['coordination'] = resumed
                 if target == selected_account(self.store):
                     result.update(self.prepare_account(target))
+                result['first_setup'] = self.first_login_setup(target)
                 return result
             return self.job('Use the NotionTool sign-in in Edge', adopt, account_id or 'login')
         if path=='/api/account/browser-login':
@@ -1333,11 +1425,15 @@ class Application:
                     result['coordination'] = resumed
                 if result.get('account_id') and result['account_id'] == selected_account(self.store):
                     result.update(self.prepare_account(result['account_id']))
+                if result.get('account_id'):
+                    result['first_setup'] = self.first_login_setup(result['account_id'])
                 return result
             return self.job('Sign in to Notion in the browser window',login,'login')
         if path=='/api/account/remove':
-            from .harness_account import selected_account
-            ident=account_id or selected_account(self.store)
+            # B45: removing needs an explicit account_id; never falls back to the logged-in account.
+            if not account_id:
+                raise ValueError('Choose the account to remove (account_id)')
+            ident=account_id
             chats={c['id'] for c in self.store.all('chats') if self.store.get('workers',c.get('main_worker'),{}).get('account_id')==ident}
             if any(r.get('chat_id') in chats and r.get('state') in ('queued','paused','approach','planning','executing') for r in self.store.all('runs')):
                 raise ValueError('Work is still running or paused on this account. Stop it before removing the account.')
