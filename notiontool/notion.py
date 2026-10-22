@@ -599,6 +599,41 @@ class NotionClient:
                 limit = max(1, limit // 4)
 
 
+HANDOFF_EXCERPT_DEFAULT = 1500
+
+
+def handoff_excerpt_limit(settings):
+    """Setting handoff_excerpt_chars (default 1500; 0 = old behavior, the full checkpoint text)."""
+    try:
+        return max(0, int(settings.get('handoff_excerpt_chars', HANDOFF_EXCERPT_DEFAULT)))
+    except (TypeError, ValueError):
+        return HANDOFF_EXCERPT_DEFAULT
+
+
+def handoff_excerpt(text, limit):
+    """At most limit characters of a checkpoint, cut at a line end.
+
+    limit <= 0 or a text that already fits is returned unchanged. Without a line end inside
+    the limit the cut falls back to the last space, then to exactly limit characters."""
+    text = text or ''
+    if limit <= 0 or len(text) <= limit:
+        return text
+    cut = text.rfind('\n', 0, limit + 1)
+    if cut <= 0:
+        cut = text.rfind(' ', 0, limit + 1)
+    if cut <= 0:
+        cut = limit
+    return text[:cut].rstrip()
+
+
+def handoff_excerpt_block(text, limit, path):
+    """Coworker checkpoint: excerpt, the path of the full handoff file and one 'read only if needed' line."""
+    excerpt = handoff_excerpt(text, limit)
+    return (excerpt + '\n[Checkpoint excerpt: %d of %d characters. Full checkpoint ("handoff" field): %s]\n'
+            'Read that file with the NotionTool read_file tool only if you need more than this excerpt.'
+            % (len(excerpt), len(text or ''), path))
+
+
 class NotionAdapter:
     single_account_harness = True
     semantic_context = True
@@ -1356,6 +1391,48 @@ class NotionAdapter:
             return True
         return False
 
+    def _inline_handoff_text(self, worker, task):
+        """Checkpoint text for an inline handoff (token saving, setting handoff_excerpt_chars).
+
+        Coworkers (purpose 'worker') get at most handoff_excerpt_chars characters, cut at a line end,
+        plus the path of a local file with the full checkpoint. 0, a short checkpoint or any failure
+        sends the full text as before. Main and all other chats always get the full text unchanged.
+        The file is separate from the ack-token handoff file, so handoff_token/handoff_delivered stay as they are."""
+        text = worker['handoff']
+        if worker.get('purpose') != 'worker':
+            return text
+        limit = handoff_excerpt_limit(self.store.settings())
+        if limit <= 0 or len(text) <= limit:
+            return text
+        run_id = task.get('run_id', '')
+        try:
+            from . import handoff_files
+            folder = str(self.store.directory / 'handoffs')
+            key = handoff_files.file_key(worker['id'] + ':excerpt')
+            path = handoff_files.handoff_path(folder, key)
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    old = json.load(fh)
+                if old.get('handoff') != handoff_files.redact_text(text) or old.get('new_thread') != worker['thread_id']:
+                    raise ValueError('stale')
+            except FileNotFoundError:
+                pass
+            except Exception:
+                os.remove(path)  # an older checkpoint: the current one replaces it
+            record = handoff_files.write_handoff(folder, key, dict(handoff=text, purpose='handoff_excerpt_source',
+                old_thread=(worker.get('retired_threads') or [''])[-1], new_thread=worker['thread_id'],
+                run_id=run_id, task_id=task.get('id', '')), time.time())
+            block = handoff_excerpt_block(text, limit, record['path'])
+        except Exception as exc:
+            self.store.event('handoff_excerpt_failed', run_id, worker_id=worker.get('id', ''),
+                             message=str(exc)[:160] + '; full checkpoint is sent inline')
+            return text
+        if len(block) >= len(text):
+            return text
+        self.store.event('handoff_excerpt', run_id, worker_id=worker['id'], message=record['path'],
+                         chars=len(block), full_chars=len(text))
+        return block
+
     def run(self, worker, task, prompt, cancel, update):
         account = self.store.get('accounts',worker['account_id'])
         if not account.get('model'):
@@ -1432,7 +1509,7 @@ class NotionAdapter:
             # Without a server-side reset the earlier history stays visible; mark it as superseded.
             note = '' if worker.get('context_reset') else ('\n\nEarlier messages in this chat are superseded by '
                                                           'this checkpoint; use them only as reference history.')
-            prompt = worker['handoff'] + note + '\n\nCurrent assignment (continue from the checkpoint):\n' + prompt
+            prompt = self._inline_handoff_text(worker, task) + note + '\n\nCurrent assignment (continue from the checkpoint):\n' + prompt
         inherited = (inherit_main_config(client, worker['thread_id'])
                      if worker.get('purpose') in MAIN_OWN_CONFIG else None)
         if inherited is not None:
