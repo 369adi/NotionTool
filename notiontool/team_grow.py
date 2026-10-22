@@ -20,6 +20,9 @@ from .team_size import team_size
 
 CHECK_S = 300
 BACKOFF_S = 900
+REGREET_AFTER_S = 240
+REGREET_MAX = 2
+REGREET_GAP_S = 4
 RETIRED_STATES = ('missing', 'retired')
 
 
@@ -28,6 +31,12 @@ def usable_count(workers, account_id):
     return sum(1 for w in workers if w.get('account_id') == account_id
                and w.get('purpose', 'worker') == 'worker' and w.get('join_state') == 'joined'
                and w.get('enabled') and w.get('state') not in RETIRED_STATES and not w.get('retired'))
+
+
+def has_main(workers, account_id):
+    """The account has a Main (or an operator Main) that is not missing."""
+    return any(w.get('account_id') == account_id and w.get('purpose') in ('main', 'operator')
+               and w.get('state') not in RETIRED_STATES for w in workers)
 
 
 def pending_roles(account):
@@ -88,9 +97,10 @@ class TeamGrower:
             if account.get('state') != 'ready' or not ident:
                 continue
             usable = usable_count(workers, ident)
+            main_ok = has_main(workers, ident)
             reason = ''
             with self.lock:
-                if usable >= target or ident in self.growing:
+                if (usable >= target and main_ok) or ident in self.growing:
                     self.blocked.pop(ident, None)
                     continue
                 if now < self.failed_until.get(ident, 0):
@@ -106,7 +116,7 @@ class TeamGrower:
                 self.blocked[ident] = reason
             if reason:
                 continue
-            title = 'Grow Welcome Coworkers to %d' % target
+            title = ('Grow Welcome Coworkers to %d' % target) if main_ok else ('Create the Main and %d Welcome Coworkers' % target)
             try:
                 self.start_job(title, lambda ident=ident, usable=usable: self._grow(ident, target, usable), ident)
             except ValueError:
@@ -117,11 +127,97 @@ class TeamGrower:
             self.store.event('team_grow_started', message='Creating missing Welcome Coworkers (%d of %d usable)' % (usable, target),
                              account_id=ident, target=target, usable=usable)
             started.append(ident)
+        try:
+            self.regreet(now)
+        except Exception as exc:  # never breaks the growth check
+            self.store.event('welcome_resend_failed', message=str(exc)[:200])
         return started
+
+    def pending_count(self, ident):
+        """Managed Welcome Coworkers that exist but have not joined yet (shown as 'being prepared')."""
+        return sum(1 for w in self.store.all('workers') if w.get('account_id') == ident
+                   and w.get('purpose', 'worker') == 'worker' and w.get('join_state') == 'pending'
+                   and w.get('pool_admitted') and w.get('state') not in RETIRED_STATES)
+
+    def regreet_due(self, account, workers, now):
+        """Thread ids of managed Welcome Coworkers that are listed but still not joined."""
+        ledger = (account or {}).get('team_threads') or {}
+        ids = {item.get('id') for role, item in ledger.items()
+               if role != 'main' and isinstance(item, dict) and not item.get('pending')}
+        return [w['thread_id'] for w in workers if w.get('account_id') == account.get('id')
+                and w.get('thread_id') in ids and w.get('purpose', 'worker') == 'worker'
+                and w.get('join_state') == 'pending' and w.get('state') not in RETIRED_STATES
+                and not w.get('lease') and int(w.get('regreets') or 0) < REGREET_MAX
+                and now >= float(w.get('regreet_at') or 0)
+                and now - float(w.get('welcome_at') or 0) >= REGREET_AFTER_S]
+
+    def regreet(self, now=None):
+        """Start one job per account that resends the greeting to Coworkers stuck in 'pending'."""
+        now = self.clock() if now is None else now
+        if not callable(getattr(self.adapter, 'regreet_welcome', None)) or self.budget_reason():
+            return []
+        workers = self.store.all('workers')
+        started = []
+        for account in self.store.all('accounts'):
+            ident = account.get('id')
+            if account.get('state') != 'ready' or not ident:
+                continue
+            due = self.regreet_due(account, workers, now)
+            with self.lock:
+                if not due or ident in self.growing:
+                    continue
+                self.growing.add(ident)
+            try:
+                self.start_job('Resend the Welcome greeting to %d Coworkers' % len(due),
+                               lambda ident=ident, due=due: self._regreet(ident, due), ident)
+            except ValueError:
+                with self.lock:
+                    self.growing.discard(ident)
+                continue
+            started.append(ident)
+        return started
+
+    def _regreet(self, ident, due):
+        sent = 0
+        try:
+            for index, tid in enumerate(due):
+                if index:
+                    time.sleep(REGREET_GAP_S)
+                try:
+                    sent += bool(self.adapter.regreet_welcome(ident, tid))
+                except Exception as exc:
+                    self.store.event('welcome_resend_failed', message=(tid + ': ' + str(exc))[:200], account_id=ident)
+                self._restore_name(ident, tid)
+            try:
+                self.adapter.refresh(ident)  # picks up the joins
+            except Exception:
+                pass
+        finally:
+            with self.lock:
+                self.growing.discard(ident)
+        return dict(resent=sent, tried=len(due))
+
+    def _restore_name(self, ident, tid):
+        """The resent greeting sets the title 'Welcome to Notion' again; give the Coworker its name back (I41)."""
+        worker = next((w for w in self.store.all('workers') if w.get('account_id') == ident
+                       and w.get('thread_id') == tid), None) or {}
+        name = worker.get('harness_title')
+        rename = getattr(self.adapter, 'rename_thread', None)
+        client_fn = getattr(self.adapter, 'client', None)
+        if not name or not callable(rename) or not callable(client_fn):
+            return False
+        try:
+            rename(client_fn(ident), tid, name)
+        except Exception as exc:
+            self.store.event('coworker_rename_failed', message=(name + ' ' + tid + ': ' + str(exc))[:200], account_id=ident)
+            return False
+        self.store.event('coworker_name_restored', message=name + ' ' + tid, account_id=ident)
+        return True
 
     def _grow(self, ident, target, usable):
         try:
-            result = self.adapter.ensure_team(ident)
+            # At least one Main always: ensure_team creates it only when the account has no usable Main.
+            result = self.adapter.ensure_team(ident, create_main=True)
         except Exception as exc:
             error = (type(exc).__name__ + ': ' + str(exc))[:300]
             with self.lock:

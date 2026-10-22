@@ -42,6 +42,7 @@
   var CLS_ACTIVE = 'nt-shell-tab-active';
   var CLS_HAS_BADGE = 'nt-shell-has-badge';
   var CLS_BRAND = 'nt-shell-brand';
+  var CLS_TIGHT = 'nt-shell-tight';
   var ICONS = {
     chat: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg>',
     live: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10h3l2-5 3 10 2-6 1.5 1H18"/></svg>',
@@ -89,6 +90,19 @@
     return n > 99 ? '99+' : String(Math.floor(n));
   }
 
+  // Tab bar keyboard: arrows move (wrapping), Home/End jump. Returns the target tab id or null.
+  function tabStep(current, key) {
+    var n = TAB_IDS.length;
+    var i = TAB_IDS.indexOf(current);
+    if (i < 0) i = 0;
+    key = String(key || '');
+    if (key === 'ArrowRight' || key === 'ArrowDown') return TAB_IDS[(i + 1) % n];
+    if (key === 'ArrowLeft' || key === 'ArrowUp') return TAB_IDS[(i + n - 1) % n];
+    if (key === 'Home') return TAB_IDS[0];
+    if (key === 'End') return TAB_IDS[n - 1];
+    return null;
+  }
+
   function hasTopLabels(node) {
     var text = norm(node.textContent);
     if (!text || text.length > 120) return false;
@@ -113,8 +127,9 @@
     if (!row || !row.querySelectorAll) return null;
     var items = row.querySelectorAll('[role="tab"]');
     for (var i = 0; i < items.length; i++) {
-      var name = norm(items[i].getAttribute('aria-label')) || norm(items[i].textContent).replace(/\d+/g, '');
-      if (name === label) return items[i];
+      // Labels can carry an unread count ('Chat 3', 'Chat, 3 unread'): match the leading word.
+      var name = norm(items[i].getAttribute('aria-label')) || norm(String(items[i].textContent || '').replace(/\d+/g, ' '));
+      if (name === label || name.indexOf(label + ' ') === 0 || name.indexOf(label + ',') === 0) return items[i];
     }
     return null;
   }
@@ -147,13 +162,18 @@
     function mountTab(tab) {
       var entry = views[tab];
       var box = host.viewBox(tab);
+      if (typeof host.pruneViews === 'function') host.pruneViews(tab);
+      // Mark first: a view that opens another tab while mounting is unmounted, not orphaned.
+      mounted = tab;
       if (entry && typeof entry.mount === 'function') {
         var cleanup = safe(entry.mount, [box, host.ctx]);
-        if (typeof cleanup === 'function') entry.cleanup = cleanup;
+        if (typeof cleanup === 'function') {
+          if (mounted === tab && views[tab] === entry) entry.cleanup = cleanup;
+          else safe(cleanup, []);
+        }
       } else {
         host.placeholder(tab, box);
       }
-      mounted = tab;
     }
     function open(tab) {
       tab = norm(tab);
@@ -214,9 +234,94 @@
     };
   }
 
+  // ---- Sidebar 'Coworkers' section toggle ------------------------------------------------------
+  // The section and its header button are built by the overlay part (data-nt-desk="coworkers" /
+  // "coworkers-head"). One delegated window listener in the capture phase handles the toggle: it runs
+  // before Notion's sidebar handlers and before the header's own listener (which it stops, so there is
+  // exactly one toggle), and it does not depend on the header node, so it keeps working when Notion
+  // re-renders the sidebar or the overlay rebuilds the header. Only our own nodes are touched.
+  var COWORKERS_KEY = 'ntDesk.coworkersCollapsed';
+  // keydown is not listed: the shell's one window keydown listener (onKey) passes it to handle() first.
+  var COWORKER_EVENTS = ['pointerdown', 'mousedown', 'click', 'keyup'];
+
+  function createCoworkerToggle(win, doc) {
+    var memo = null;
+    var keyAt = 0;
+    function read() {
+      try {
+        var v = win.localStorage.getItem(COWORKERS_KEY);
+        if (v === '1' || v === '0') memo = v === '1';
+      } catch (e) { /* storage blocked: memory only */ }
+      return memo === true;
+    }
+    function write(value) {
+      memo = !!value;
+      try { win.localStorage.setItem(COWORKERS_KEY, value ? '1' : '0'); } catch (e) { /* not stored */ }
+    }
+    function headOf(target) {
+      var node = target && target.nodeType === 3 ? target.parentNode : target;
+      var head = node && node.closest ? node.closest('[data-nt-desk="coworkers-head"]') : null;
+      return head && isOwn(head) ? head : null;
+    }
+    function sync(section, collapsed) {
+      if (!section || !isOwn(section)) return;
+      if (section.classList.contains('nt-desk-collapsed') !== collapsed) section.classList.toggle('nt-desk-collapsed', collapsed);
+      var head = section.querySelector('[data-nt-desk="coworkers-head"]');
+      if (!head) return;
+      var expanded = String(!collapsed);
+      if (head.getAttribute('aria-expanded') !== expanded) head.setAttribute('aria-expanded', expanded);
+      var title = collapsed ? 'Show coworkers' : 'Hide coworkers';
+      if (head.getAttribute('title') !== title) head.setAttribute('title', title);
+    }
+    function syncAll() {
+      var collapsed = read();
+      var list = doc.querySelectorAll('[data-nt-desk="coworkers"]');
+      for (var i = 0; i < list.length; i++) sync(list[i], collapsed);
+      return collapsed;
+    }
+    function toggle(head) {
+      var next = !read();
+      write(next);
+      sync(head.closest('[data-nt-desk="coworkers"]'), next);
+      return next;
+    }
+    function block(ev) {
+      if (ev.preventDefault) ev.preventDefault();
+      if (ev.stopPropagation) ev.stopPropagation();
+      if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+    }
+    function handle(ev) {
+      var head = headOf(ev && ev.target);
+      if (!head || ev.ntDeskCoworkers) return false;
+      ev.ntDeskCoworkers = true;
+      var type = ev.type;
+      if (type === 'pointerdown' || type === 'mousedown') {
+        // Keep Notion's sidebar (drag, focus moves) out of it; the button still gets focus.
+        if (ev.stopPropagation) ev.stopPropagation();
+        return true;
+      }
+      if (type === 'keydown' || type === 'keyup') {
+        if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return false;
+        block(ev);
+        if (type === 'keydown' && !ev.repeat) { keyAt = Date.now(); toggle(head); }
+        return true;
+      }
+      if (type !== 'click') return false;
+      block(ev);
+      // A click the browser makes from Enter/Space (detail 0) right after our key toggle is no second toggle.
+      if (ev.detail === 0 && Date.now() - keyAt < 500) return true;
+      toggle(head);
+      return true;
+    }
+    function start() { COWORKER_EVENTS.forEach(function (t) { win.addEventListener(t, handle, true); }); }
+    function stop() { COWORKER_EVENTS.forEach(function (t) { win.removeEventListener(t, handle, true); }); }
+    return { handle: handle, read: read, write: write, sync: sync, syncAll: syncAll, toggle: toggle, start: start, stop: stop };
+  }
+
   window.__ntDesk.shellUtil = {
     TABS: TABS, TAB_IDS: TAB_IDS, liveBadge: liveBadge, connInfo: connInfo, keyTab: keyTab,
-    badgeText: badgeText, findTopRow: findTopRow, nativeTab: nativeTab, createRouter: createRouter
+    badgeText: badgeText, tabStep: tabStep, findTopRow: findTopRow, nativeTab: nativeTab, createRouter: createRouter,
+    createCoworkerToggle: createCoworkerToggle, COWORKERS_KEY: COWORKERS_KEY
   };
 
   window.__ntDesk.shell = function (ctx) {
@@ -240,6 +345,7 @@
     var tick = null;
     var bar = null;
     var layer = null;
+    var coworkers = createCoworkerToggle(window, doc);
 
     function mk(tag, attrs, text) {
       var node = doc.createElement(tag);
@@ -272,11 +378,16 @@
       (doc.body || html).appendChild(layer);
       return layer;
     }
+    function rightOf(node) {
+      if (!node || typeof node.getBoundingClientRect !== 'function') return 0;
+      return Math.max(0, Math.round(node.getBoundingClientRect().right || 0));
+    }
     function placeLayer() {
       if (!layer) return;
-      var box = doc.querySelector(SIDEBAR_BOX_SELECTOR);
-      var left = 0;
-      if (box && typeof box.getBoundingClientRect === 'function') left = Math.max(0, Math.round(box.getBoundingClientRect().right || 0));
+      // No measurable sidebar: keep the last (or CSS default) left. A left: 0 layer would cover
+      // the whole sidebar, its tab bar and its footer.
+      var left = rightOf(doc.querySelector(SIDEBAR_BOX_SELECTOR)) || rightOf(sidebar());
+      if (!left) return;
       var value = left + 'px';
       if (layer.style.left !== value) layer.style.left = value;
     }
@@ -287,8 +398,14 @@
       return null;
     }
 
+    // Only the current tab's view may live in the layer (fast switching, re-entrant mounts).
+    function pruneViews(keep) {
+      dropAll('[data-nt-desk="shell-view"]', viewOf(keep));
+    }
+
     var host = {
       ctx: ctx,
+      pruneViews: pruneViews,
       viewBox: function (tab) {
         var box = viewOf(tab);
         if (!box) {
@@ -302,6 +419,7 @@
         if (box && box.parentNode) box.parentNode.removeChild(box);
       },
       showView: function (tab) {
+        pruneViews(tab);
         ensureLayer().setAttribute('data-nt-shell-tab', tab);
         placeLayer();
         html.classList.add(CLS_VIEW_OPEN);
@@ -318,19 +436,15 @@
       placeholder: function (tab, box) {
         box.appendChild(mk('div', { cls: 'nt-shell-empty-title' }, TAB_LABEL[tab] || ''));
         box.appendChild(mk('div', { cls: 'nt-shell-empty-text' }, PLACEHOLDER[tab] || ''));
-        var part = window.__ntDeskMounted && window.__ntDeskMounted[tab];
-        if (part && typeof part.open === 'function') {
-          var btn = mk('button', { type: 'button', cls: 'nt-shell-btn' }, 'Open ' + (TAB_LABEL[tab] || tab));
-          btn.addEventListener('click', function () { try { part.open(); } catch (e) { warn('open failed', e); } });
-          box.appendChild(btn);
-        }
+        // No 'Open' button: views register themselves and render directly in the tab.
       },
       chatBadge: function () {
         var tab = nativeTab(findTopRow(sidebar()), 'chat');
         var m = tab ? norm(tab.textContent).match(/\d+/) : null;
         return m ? Number(m[0]) : 0;
       },
-      changed: function () { schedule(); }
+      // Highlight follows the tab at once; the rest (badges, placement) on the next apply.
+      changed: function () { renderBar(); schedule(); }
     };
     var router = createRouter(host);
 
@@ -339,7 +453,7 @@
       var node = own(mk('div', { cls: 'nt-shell-tabs', role: 'tablist', 'aria-label': 'NotionTool sections' }), 'tabbar');
       TABS.forEach(function (t) {
         var btn = own(mk('button', { type: 'button', cls: 'nt-shell-tab', role: 'tab', 'data-nt-shell-tab': t.id,
-          title: t.hint + ' (Ctrl+' + t.key + ')', 'aria-selected': 'false' }), 'tab');
+          title: t.hint + ' (Ctrl+' + t.key + ')', 'aria-selected': 'false', tabindex: t.id === 'chat' ? '0' : '-1' }), 'tab');
         var icon = mk('span', { cls: 'nt-shell-tab-icon', 'aria-hidden': 'true' });
         icon.innerHTML = ICONS[t.id];
         btn.appendChild(icon);
@@ -352,7 +466,42 @@
         });
         node.appendChild(btn);
       });
+      function focusTab(id) {
+        var kids = node.children || [];
+        for (var i = 0; i < kids.length; i++) {
+          if (kids[i].getAttribute('data-nt-shell-tab') === id && typeof kids[i].focus === 'function') { kids[i].focus(); return; }
+        }
+      }
+      // Tablist keyboard: arrows/Home/End move and open, Enter/Space open the focused tab.
+      node.addEventListener('keydown', function (ev) {
+        if (!ev || ev.ctrlKey || ev.altKey || ev.metaKey) return;
+        var key = String(ev.key || '');
+        var el = ev.target && typeof ev.target.closest === 'function' ? ev.target.closest('[data-nt-shell-tab]') : null;
+        var from = el ? el.getAttribute('data-nt-shell-tab') : router.current;
+        var to = key === 'Enter' || key === ' ' || key === 'Spacebar' ? from : tabStep(from, key);
+        if (!to) return;
+        if (ev.preventDefault) ev.preventDefault();
+        if (ev.stopPropagation) ev.stopPropagation();
+        router.open(to);
+        focusTab(to);
+      });
       return node;
+    }
+
+    // Notion's header wrapper around the hidden top row keeps its padding/height: the empty gap
+    // between the brand header and the tab bar. Collapse it with our own class (node is kept).
+    function tightenWrap(sb, row) {
+      var parent = row ? row.parentNode : null;
+      var wrap = parent && parent !== sb && !isOwn(parent) && (parent.children || []).length <= 3 ? parent : null;
+      var marked = doc.querySelectorAll('[data-nt-shell="wrap"]');
+      for (var i = 0; i < marked.length; i++) {
+        if (marked[i] === wrap) continue;
+        marked[i].classList.remove(CLS_TIGHT);
+        marked[i].removeAttribute('data-nt-shell');
+      }
+      if (!wrap || wrap.getAttribute('data-nt-shell')) return;
+      wrap.classList.add(CLS_TIGHT);
+      wrap.setAttribute('data-nt-shell', 'wrap');
     }
 
     function placeBar(sb) {
@@ -367,8 +516,10 @@
         if (!row.classList.contains(CLS_HIDE)) row.classList.add(CLS_HIDE);
         if (row.getAttribute('data-nt-shell') !== 'toprow') row.setAttribute('data-nt-shell', 'toprow');
       }
-      if (!bar || !bar.parentNode) bar = doc.querySelector('[data-nt-desk="tabbar"]') || buildBar();
+      // Never adopt a bar of an older mount: its click handlers talk to a dead router.
+      if (!bar) bar = buildBar();
       dropAll('[data-nt-desk="tabbar"]', bar);
+      tightenWrap(sb, row);
       if (row) {
         if (bar.parentNode !== row.parentNode || bar.nextSibling !== row) row.parentNode.insertBefore(bar, row);
       } else {
@@ -395,6 +546,8 @@
         }
         var sel = active ? 'true' : 'false';
         if (btn.getAttribute('aria-selected') !== sel) btn.setAttribute('aria-selected', sel);
+        var ti = active ? '0' : '-1';
+        if (btn.getAttribute('tabindex') !== ti) btn.setAttribute('tabindex', ti);
         var text = badgeText(router.badge(id, s));
         var badge = btn.lastChild;
         if (badge && badge.textContent !== text) badge.textContent = text;
@@ -409,6 +562,25 @@
       var brand = sb.querySelector('[data-nt-desk="brand"]');
       if (!brand) return;
       if (!brand.classList.contains(CLS_BRAND)) brand.classList.add(CLS_BRAND);
+      // Notion collapses its own workspace/profile switcher (height 0, opacity 0, pointer-events none)
+      // and our brand header sits where it used to be. Forward clicks so the profile menu opens again
+      // (bug 2026-10-21: profile could no longer be clicked).
+      if (!brand.__ntSwitchBound) {
+        brand.__ntSwitchBound = true;
+        brand.style.cursor = 'pointer';
+        brand.setAttribute('role', 'button');
+        brand.setAttribute('aria-label', 'Workspace and profile');
+        brand.addEventListener('click', function (ev) {
+          var t0 = ev.target;
+          if (t0 && t0.closest && t0.closest('[data-nt-desk="conn"]')) return;
+          var sw = document.querySelector('.notion-sidebar-switcher');
+          if (!sw) return;
+          var t = sw.querySelector('[role=button]') || sw;
+          ev.preventDefault();
+          ev.stopPropagation();
+          t.click();
+        });
+      }
       var dot = null;
       var kids = brand.children || [];
       for (var i = 0; i < kids.length; i++) if (kids[i].getAttribute('data-nt-desk') === 'conn') { dot = kids[i]; break; }
@@ -436,6 +608,7 @@
         }
         renderBar();
         if (router.current !== 'chat') placeLayer();
+        coworkers.syncAll();
       } catch (e) {
         warn('apply failed', e);
       }
@@ -446,6 +619,7 @@
     }
 
     function onKey(ev) {
+      if (coworkers.handle(ev)) return;
       var tab = keyTab(ev);
       if (!tab) return;
       if (ev.preventDefault) ev.preventDefault();
@@ -464,6 +638,7 @@
       if (typeof offState === 'function') offState();
       window.removeEventListener('keydown', onKey, true);
       window.removeEventListener('resize', onResize);
+      coworkers.stop();
       router.destroy();
       dropAll('[data-nt-desk="tabbar"]');
       dropAll('[data-nt-desk="shell-layer"]');
@@ -472,6 +647,11 @@
       for (var i = 0; i < marked.length; i++) {
         marked[i].classList.remove(CLS_HIDE);
         marked[i].removeAttribute('data-nt-shell');
+      }
+      var wraps = doc.querySelectorAll('[data-nt-shell="wrap"]');
+      for (var k = 0; k < wraps.length; k++) {
+        wraps[k].classList.remove(CLS_TIGHT);
+        wraps[k].removeAttribute('data-nt-shell');
       }
       var brands = doc.querySelectorAll('[data-nt-desk="brand"]');
       for (var j = 0; j < brands.length; j++) brands[j].classList.remove(CLS_BRAND);
@@ -497,9 +677,10 @@
     if (typeof ctx.onState === 'function') offState = ctx.onState(function () { lastTs = Date.now(); schedule(); });
     window.addEventListener('keydown', onKey, true);
     window.addEventListener('resize', onResize);
+    coworkers.start();
     tick = setInterval(schedule, 5000);
     if (typeof MutationObserver === 'function' && doc.body) {
-      observer = new MutationObserver(schedule);
+      observer = new MutationObserver((window.__ntIdle2 || (window.__ntIdle2 = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); w.addEventListener('keydown', function () { w.__ntLastKey = Date.now(); }, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = Math.max((w.__ntLastScroll || 0) + 400, (w.__ntLastKey || 0) + 1200) - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 4000 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
       observer.observe(doc.body, { childList: true, subtree: true });
     }
 

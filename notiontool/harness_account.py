@@ -11,6 +11,19 @@ def selected_account(store):
     return ''
 
 
+def runnable_accounts(store):
+    """Accounts whose Mains and Coworkers may work: every ready account (B39).
+
+    Before B39 only the one selected harness account ran, so runs of every other Main (Slot 1, the
+    operator Main) stayed queued forever with free coworkers. Falls back to the selected account.
+    """
+    ready = {a['id'] for a in store.all('accounts') if a.get('state') == 'ready'}
+    if ready:
+        return ready
+    selected = selected_account(store)
+    return {selected} if selected else set()
+
+
 def main_chat(store, account_id):
     """Chat of the account's Main worker, chosen by chat_pool.pick_main so both always agree.
 

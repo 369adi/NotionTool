@@ -30,10 +30,10 @@ class DesktopExtrasTest(unittest.TestCase):
 
     def test_markers(self):
         for marker in ('main_switch_start', 'context_ask', '#nt-live', 'nt-desk-off', 'ntDeskOff', 'not connected',
-                       'nt-desk-bar', 'nt-desk-banner', 'sessionStorage', 'localStorage', 'onState',
+                       'nt-desk-brand-dot', 'nt-desk-banner', 'sessionStorage', 'localStorage', 'onState',
                        'Switch now', 'Later', 'Switch started', 'Switching Main chat: ',
                        'This Main chat is getting long (', 'Switch to a fresh Main chat?',
-                       'NotionTool harness is not connected. Restarting? Your actions are kept.',
+                       'NotionTool lost connection to the harness - retrying',
                        'NotionTool layer off - press Ctrl+Alt+Shift+N again to turn it on',
                        'brief_requested', 'brief_ready', 'prompt_sent', 'attention'):
             self.assertIn(marker, self.js)
@@ -57,7 +57,7 @@ class DesktopExtrasTest(unittest.TestCase):
 
     def test_kill_switch_css(self):
         self.assertIn('html.nt-desk-off .nt-desk-hidden { display: revert !important; }', self.css)
-        self.assertIn('html.nt-desk-off .nt-desk-bar, html.nt-desk-off .nt-desk-banner { display: none !important; }',
+        self.assertIn('html.nt-desk-off .nt-desk-brand-dot, html.nt-desk-off .nt-desk-banner { display: none !important; }',
                       self.css)
         self.assertIn('prefers-color-scheme: dark', self.css)
 
@@ -157,6 +157,46 @@ class DesktopExtrasTest(unittest.TestCase):
         self.assertEqual(got['miss'], 0)
         self.assertEqual(got['empty'], 1)
         self.assertEqual(got['part'], 'function')
+
+
+    # ---- single Live entry point -----------------------------------------------------------
+    def test_no_floating_live_bar(self):
+        for bad in ('nt-desk-bar', 'dockBar', 'dockPosition', 'sidebarFooter', 'nt-desk-badge'):
+            self.assertNotIn(bad, self.js, bad)
+            self.assertNotIn(bad, self.css, bad)
+        self.assertIn('[data-nt-desk="live-pill"] { display: none !important; }', self.css)
+        self.assertIn("document.querySelector('[data-nt-desk=\"brand\"]')", self.js)
+        self.assertIn('placeDot();', self.js)
+        self.assertIn('window.__ntDesk.counts = counts', self.js)
+
+    @unittest.skipUnless(os.path.isfile(NODE), 'node not installed')
+    def test_node_counts(self):
+        script = (
+            "global.window = {}; require(%s); var c = window.__ntDesk.counts; var w = [];"
+            "for (var i = 0; i < 10; i++) w.push({id: 'w' + i, purpose: 'worker', state: i ? 'idle' : 'busy'});"
+            "w.push({id: 'm', purpose: 'main', state: 'busy'}, {id: 'o', purpose: 'operator'},"
+            " {id: 'x', purpose: 'worker', enabled: false, state: 'busy'});"
+            "var s = {workers: w, attention: [1, 2, 3, 4, 5], chats: Array(13).fill({role: 'coworker'}),"
+            " runs: [{id: 'r0', state: 'done', tasks_total: 1, tasks_done: 1},"
+            " {id: 'r1', state: 'executing', tasks_total: 3, tasks_done: 2}]};"
+            "var a = c(s), e = c({});"
+            "var p = c({runs: [{id: 'r', state: 'paused', tasks_total: 4, tasks_done: 1}]});"
+            "var f = c({runs: [{id: 'r', state: 'failed', tasks_total: 2, tasks_done: 2}]});"
+            "console.log(JSON.stringify({a: a, e: e, p: p.runText, f: f.runText,"
+            " same: window.__ntDesk.extrasUtil.counts === c}))" % json.dumps(str(JS)))
+        res = subprocess.run([NODE, '-e', script], capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        got = json.loads(res.stdout.strip().splitlines()[-1])
+        a, e = got['a'], got['e']
+        self.assertEqual((a['coworkers'], a['busy'], a['attention'], a['liveBadge']), (10, 1, 5, '5'))
+        self.assertEqual(a['coworkersText'], 'Coworkers 1 of 10 busy')
+        self.assertEqual(a['runText'], 'Run 2 of 3 steps')
+        self.assertEqual(a['run']['percent'], 67)
+        self.assertEqual((e['coworkers'], e['liveBadge'], e['coworkersText'], e['runText']),
+                         (0, '', 'No coworkers', 'No run yet'))
+        self.assertEqual(got['p'], 'Run paused \u00b7 1 of 4 steps')
+        self.assertEqual(got['f'], 'Last run failed \u00b7 2 of 2 steps')
+        self.assertTrue(got['same'])
 
 
 if __name__ == '__main__':

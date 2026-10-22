@@ -127,15 +127,17 @@ class SettingsTabRoundTrip(unittest.TestCase):
 
 
 class SettingsTabKeys(unittest.TestCase):
-    def test_default_coworker_count_is_ten_everywhere(self):
-        self.assertEqual(DEFAULT_PER_ACCOUNT, 10)
-        self.assertEqual(ds.DEFAULT_COWORKERS, 10)
-        self.assertEqual(team_size({}), 10)
+    def test_default_coworker_count_is_five_everywhere(self):
+        # owner rule 2026-10-22: new accounts get at most 5 Coworkers by default
+        self.assertEqual(DEFAULT_PER_ACCOUNT, 5)
+        self.assertEqual(ds.DEFAULT_COWORKERS, 5)
+        self.assertEqual(team_size({}), 5)
         entries = {e['key']: e for e in ds.settings_schema({})['harness']}
-        self.assertEqual(entries['per_account']['value'], 10)
-        self.assertEqual(entries['coworker_max_age_hours']['value'], 23)
+        self.assertEqual(entries['per_account']['value'], 5)
+        # Rotation runs at 22 h on purpose (commit 49abeb2): 1 h safety margin before the hard 23 h limit (I32).
+        self.assertEqual(entries['coworker_max_age_hours']['value'], 22)
         store = (ROOT / 'notiontool' / 'store.py').read_text(encoding='utf-8')
-        self.assertIn('max_workers=40, per_account=10, coworker_max_age_hours=23', store)
+        self.assertIn('max_workers=40, per_account=5, coworker_max_age_hours=22', store)
 
     def test_team_keys_go_to_the_server_route(self):
         keys = notion_shell.page_settings_keys()

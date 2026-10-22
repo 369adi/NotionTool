@@ -132,3 +132,53 @@ overlay rule off.
 - Sidebar: chat rows are matched by title/href of the live rows; tiles detected and collapsible.
 - Theme: overrides Notion's --c-* / --ca-* variables on body / .notion-dark-theme plus a --nt-bg-glow background; all rules under html.nt-theme:not(.nt-desk-off). The user bubble selector depends on Notion markup (no stable class).
 - Reasoning effort: notion.py EFFORT_FIELD = 'reasoningEffort', written to body.transcript[0].value next to model / modelFromUser; value from effort_policy.choose_reasoning_effort, clamped to the model's supportedReasoningEfforts; resume passes the task effort. Set EFFORT_FIELD = None to stop sending it.
+
+## Studio v3 (2026-10-19): tabs, shortcuts, settings keys
+
+This section replaces the Shortcuts table above where they differ.
+
+### Tabs (shell.js, window.__ntShell)
+
+| Tab | Part | What it shows | Fallback without the shell |
+|---|---|---|---|
+| Chat | Notion itself | Notion's AI chat (our view layer is hidden) | - |
+| Live | live.js (+ progress.js cards) | Needs you, Working now, Team, History, Details | slide-in panel, #nt-live, Ctrl+Shift+L |
+| Notes | notes.js | Plans and notes linked to requests, reader, draft box (never sends) | panel, #nt-notes, Ctrl+Shift+O |
+| Settings | settings.js | Team, Models & effort, App look, Notifications | full-window page, Ctrl+Shift+, |
+
+Shell API today: register(tab, {mount(box, ctx) -> cleanup fn, unmount(box), badge(state)}), open(tab),
+window.__ntShellQueue.push([tab, view]) before the shell exists. live.js and settings.js register with ONE
+descriptor object ({id, mount, ...}) and look for registerTab/openTab/unregisterTab and the
+nt-desk-shell-ready event; the shell does not offer these yet (open point, see below).
+
+### Shortcuts
+
+| Keys | Action | Part |
+|---|---|---|
+| Ctrl+1 / 2 / 3 / 4 | Chat / Live / Notes / Settings tab | shell |
+| Ctrl+Shift+L | Live (tab, else panel; also #nt-live) | live |
+| Ctrl+Shift+O | Notes (tab, else panel; also #nt-notes) | notes |
+| Ctrl+Shift+, | Settings (tab, else page) | settings |
+| Ctrl+K | Command palette (kept; not while text is selected in an editable field) | extras |
+| Ctrl+Alt+Shift+N | Emergency stop: NotionTool layer off/on (localStorage ntDeskOff) | extras |
+| Esc | Close palette, panel or settings page | extras, live, notes, settings |
+
+### Settings keys
+
+| Label | Key | Saved via | Range / values |
+|---|---|---|---|
+| Coworkers | per_account | settings_set -> POST /api/settings | 1..40, default 10 |
+| Replace chats after (hours) | coworker_max_age_hours | settings_set -> POST /api/settings | 1..72, default 23 (team_rotation.py) |
+| Max at once (all accounts) | max_workers | settings_set -> POST /api/settings | 1..40 |
+| Effort | app_effort_override | app_settings_set | auto, low, medium, high, xhigh, max |
+| Color strength | app_theme_intensity | app_settings_set | soft, normal, strong |
+| Compact mode | app_compact | app_settings_set | on/off |
+| Hide Notion extras | app_declutter | app_settings_set | on/off |
+| Desktop pop-ups / When a task is done / When the app needs you / Play a sound | app_notify_desktop, app_notify_done, app_notify_needs_you, app_notify_sound | app_settings_set | on/off |
+
+Not yet effective: app_effort_override (notion.py does not read it), app_notify_* (studio.js does not read them).
+
+### Notes routes
+
+HTTP (server.py hook, GET only): /api/notes, /api/notes/page, /api/notes/draft, /api/notes/status -> notes_routes.http_route.
+The tab itself uses overlay actions notes_list, notes_page, notes_draft; these need desktop_shell.py wiring (open point).
