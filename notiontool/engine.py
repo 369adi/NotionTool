@@ -73,6 +73,15 @@ def task_is_read_only(task):
         return True
     head = (task.get('prompt') or '').lstrip()[:40]
     return bool(re.match(r'read[- ]only\b', head, re.I))
+
+
+_NO_ACCESS_RE = re.compile(r"\b(?:i\s+)?(?:have|had)\s+no\s+access\s+to\s+(?:your|the)\s+(?:worktree|project(?:\s+folder)?|copy|files)"
+                           r"|\bno\s+(?:notiontool\s+)?tools?\s+(?:are\s+)?available\b", re.I)
+
+
+def reports_no_tool_access(summary):
+    """True when a coworker's result says it could not reach the project at all (its chat lacks the tools)."""
+    return bool(_NO_ACCESS_RE.search(str(summary or '')[:600]))
 # Merge results that are worth one more try later; anything else stays 'failed' for the operator.
 # 'main_red': the same tests also fail on clean main, so the task is not to blame. It waits until main
 # moves (a fix landed) and is then merged again; these waits never use up PATCH_RETRY_LIMIT.
@@ -1782,6 +1791,19 @@ class Engine:
                 worker.pop('heal_step', None)
             self.store.put('workers', worker)
 
+    def _no_tool_access(self, task, worker_id):
+        """A coworker reported it cannot reach the project at all: take its chat out of the pool and give the
+        task once more to another coworker (the reply changed nothing, so the retry is safe)."""
+        worker = self.store.get('workers', worker_id)
+        if worker and worker.get('purpose') == 'worker':
+            worker.update(enabled=False, tool_access_lost=time.time())
+            self.store.put('workers', worker)
+        self.store.event('coworker_no_tool_access', task['run_id'], commit=False, task_id=task['id'], worker_id=worker_id,
+                         message='The coworker reported no access to the project; its chat is taken out of the pool')
+        if not task.get('no_access_retried'):
+            task.update(no_access_retried=True, state='retry', next_at=time.time(), error='')
+            task['attempts'] = max(0, task.get('attempts', 1) - 1)
+
     def _complete(self, future, info):
         task = self.store.get('tasks', info['task_id'])
         if not task or task.get('lease') != info['lease']:
@@ -1821,6 +1843,8 @@ class Engine:
                 task['result'] = json.dumps(data, ensure_ascii=False)
                 task['requires_review']=bool(data.get('requires_review'))
                 task['error'] = data.get('summary', '') if task['state'] != 'done' else ''
+                if task['role'] == 'executor' and reports_no_tool_access(data.get('summary', '')):
+                    self._no_tool_access(task, info['worker_id'])
             if task.get('paused_by') == LIMIT_PAUSED_BY:
                 self._limit_charge_reply(task, info, text)
             task['finished'] = time.time()
