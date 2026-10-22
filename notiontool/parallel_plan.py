@@ -16,7 +16,7 @@ count = min(free young coworkers (I32: < 23 h), widest DAG level, file-disjoint 
             network budget 180 req/min / requests per busy coworker per minute, live parallel_limit),
 then reduced while the extra coworkers buy less than min_gain each in expected wall time.
 
-Age limit: I32 is 23 h, the same as team_rotation.DEFAULT_MAX_AGE_HOURS.
+Age limit: I32, read from coworker_age_guard.HARD_MAX_AGE_HOURS (the one shared 23 h constant).
 
 Network budget is on by default, but the default rate is CONFIGURED, not measured: 14.4 req per
 busy coworker per minute = the 180 req/min hard limit times the 0.8 headroom spread over the highest
@@ -33,8 +33,18 @@ stats_from_history(runs) builds both from earlier runs only.
 
 MEASURED_PARALLEL_TOP = 10  # bench: top network_budget.parallel_limit, 0 rate-limit events
 
+
+def _hard_max_age_hours():
+    """The one I32 limit (coworker_age_guard.HARD_MAX_AGE_HOURS); 23 only if that module cannot load."""
+    try:
+        from .coworker_age_guard import HARD_MAX_AGE_HOURS
+        return float(HARD_MAX_AGE_HOURS)
+    except Exception:
+        return 23.0
+
+
 DEFAULTS = {
-    'max_age_h': 23.0,           # I32: Welcome chats at or above this age are not used
+    'max_age_h': _hard_max_age_hours(),  # I32: Welcome chats at or above this age are not used
     'unknown_age_young': False,  # coworkers without a known age are excluded
     'min_gain': 0.05,            # bench knee: below 5 % gain per extra coworker stop adding
     'req_limit_per_min': 180.0,  # network_budget.HARD_LIMIT_PER_MINUTE
