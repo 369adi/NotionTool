@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import os
 import threading
 import time
 
@@ -192,8 +193,41 @@ STUCK_NEXT = ("Next for the Main: open the coworker chat, check whether it finis
               "If it finished, resolve it with POST /api/task/reconcile; otherwise cancel and re-delegate.")
 
 
-def stuck_tasks(tasks, runs_by_id, alerted, checks=STUCK_CHECKS):
-    """Pure: unconfirmed coworker tasks of operator runs that need one alarm."""
+STUCK_ACTIVE_S = 300.0  # a coworker that changed its copy or showed a Notion step within 5 min is not stuck
+STUCK_SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__", ".pytest_cache", ".venv", "venv"})
+
+
+def remote_alive(task, now, window=STUCK_ACTIVE_S):
+    """Pure: Notion reports the coworker turn as running with a recent step."""
+    if task.get("remote_working"):
+        return True
+    progress = _num(task.get("remote_progress_at"))
+    return bool(task.get("remote_running")) and progress > 0 and now - progress < window
+
+
+def worktree_active(folder, now, window=STUCK_ACTIVE_S):
+    """True when any file in the coworker copy changed within window seconds (stops at the first hit)."""
+    if not folder or not os.path.isdir(str(folder)):
+        return False
+    limit = now - window
+    for root, dirs, files in os.walk(str(folder)):
+        dirs[:] = [d for d in dirs if d not in STUCK_SKIP_DIRS]
+        for name in files:
+            try:
+                if os.path.getmtime(os.path.join(root, name)) >= limit:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def stuck_tasks(tasks, runs_by_id, alerted, checks=STUCK_CHECKS, alive=None):
+    """Unconfirmed coworker tasks of operator runs that need one alarm.
+
+    alive(task) -> bool: optional live evidence (Notion step or fresh writes in the coworker copy);
+    a task that is still visibly working is not reported and not marked, so a real stall later
+    still raises its one alarm.
+    """
     found = []
     for task in tasks or []:
         if task.get("state") != "uncertain" or task.get("remote_working"):
@@ -201,8 +235,11 @@ def stuck_tasks(tasks, runs_by_id, alerted, checks=STUCK_CHECKS):
         if int(_num(task.get("reconcile_checks"))) < checks or task.get("id") in alerted:
             continue
         run = runs_by_id.get(task.get("run_id")) or {}
-        if run.get("operator"):
-            found.append((run, task))
+        if not run.get("operator"):
+            continue
+        if alive is not None and alive(task):
+            continue
+        found.append((run, task))
     return found
 
 
@@ -392,8 +429,21 @@ class MainWake:
         """Report each unconfirmed coworker task once to its Main chat; returns the task ids sent."""
         alerted = {r.get("id") for r in self.store.all(STUCK_KIND)}
         runs = {r.get("id"): r for r in self.store.all("runs")}
+        tasks = self.store.all("tasks")
+        by_id = {t.get("id"): t for t in tasks}
+
+        def alive(task):
+            # Live evidence beats the missing Notion confirmation: a recent Notion step, or fresh
+            # writes (code, tests, test db) in the coworker copy or in the reviewed task's copy.
+            if remote_alive(task, now):
+                return True
+            folders = [task.get("patch_worktree")]
+            if task.get("review_of"):
+                folders.append((by_id.get(task["review_of"]) or {}).get("patch_worktree"))
+            return any(worktree_active(f, now) for f in folders if f)
+
         groups = {}
-        for run, task in stuck_tasks(self.store.all("tasks"), runs, alerted):
+        for run, task in stuck_tasks(tasks, runs, alerted, alive=alive):
             account, thread = self.thread_of(run)
             if thread:
                 groups.setdefault((account, thread), []).append((run, task))
