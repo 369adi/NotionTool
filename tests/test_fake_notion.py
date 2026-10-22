@@ -552,6 +552,46 @@ class AdapterSeedCliTests(FakeNotionTestCase):
         with self.assertRaises(ValueError):
             fake_notion.seed_scenario(store, self.state, name='unknown')
 
+    def test_seed_scenario_writes_joined_workers_and_team_ledger(self):
+        store = self.store()
+        fake_notion.seed_scenario(store, self.state)
+        for key in ('ready', 'noai'):
+            workers = [w for w in store.all('workers') if w['account_id'] == key]
+            coworkers = [w for w in workers if w['purpose'] == 'worker']
+            self.assertEqual(len(coworkers), 3)
+            for worker in coworkers:
+                self.assertEqual((worker['join_state'], worker['enabled'], worker['pool_admitted']), ('joined', True, True))
+            private = [w for w in workers if w['purpose'] == 'private']
+            self.assertEqual(len(private), 2)
+            for worker in private:
+                self.assertFalse(worker['enabled'])
+                self.assertNotIn('join_state', worker)
+            ledger = store.get('accounts', key)['team_threads']
+            expected = {'main': {'id': tid(self.state, 'main', key), 'pending': False}}
+            for number in (1, 2, 3):
+                expected['worker%d' % number] = {'id': tid(self.state, 'coworker', key, number - 1), 'pending': False}
+            self.assertEqual(ledger, expected)  # same shape as notion.py ensure_team; no private chat in it
+        before = store.get('accounts', 'ready')['team_threads']
+        again = fake_notion.seed_scenario(store, self.state)
+        self.assertEqual((again['accounts'], again['workers'], again['chats']), (0, 0, 0))
+        self.assertEqual(store.get('accounts', 'ready')['team_threads'], before)
+
+    def test_team_setup_after_seed_creates_no_welcome_chat(self):
+        store = self.store()
+        fake_notion.seed_scenario(store, self.state)
+        adapter = self.adapter(store)
+        adapter.welcome_gap_s = 0
+        before = {key: sorted(t['id'] for t in self.state.threads_of(key)) for key in ('ready', 'noai')}
+        welcome_before = [t for t in self.state.threads_of('ready') if t['title'] == fake_notion.WELCOME_TITLE]
+        result = adapter.ensure_team('ready')
+        self.assertEqual(result['team_size'], 3)
+        after = {key: sorted(t['id'] for t in self.state.threads_of(key)) for key in ('ready', 'noai')}
+        self.assertEqual(after, before)  # no thread was created in either simulated account
+        welcome_after = [t for t in self.state.threads_of('ready') if t['title'] == fake_notion.WELCOME_TITLE]
+        self.assertEqual(len(welcome_after), len(welcome_before))
+        self.assertEqual(welcome_after, [])
+        self.assertEqual(sorted(store.get('accounts', 'ready')['team_threads']), ['main', 'worker1', 'worker2', 'worker3'])
+
     def run_main(self, *argv):
         import contextlib
         import io
