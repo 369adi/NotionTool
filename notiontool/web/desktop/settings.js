@@ -53,8 +53,13 @@
     token_budget_6h: 'team', burst_soft_15m: 'team', burst_hard_15m: 'team', burst_hard_60m: 'team', burst_turns_5m: 'team', burst_spacing_s: 'team',
     max_workers: 'team', per_account: 'team', max_runs_per_chat: 'team', coworker_fresh_context: 'team',
     coworker_delete_old_chat: 'team', coworker_max_age_hours: 'team',
-    context_token_limit: 'advanced', main_context_ask_tokens: 'advanced', main_context_ask_turns: 'advanced'
+    context_token_limit: 'advanced', main_context_ask_tokens: 'advanced', main_context_ask_turns: 'advanced',
+    // Coworker switch rule (schema.switch, desktop_settings.SWITCH_SETTINGS): own card in the Team section.
+    coworker_switch_policy: 'team', switch_min_tokens: 'team', switch_base_tokens: 'team', switch_cost_s: 'team',
+    switch_slope_ms_per_100k: 'team', switch_error_permille_per_100k: 'team', switch_retry_s: 'team',
+    switch_remaining_tasks: 'team'
   };
+  var SWITCH_CARD = { section: 'team', title: 'Context switch rule' };
   var SECTION_OF_GROUP = { 'coworkers': 'team', 'main chat': 'general', 'app': 'app' };
   var CLS = {
     hidden: 'nt-desk-hidden',
@@ -751,7 +756,8 @@
       return { wrap: wrap, labelFor: labelFor };
     }
 
-    function rowFor(entry, section) {
+    // noRange: leave out the 'Allowed: x to y' line (spec rows; the range then shows only in the error text).
+    function rowFor(entry, section, noRange) {
       var kind = kindOf(entry);
       var control = controlFor(entry, section);
       var label = el('label', { cls: 'nt-desk-set-label', 'for': control.labelFor, text: entry.label || entry.key });
@@ -761,7 +767,7 @@
       }
       var text = el('div', { cls: 'nt-desk-set-text' }, [label]);
       if (entry.help) text.appendChild(el('div', { cls: 'nt-desk-set-help', text: String(entry.help) }));
-      if (kind === 'number' && typeof entry.min === 'number' && typeof entry.max === 'number') {
+      if (!noRange && kind === 'number' && typeof entry.min === 'number' && typeof entry.max === 'number') {
         text.appendChild(el('div', { cls: 'nt-desk-set-range', text: 'Allowed: ' + fmt(entry.min) + ' to ' + fmt(entry.max) }));
       }
       var row = el('div', { cls: 'nt-desk-set-row nt-desk-set-row-' + kind, 'data-key': String(entry.key) },
@@ -788,6 +794,20 @@
       });
       if (bodyNode) bodyNode.scrollTop = 0;
       if (id === 'mcp' && mcpPart) mcpPart.load();
+    }
+
+    // The Coworker switch rule (schema.switch) as its own card with a group header. Rows use the spec
+    // row rules without the range line; values are server keys, so collect()/doSave() send them with
+    // the other settings through settings_set.
+    function switchCard(page, section) {
+      var entries = list(schema && schema.switch).filter(function (entry) {
+        return entry && entry.key && !inputs[entry.key];
+      });
+      if (!entries.length) return;
+      var card = el('div', { cls: 'nt-desk-set-card nt-desk-set-card-spec', 'data-card': 'switch' });
+      entries.forEach(function (entry) { card.appendChild(rowFor(entry, section, true)); });
+      page.appendChild(el('h3', { cls: 'nt-desk-set-group', text: SWITCH_CARD.title }));
+      page.appendChild(card);
     }
 
     function renderPanel(node) {
@@ -859,6 +879,7 @@
           ]),
           card
         ]);
+        if (schema && sec.id === SWITCH_CARD.section) switchCard(page, sec.id);
         bodyNode.appendChild(page);
         pages[sec.id] = page;
       });

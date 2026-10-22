@@ -167,8 +167,9 @@ def settings_schema(current):
     """{'harness': entries with 'value' (from current or the default), 'switch': the Coworker switch
     rule entries (same shape), 'hidden_notion': sections}.
 
-    The switch entries stay a separate list until web/desktop/settings.js maps them to a section
-    (SECTION_OF_KEY); they are set through /api/settings."""
+    The switch entries stay a separate list: web/desktop/settings.js maps them to the Team section
+    (SECTION_OF_KEY) and draws them as the 'Context switch rule' card; they are saved through
+    /api/settings with the other server keys."""
     current = current if isinstance(current, dict) else {}
 
     def items(entries):
