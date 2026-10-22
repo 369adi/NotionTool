@@ -121,6 +121,21 @@ TELEMETRY_SECONDS = 5
 EMPTY_PROOF_STATES = ('done_empty', 'done_error')
 
 
+# B46: a coworker whose turn Notion still runs and that keeps adding steps is working, not hung.
+REMOTE_LIVE_FIELDS = ('remote_running', 'remote_steps', 'remote_checked_at', 'remote_newest_seq',
+                      'remote_progress_at', 'remote_working', 'remote_stall_noted')
+REMOTE_WORKING_POLL_SECONDS = 15
+REMOTE_QUIET_MINUTES = 10  # mirrors notion.REMOTE_QUIET_SECONDS
+
+
+def working_text(stored, now):
+    """B46: honest status line for a coworker that is still working after the live stream ended."""
+    stored = stored or {}
+    ago = max(0, int(now - float(stored.get('remote_progress_at') or now)))
+    return ('Coworker is still working in Notion (%d steps, last step %ds ago); watching, nothing is resent'
+            % (int(stored.get('remote_steps') or 0), ago))
+
+
 class PendingRemote(Exception):
     """Upstream acceptance/completion is unknown. Never automatically resend.
 
@@ -1335,7 +1350,9 @@ class Engine:
                     thread_id=worker['thread_id'], submission_phase='preparing')
         # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
         task.update(reconcile_checks=0, remote_done_at=0, reconcile_at=0, approval_seen=None, awaiting_approval='',
-                    approval_evidence=False, pending_tool='', pending_tool_state='', turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False)
+                    approval_evidence=False, pending_tool='', pending_tool_state='', turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False,
+                        remote_working=False, remote_running=False, remote_progress_at=0, remote_newest_seq=0,
+                        remote_steps=0, remote_stall_noted=False)
         # Every attempt keeps its own timing record for the metrics.
         task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
             dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
@@ -1624,9 +1641,22 @@ class Engine:
                 since = 0 if overdue else self._done_poll_since(task, info, now, settings)
                 slot_free = bool(since) and not approval and self._done_poll_slot_free(task['id'], now, settings)
                 delay = 300 if overdue else reconcile_delay(checks, now, since, approval, slot_free, settings)
+                # B46: keep the liveness fields recover() just stored (this put would overwrite them otherwise).
+                for key in REMOTE_LIVE_FIELDS:
+                    if key in stored:
+                        task[key] = stored[key]
+                working = getattr(exc, 'reason', '') == 'remote_working' and not approval
+                if working:
+                    delay = min(delay, REMOTE_WORKING_POLL_SECONDS)  # near-live finish detection, also when overdue
+                elif stored.get('remote_running') and stored.get('remote_progress_at') and not stored.get('remote_stall_noted'):
+                    task['remote_stall_noted'] = True
+                    self.store.event('remote_stalled', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
+                                     message='The coworker chat shows no new step for %d min; nothing is resent'
+                                             % (REMOTE_QUIET_MINUTES,))
                 task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks, reconcile_at=now+delay,
-                            done_poll_since=since, done_poll_fast=slot_free,
-                            error='Awaiting confirmation from Notion; request will not be resent')
+                            done_poll_since=since, done_poll_fast=slot_free, remote_working=working,
+                            error=(working_text(stored, now) if working else
+                                   'Awaiting confirmation from Notion; request will not be resent'))
                 tool = stored.get('awaiting_approval') or stored.get('pending_tool')
                 if tool:
                     # Honest label (H5): 'approval' only with explicit evidence in the transcript entry

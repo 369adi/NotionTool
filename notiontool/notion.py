@@ -32,6 +32,7 @@ def pending_tool_label(entity):
 
 
 APPROVAL_WAIT_SECONDS = 90  # a tool call pending this long really waits for a click
+REMOTE_QUIET_SECONDS = 600  # B46: a running turn without a new step for this long counts as stalled, not working
 
 class ThreadMissing(ValueError):
     """Notion answered HTTP 404 for a worker thread (the chat was deleted)."""
@@ -1607,8 +1608,30 @@ class NotionAdapter:
             # Notion may have ended this turn with an error step and no reply (confirmed retry).
             self.confirm_turn_error(worker,task)
         self.note_pending_interaction(task, own_turn)
+        # B46: liveness from the same read. A turn Notion still runs and that keeps adding steps is working, not hung.
+        live = self.note_remote_progress(task, own_turn, session, transcript)
         # A timeout is not evidence that the server didn't accept the POST.
-        raise PendingRemote()
+        raise PendingRemote(state='running' if live else '', reason='remote_working' if live else '')
+
+    def note_remote_progress(self, task, own_turn, session, transcript):
+        """B46: record the newest step of our own turn. True while Notion still runs the turn and a new
+        step arrived within REMOTE_QUIET_SECONDS; then the coworker is working, not hung."""
+        running = str((session or {}).get('status') or '') == 'running' or bool((transcript or {}).get('session_pending'))
+        newest = max([float(e.get('sequence', 0) or 0) for e in own_turn], default=0.0)
+        now = time.time()
+        stored = self.store.get('tasks', task.get('id', ''), {}) or {}
+        fields = {'remote_running': running, 'remote_steps': len(own_turn), 'remote_checked_at': now}
+        if newest and (newest != float(stored.get('remote_newest_seq') or 0)
+                       or len(own_turn) != int(stored.get('remote_steps') or 0)):
+            fields.update(remote_newest_seq=newest, remote_progress_at=now)
+        progress_at = float(fields.get('remote_progress_at') or stored.get('remote_progress_at') or 0)
+        live = bool(running and progress_at and now - progress_at <= REMOTE_QUIET_SECONDS)
+        fields['remote_working'] = live
+        try:
+            self.mark_task(task['id'], **fields)
+        except Exception:
+            pass
+        return live
 
     def note_pending_interaction(self, task, own_turn):
         """Record when the turn is paused on a tool call that waits for an approval click in the chat.
