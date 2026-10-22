@@ -230,7 +230,7 @@ class Application:
                             run = app.store.get('runs',query.get('id',[''])[0])
                             if not run:
                                 return self.response(404,{'error':'Run not found'})
-                            if query.get('compact',[''])[0] in ('1','true','yes') and app.store.settings().get('api_run_compact',True):
+                            if query.get('compact',[''])[0] in ('1','true','yes') and compact_enabled(app.store):
                                 return self.response(200,compact_run_response(app.engine,run))
                             return self.response(200,{'run':{k:v for k,v in run.items() if k!='context'},
                                 'tasks':[app.safe_task(t) for t in app.engine.tasks(run['id'])]})
@@ -1278,7 +1278,7 @@ class Application:
                 for key in ('harness_enabled', 'mcp_full_access', 'mcp_browser_access',
                             'automatic_setup', 'background_remote', 'bridge_auto',
                             'remote_mcp_enabled', 'advertise_project_tools',
-                            'turn_watch', 'main_auto_continue', 'idle_mode') + LOCAL_SETTINGS:
+                            'turn_watch', 'main_auto_continue', 'idle_mode', 'api_run_compact') + LOCAL_SETTINGS:
                     if key in body:
                         settings[key] = str(body[key]).lower() in ('true', '1', 'on', 'yes')
                 if 'browser_path' in body:
@@ -1736,3 +1736,14 @@ def compact_run_response(engine, run):
                           model=str(model or ''), worker_id=t.get('worker_id', ''),
                           summary=' '.join(str(plain_task_summary(t) or '').split())[:200]))
     return {'run': {k: run.get(k) for k in ('id', 'state', 'title', 'stage') if k in run}, 'tasks': tasks}
+
+
+def compact_enabled(store):
+    """Setting api_run_compact (default on). 'false', '0', 'off', 'no' and '' are off, like token_ledger_enabled."""
+    try:
+        value = (store.settings() or {}).get('api_run_compact', True)
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ('0', 'false', 'off', 'no', '')
+    return bool(value) if value is not None else True

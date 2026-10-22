@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -153,6 +154,30 @@ class UsageAndCompactTests(unittest.TestCase):
         _, plain = call(app, '/api/run?id=r1')
         self.assertEqual(off, plain)
         self.assertIn('proof', off['tasks'][0])
+
+    def test_setting_values_false_zero_off_no_and_empty_are_off(self):
+        for value in ('false', 'False', '0', 'off', 'no', '', False, 0):
+            app = self.app({'api_run_compact': value})
+            _, off = call(app, '/api/run?id=r1&compact=1')
+            self.assertIn('proof', off['tasks'][0], repr(value))
+            self.assertFalse(server_mod.compact_enabled(app.store), repr(value))
+        for value in ('true', '1', 'on', 'yes', True, None):
+            app = self.app({'api_run_compact': value})
+            _, on = call(app, '/api/run?id=r1&compact=1')
+            self.assertEqual(set(on['tasks'][0]), set(server_mod.COMPACT_TASK_KEYS), repr(value))
+            self.assertTrue(server_mod.compact_enabled(app.store), repr(value))
+
+    def test_settings_route_accepts_api_run_compact(self):
+        app = self.app()
+        app.engine.lock = threading.RLock()
+        app.bridge.local_refresh = mock.Mock(return_value=[])
+        with mock.patch.object(server_mod.Application, 'grow_teams', mock.Mock()):
+            app.action('/api/settings', {'api_run_compact': 'false'})
+            self.assertIs(app.store.settings()['api_run_compact'], False)
+            self.assertFalse(server_mod.compact_enabled(app.store))
+            app.action('/api/settings', {'api_run_compact': 'true'})
+            self.assertIs(app.store.settings()['api_run_compact'], True)
+            self.assertTrue(server_mod.compact_enabled(app.store))
 
     def test_setting_defaults_to_on(self):
         self.assertIs(self.app().store.settings().get('api_run_compact', True), True)
