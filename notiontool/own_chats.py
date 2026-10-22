@@ -215,6 +215,27 @@ def _titles(store, account_id, skip=''):
             and w.get('purpose') in (PRIVATE_PURPOSE, MAIN_PURPOSE, USER_PURPOSE)]
 
 
+def _refresh_if_duplicate(server, body):
+    """A chat deleted in Notion stays in the store until the next chat-list refresh, so its name looked taken.
+
+    Before refusing a name, read the account's Notion chat list once; deleted chats then become 'missing'
+    and drop out of _titles. A failed refresh only logs and the normal duplicate check decides.
+    """
+    store = server.store
+    name = body.get('name')
+    account_id = _selected_account(store, body)
+    if not account_id or not isinstance(name, str) or not name.strip():
+        return False
+    taken = {str(t or '').strip().casefold() for t in _titles(store, account_id)}
+    if name.strip().casefold() not in taken:
+        return False
+    try:
+        server.adapter.refresh(account_id)
+    except Exception as exc:
+        store.event('app_chat_name_refresh_skipped', message=str(exc)[:200], account_id=account_id)
+    return True
+
+
 def _worker_by_thread(store, thread_id, account_id=''):
     return next((w for w in store.all('workers') if w.get('thread_id') == thread_id
                  and (not account_id or w.get('account_id') == account_id)), None)
@@ -268,6 +289,8 @@ def create_chat(server, body):
     if not request_id:
         raise ValueError(MSG_REQUEST)
     ident = APP_PREFIX + request_id
+    if not store.get(APP_LEDGER, ident):
+        _refresh_if_duplicate(server, body)  # outside the lock: it reads the Notion chat list
     with store.lock:
         ledger = store.get(APP_LEDGER, ident)
         if ledger:
