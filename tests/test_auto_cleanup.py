@@ -253,8 +253,10 @@ class AutoCleanupTests(unittest.TestCase):
         self.sweep()
         for run_id, before in (('rb', 'blocked'), ('rp', 'paused')):
             run = self.store.get('runs', run_id)
-            self.assertEqual(run['state'], 'stale')
+            self.assertEqual(run['state'], 'cancelled')  # final state the server already treats as finished
+            self.assertTrue(run['stale'])
             self.assertEqual(run['stale_from'], before)
+            self.assertIn('no update for', run['stale_reason'])
             self.assertIn(run_id, [r['id'] for r in self.store.all('runs')])  # never deleted
         self.assertEqual(self.state('tasks', 'failed1'), 'failed')
         self.assertEqual(self.state('tasks', 'blocked1'), 'cancelled')
@@ -271,7 +273,46 @@ class AutoCleanupTests(unittest.TestCase):
         self.task('late', 'rb', 'queued')
         self.sweep()
         self.assertEqual(self.state('tasks', 'late'), 'cancelled')
-        self.assertEqual(self.state('runs', 'rb'), 'stale')
+        self.assertEqual(self.state('runs', 'rb'), 'cancelled')
+
+    def test_e_stale_run_is_finished_for_chat_list_and_live_stream(self):
+        import io
+        from types import SimpleNamespace
+        from notiontool.server import Application
+
+        class Handler:
+            def __init__(self):
+                self.headers = {}
+                self.wfile = io.BytesIO()
+                self.close_connection = False
+
+            def send_response(self, code):
+                self.code = code
+
+            def send_header(self, key, value):
+                pass
+
+            def end_headers(self):
+                pass
+
+        self.worker('m', purpose='main')
+        self.run_('rp', 'paused', age=48 * H)
+        self.task('retry1', 'rp', 'retry', age=48 * H, next_at=self.now - 48 * H)
+        app = SimpleNamespace(store=self.store, engine=self.engine)
+        chat = [c for c in Application.chat_list(app) if c['id'] == 'c'][0]
+        self.assertEqual(chat['active_run'], 'rp')  # a paused run counts as active before the sweep
+        self.sweep()
+        self.assertTrue(self.store.get('runs', 'rp')['stale'])
+        chat = [c for c in Application.chat_list(app) if c['id'] == 'c'][0]
+        self.assertEqual(chat['active_run'], '')  # the stale run is no longer the active run
+        handler = Handler()
+        started = time.time()
+        Application.stream(app, handler, {'run_id': ['rp'], 'timeout': ['5']})
+        self.assertLess(time.time() - started, 4)  # ended by run_finished, not by the 5 s timeout
+        text = handler.wfile.getvalue().decode('utf-8')
+        self.assertIn('event: run_finished', text)
+        self.assertIn('"state": "cancelled"', text)
+        self.assertIn('event: auto_cleanup', text)
 
     def test_e_run_with_live_task_or_recent_update_is_kept(self):
         self.run_('live', 'blocked', age=48 * H)
@@ -308,7 +349,8 @@ class AutoCleanupTests(unittest.TestCase):
         self.assertEqual(self.store.get('workers', 'm')['lease'], 'LM')
         self.assertEqual(self.store.get('workers', 'op')['lease'], 'LO')
         self.assertEqual(self.state('runs', 'rd'), 'done')
-        self.assertEqual(self.state('runs', 'rb'), 'stale')  # the run is stale, the operator thread untouched
+        self.assertEqual(self.state('runs', 'rb'), 'cancelled')  # the run is stale, the operator thread untouched
+        self.assertTrue(self.store.get('runs', 'rb')['stale'])
 
     def test_inflight_task_is_skipped(self):
         self.run_('rd', 'done')

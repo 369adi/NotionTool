@@ -23,7 +23,9 @@ starts it every auto_cleanup_seconds (Engine._auto_cleanup_maybe). Every action 
       Engine._unsent_proof proves the prompt never arrived, is abandoned through Engine.resolve_uncertain.
       Without such proof the task is left alone.
   (e) A blocked or paused run without a live task and without any update for stale_run_hours (default 24)
-      moves to the final state 'stale'. It stays in the history and is never deleted. Its queued, retry and
+      moves to the final state 'cancelled', marked stale=True (stale_from, stale_at, stale_reason), so the chat
+      list shows no active run and the live stream sends run_finished (server.py already treats 'cancelled'
+      as finished). It stays in the history and is never deleted. Its queued, retry and
       blocked tasks are cancelled and leased coworker threads are released, so it holds no files any more.
 Never touched: running, cancelling and sending tasks, tasks with an unconfirmed remote turn (remote_unknown),
 tasks of a running reconciliation, and Main or operator workers. Nothing is ever sent to Notion (rule I5):
@@ -95,8 +97,11 @@ def stale_context_tasks(store, now=None, max_age=MAX_AGE):
 
 # ---- Auto cleanup (owner rule 2026-10-22) ----------------------------------------------------------
 CLEANUP_EVENT = 'auto_cleanup'
-STALE_RUN = 'stale'
-FINISHED_RUNS = ('done', 'cancelled', STALE_RUN)
+# Rule (e) final run state. 'cancelled' (allowed by the owner rule: "'stale' or cancelled") because server.py
+# already treats it as finished: the chat list picks no active run and the live stream sends run_finished.
+# The run is marked stale=True with stale_from, stale_at and stale_reason, so history shows why it ended.
+STALE_RUN = 'cancelled'
+FINISHED_RUNS = ('done', 'cancelled', 'stale')  # 'stale': records written by an earlier build of this sweep
 STUCK_RUNS = ('blocked', 'failed', 'awaiting_main')
 STALE_RUN_STATES = ('blocked', 'paused')
 WAITING = ('queued', 'retry')
@@ -297,7 +302,7 @@ def cleanup_plan(store, now=None, settings=None, inflight=(), worktree_exists=No
         if last <= 0 or now - last <= run_age:
             continue
         actions.append(_action('e', 'stale', None, run_id, run_state=state, reason=(
-            'Auto cleanup: run was %s with no live task and no update for %.1f h (limit %.1f h); it is now stale. '
+            'Auto cleanup: run was %s with no live task and no update for %.1f h (limit %.1f h); it is now cancelled as stale. '
             'It stays in the history; its waiting tasks are cancelled and its coworker threads are released. %s'
             % (state, (now - last) / 3600, run_age / 3600, NO_SEND))))
     return actions
@@ -352,11 +357,11 @@ def _stale_run(engine, action, now, inflight):
             task.update(state='cancelled', error=why, auto_cleanup=dict(rule='e', at=now))
             store.put('tasks', task)
             _cleanup_event(store, action, task_id=task['id'], reason=why)
-    run.update(state=STALE_RUN, stale_from=action['run_state'], stale_at=now, updated=now,
-               stale_reason=action['reason'])
+    run.update(state=STALE_RUN, stale=True, stale_from=action['run_state'], stale_at=now, updated=now,
+               stale_reason=action['reason'], error=run.get('error') or action['reason'][:600])
     store.put('runs', run)
     _cleanup_event(store, action, task_id='')
-    store.event('stage_changed', run['id'], message=STALE_RUN)
+    store.event('stage_changed', run['id'], message=STALE_RUN + ' (stale)')
     return True
 
 
