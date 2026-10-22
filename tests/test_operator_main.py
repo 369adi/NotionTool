@@ -113,8 +113,7 @@ class OperatorMainTest(unittest.TestCase):
         self.assertEqual(len([r for r in self.store.all('runs') if r.get('operator')]), 1)
 
     def test_delegate_refusals(self):
-        with self.assertRaisesRegex(ValueError, 'Register this chat'):
-            delegate(self.engine, 'c4', 'Goal', tasks('a'))
+        # Build 19: every Main chat may delegate, so an unregistered chat is no longer refused here.
         chat_id = self.register()['chat_id']
         bad = tasks('a')
         bad[0]['acceptance'] = ''
@@ -210,6 +209,22 @@ class OperatorMainTest(unittest.TestCase):
         more = tasks('d')
         more[0]['files'] = ['other.txt']
         self.assertEqual(delegate(self.engine, chat_id, 'Goal 3', more)['warnings'], [])
+
+class UnknownTaskKeyWarningTest(__import__('unittest').TestCase):
+    def test_unknown_keys_are_reported_and_known_are_not(self):
+        from notiontool import operator_main
+
+        class Store:
+            def get(self, *a, **k):
+                return {}
+
+            def settings(self):
+                return {'advertise_project_tools': True}
+
+        warnings = operator_main._warnings(Store(), {}, [
+            {'id': 'T1', 'title': 'a', 'prompt': 'p', 'acceptance': 'x', 'depends_on': [], 'summary': 's'},
+            {'id': 'T2', 'title': 'b', 'prompt': 'p', 'acceptance': 'x', 'needs': ['T1'], 'prio': 1}])
+        self.assertEqual(warnings, ['Task T2: unknown key(s) needs, prio were ignored'])
 
 
 if __name__ == '__main__':

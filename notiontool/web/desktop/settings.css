@@ -283,3 +283,12 @@ html[data-nt-look="soft"] { --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .18);
 html[data-nt-look="strong"] { --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .55), 0 8px 30px rgba(124, 92, 255, .35), 0 0 44px rgba(34, 211, 238, .2);
   --nt-accent-soft: rgba(124, 92, 255, .26); }
 @media (max-width: 720px) { .nt-desk-stab-main { grid-template-columns: 1fr; } .nt-desk-stab-nav { position: static; flex-direction: row; flex-wrap: wrap; } }
+
+/* NT_PATCH_UI_2026_10_21: settings open -> Notion's top/chat bar is hidden (it was drawn over the settings). */
+html:has(.nt-desk-set-modal) .notion-topbar, html:has(.nt-desk-set-modal) .nt-desk-topbar,
+html:has(.nt-desk-stab-host) .notion-topbar, html:has(.nt-desk-stab-host) .nt-desk-topbar,
+html.nt-shell-view-open:has(.nt-desk-stab-card) .notion-topbar,
+html.nt-shell-view-open:has(.nt-desk-stab-card) .nt-desk-topbar { display: none !important; }
+.nt-desk-stab-main-refresh { margin-top: 10px; padding: 8px 14px; border-radius: var(--nt-radius-sm, 8px);
+  border: 1px solid rgba(255,255,255,.18); background: var(--nt-accent, #3b82f6); color: #fff; font-weight: 600; cursor: pointer; }
+.nt-desk-stab-main-refresh:disabled { opacity: .55; cursor: default; }

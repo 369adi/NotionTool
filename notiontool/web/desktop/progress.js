@@ -234,8 +234,11 @@
     }
     function renderGrid(models) {
       if (!placeGrid()) return;
-      var busy = models.filter(function (m) { return m.busy; }).length;
-      setText(gridCount, models.length ? busy + ' of ' + models.length + ' busy' : '');
+      // Same numbers as the composer chips: window.__ntDesk.counts (extras.js) when loaded.
+      var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
+      var busy = c ? c.busy : models.filter(function (m) { return m.busy; }).length;
+      var total = c ? c.coworkers : models.length;
+      setText(gridCount, total ? busy + ' of ' + total + ' busy' : '');
       hide(gridEmpty, models.length > 0);
       var seen = {};
       models.forEach(function (m, i) {

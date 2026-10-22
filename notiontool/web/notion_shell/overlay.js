@@ -14,7 +14,8 @@
   window.__ntOverlayInstalled = true;
 
   var ACTIONS = ['state', 'runs', 'run_pause', 'run_cancel', 'run_retry', 'task_reconcile', 'settings_get',
-    'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm'];
+    'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm', 'mcp_add', 'mcp_bridge', 'host_key',
+    'bridge_tunnel'];
   var TABS = [['live', 'Live'], ['runs', 'Runs'], ['harness', 'Harness'], ['mcp', 'MCP'], ['settings', 'Settings']];
   // Sidebar and menu entries that are not part of the AI chat (matched on aria-label or visible text).
   var HIDE_LABELS = ['home', 'inbox', 'search', 'meetings', 'meeting notes', 'agents', 'new agent', 'help',

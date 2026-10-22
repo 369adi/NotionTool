@@ -29,8 +29,18 @@
       'new features', 'neue funktionen', 'neuigkeiten', 'was ist neu'],
     help: ['help', 'hilfe', 'help & support', 'hilfe & support', 'help and support', 'hilfe und support',
       'help, feedback, and more', 'hilfe, feedback und mehr'],
-    meetings: ['meetings', 'besprechungen', 'ai meeting notes', 'ki-besprechungsnotizen']
+    meetings: ['meetings', 'besprechungen', 'ai meeting notes', 'ki-besprechungsnotizen'],
+    // Icon buttons next to Notion's 'New chat' pill at the bottom of the sidebar (only there).
+    footer: ['new page', 'neue seite', 'hot and fresh features', 'heiße neue funktionen', 'neue funktionen']
   };
+  var NEW_CHAT_SEL = '[aria-label="New chat"],[aria-label="Neuer Chat"]';
+  function nearNewChat(node) {
+    var cur = node && node.parentElement;
+    for (var i = 0; cur && i < 3; i++, cur = cur.parentElement) {
+      try { if (cur.querySelector(NEW_CHAT_SEL)) return true; } catch (err) { return false; }
+    }
+    return false;
+  }
   // Exact visible texts of short buttons; their small card is hidden with them.
   var BUTTONS = {
     trial: ['probe-abo starten', 'start trial', 'start free trial', 'start a free trial', 'kostenlos testen',
@@ -174,6 +184,7 @@
     function scan() {
       timer = 0;
       if (stopped) return;
+      scan.lastRun = Date.now();
       if (!enabled()) { release(marked); marked = []; reasons = {}; return; }
       reasons = {};
       var keep = [];
@@ -182,6 +193,7 @@
         var label = node.getAttribute('aria-label') || '';
         var role = node.getAttribute('role') || (node.tagName === 'BUTTON' ? 'button' : '');
         var reason = labelReason(label, role);
+        if (reason === 'footer' && !nearNewChat(node)) reason = '';
         if (reason) { hide(node, reason, keep); return; }
         if (label && keepLabel(label)) return;
         var isClick = false;
@@ -200,6 +212,27 @@
         var reason = dialogReason(node.getAttribute('aria-label') || '', visibleText(node));
         if (reason) hide(node, reason, keep);
       });
+      // Sidebar footer: our sidebar carries data-nt-desk, so the label pass above skips it. Hide the icon
+      // buttons that sit next to Notion's 'New chat' pill (New page, Hot and fresh features); the pill stays.
+      all(document, NEW_CHAT_SEL).forEach(function (pill) {
+        var box = pill.parentElement;
+        var pr = pill.getBoundingClientRect();
+        for (var depth = 0; box && depth < 7; depth++, box = box.parentElement) {
+          var hits = all(box, '[aria-label]').filter(function (n) {
+            if (n === pill || inside(n, '[data-nt-desk-own]')) return false;
+            if (labelReason(n.getAttribute('aria-label'), 'button') !== 'footer') return false;
+            // Same row as the pill only (the footer), never a 'New page' button elsewhere in the sidebar.
+            var r = n.getBoundingClientRect();
+            return Math.abs((r.top + r.height / 2) - (pr.top + pr.height / 2)) < 30;
+          });
+          if (hits.length) {
+            // Own class: chrome.js manages nt-desk-hidden in the sidebar and would put these back.
+            hits.forEach(function (n) { if (!n.classList.contains('nt-desk-footer-hidden')) n.classList.add('nt-desk-footer-hidden'); });
+            reasons.footer = hits.length;
+            break;
+          }
+        }
+      });
       // Nodes that no longer match (or left the page) get their class back off.
       var gone = marked.filter(function (node) { return keep.indexOf(node) < 0; });
       if (gone.length) { release(gone); marked = marked.filter(function (node) { return keep.indexOf(node) >= 0; }); }
@@ -207,11 +240,11 @@
 
     function schedule() {
       if (stopped || timer) return;
-      timer = setTimeout(scan, THROTTLE_MS);
+      timer = setTimeout(scan, Math.max(THROTTLE_MS, (scan.lastRun || 0) + 3000 - Date.now()));
     }
 
     if (typeof MutationObserver === 'function' && document.body) {
-      observer = new MutationObserver(schedule);
+      observer = new MutationObserver((window.__ntIdle2 || (window.__ntIdle2 = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); w.addEventListener('keydown', function () { w.__ntLastKey = Date.now(); }, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = Math.max((w.__ntLastScroll || 0) + 400, (w.__ntLastKey || 0) + 1200) - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 4000 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
       observer.observe(document.body, { childList: true, subtree: true });
     }
     if (typeof ctx.onState === 'function') unsubscribe = ctx.onState(schedule);
