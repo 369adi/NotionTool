@@ -1160,6 +1160,11 @@ class Application:
                 return self.store.put('chats',chat)
             if path=='/api/send':
                 return self.engine.submit(body['chat_id'],str(body.get('text','')),body.get('request_id',''))
+            if path=='/api/step_guard/seed':
+                # Fill the 48 h step counter from history (hour start -> steps); the larger value per hour wins.
+                from . import step_guard
+                total = step_guard.seed_h48(self.store, str(body['account']), dict(body.get('h48') or {}))
+                return {'ok':True,'steps_48h':total}
             if path=='/api/run/cancel':
                 self.engine.cancel(body['id'])
                 return {'ok':True}

@@ -24,11 +24,11 @@ KEEP = 3600
 DEFAULTS = dict(step_soft_15m=800, step_hard_15m=1000, step_hard_60m=1500, step_pause_s=900,
                 wsteps_soft_15m=112_000_000, wsteps_hard_15m=140_000_000, wsteps_hard_60m=210_000_000,
                 step_context_cap=200_000, max_parallel_turns=5, start_spacing_s=45, starts_5m=8,
-                provider_cooldown_s=900, step_soft_48h=8500, step_hard_48h=10000)
-# Owner rule 2026-10-22 (la@arisya analysis): the AI-disabled block came at 329 steps / 15 min and
-# 4,994 / 6 h, far below earlier peaks (765 / 15 min, 5,627 / 6 h) that were fine, after ~20,000 steps
-# in ~51 h. So no daily cap: a rolling 48 h budget of real steps (about half of that total).
-# Soft: no new coworker turns. Hard: all chats stop until the 48 h sum is below the soft value again.
+                provider_cooldown_s=900, step_soft_48h=14000, step_hard_48h=16000)
+# Owner rule 2026-10-22 (la@arisya analysis + owner decision 14:30): no daily cap. The block comes from
+# many coworkers in a short time, so the rolling 48 h budget only brakes COWORKERS and never stops the
+# Main (qoleqabi had ~12,600 steps in 48 h without a block, so 14,000 / 16,000).
+# Soft: at most half the parallel coworker turns. Hard: no new coworker turns until below hard again.
 H48 = 48 * 3600
 SCALED = ('step_soft_15m', 'step_hard_15m', 'step_hard_60m', 'wsteps_soft_15m', 'wsteps_hard_15m',
           'wsteps_hard_60m', 'max_parallel_turns', 'starts_5m')
@@ -153,12 +153,8 @@ def add_steps(store, worker, steps, now=None):
 
 def _latch_step_pause(record, lim, account, now):
     """At the hard step limit: set step_pause[account] = now + step_pause_s once; returns the reason or ''."""
-    if float(record['step_pause'].get(account) or 0) > now or float(record['h48_pause'].get(account) or 0) > now:
+    if float(record['step_pause'].get(account) or 0) > now:
         return ''
-    s48 = _h48_sum(record, account, now)
-    if s48 >= lim['step_hard_48h']:
-        record['h48_pause'][account] = _h48_until(record, account, now, lim['step_soft_48h'])
-        return '48 h budget: %d steps in 48 h (max %d)' % (s48, lim['step_hard_48h'])
     items = [i for i in record['items'] if (i[4] if len(i) > 4 else '') == account and now - float(i[0]) <= 3600]
     s15 = sum(int(i[1]) for i in items if now - float(i[0]) <= 900)
     s60 = sum(int(i[1]) for i in items)
@@ -241,11 +237,6 @@ def _account_state(record, lim, account, now):
         return dict(level='pause', reason='Notion rate limit: cooldown after a provider error', wait=int(until - now) + 1,
                     account=account, provider_until=until, limits=base)
     s48 = _h48_sum(record, account, now)
-    paused48 = float((record.get('h48_pause') or {}).get(account) or 0)
-    if paused48 > now:
-        return dict(level='pause', reason='48 h step budget used: all chats stop until %s' % time.strftime(
-                    '%H:%M', time.localtime(paused48)), wait=int(paused48 - now) + 1, account=account,
-                    provider_until=until, step_pause_until=paused48, steps_48h=s48, limits=base)
     paused = float((record.get('step_pause') or {}).get(account) or 0)
     if paused > now:
         return dict(level='pause', reason='step limit: all chats stop for %d min' % (lim['step_pause_s'] // 60),
@@ -263,7 +254,7 @@ def _account_state(record, lim, account, now):
     starts5 = sum(1 for t in starts if now - t <= 300)
     out = dict(account=account, steps_15m=s15, steps_60m=s60, weighted_15m=w15, weighted_60m=w60,
                starts_5m=starts5, last_start=max(starts or [0]), provider_until=until, limits=lim,
-               steps_48h=s48, soft_48h=s48 >= lim['step_soft_48h'])
+               steps_48h=s48, soft_48h=s48 >= lim['step_soft_48h'], hard_48h=s48 >= lim['step_hard_48h'])
     if s15 >= lim['step_hard_15m'] or s60 >= lim['step_hard_60m'] \
             or w15 >= lim['wsteps_hard_15m'] or w60 >= lim['wsteps_hard_60m']:
         # wait until the oldest counted item of the 15 min window drops out, at least 60 s
@@ -374,12 +365,14 @@ def start_wait(store, worker, now=None, task=None):
     lim = st.get('limits') or DEFAULTS
     if st['level'] == 'pause':
         return max(5, int(st.get('wait') or 60)), st['reason']
-    if st.get('soft_48h'):
-        return 600, '48 h step budget almost used: %d of %d steps, no new coworker turns' % (
+    if st.get('hard_48h'):
+        return 900, '48 h step budget used: %d of %d steps, no new coworker turns (the Main goes on)' % (
             int(st.get('steps_48h') or 0), lim['step_hard_48h'])
     running = running_turns(store, account, str((worker or {}).get('id') or ''))
-    if running >= lim['max_parallel_turns']:
-        return 30, '%d coworker turns already run on this account (max %d)' % (running, lim['max_parallel_turns'])
+    max_par = max(1, lim['max_parallel_turns'] // 2) if st.get('soft_48h') else lim['max_parallel_turns']
+    if running >= max_par:
+        return 30, '%d coworker turns already run on this account (max %d%s)' % (
+            running, max_par, ', 48 h budget almost used' if st.get('soft_48h') else '')
     if task is not None:
         need = min(estimate(store, task) * (running + 1), lim['step_hard_15m'] // 2)
         used = int(st.get('steps_15m') or 0)
@@ -406,6 +399,24 @@ def refuse_start(store, worker, now=None, task=None):
     except Exception:
         pass
     raise RateLimited(wait, 'Coworker start delayed (' + reason + ')', free=True, scope='thread')
+
+
+def seed_h48(store, account, buckets, now=None):
+    """Fill the 48 h counter from history (hour start -> steps); per hour the larger value wins."""
+    now = time.time() if now is None else now
+    account = str(account or '')
+    if not account:
+        raise ValueError('account is required')
+    with _lock(store):
+        record = _record(store)
+        merged = dict(record['h48'].get(account) or {})
+        for key, steps in (buckets or {}).items():
+            hour = str(int(float(key) // 3600 * 3600))
+            if now - float(hour) < H48:
+                merged[hour] = max(int(merged.get(hour) or 0), int(steps or 0))
+        record['h48'][account] = merged
+        _save(store, record, now)
+        return _h48_sum(record, account, now)
 
 
 def public(store, now=None):
