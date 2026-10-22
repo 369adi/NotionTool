@@ -185,10 +185,12 @@ def test_tail(result, limit=TAIL_LIMIT):
 
 class PatchMode:
     def __init__(self, root, base=BASE, remote='origin', python=None, test_timeout=TEST_TIMEOUT_S,
-                 desktop_pattern=DESKTOP_PATTERN, create_task=None, lock_wait=900):
+                 desktop_pattern=DESKTOP_PATTERN, create_task=None, lock_wait=900, auto_push=False):
         self.root = Path(root).resolve()
         self.base = base
         self.remote = remote
+        # Owner rule: push only when Jens says so. A green merge stays local unless auto_push is set explicitly.
+        self.auto_push = bool(auto_push)
         self.python = python or ('python' if getattr(sys, 'frozen', False) else sys.executable)
         self.test_timeout = test_timeout
         self.desktop_pattern = desktop_pattern
@@ -590,7 +592,10 @@ class PatchMode:
             return dict(result, status='main_busy', message='Could not fast-forward main: ' + detail)
         result.update(status='merged', message='Merged into main', main_after=head)
         result['cleanup'] = self._remove(path, branch)
-        result['push'] = self.push(old_main, head, green=True)
+        if self.auto_push:
+            result['push'] = self.push(old_main, head, green=True)
+        else:
+            result['push'] = dict(pushed=False, reason='Auto-push is off; push only on request')
         result['pushed'] = result['push']['pushed']
         return result
 

@@ -64,6 +64,8 @@ PATCH_MODE_DEFAULT = True
 # moves (a fix landed) and is then merged again; these waits never use up PATCH_RETRY_LIMIT.
 PATCH_RETRY = ('main_moved', 'main_busy', 'main_red')
 PATCH_RETRY_LIMIT = 3
+# A transport error before anything was sent moves the task to another coworker at most this often.
+PRESEND_RETRY_LIMIT = 2
 # Failed merges that /api/task/remerge may put back to 'waiting' (only with an existing worktree).
 REMERGE_STATUSES = ('red', 'main_red')
 PATCH_NOTE = ('\n\nWork only inside this folder: %s\nIt is your own copy of the project (a git worktree on branch %s). '
@@ -1731,6 +1733,18 @@ class Engine:
                 self._release(info['worker_id'], info['lease'])
                 task.update(state='cancelled' if (run or {}).get('state') == 'cancelled' else 'retry',
                             attempts=max(0, task['attempts']-1), next_at=time.time(), error='')
+            elif (not task.get('sent_at') and task.get('submission_phase') == 'preparing'
+                  and task.get('presend_retries', 0) < PRESEND_RETRY_LIMIT
+                  and (run or {}).get('state') != 'cancelled'):
+                # Live bug t531ad0a (Coworker 9): an Edge error before anything was sent blocked the whole run.
+                # Nothing reached Notion, so the task moves to another coworker; this chat is marked 'error'.
+                self._release(info['worker_id'], info['lease'], 'error')
+                skip = [w for w in task.get('exclude_workers') or [] if w != info['worker_id']] + [info['worker_id']]
+                task.update(state='retry', attempts=max(0, task['attempts'] - 1), next_at=time.time() + 2,
+                            presend_retries=task.get('presend_retries', 0) + 1, exclude_workers=skip,
+                            error='')
+                self.store.event('presend_failover', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
+                                 message='Nothing was sent; moved to another coworker: ' + str(exc)[:200])
             else:
                 self._release(info['worker_id'], info['lease'], 'error')
                 task.update(state='blocked', error=str(exc)[:400])
