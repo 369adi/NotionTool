@@ -43,30 +43,45 @@ def stop(store, purpose, now):
 
 def test_steps_soft_then_hard_stops_every_chat():
     s = Store()
-    step_guard.add_steps(s, W, 400, now=NOW)
+    step_guard.add_steps(s, W, 700, now=NOW)
     assert step_guard.state(s, NOW + 1)['level'] == 'ok'
     step_guard.add_steps(s, M, 150, now=NOW + 2)  # Main steps count too
     assert step_guard.state(s, NOW + 3)['level'] == 'throttle'
     assert token_budget.burst_state(s, NOW + 3)['level'] == 'throttle'
     assert not stop(s, 'main', NOW + 3)['stop']
-    step_guard.add_steps(s, W, 250, now=NOW + 4)
+    step_guard.add_steps(s, W, 200, now=NOW + 4)  # 1050 >= hard 1000: 15 min stop for all chats
     st = step_guard.state(s, NOW + 5)
-    assert st['level'] == 'pause' and st['steps_15m'] == 800
+    assert st['level'] == 'pause' and 890 <= st['wait'] <= 900
+    assert [k for k, _ in s.events].count('step_limit_stop') == 1
+    assert step_guard.state(s, NOW + 14 * 60)['level'] == 'pause'
     assert token_budget.burst_state(s, NOW + 5)['level'] == 'pause'
     assert stop(s, 'main', NOW + 5)['stop'] and stop(s, 'main', NOW + 5)['source'] == 'steps'
     assert stop(s, 'worker', NOW + 5)['stop']
     assert 'all chats pause' in token_budget.limit_stop_text(60, 'steps')
-    # 15 min later the 15 min window is free again, the 60 min sum (800) is below 1000
+    # 15 min later the 15 min window is free again, the 60 min sum (1050) is below 1500
     assert step_guard.state(s, NOW + 16 * 60)['level'] == 'ok'
+
+
+def test_step_pause_latches_once_and_60_min_net_stops_again():
+    s = Store()
+    step_guard.add_steps(s, W, 1000, now=NOW)
+    step_guard.add_steps(s, W, 50, now=NOW + 10)  # already paused: no second stop event
+    assert [k for k, _ in s.events].count('step_limit_stop') == 1
+    with pytest.raises(RateLimited):
+        step_guard.refuse_start(s, W2, NOW + 20)
+    assert step_guard.state(s, NOW + 901)['level'] == 'ok'
+    step_guard.add_steps(s, W, 500, now=NOW + 960)  # 60 min sum 1550 >= 1500: stop again
+    assert step_guard.state(s, NOW + 961)['level'] == 'pause'
+    assert [k for k, _ in s.events].count('step_limit_stop') == 2
 
 
 def test_weighted_steps_hit_before_plain_steps():
     s = Store()
-    step_guard.add_steps(s, M, 300, now=NOW)  # 300 x 200k cap = 60M
+    step_guard.add_steps(s, M, 500, now=NOW)  # 500 x 200k cap = 100M
     assert step_guard.state(s, NOW + 1)['level'] == 'ok'
-    step_guard.add_steps(s, M, 100, now=NOW + 1)  # 80M >= soft 70M
+    step_guard.add_steps(s, M, 60, now=NOW + 1)  # 112M >= soft 112M
     assert step_guard.state(s, NOW + 2)['level'] == 'throttle'
-    step_guard.add_steps(s, M, 100, now=NOW + 2)  # 100M = hard
+    step_guard.add_steps(s, M, 140, now=NOW + 2)  # 140M = hard
     assert step_guard.state(s, NOW + 3)['level'] == 'pause'
 
 
@@ -96,10 +111,10 @@ def test_provider_error_pauses_all_then_half_speed():
         token_budget.refuse_if_burst(s, W, NOW + 10)
     after = NOW + 901
     assert step_guard.state(s, after)['level'] == 'ok'
-    step_guard.add_steps(s, W, 260, now=after)  # half of soft 500 = 250
+    step_guard.add_steps(s, W, 410, now=after)  # half of soft 800 = 400
     assert step_guard.state(s, after + 1)['level'] == 'throttle'
     assert step_guard.state(s, after + 1)['limits']['max_parallel_turns'] == 2
-    step_guard.add_steps(s, W, 120, now=after + 2)  # half of hard 750 = 375
+    step_guard.add_steps(s, W, 100, now=after + 2)  # half of hard 1000 = 500
     assert step_guard.state(s, after + 3)['level'] == 'pause'
 
 

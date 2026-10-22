@@ -19,8 +19,10 @@ import time
 
 KIND = 'step_guard'
 KEEP = 3600
-DEFAULTS = dict(step_soft_15m=500, step_hard_15m=750, step_hard_60m=1000,
-                wsteps_soft_15m=70_000_000, wsteps_hard_15m=100_000_000, wsteps_hard_60m=180_000_000,
+# Owner rule 2026-10-22: hard stop at 1000 steps / 15 min, then ALL chats pause 15 min (step_pause_s) and
+# go on. step_hard_60m 1500 stays as a safety net below the 1,760 steps / 60 min that tripped Notion.
+DEFAULTS = dict(step_soft_15m=800, step_hard_15m=1000, step_hard_60m=1500, step_pause_s=900,
+                wsteps_soft_15m=112_000_000, wsteps_hard_15m=140_000_000, wsteps_hard_60m=210_000_000,
                 step_context_cap=200_000, max_parallel_turns=5, start_spacing_s=45, starts_5m=8,
                 provider_cooldown_s=900)
 SCALED = ('step_soft_15m', 'step_hard_15m', 'step_hard_60m', 'wsteps_soft_15m', 'wsteps_hard_15m',
@@ -60,6 +62,7 @@ def _record(store):
     record.setdefault('starts', [])
     record.setdefault('provider', {})
     record.setdefault('keys', [])
+    record.setdefault('step_pause', {})  # account -> until: the 15 min stop after the hard step limit
     return record
 
 
@@ -98,11 +101,34 @@ def add_steps(store, worker, steps, now=None):
         purpose = 'w' if (worker or {}).get('purpose') == 'worker' else 'm'
         with _lock(store):
             record = _record(store)
-            record['items'].append([round(now, 1), steps, int(weighted), purpose, account_of(worker)])
+            account = account_of(worker)
+            record['items'].append([round(now, 1), steps, int(weighted), purpose, account])
+            latched = _latch_step_pause(record, lim, account, now)
             _save(store, record, now)
+        if latched:
+            try:
+                store.event('step_limit_stop', account_id=account, seconds=lim['step_pause_s'], detail=latched,
+                            message='Step limit reached (%s): all chats of this account stop for %d min'
+                                    % (latched, lim['step_pause_s'] // 60))
+            except Exception:
+                pass
         return steps
     except Exception:
         return 0
+
+
+def _latch_step_pause(record, lim, account, now):
+    """At the hard step limit: set step_pause[account] = now + step_pause_s once; returns the reason or ''."""
+    if float(record['step_pause'].get(account) or 0) > now:
+        return ''
+    items = [i for i in record['items'] if (i[4] if len(i) > 4 else '') == account and now - float(i[0]) <= 3600]
+    s15 = sum(int(i[1]) for i in items if now - float(i[0]) <= 900)
+    s60 = sum(int(i[1]) for i in items)
+    if s15 < lim['step_hard_15m'] and s60 < lim['step_hard_60m']:
+        return ''
+    record['step_pause'][account] = now + lim['step_pause_s']
+    # The counted steps stay: after the pause the 15 min window is empty again, the 60 min net still counts.
+    return '%d steps in 15 min, %d in 60 min' % (s15, s60)
 
 
 def count_new(store, worker, steps, counted, now=None):
@@ -176,6 +202,11 @@ def _account_state(record, lim, account, now):
     if until > now:
         return dict(level='pause', reason='Notion rate limit: cooldown after a provider error', wait=int(until - now) + 1,
                     account=account, provider_until=until, limits=base)
+    paused = float((record.get('step_pause') or {}).get(account) or 0)
+    if paused > now:
+        return dict(level='pause', reason='step limit: all chats stop for %d min' % (lim['step_pause_s'] // 60),
+                    wait=int(paused - now) + 1, account=account, provider_until=until, step_pause_until=paused,
+                    limits=base)
     if until and now < until + lim['provider_cooldown_s']:
         for key in SCALED:
             lim[key] = max(1, lim[key] // 2)  # after the cooldown: half speed for the same time
