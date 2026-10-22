@@ -121,6 +121,46 @@ def refuse_if_exhausted(store, now=None):
                       % (limit(store), wait // 60 + 1), free=True, scope='account')
 
 
+# ---- Hard stop for every chat (Main and coworkers) -------------------------------------------
+# Owner rule: when the 6 h budget is used up, ALL chats stop at once. The engine refuses and
+# cancels coworker turns; the Main only works through the MCP bridge, so bridge.Bridge refuses its
+# tools (error text starts with LIMIT_STOP_PREFIX) using hard_stop_state below.
+LIMIT_STOP_CODE = 'LIMIT_STOP'
+LIMIT_STOP_PREFIX = LIMIT_STOP_CODE + ':'
+
+
+class LimitStop(ValueError):
+    """A tool refused at the hard limit. ValueError, so bridge.rpc returns its text as isError."""
+
+
+def hard_stop_state(store, now=None):
+    """dict(stop, reason, wait): stop is True exactly while exhausted(store, now) > 0.
+
+    wait is the number of seconds until the window resets. Never raises: on any error the state
+    is fail-open (stop=False), like charge().
+    """
+    try:
+        wait = int(exhausted(store, now) or 0)
+        if wait > 0:
+            return dict(stop=True, wait=wait,
+                        reason='6 h token budget of %d tokens used up; resets in about %d min'
+                               % (limit(store), wait // 60 + 1))
+    except Exception:
+        pass
+    return dict(stop=False, reason='', wait=0)
+
+
+def limit_stop_text(wait):
+    """The LIMIT_STOP: refusal text for a tool call at the hard limit (short: rpc keeps 400 chars)."""
+    try:
+        minutes = max(0, int(wait or 0)) // 60 + 1
+    except (TypeError, ValueError):
+        minutes = 1
+    return (LIMIT_STOP_PREFIX + ' hard usage limit reached (6 h token budget used up). Stop now, do no '
+            'further work and tell the user that the usage limit is reached. It resets in about %d min.'
+            % minutes)
+
+
 # ---- Burst guard (short-term usage) ----------------------------------------------------------
 # The 6 h budget (45M) means an average pace of 7.5M/h = 1.9M per 15 min. Coworkers may run faster
 # than that for a while, but not so fast that the whole window burns in a short time (that pattern
