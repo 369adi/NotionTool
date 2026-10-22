@@ -13,7 +13,7 @@ def fill(s, hours, per_hour, worker=W, start=NOW):
 
 def test_48h_defaults_only_brake_coworkers():
     lim = step_guard.DEFAULTS
-    assert lim['step_soft_48h'] == 14000 and lim['step_hard_48h'] == 16000
+    assert lim['step_soft_48h'] == 25000 and lim['step_hard_48h'] == 30000
 
 
 def test_48h_soft_never_pauses():

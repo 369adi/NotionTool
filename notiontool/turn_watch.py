@@ -481,20 +481,25 @@ class TurnWatch:
                                                    key='%s:%s' % (worker.get('thread_id', ''), entity.get('id') or when))
             if worker.get('purpose') not in (OPERATOR, 'main'):
                 return 0
-            ids = set()
+            ids, roles = set(), {}
             for entity in entities:
                 kind = str(entity.get('kind') or entity.get('type') or '').lower()
                 if entity.get('id') and _role(entity) in ('assistant_message', 'tool', 'error') and 'result' not in kind:
                     ids.add(str(entity['id']))
+                    roles[str(entity['id'])] = 'e' if 'error' in kind else _role(entity)
             seen_map = self.__dict__.setdefault('step_seen', {})
             key = worker['id'] + ':' + str(worker.get('thread_id', ''))
             seen = seen_map.get(key)
             seen_map[key] = set(list((seen or set()) | ids)[-2000:])
             if seen is None:
                 return 0
-            new = len(ids - seen)
+            fresh = ids - seen
+            new = len(fresh)
             if new:
-                step_guard.add_steps(self.store, worker, new, now=now)
+                # assistant messages = AI (inference) steps; error entries count for the error brake
+                inference = sum(1 for i in fresh if roles.get(i) == 'assistant_message')
+                errors = sum(1 for i in fresh if roles.get(i) in ('e', 'error'))
+                step_guard.add_steps(self.store, worker, new, now=now, inference=inference, errors=errors)
             return new
         except Exception:
             return 0
