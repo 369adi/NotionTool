@@ -117,7 +117,7 @@ Rows from the earlier snapshot that A4 no longer lists (full IDs): te8a8591b4c90
 | presend_timing.rotate | 1.73 [1.60-2.42] s | 16 |
 | Main handoff to ack | 26.4 [23.0-29.2] s | 7 |
 
-C_switch = 13.0 + 49.0 = 62 s (band about 10-165 s). The old chat at a switch has a median of 27k tokens, the handoff 12k and the checkpoint 3k.
+C_switch = 13.2 + 28.4 = 41.6 s, with R = 61.7 s (23:58 UTC snapshot, see the note below). Older value (23:17 UTC snapshot, table above): C_switch = 13.0 + 49.0 = 62 s (band about 10-165 s). The old chat at a switch has a median of 27k tokens, the handoff 12k and the checkpoint 3k.
 
 Snapshot note: these values come from the 23:17 UTC snapshot. The 23:58 UTC re-run (A2/A3) gives an extra pre-send of 13.2 [9.1-17.9] s (n=51) and handoff to end of turn 139.4 s. The first turn without handoff is now 110.9 s instead of 90.3 s, because of the 6 new 06e0 tasks. So C_switch = 13.2 + 28.4 = 41.6 s and R = 61.7 s. A handful of new tasks moves C_switch by about a third, so it is not a stable value.
 
@@ -126,6 +126,8 @@ Snapshot note: these values come from the 23:17 UTC snapshot. The 23:58 UTC re-r
 Task cs_recall_sum; checklist Q1 JSON shape, Q2 count=12, Q3 sum=454, Q4 codeword AMBER-4417, Q5 file unchanged.
 
 Generated with `python bench/context_switch.py bench --client bench.context_switch:offline_client --account offline --reps 3 --out work/bench/context_switch_offline.jsonl --report` (exit 0, 30 rows written). The table below is the B1 section of that run, pasted unchanged, so run_ref, context tokens, turn and switch match the JSONL file. All rows are mocked: the times are local script times in seconds.
+
+The JSONL file is not in git: `work/` is git-ignored (`git check-ignore -v work/bench/context_switch_offline.jsonl` -> `.gitignore:13:work/`). To regenerate it, run the same command again from the project root: `python bench/context_switch.py bench --client bench.context_switch:offline_client --account offline --reps 3 --out work/bench/context_switch_offline.jsonl --report` (options from `bench/context_switch.py` lines 844-849; without `--out` the script writes to its default `work/bench/context_switch.jsonl`, line 57). The run times are mocked, so new run times differ slightly from the table.
 
 | Level | Variant | rep | run_ref | context tokens | TTFO s | turn s | switch s | Q1 | Q2 | Q3 | Q4 | Q5 | quality | accepted | mocked |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -166,12 +168,12 @@ The control client (no codeword in the handoff) fails Q4 in 5/5 fresh runs, so t
 
 ## R4. Break-even
 
-T* = T0 + C_switch / (N_remaining x (b + e x R)), with C=62 s, T0=12k, R=60.4 s, b=-44 s/100k, e=+0.158/100k.
+T* = T0 + C_switch / (N_remaining x (b + e x R)), with C=41.6 s (13.2 + 28.4), T0=12k, R=61.7 s, e=+0.1581/100k and b=-46.2 s/100k (23:58 UTC snapshot, R1/R2).
 
 - Time only: b <= 0, so no break-even.
-- Errors only (e x R = 9.5 s/100k): T* = 12k + 652k/N. That gives N=1 665k, N=3 230k, N=5 143k, N=10 77k, N=20 45k. Halving e doubles the term; the C band scales it by 0.16 to 2.7.
-- Combined point estimate: -34.8 s/100k, so no break-even.
-- Sensitivity with the 23:58 snapshot (C=41.6 s, e x R = 0.1575 x 61.7 = 9.7 s/100k, errors only): T* = 12k + 428k/N. That gives N=1 440k, N=3 155k, N=5 98k, N=10 55k. Combined with b=-46.2 the estimate is still negative, so still no break-even.
+- Errors only (e x R = 0.1581 x 61.7 = 9.75 s/100k): T* = 12k + 427k/N (41.6 s / 9.75 s per 100k = 426.7k). That gives N=1 439k, N=3 154k, N=5 97k, N=10 55k. Halving e doubles the term.
+- Combined point estimate: b + e x R = -46.2 + 9.75 = -36.4 s/100k, so no break-even.
+- Older comparison (23:17 UTC snapshot: C=62 s, R=60.4 s, b=-44 s/100k, e x R = 9.5 s/100k): T* = 12k + 652k/N, i.e. older values N=1 665k, N=3 230k, N=5 143k, N=10 77k, N=20 45k; combined -34.8 s/100k, also no break-even. The older C band (about 10-165 s) scaled that term by 0.16 to 2.7.
 - Every T* above about 150k is extrapolated beyond the measured range.
 
 ## R5. Live measurement not possible
@@ -180,10 +182,10 @@ Re-checked on 2026-10-22 (GET /api/state in the fix run): hg/d84a (d84a51c708be4
 
 ## R6. Recommendation
 
-1. Do not switch Coworkers below about 150k estimated tokens for speed reasons. The switch costs about 62 s plus more errors in the first turn, and there is no measured time penalty in that range.
+1. Do not switch Coworkers below about 150k estimated tokens for speed reasons. The switch costs about 42 s (C_switch = 41.6 s; older value 62 s) plus more errors in the first turn, and there is no measured time penalty in that range. Until live data exists, the only measured result is: no slowdown up to about 150k tokens.
 2. Above that, switch only between tasks when tokens_at_send >= T0 + C_switch / (N_remaining x (b + e x R)). Use rolling DB values: C from thread_generations, b and e from bootstrap fits, N_remaining from queued tasks. If b + e x R <= 0 or its 90% interval includes 0, switch only at the hard limits.
-3. Starting values until live data exists: C=62 s, T0=12k, e x R=9.5 s/100k, **b=0 (assumption, not a measurement)**. b=0 is set because the measured turn-time slope is negative (-44 to -46 s/100k). That slope is skewed by the task mix: the large chats are mostly short check turns of run r9ef733ebc6cb484d898bfc549c5e02ea. With the measured b, the combined estimate b + e x R is negative, so it gives no break-even. Under b=0 the thresholds are 665k (1 task left), 230k (3) and 143k (5), but never below 150k. **665k and 230k are estimates beyond the measured range (at most about 150k tokens in the DB) and must be replaced once live data exists.** Keep the hard cap at 2M, the age limit at 22 h and the turn limit at 600.
-4. Influencing factors: N_remaining, C_switch (Welcome 13-20 s, handoff +49 s), the error slope, the handoff size, and the account/model.
+3. Starting values until live data exists: C=41.6 s, T0=12k, e x R=9.75 s/100k (e=0.1581/100k, R=61.7 s), **b=0 (assumption, not a measurement)**. b=0 is set because the measured turn-time slope is negative (-44 to -46 s/100k). That slope is skewed by the task mix: the large chats are mostly short check turns of run r9ef733ebc6cb484d898bfc549c5e02ea. With the measured b, the combined estimate b + e x R is negative, so it gives no break-even. Under b=0 the thresholds are T* = 12k + 427k/N = 439k (1 task left), 154k (3) and 97k (5), but never below 150k (so N=5 uses 150k). **439k and 154k are estimates beyond the measured range (at most about 150k tokens in the DB) and must be replaced once live data exists.** Older comparison (C=62 s, e x R=9.5 s/100k): 665k / 230k / 143k. Keep the hard cap at 2M, the age limit at 22 h and the turn limit at 600.
+4. Influencing factors: N_remaining, C_switch (Welcome 13-20 s, handoff +28 s; older value +49 s), the error slope, the handoff size, and the account/model.
 
 ## R7. Limits
 
@@ -191,3 +193,28 @@ Re-checked on 2026-10-22 (GET /api/state in the fix run): hg/d84a (d84a51c708be4
 - The data is observational and confounded, with no data above 150k. The error share is an upper bound.
 - The events table is pruned (16 presend_timing rows). create_welcome comes from the /api/state log, not from the DB.
 - R3 is mocked: its times are meaningless for the model and only prove the pipeline and checklist.
+
+## Defaults 2026-10-22
+
+Production defaults of the switch rule. Sources are lines of `docs/context_sweet_spot.md`:
+
+| Value | Default | Source |
+|---|---|---|
+| C (switch cost) | 76 s | line 69: S = 141 - 64.9 = 76 s (76.4 s), measured |
+| b (turn-time slope) | 3514 ms per task per 100k | line 86: fit A, 0.251 s per step per 100k; line 75: median of 14 steps per task, so 0.251 x 14 = 3.514 s |
+| e (error slope) | 0 | not used in production; the measured +0.1581/100k (R1) is only an upper bound |
+| floor (minimum tokens) | 400k | line 90: up to 400k the extra time per task stays at or below +3.5 s, far below 76 s |
+| T0 (context after a switch) | 12k | handoff median 12k (R2) |
+| R (seconds lost per failed turn) | 60 s | rounded from the measured R = 61.7 s (R2); not used while e = 0 |
+
+Lines 87-88: fit B gives T* of about 265,235 tokens instead, and the fit swings 8x depending on how single huge tool results are counted, so it is not robust.
+
+Switch points: T* = 12,000 + 76 s / (N x 3.514 s per 100k), at least the 400k floor and at most the 1,200,000-token hard limit:
+
+| Tasks ahead N | formula | switch point |
+|---|---|---|
+| 1 | 2,174,778 | 1,200,000 (capped at the hard limit) |
+| 3 | 732,926 | 732,926 |
+| 5 | 444,556 | 444,556 |
+
+These defaults are deliberately more conservative than the measured C_switch = 41.6 s: the higher C = 76 s, e = 0 and the 400k floor move every switch point later, so a Coworker only switches when the expected saving clearly outweighs the cost.
