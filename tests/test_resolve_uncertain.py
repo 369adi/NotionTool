@@ -158,6 +158,168 @@ class ResolveUncertainTests(unittest.TestCase):
         self.assertEqual(self.adapter.calls, [])
 
 
+# Live case te4de127 (22 Oct 2026): Notion's thread record vs. our send time.
+SENT_S = 1792644092.0           # our send (seconds)
+LATEST_MS = 1792636606714.0     # Notion's latest user/trigger turn (ms), about 2 h before our send
+COMPLETED_MS = 1792636644463.0  # that turn's completion (ms)
+
+
+class TurnOutcomeAdapter(NoSendAdapter):
+    """Stub: answers turn_outcome with fixed values (or raises) and records how it was called."""
+
+    def __init__(self, outcome=(LATEST_MS, COMPLETED_MS, 'success'), error=None):
+        super().__init__()
+        self.outcome, self.error, self.engine = outcome, error, None
+        self.lock_free = []
+
+    def client(self, account_id, anonymous=False):
+        self.calls.append(('client', account_id))
+        return ('client', account_id)
+
+    def turn_outcome(self, client, thread_id):
+        self.calls.append(('turn_outcome', client, thread_id))
+        if self.engine is not None:
+            # The network read must happen before resolve_uncertain takes the engine lock.
+            def probe():
+                ok = self.engine.lock.acquire(timeout=1)
+                if ok:
+                    self.engine.lock.release()
+                self.lock_free.append(ok)
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join()
+        if self.error is not None:
+            raise self.error
+        return self.outcome
+
+
+class AbandonUnsentTests(unittest.TestCase):
+    """'abandon' without remote_done_at only when Notion's thread record proves the prompt never arrived."""
+
+    def setUp(self):
+        root = Path(__file__).resolve().parent / '.test-data'
+        root.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=root, ignore_cleanup_errors=True)
+        self.store = Store(self.temp.name)
+        self.store.put('accounts', dict(id='a', slot=1, email='test@example.test', state='ready', cooldown_until=0))
+        self.store.put('chats', dict(id='c', title='Main', main_worker='m', folder_id='f', project_path=self.temp.name))
+        self.store.put('runs', dict(id='r1', chat_id='c', state='executing', operator=True, project_path=self.temp.name,
+                                    error='', capacity=2, worker_budget=2, fixes=0, main_worker='m',
+                                    created=time.time(), updated=time.time()))
+        self.engines = []
+
+    def tearDown(self):
+        for engine in self.engines:
+            engine.close()
+        time.sleep(.03)
+        self.store.close()
+        self.temp.cleanup()
+
+    def start(self, adapter):
+        engine = Engine(self.store, adapter)
+        self.engines.append(engine)
+        if hasattr(adapter, 'engine'):
+            adapter.engine = engine
+        return engine
+
+    def put_task(self, **extra):
+        # Put after the engine started: the engine frees leases without a task when it starts.
+        task = dict(id='t1', run_id='r1', role='executor', title='Review', prompt='p', state='uncertain', result='',
+                    deps=[], files=[], attempts=1, worker_id='w1', lease='L1', thread_id='thread-task',
+                    sent_at=SENT_S, remote_done_at=0, side_effect_hold=True, reconcile_checks=3,
+                    reconcile_at=time.time() + 3600, error='Awaiting confirmation from Notion; request will not be resent')
+        task.update(extra)
+        self.store.put('workers', dict(id='w1', account_id='a', thread_id='thread-worker', purpose='worker', enabled=True,
+                                       state='recovering', lease='L1', label='w1', last_used=0))
+        self.store.put('tasks', task)
+        return task
+
+    def outcome_calls(self, adapter):
+        return [call for call in adapter.calls if call[0] == 'turn_outcome']
+
+    def events(self, kind):
+        return [event for event in self.store.events(limit=500) if event.get('kind') == kind]
+
+    def assert_untouched(self, adapter):
+        task = self.store.get('tasks', 't1')
+        self.assertEqual(task['state'], 'uncertain')
+        self.assertTrue(task.get('side_effect_hold'))
+        self.assertNotIn('unsent_proof', task)
+        worker = self.store.get('workers', 'w1')
+        self.assertEqual((worker['state'], worker['lease']), ('recovering', 'L1'))
+        self.assertFalse([call for call in adapter.calls if call[0] in ('run', 'recover')])
+        self.assertEqual(self.events('task_resolved_by_main'), [])
+
+    def refused(self, adapter, resolution='abandon', **extra):
+        engine = self.start(adapter)
+        self.put_task(**extra)
+        with self.assertRaisesRegex(ValueError, 'not confirmed'):
+            engine.resolve_uncertain('t1', resolution, 'try')
+        self.assert_untouched(adapter)
+
+    def test_proof_abandons_without_resend_and_records_the_proof(self):
+        adapter = TurnOutcomeAdapter()
+        engine = self.start(adapter)
+        self.put_task()
+        out = engine.resolve_uncertain('t1', 'abandon', 'Prompt never reached Notion.')
+        self.assertEqual(out, dict(id='t1', state='failed', resolution='abandon'))
+        task = self.store.get('tasks', 't1')
+        self.assertEqual(task['state'], 'failed')
+        for text in ('never arrived', 'thread-task', '1792636606714', '1792644092', '1792636644463',
+                     'nothing was resent', 'Prompt never reached Notion.'):
+            self.assertIn(text, task['error'])
+        self.assertEqual((task['unsent_proof']['latest_user_ms'], task['unsent_proof']['completed_ms']),
+                         (LATEST_MS, COMPLETED_MS))
+        for key in ('remote_unknown', 'side_effect_hold', 'reconcile_at'):
+            self.assertNotIn(key, task)
+        worker = self.store.get('workers', 'w1')
+        self.assertEqual((worker['state'], worker['lease']), ('ready', ''))
+        self.assertEqual(self.outcome_calls(adapter), [('turn_outcome', ('client', 'a'), 'thread-task')])
+        self.assertEqual(adapter.lock_free, [True])
+        self.assertFalse([call for call in adapter.calls if call[0] in ('run', 'recover')])
+        events = self.events('task_resolved_by_main')
+        self.assertEqual(len(events), 1)
+        self.assertIn('1792636606714', str(events[0]))
+        self.assertIn('never arrived', str(events[0]))
+
+    def test_worker_thread_is_used_when_the_task_has_none(self):
+        adapter = TurnOutcomeAdapter()
+        engine = self.start(adapter)
+        self.put_task(thread_id='')
+        engine.resolve_uncertain('t1', 'abandon')
+        self.assertEqual(self.store.get('tasks', 't1')['state'], 'failed')
+        self.assertEqual(self.outcome_calls(adapter), [('turn_outcome', ('client', 'a'), 'thread-worker')])
+
+    def test_user_turn_after_the_send_is_refused(self):
+        adapter = TurnOutcomeAdapter(outcome=((SENT_S + 5) * 1000, (SENT_S + 40) * 1000, 'success'))
+        self.refused(adapter)
+        self.assertEqual(len(self.outcome_calls(adapter)), 1)
+
+    def test_user_turn_within_60_s_before_the_send_is_refused(self):
+        self.refused(TurnOutcomeAdapter(outcome=((SENT_S - 30) * 1000, (SENT_S - 1) * 1000, 'success')))
+
+    def test_unfinished_latest_turn_is_refused(self):
+        self.refused(TurnOutcomeAdapter(outcome=(LATEST_MS, LATEST_MS - 1000, '')))
+
+    def test_read_error_is_refused(self):
+        adapter = TurnOutcomeAdapter(error=ConnectionError('Notion unreachable'))
+        self.refused(adapter)
+        self.assertEqual(len(self.outcome_calls(adapter)), 1)
+        self.assertTrue(self.events('unsent_proof_failed'))
+
+    def test_adapter_without_turn_outcome_is_refused(self):
+        self.refused(NoSendAdapter())
+
+    def test_task_without_send_time_is_refused(self):
+        adapter = TurnOutcomeAdapter()
+        self.refused(adapter, sent_at=0)
+        self.assertEqual(self.outcome_calls(adapter), [])
+
+    def test_accept_without_remote_done_at_is_refused_even_with_proof(self):
+        adapter = TurnOutcomeAdapter()
+        self.refused(adapter, resolution='accept')
+        self.assertEqual(self.outcome_calls(adapter), [])
+
 
 class MainResolutionRouteTests(unittest.TestCase):
     """The existing routes carry the new decisions; no new endpoint (I2)."""

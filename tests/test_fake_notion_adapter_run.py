@@ -149,14 +149,15 @@ class FakeAdapterRunTests(unittest.TestCase):
         self.assertNotIn(DONE, fake_text(self.own_turn()))
         self.assert_one_send_of_the_task()
         self.adapter.verify_response_model.assert_not_called()
-        # The later recover reads that same partial turn. Finding: the fake's session is 'idle' after the cut and
-        # the real code treats 'idle' as completed, so the half answer is accepted as the reply.
-        reply = self.recover()
+        # Like the real Notion, the fake keeps the session 'running' after the cut (no turn_completed), so the
+        # later recover does not accept the half answer as the reply: the task stays pending, never resent.
+        self.assertEqual(self.session_status(), 'running')
+        with self.assertRaises(PendingRemote):
+            self.recover()
         self.assertEqual(self.events('recover_timing')[-1]['window'], self.adapter.RECOVER_WINDOW)
-        self.assertEqual(str(reply), fake_text(self.own_turn()))
-        self.assertTrue(str(reply).startswith('Simulated answer'))
-        self.assertNotIn(DONE, str(reply))
-        self.adapter.verify_response_model.assert_called_once()
+        self.assertEqual(self.kinds(), ['user_message', 'assistant_message'])
+        self.assertEqual(self.session_status(), 'running')
+        self.adapter.verify_response_model.assert_not_called()
         self.assert_one_send_of_the_task()
 
     # --- lost_stream -----------------------------------------------------------------------
@@ -190,7 +191,10 @@ class FakeAdapterRunTests(unittest.TestCase):
         self.assertEqual(self.kinds(), ['user_message', 'assistant_message', 'turn_completed'])
         self.assertEqual(str(reply), fake_text(self.own_turn()))  # the committed reply, not stream text
         done = self.events('remote_done')
-        self.assertEqual([(e['outcome'], e['error_class']) for e in done], [('stream_end', '')])
+        # The stream died before the first patch-start line: an empty stream is unknown, and run() reconciles it.
+        self.assertEqual([(e['outcome'], e['error_class']) for e in done], [('unknown', 'REMOTE_UNKNOWN')])
+        self.assertIn('empty stream', done[0]['detail'])
+        self.assertEqual(done[0]['lines'], 0)
         self.assertEqual(self.events('first_output'), [])  # the stream carried no answer text at all
         self.assertEqual(len(self.events('recover_timing')), 1)
         self.adapter.verify_response_model.assert_called_once()
