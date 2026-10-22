@@ -237,6 +237,8 @@
   .nt-desk-set-brand-text, .nt-desk-set-sec-label, .nt-desk-set-side-foot, .nt-desk-set-kbd { display: none; }
   .nt-desk-set-body, .nt-desk-set-foot { padding-left: 20px; padding-right: 20px; }
   .nt-desk-set-row { flex-wrap: wrap; gap: 10px; }
+  .nt-desk-set-card-spec .nt-desk-set-row { flex-wrap: wrap; gap: 10px; }
+  .nt-desk-set-card-spec .nt-desk-set-control { flex: 1 1 100%; width: 100%; margin-top: 8px; justify-content: flex-start; }
 }
 
 /* ---- Settings tab view (Studio v3) ------------------------------------------------------- */
@@ -287,6 +289,8 @@
 html.nt-desk-compact .nt-desk-stab { padding: 14px 18px; }
 html.nt-desk-compact .nt-desk-stab-row { padding: 7px 0; }
 html.nt-desk-compact .nt-desk-stab-card { padding: 10px 14px; }
+html.nt-desk-compact .nt-desk-set-card-spec .nt-desk-set-row { min-height: 48px; padding: 8px 20px; }
+html.nt-desk-compact .nt-desk-set-group { margin-top: 16px; }
 html[data-nt-look="soft"] { --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .18); --nt-accent-soft: rgba(124, 92, 255, .08); }
 html[data-nt-look="strong"] { --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .55), 0 8px 30px rgba(124, 92, 255, .35), 0 0 44px rgba(34, 211, 238, .2);
   --nt-accent-soft: rgba(124, 92, 255, .26); }

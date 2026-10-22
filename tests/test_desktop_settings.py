@@ -122,6 +122,25 @@ class DesktopSettingsTests(unittest.TestCase):
         self.assertIn("if (isAppLocal(entry)) app[key] = value; else server[key] = value;", js)
         self.assertIn("call('settings_set', { values: data.server })", js)
 
+    def switch_css(self):
+        return (ROOT / 'notiontool/web/desktop/settings.css').read_text(encoding='utf-8')
+
+    def test_switch_card_wraps_on_narrow_width(self):
+        css = self.switch_css()
+        start = css.index('@media (max-width: 720px) {\n')
+        block = css[start:css.index('\n}', start)]
+        self.assertIn('.nt-desk-set-card-spec .nt-desk-set-row { flex-wrap: wrap; gap: 10px; }', block)
+        self.assertIn('.nt-desk-set-card-spec .nt-desk-set-control { flex: 1 1 100%; width: 100%; margin-top: 8px; '
+                      'justify-content: flex-start; }', block)
+
+    def test_switch_card_compact_mode(self):
+        css = self.switch_css()
+        compact = [line for line in css.splitlines() if line.startswith('html.nt-desk-compact ')]
+        self.assertIn('html.nt-desk-compact .nt-desk-set-card-spec .nt-desk-set-row { min-height: 48px; padding: 8px 20px; }',
+                      compact)
+        # Cards 16 px apart in compact mode: the group header above the switch card moves up to 16 px.
+        self.assertIn('html.nt-desk-compact .nt-desk-set-group { margin-top: 16px; }', compact)
+
     def test_files_use_lf(self):
         for rel in ('notiontool/desktop_settings.py', 'tests/test_desktop_settings.py'):
             self.assertNotIn(b'\r', (ROOT / rel).read_bytes(), rel)
