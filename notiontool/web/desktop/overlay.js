@@ -323,6 +323,7 @@
   var OPEN_WAIT_MS = 15000;
   var PLUS_GLYPH = '+';
   var GEAR_GLYPH = '\u2699\uFE0E';
+  var SWITCH_GLYPH = '\u21BB';  // Switch context buttons (an icon, not shown text)
 
   // One uuid per dialog: a double click or a retry sends the same request_id, so the backend
   // never creates the chat twice.
@@ -885,7 +886,7 @@
       props.role = 'button';
       props.tabindex = '0';
       var sw = el('button', { cls: 'nt-desk-chip nt-desk-switch', type: 'button', 'data-nt-desk': 'switch',
-        text: '\u21BB', title: 'Switch context: fresh chat before the next task', 'aria-label': 'Switch context of ' + row.label });
+        text: SWITCH_GLYPH, title: 'Switch context: fresh chat before the next task', 'aria-label': 'Switch context of ' + row.label });
       ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach(function (type) {
         sw.addEventListener(type, function (ev) { ev.stopPropagation(); });
       });
@@ -1370,7 +1371,7 @@
     // Visible Switch context button on every Main row (owner 2026-10-22: the gear menu alone was not found).
     function mainSwitchButton(info) {
       var btn = mk('button', { cls: 'nt-desk-cw-switch nt-desk-main-switch', 'data-nt-desk': 'main-switch', type: 'button',
-        text: '\u21BB', title: 'Switch context: hand this Main over to a fresh chat', 'aria-label': 'Switch context of ' + info.name });
+        text: SWITCH_GLYPH, title: 'Switch context: hand this Main over to a fresh chat', 'aria-label': 'Switch context of ' + info.name });
       btn.__ntChat = info;
       guard(btn, ['pointerdown', 'mousedown', 'mouseup', 'pointerup']);
       btn.addEventListener('click', function (ev) {
