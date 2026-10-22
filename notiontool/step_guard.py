@@ -24,7 +24,12 @@ KEEP = 3600
 DEFAULTS = dict(step_soft_15m=800, step_hard_15m=1000, step_hard_60m=1500, step_pause_s=900,
                 wsteps_soft_15m=112_000_000, wsteps_hard_15m=140_000_000, wsteps_hard_60m=210_000_000,
                 step_context_cap=200_000, max_parallel_turns=5, start_spacing_s=45, starts_5m=8,
-                provider_cooldown_s=900)
+                provider_cooldown_s=900, step_soft_48h=8500, step_hard_48h=10000)
+# Owner rule 2026-10-22 (la@arisya analysis): the AI-disabled block came at 329 steps / 15 min and
+# 4,994 / 6 h, far below earlier peaks (765 / 15 min, 5,627 / 6 h) that were fine, after ~20,000 steps
+# in ~51 h. So no daily cap: a rolling 48 h budget of real steps (about half of that total).
+# Soft: no new coworker turns. Hard: all chats stop until the 48 h sum is below the soft value again.
+H48 = 48 * 3600
 SCALED = ('step_soft_15m', 'step_hard_15m', 'step_hard_60m', 'wsteps_soft_15m', 'wsteps_hard_15m',
           'wsteps_hard_60m', 'max_parallel_turns', 'starts_5m')
 MARKERS = ('userratelimitresponse', 'fairuseairatelimit', 'high usage in a short amount of time',
@@ -63,7 +68,33 @@ def _record(store):
     record.setdefault('provider', {})
     record.setdefault('keys', [])
     record.setdefault('step_pause', {})  # account -> until: the 15 min stop after the hard step limit
+    record.setdefault('h48', {})  # account -> {hour start (str): steps}
+    record.setdefault('h48_pause', {})  # account -> until: stop after the hard 48 h budget
     return record
+
+
+def _h48_add(record, account, steps, now):
+    buckets = dict(record['h48'].get(account) or {})
+    key = str(int(now // 3600 * 3600))
+    buckets[key] = int(buckets.get(key) or 0) + int(steps)
+    record['h48'][account] = {k: v for k, v in buckets.items() if now - float(k) < H48}
+
+
+def _h48_sum(record, account, now):
+    return sum(int(v) for k, v in (record['h48'].get(account) or {}).items() if now - float(k) < H48)
+
+
+def _h48_until(record, account, now, target):
+    """Time when the 48 h sum drops below target (old hours fall out)."""
+    items = sorted((float(k), int(v)) for k, v in (record['h48'].get(account) or {}).items() if now - float(k) < H48)
+    total = sum(v for _, v in items)
+    until = now + 60
+    for start, v in items:
+        if total < target:
+            break
+        total -= v
+        until = start + H48
+    return max(now + 60, until)
 
 
 def _save(store, record, now):
@@ -103,13 +134,16 @@ def add_steps(store, worker, steps, now=None):
             record = _record(store)
             account = account_of(worker)
             record['items'].append([round(now, 1), steps, int(weighted), purpose, account])
+            _h48_add(record, account, steps, now)
             latched = _latch_step_pause(record, lim, account, now)
+            pause_s = int(float(record['h48_pause'].get(account) or 0) - now) if latched.startswith('48 h') \
+                else lim['step_pause_s']
             _save(store, record, now)
         if latched:
             try:
-                store.event('step_limit_stop', account_id=account, seconds=lim['step_pause_s'], detail=latched,
+                store.event('step_limit_stop', account_id=account, seconds=pause_s, detail=latched,
                             message='Step limit reached (%s): all chats of this account stop for %d min'
-                                    % (latched, lim['step_pause_s'] // 60))
+                                    % (latched, max(1, pause_s // 60)))
             except Exception:
                 pass
         return steps
@@ -119,8 +153,12 @@ def add_steps(store, worker, steps, now=None):
 
 def _latch_step_pause(record, lim, account, now):
     """At the hard step limit: set step_pause[account] = now + step_pause_s once; returns the reason or ''."""
-    if float(record['step_pause'].get(account) or 0) > now:
+    if float(record['step_pause'].get(account) or 0) > now or float(record['h48_pause'].get(account) or 0) > now:
         return ''
+    s48 = _h48_sum(record, account, now)
+    if s48 >= lim['step_hard_48h']:
+        record['h48_pause'][account] = _h48_until(record, account, now, lim['step_soft_48h'])
+        return '48 h budget: %d steps in 48 h (max %d)' % (s48, lim['step_hard_48h'])
     items = [i for i in record['items'] if (i[4] if len(i) > 4 else '') == account and now - float(i[0]) <= 3600]
     s15 = sum(int(i[1]) for i in items if now - float(i[0]) <= 900)
     s60 = sum(int(i[1]) for i in items)
@@ -202,6 +240,12 @@ def _account_state(record, lim, account, now):
     if until > now:
         return dict(level='pause', reason='Notion rate limit: cooldown after a provider error', wait=int(until - now) + 1,
                     account=account, provider_until=until, limits=base)
+    s48 = _h48_sum(record, account, now)
+    paused48 = float((record.get('h48_pause') or {}).get(account) or 0)
+    if paused48 > now:
+        return dict(level='pause', reason='48 h step budget used: all chats stop until %s' % time.strftime(
+                    '%H:%M', time.localtime(paused48)), wait=int(paused48 - now) + 1, account=account,
+                    provider_until=until, step_pause_until=paused48, steps_48h=s48, limits=base)
     paused = float((record.get('step_pause') or {}).get(account) or 0)
     if paused > now:
         return dict(level='pause', reason='step limit: all chats stop for %d min' % (lim['step_pause_s'] // 60),
@@ -218,7 +262,8 @@ def _account_state(record, lim, account, now):
     starts = [float(s[0]) for s in record['starts'] if (s[1] if len(s) > 1 else '') == account]
     starts5 = sum(1 for t in starts if now - t <= 300)
     out = dict(account=account, steps_15m=s15, steps_60m=s60, weighted_15m=w15, weighted_60m=w60,
-               starts_5m=starts5, last_start=max(starts or [0]), provider_until=until, limits=lim)
+               starts_5m=starts5, last_start=max(starts or [0]), provider_until=until, limits=lim,
+               steps_48h=s48, soft_48h=s48 >= lim['step_soft_48h'])
     if s15 >= lim['step_hard_15m'] or s60 >= lim['step_hard_60m'] \
             or w15 >= lim['wsteps_hard_15m'] or w60 >= lim['wsteps_hard_60m']:
         # wait until the oldest counted item of the 15 min window drops out, at least 60 s
@@ -243,6 +288,7 @@ def state(store, now=None, account=None):
             return _account_state(record, dict(lim), account, now)
         accounts = {i[4] for i in record['items'] if len(i) > 4} | set(record['provider'])
         accounts |= {s[1] for s in record['starts'] if len(s) > 1}
+        accounts |= set(record['h48']) | set(record['h48_pause'])
         rank = dict(ok=0, throttle=1, pause=2)
         worst = dict(level='ok', reason='', wait=0, account='', limits=lim, steps_15m=0, steps_60m=0,
                      weighted_15m=0, weighted_60m=0, starts_5m=0)
@@ -328,6 +374,9 @@ def start_wait(store, worker, now=None, task=None):
     lim = st.get('limits') or DEFAULTS
     if st['level'] == 'pause':
         return max(5, int(st.get('wait') or 60)), st['reason']
+    if st.get('soft_48h'):
+        return 600, '48 h step budget almost used: %d of %d steps, no new coworker turns' % (
+            int(st.get('steps_48h') or 0), lim['step_hard_48h'])
     running = running_turns(store, account, str((worker or {}).get('id') or ''))
     if running >= lim['max_parallel_turns']:
         return 30, '%d coworker turns already run on this account (max %d)' % (running, lim['max_parallel_turns'])
