@@ -183,6 +183,41 @@ WAKE_HEAD = "NotionTool (automatic): Cowork run finished."
 WAKE_HEAD_MANY = "NotionTool (automatic): Cowork runs finished."
 WAKE_NEXT = ("Next for the Main: read GET /api/run?id=%s, check diffs and reviews, run tests, commit, "
              "restart, live test, confirm awaiting_main runs.")
+# Stuck alarm: an unconfirmed coworker task is reported to the Main once, instead of waiting silently.
+STUCK_KIND = "stuck_alerts"  # store kind; record id = task id
+STUCK_CHECKS = 8  # about 5 minutes with the 5/10/20/40/60 s reconcile backoff
+STUCK_HEAD = "NotionTool (automatic): Coworker task is not confirmed."
+STUCK_NEXT = ("Next for the Main: open the coworker chat, check whether it finished; never resend. "
+              "If it finished, resolve it with POST /api/task/reconcile; otherwise cancel and re-delegate.")
+
+
+def stuck_tasks(tasks, runs_by_id, alerted, checks=STUCK_CHECKS):
+    """Pure: unconfirmed coworker tasks of operator runs that need one alarm."""
+    found = []
+    for task in tasks or []:
+        if task.get("state") != "uncertain" or task.get("remote_working"):
+            continue  # a turn Notion still runs is working, not stuck
+        if int(_num(task.get("reconcile_checks"))) < checks or task.get("id") in alerted:
+            continue
+        run = runs_by_id.get(task.get("run_id")) or {}
+        if run.get("operator"):
+            found.append((run, task))
+    return found
+
+
+def build_stuck_message(items):
+    lines = [STUCK_HEAD]
+    for run, task in items[:WAKE_MAX_RUNS]:
+        worker = str(task.get("worker_id") or "").rpartition(":")[2][-12:]
+        title = _one_line(task.get("title") or task.get("name") or "")[:80]
+        error = _one_line(task.get("error") or "")[:120]
+        lines.append("- %s (run %s, chat ...%s) %s: %d checks%s" % (
+            str(task.get("id", ""))[:12], str(run.get("id", ""))[:12], worker, title,
+            int(_num(task.get("reconcile_checks"))), ("; " + error) if error else ""))
+    lines.append(STUCK_NEXT)
+    return "\n".join(lines)
+
+
 WAKE_CANCELLED = "Nothing to do for the Main: the run was cancelled; no review, commit or restart is needed."
 
 
@@ -298,6 +333,10 @@ class MainWake:
         if not self.enabled():
             return []
         now = _num(self.clock())
+        try:
+            self.stuck_tick(now)
+        except Exception as exc:
+            self._failed("stuck", exc)
         groups = {}
         for run, tasks in self.finished():
             if self.store.get(WAKE_KIND, self.record_id(run)):
@@ -343,6 +382,39 @@ class MainWake:
             for record in records:
                 self.store.put(WAKE_KIND, dict(record, status="sent"))
             self._event("main_wake_sent", ", ".join(ids), run_ids=ids, account_id=account)
+            sent.extend(ids)
+        return sent
+
+    def stuck_tick(self, now):
+        """Report each unconfirmed coworker task once to its Main chat; returns the task ids sent."""
+        alerted = {r.get("id") for r in self.store.all(STUCK_KIND)}
+        runs = {r.get("id"): r for r in self.store.all("runs")}
+        groups = {}
+        for run, task in stuck_tasks(self.store.all("tasks"), runs, alerted):
+            account, thread = self.thread_of(run)
+            if thread:
+                groups.setdefault((account, thread), []).append((run, task))
+        sent = []
+        for (account, thread), group in groups.items():
+            if now - self.last_sent.get(thread, -MIN_GAP_S) < MIN_GAP_S:
+                continue
+            try:
+                client = self.adapter.client(account)
+                if self.chat_busy(client.transcript(thread) or {}):
+                    continue  # delivered as soon as the Main chat is idle
+            except Exception as exc:
+                self._failed(thread, exc)
+                continue
+            for run, task in group:  # recorded before sending: never a second alarm for the same task
+                self.store.put(STUCK_KIND, dict(id=task["id"], run_id=run.get("id"), thread_id=thread, at=now))
+            self.last_sent[thread] = now
+            try:
+                self._send(client, thread, build_stuck_message(group))
+            except Exception as exc:
+                self._failed(thread, exc)
+                continue
+            ids = [t["id"] for _, t in group]
+            self._event("stuck_alert_sent", ", ".join(ids), task_ids=ids, account_id=account)
             sent.extend(ids)
         return sent
 
