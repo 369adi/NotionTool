@@ -69,6 +69,12 @@ def test_working_text_and_constants():
     assert 'remote_working' in E.REMOTE_LIVE_FIELDS
 
 
+def test_transcript_body_cap_fits_long_coworker_chats():
+    # A 10 MB cap cut long transcripts mid-JSON, so recover() could never see the finished turn.
+    from notiontool.vendor import transport
+    assert transport._MAX_BODY >= 32 * 1024 * 1024
+
+
 def test_running_state_is_no_empty_proof():
     # 'running' must never count as proof of an empty finished turn (no resend).
     assert 'running' not in E.EMPTY_PROOF_STATES
