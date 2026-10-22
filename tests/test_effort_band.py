@@ -51,11 +51,14 @@ class BandTest(unittest.TestCase):
         for purpose in ep.MAIN_PURPOSES:
             self.assertEqual([ep.cap_coworker(level, purpose) for level in ALL], list(ALL))
 
-    def test_band_effort_no_level_in_band_uses_closest_and_says_so(self):
-        self.assertEqual(ep.band_effort('high', ('low',), 'worker')[0], 'low')
-        self.assertIn('no level in the Coworker band', ep.band_effort('high', ('low',), 'worker')[1])
-        self.assertEqual(ep.band_effort('high', ('xhigh', 'max'), 'worker')[0], 'xhigh')
-        self.assertEqual(ep.band_effort('medium', ('low', 'xhigh'), 'worker')[0], 'low')  # tie -> weaker
+    def test_band_effort_no_level_in_band_sends_nothing_and_says_so(self):
+        # Review fix: no out-of-band fallback; a Coworker never sends low, xhigh or max.
+        for sup in (('low',), ('xhigh', 'max'), ('low', 'xhigh'), ('low', 'max')):
+            for wanted in ALL:
+                effort, note = ep.band_effort(wanted, sup, 'worker')
+                self.assertIsNone(effort, (wanted, sup))
+                self.assertIn('no level in the Coworker band', note)
+                self.assertIn('no effort sent', note)
         self.assertEqual(ep.band_effort('high', (), 'worker'), (None, ''))
         self.assertEqual(ep.band_effort('max', ALL, 'main'), ('max', ''))
 
@@ -78,13 +81,13 @@ class ChooseEverythingTest(unittest.TestCase):
         self.assertEqual(ep.choose_reasoning_effort('worker', 'code', '', ('low', 'high'))[0], 'high')
         self.assertEqual(ep.choose_reasoning_effort('worker', 'docs', '', ('low', 'high'))[0], 'high')
 
-    def test_no_level_in_band_picks_closest_and_reason_says_so(self):
-        effort, reason = ep.choose_reasoning_effort('worker', 'code', '', ('low',))
-        self.assertEqual(effort, 'low')
-        self.assertIn('no level in the Coworker band', reason)
-        effort, reason = ep.choose_reasoning_effort('worker', 'code', '', ('xhigh', 'max'))
-        self.assertEqual(effort, 'xhigh')
-        self.assertIn('closest supported level xhigh', reason)
+    def test_no_level_in_band_sends_nothing_and_reason_says_so(self):
+        for sup in (('low',), ('xhigh', 'max')):
+            for cls in CLASSES:
+                effort, reason = ep.choose_reasoning_effort('worker', cls, '', sup)
+                self.assertIsNone(effort, (cls, sup, reason))
+                self.assertIn('no level in the Coworker band', reason)
+                self.assertIn('no effort sent', reason)
 
     def test_main_chat_keeps_highest_level(self):
         for cls, risk in itertools.product(CLASSES, RISKS):
@@ -121,10 +124,12 @@ class TaskLevelEffortTest(unittest.TestCase):
     def test_model_without_efforts_sends_none(self):
         self.assertIsNone(self.pick('high', 'no-efforts')[0])
 
-    def test_model_without_band_level_uses_closest_and_says_so(self):
-        effort, reason = self.pick('high', 'low-only')
-        self.assertEqual(effort, 'low')
-        self.assertIn('no level in the Coworker band', reason)
+    def test_model_without_band_level_sends_nothing_and_says_so(self):
+        for model in ('low-only', 'top-only'):
+            for asked in ALL:
+                effort, reason = self.pick(asked, model)
+                self.assertIsNone(effort, (model, asked, reason))
+                self.assertIn('no level in the Coworker band', reason)
 
     def test_main_chat_keeps_automatic_choice(self):
         self.assertEqual(self.pick('low', purpose='main')[0], 'max')
@@ -146,6 +151,24 @@ class FinalGuardTest(unittest.TestCase):
             self.assertEqual(notion.final_effort(client, 'albuquerque-quinn', 'max', purpose), 'max')
         self.assertIsNone(notion.final_effort(client, 'albuquerque-quinn', None, 'worker'))
         self.assertEqual(notion.final_effort(client, 'albuquerque-quinn', '', 'worker'), '')
+
+    def test_unknown_names_become_medium_for_workers(self):
+        # Review fix: an unknown level name is never sent for a Coworker.
+        client = fake_client()
+        for name in ('turbo', 'minimal', ' Ultra ', 'none', 'auto'):
+            for purpose in COWORKER_PURPOSES:
+                for model in ('albuquerque-quinn', 'apple-danish', 'unknown-model', 'no-efforts'):
+                    self.assertEqual(notion.final_effort(client, model, name, purpose), ep.COWORKER_MIN_EFFORT,
+                                     (name, purpose, model))
+        self.assertEqual(notion.final_effort(client, 'albuquerque-quinn', ' HIGH ', 'worker'), 'high')
+        for purpose in ep.MAIN_PURPOSES:
+            self.assertEqual(notion.final_effort(client, 'albuquerque-quinn', 'turbo', purpose), 'turbo')
+
+    def test_model_without_band_level_sends_nothing(self):
+        client = fake_client()
+        for model in ('low-only', 'top-only'):
+            for stale in ALL + ('turbo',):
+                self.assertIsNone(notion.final_effort(client, model, stale, 'worker'), (model, stale))
 
     def test_send_and_resume_paths_use_the_guard(self):
         import inspect

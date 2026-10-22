@@ -89,6 +89,32 @@ class DesktopSettingsTests(unittest.TestCase):
                 self.assertIsNone(protected.search(value), value)
         self.assertEqual(ds.settings_schema({})['hidden_notion'], ds.HIDDEN_NOTION_SETTINGS)
 
+    def test_effort_control_offers_only_auto_medium_high(self):
+        # Design g1 / owner rule 2026-10-22: a 3-option control, Coworkers run on medium or high only.
+        entry = self.by_key(ds.settings_schema({}))['app_effort_override']
+        self.assertEqual(entry['options'], ['auto', 'medium', 'high'])
+        self.assertEqual(entry['default'], 'auto')
+        self.assertEqual(ds.STALE_EFFORTS, ('low', 'xhigh', 'max'))
+        self.assertIn('medium for light work and high otherwise', entry['help'])
+        self.assertIn('Main keeps its own pick', entry['help'])
+        for stale in ds.STALE_EFFORTS:
+            got = self.by_key(ds.settings_schema({'app_effort_override': stale}))['app_effort_override']
+            self.assertEqual(got['value'], stale)  # kept as saved, so the UI can show the warning
+            self.assertNotIn(stale, got['options'])
+
+    def test_settings_js_effort_control_and_warning(self):
+        js = (ROOT / 'notiontool' / 'web' / 'desktop' / 'settings.js').read_text(encoding='utf-8')
+        self.assertIn("var EFFORT_OPTIONS = ['auto', 'medium', 'high'];", js)
+        self.assertIn("var STALE_EFFORTS = ['low', 'xhigh', 'max'];", js)
+        self.assertIn('coworkers use medium for light work and high otherwise. The Main keeps its own pick.', js)
+        self.assertIn('nt-desk-stab-row-warn', js)
+        self.assertIn('nt-desk-set-row-warn', js)
+        self.assertNotIn('use light effort', js)
+        self.assertNotIn('highest level the model supports', js)
+        css = (ROOT / 'notiontool' / 'web' / 'desktop' / 'settings.css').read_text(encoding='utf-8')
+        self.assertIn('#F5B5441A', css)
+        self.assertIn('.nt-desk-stab-seg-btn', css)
+
     def test_files_use_lf(self):
         for rel in ('notiontool/desktop_settings.py', 'tests/test_desktop_settings.py'):
             self.assertNotIn(b'\r', (ROOT / rel).read_bytes(), rel)

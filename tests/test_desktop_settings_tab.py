@@ -120,7 +120,8 @@ class SettingsTabRoundTrip(unittest.TestCase):
 
     def test_effort_choices_follow_the_model_catalog(self):
         res = self.run_js('app_effort_override', 'medium', model_efforts=['low', 'high'])
-        self.assertEqual(res['options'], ['auto', 'low', 'high'])
+        # Design g1: only Automatic, Medium, High; the catalog can only narrow that list.
+        self.assertEqual(res['options'], ['auto', 'high'])
         self.assertEqual(res['calls'], [])
         res = self.run_js('app_effort_override', 'high', model_efforts=['low', 'high'])
         self.assertTrue(res['ok'])
@@ -150,7 +151,7 @@ class SettingsTabKeys(unittest.TestCase):
         for key in ('app_effort_override', 'app_theme_intensity', 'app_compact', 'app_declutter', 'app_notify_desktop',
                     'app_notify_done', 'app_notify_needs_you', 'app_notify_sound'):
             self.assertTrue(entries[key]['app_local'], key)
-        self.assertEqual(entries['app_effort_override']['options'], ['auto', 'low', 'medium', 'high', 'xhigh', 'max'])
+        self.assertEqual(entries['app_effort_override']['options'], ['auto', 'medium', 'high'])
         schema = ds.settings_schema({'model_efforts': ['high', 'low', 'bogus']})
         self.assertEqual(schema['model_efforts'], ['low', 'high'])
         self.assertNotIn('model_efforts', ds.settings_schema({}))

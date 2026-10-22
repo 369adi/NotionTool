@@ -177,6 +177,25 @@
   background: var(--nt-set-accent); color: #ffffff; box-shadow: 0 4px 12px rgba(124, 92, 255, 0.35);
 }
 
+/* Effort control (design g1): saved low, xhigh or max is stale -> warning state (warn / warn-soft tokens) */
+.nt-desk-set-row.nt-desk-set-row-warn { box-shadow: inset 3px 0 0 #F5B544; }
+.nt-desk-set-warn, .nt-desk-stab-warn {
+  margin-top: 4px; padding: 4px 8px; border-radius: 6px; background: #F5B5441A; color: #F5B544;
+  font-size: 12px; line-height: 18px;
+}
+.nt-desk-stab-warn[hidden] { display: none; }
+.nt-desk-stab-row.nt-desk-stab-row-warn { box-shadow: inset 3px 0 0 #F5B544; padding-left: 8px; }
+.nt-desk-stab-seg {
+  display: inline-flex; gap: 4px; padding: 4px; border-radius: 8px; border: 1px solid #FFFFFF14; background: #181C26;
+}
+.nt-desk-stab-seg-btn {
+  height: 32px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: #8A93A8;
+  font: inherit; font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer;
+}
+.nt-desk-stab-seg-btn:hover { background: #1F2430; color: #E9EBF2; }
+.nt-desk-stab-seg-btn:focus-visible { outline: 2px solid #7C5CFF; outline-offset: 1px; }
+.nt-desk-stab-seg-btn[aria-checked="true"] { background: #7C5CFF; color: #ffffff; }
+
 /* Footer with status and save */
 .nt-desk-set-foot {
   display: flex; align-items: center; gap: 12px; padding: 14px 40px; border-top: 1px solid var(--nt-set-line);

@@ -711,7 +711,10 @@
         wrap = node;
       } else if (kind === 'select') {
         var options = list(entry.options).slice();
-        if (text !== '' && options.map(String).indexOf(text) < 0) options = [value].concat(options);
+        // A stale saved effort (low, xhigh, max) is not offered again; the row shows the warning state.
+        if (text !== '' && options.map(String).indexOf(text) < 0 && entry.key !== 'app_effort_override') {
+          options = [value].concat(options);
+        }
         if (options.length && options.length <= SEGMENT_MAX) {
           // Segmented control; the hidden input holds the value that collect() reads.
           node = el('input', { type: 'hidden', id: id });
@@ -761,10 +764,16 @@
       }
       var text = el('div', { cls: 'nt-desk-set-text' }, [label]);
       if (entry.help) text.appendChild(el('div', { cls: 'nt-desk-set-help', text: String(entry.help) }));
+      var staleEffort = entry.key === 'app_effort_override' && ['low', 'xhigh', 'max'].indexOf(entry.value) >= 0;
+      if (staleEffort) {
+        text.appendChild(el('div', { cls: 'nt-desk-set-warn', role: 'note', text: 'Saved level ' + pretty(entry.value) +
+          ' is no longer used. Coworkers run on medium or high only. Pick Automatic, Medium or High.' }));
+      }
       if (kind === 'number' && typeof entry.min === 'number' && typeof entry.max === 'number') {
         text.appendChild(el('div', { cls: 'nt-desk-set-range', text: 'Allowed: ' + fmt(entry.min) + ' to ' + fmt(entry.max) }));
       }
-      var row = el('div', { cls: 'nt-desk-set-row nt-desk-set-row-' + kind, 'data-key': String(entry.key) },
+      var row = el('div', { cls: 'nt-desk-set-row nt-desk-set-row-' + kind + (staleEffort ? ' nt-desk-set-row-warn' : ''),
+        'data-key': String(entry.key) },
         [text, el('div', { cls: 'nt-desk-set-control' }, [control.wrap])]);
       inputs[entry.key].row = row;
       return row;
@@ -1154,7 +1163,7 @@
     per_account: ['Coworkers', 'Helper chats per Notion account. 1 to 40.'],
     coworker_max_age_hours: ['Replace chats after (hours)', 'A helper chat older than this gets a fresh chat. The old one is kept.'],
     max_workers: ['Max at once (all accounts)', 'Most helper chats working at the same time, over all accounts.'],
-    app_effort_override: ['Effort', 'Automatic is best for most people. Pick a level to use it for every task.'],
+    app_effort_override: ['Effort', 'Automatic: coworkers use medium for light work and high otherwise. The Main keeps its own pick.'],
     app_theme_intensity: ['Color strength', 'How strong the colors and glow are.'],
     app_compact: ['Compact mode', 'Smaller spacing so more fits on screen.'],
     app_declutter: ['Hide Notion extras', 'Hide tips, upgrade offers and other Notion parts the app does not use.'],
@@ -1165,8 +1174,17 @@
   };
   var OPTION_TEXT = { auto: 'Automatic', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Very high',
     max: 'Maximum', soft: 'Soft', normal: 'Normal', strong: 'Strong' };
-  var EFFORT_RULE = 'Automatic: quick jobs (routine, docs, tests) use light effort, code and research use high, ' +
-    'reviews and the Main chat use the highest level the model supports.';
+  var EFFORT_RULE = 'Automatic: coworkers use medium for light work and high otherwise. The Main keeps its own pick.';
+  // Design g1: the Effort control offers only these; a saved low, xhigh or max is stale and shows a warning.
+  var EFFORT_OPTIONS = ['auto', 'medium', 'high'];
+  var STALE_EFFORTS = ['low', 'xhigh', 'max'];
+  function effortWarning(entry) {
+    if (!entry || entry.key !== 'app_effort_override') return '';
+    var v = entry.value === undefined ? entry['default'] : entry.value;
+    if (STALE_EFFORTS.indexOf(v) < 0) return '';
+    return 'Saved level ' + (OPTION_TEXT[v] || v) + ' is no longer used. Coworkers run on medium or high only. ' +
+      'Pick Automatic, Medium or High.';
+  }
 
   // ---- pure logic ------------------------------------------------------------------------
   function entriesOf(schema) {
@@ -1183,8 +1201,9 @@
   function optionsOf(entry, schema) {
     var opts = (entry && entry.options) || [];
     var cat = schema && schema.model_efforts;
-    if (entry && entry.key === 'app_effort_override' && cat && cat.length) {
-      opts = opts.filter(function (o) { return o === 'auto' || cat.indexOf(o) >= 0; });
+    if (entry && entry.key === 'app_effort_override') {
+      opts = opts.filter(function (o) { return EFFORT_OPTIONS.indexOf(o) >= 0; });
+      if (cat && cat.length) opts = opts.filter(function (o) { return o === 'auto' || cat.indexOf(o) >= 0; });
     }
     return opts;
   }
@@ -1268,7 +1287,8 @@
   }
 
   window.__ntDesk.settingsLogic = { sections: TAB_SECTIONS, text: TAB_TEXT, entriesOf: entriesOf, validate: validate,
-    planWrite: planWrite, verify: verify, teamSize: teamSize, saveField: saveField, optionsOf: optionsOf };
+    planWrite: planWrite, verify: verify, teamSize: teamSize, saveField: saveField, optionsOf: optionsOf,
+    effortWarning: effortWarning, effortOptions: EFFORT_OPTIONS };
 
   // Backups and Details cards (notiontool/backup.py: backup_status, backup_now, usage_report).
   function backupText(res) {
@@ -1429,8 +1449,19 @@
       if (entry.type === 'bool') {
         row.control.setAttribute('aria-checked', entry.value === true ? 'true' : 'false');
         row.control.textContent = entry.value === true ? 'On' : 'Off';
+      } else if (row.control.getAttribute('role') === 'radiogroup') {
+        var btns = row.control.querySelectorAll('.nt-desk-stab-seg-btn');
+        for (var i = 0; i < btns.length; i++) {
+          btns[i].setAttribute('aria-checked', btns[i].getAttribute('data-value') === String(entry.value) ? 'true' : 'false');
+        }
       } else {
         row.control.value = String(entry.value);
+      }
+      if (row.warn) {
+        var warning = effortWarning(entry);
+        row.warn.textContent = warning;
+        row.warn.hidden = !warning;
+        if (row.wrap) row.wrap.classList.toggle('nt-desk-stab-row-warn', !!warning);
       }
     }
 
@@ -1456,6 +1487,18 @@
         c.addEventListener('click', function (ev) {
           ev.preventDefault();
           commit(view, row, c.getAttribute('aria-checked') !== 'true');
+        });
+      } else if (entry.type === 'choice' && entry.key === 'app_effort_override') {
+        // Design g1: a 3-option control (Automatic, Medium, High), not a dropdown.
+        c = node('div', 'nt-desk-stab-seg');
+        c.setAttribute('role', 'radiogroup');
+        optionsOf(entry, schema).forEach(function (o) {
+          var b = node('button', 'nt-desk-stab-seg-btn', OPTION_TEXT[o] || o);
+          b.type = 'button';
+          b.setAttribute('role', 'radio');
+          b.setAttribute('data-value', o);
+          b.addEventListener('click', function (ev) { ev.preventDefault(); commit(view, row, o); });
+          c.appendChild(b);
         });
       } else if (entry.type === 'choice') {
         c = node('select', 'nt-desk-stab-select');
@@ -1485,6 +1528,13 @@
       var label = node('label', 'nt-desk-stab-label', text[0]);
       info.appendChild(label);
       info.appendChild(node('div', 'nt-desk-stab-help', text[1]));
+      row.wrap = wrap;
+      if (entry.key === 'app_effort_override') {
+        row.warn = node('div', 'nt-desk-stab-warn');
+        row.warn.setAttribute('role', 'note');
+        row.warn.hidden = true;
+        info.appendChild(row.warn);
+      }
       row.status = node('div', 'nt-desk-stab-status');
       row.status.setAttribute('role', 'status');
       row.status.setAttribute('aria-live', 'polite');

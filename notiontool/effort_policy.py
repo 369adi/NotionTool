@@ -193,9 +193,9 @@ def band_effort(target, supported, purpose=""):
     - Main purposes -> (clamp_effort(target, supported), ''): the full range, unchanged.
     - Coworkers: target goes into the band (medium..high) first, then the strongest supported
       in-band level not above it, else the weakest supported in-band level.
-    - A model with no supported level in the band gets the supported level closest to the banded
-      target (a tie goes to the weaker level); note says so. That is the only way a Coworker
-      request can leave the band, and only because the model offers nothing else.
+    - A model with no supported level in the band gets NO effort: (None, note). The request is
+      then sent without an effort (the model uses its own default), so a Coworker never sends
+      'low', 'xhigh' or 'max'; note says why.
     """
     supported = _levels(supported)
     if not supported:
@@ -210,12 +210,9 @@ def band_effort(target, supported, purpose=""):
     inside = tuple(level for level in supported if level in band)
     if inside:
         return clamp_effort(wanted, inside), ""
-    index = REASONING_ORDER.index(wanted)
-    closest = min(supported, key=lambda level: (abs(REASONING_ORDER.index(level) - index),
-                                                REASONING_ORDER.index(level)))
-    note = ("no level in the Coworker band (%s) among supported: %s; closest supported level %s"
-            % (", ".join(band), ", ".join(supported), closest))
-    return closest, note
+    note = ("no level in the Coworker band (%s) among supported: %s; no effort sent"
+            % (", ".join(band), ", ".join(supported)))
+    return None, note
 
 
 def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), default=None):
@@ -256,8 +253,8 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
         rule, target = "%s, risk %s: high effort" % ("task_class " + cls if cls else "no task_class",
                                                     rk or "medium"), "high"
     effort, note = band_effort(target, supported, purpose)
-    reason = rule + " -> " + effort
-    if effort != target:
+    reason = rule + " -> " + (effort or "no effort")
+    if effort and effort != target:
         reason += " (clamped from %s)" % target
     if note:
         reason += "; " + note

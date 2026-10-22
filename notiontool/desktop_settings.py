@@ -17,6 +17,13 @@ except Exception:  # pragma: no cover - keeps the schema usable without the poli
 # Default team size (Coworkers per account); team_size.py and store.py use the same value.
 DEFAULT_COWORKERS = 5
 
+# Effort control (design g1, owner rule 2026-10-22): Coworkers only run on medium or high, so the
+# control offers just these three options. A saved low, xhigh or max is stale and shows a warning.
+EFFORT_OPTIONS = ('auto', 'medium', 'high')
+STALE_EFFORTS = tuple(level for level in REASONING_ORDER if level not in EFFORT_OPTIONS)
+EFFORT_HELP = ('Automatic: coworkers use medium for light work and high otherwise. '
+               'The Main keeps its own pick.')
+
 
 def _int(key, label, group, low, high, default, help_text):
     return dict(key=key, label=label, group=group, type='int', min=low, max=high, options=None,
@@ -98,8 +105,7 @@ HARNESS_SETTINGS = [
           'Play a soft chime when a Main chat, the Test chat or your own chat finishes. Coworker chats stay silent.',
           app_local=True),
     # Models & effort, App look, Notifications (app-local, Studio v3 Settings tab)
-    _choice('app_effort_override', 'Effort', 'App', ('auto',) + tuple(REASONING_ORDER), 'auto',
-            'Automatic is best for most people. Pick a level to use it for every task.', app_local=True),
+    _choice('app_effort_override', 'Effort', 'App', EFFORT_OPTIONS, 'auto', EFFORT_HELP, app_local=True),
     _choice('app_theme_intensity', 'Color strength', 'App', ('soft', 'normal', 'strong'), 'normal',
             'How strong the colors and glow are.', app_local=True),
     _bool('app_compact', 'Compact mode', 'App', False,

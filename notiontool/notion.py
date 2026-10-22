@@ -300,6 +300,8 @@ def choose_task_effort(client, model_id, purpose='', task=None):
         supported, _default = catalog_efforts(catalog_entry(client, model_id))
         # Owner rule 2026-10-22: a Coworker effort set by the Main stays in the band medium..high.
         effort, note = band_effort(asked, supported, purpose)
+        if effort is None and note:
+            return None, 'set by Main: %s; not sent: %s' % (asked, note)
         if effort is None:
             return None, ('set by Main: %s; not sent: no supportedReasoningEfforts for this model '
                           'in the cached catalog' % asked)
@@ -311,14 +313,19 @@ def choose_task_effort(client, model_id, purpose='', task=None):
 def final_effort(client, model_id, effort, purpose=''):
     """Last guard before an effort is sent for a Coworker (owner rule 2026-10-22): a stored or stale
     value (older tasks, resumes) is put into the band medium..high and clamped to the model.
-    Main purposes and empty/non-string values pass through unchanged."""
-    from .effort_policy import MAIN_PURPOSES, band_effort, cap_coworker, catalog_efforts
+    An unknown level name becomes COWORKER_MIN_EFFORT ('medium'); a model without any level in the
+    band gets None (no effort is sent). Main purposes and empty/non-string values pass through unchanged."""
+    from .effort_policy import (COWORKER_MIN_EFFORT, MAIN_PURPOSES, REASONING_ORDER, band_effort,
+                                cap_coworker, catalog_efforts)
     if purpose in MAIN_PURPOSES or not isinstance(effort, str) or not effort.strip():
         return effort
+    level = effort.strip().lower()
+    if level not in REASONING_ORDER:
+        level = COWORKER_MIN_EFFORT
     supported, _default = catalog_efforts(catalog_entry(client, model_id))
     if supported:
-        return band_effort(effort, supported, purpose)[0]
-    return cap_coworker(effort.strip().lower(), purpose)
+        return band_effort(level, supported, purpose)[0]
+    return cap_coworker(level, purpose)
 
 
 MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main', 'external')  # external = the user's own chats (Test chat)
