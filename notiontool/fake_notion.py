@@ -703,6 +703,8 @@ class FakeTransport:
                 thread['sequence'] += 1
                 thread['entries'].append(_entity('turn_completed', fake_uuid('done', tid, thread['sequence']),
                                                  thread['sequence'], now))
+            if not completed:
+                return  # an interrupted turn: Notion keeps the session 'running' and sets no completed_time
             thread['session_status'] = 'idle'
             thread['completed_time'] = max(_ms(now), int(thread.get('latest_user_or_trigger_time') or 0))
 
@@ -730,6 +732,11 @@ class FakeTransport:
         tid = thread['id']
         answer = answer_for(thread['title'], prompt, turn)
         inference = fake_uuid('inference', tid, thread['sequence'])
+        if 'empty_stream' in faults:
+            # Notion commits the user step, the full reply and turn_completed, but the stream dies before the
+            # first patch-start line: the adapter sees an empty stream (unknown / REMOTE_UNKNOWN) and reconciles.
+            self._commit_reply(tid, answer, completed=True)
+            raise OSError('fake empty stream')
         yield json.dumps({'type': 'patch-start', 'data': {'s': [{'id': inference, 'type': 'agent-inference', 'value': []}]}})
 
         def chunk(text):
@@ -754,9 +761,6 @@ class FakeTransport:
             self._commit_reply(tid, ''.join(partial).rstrip('\n'), completed=False)
             if params.get('cut', True):
                 raise OSError('fake: stream interrupted mid-answer')
-            return
-        if 'empty_stream' in faults:
-            self._commit_reply(tid, answer, completed=True)  # committed, but nothing came over the stream
             return
         if 'error_step' in faults:
             text = str(_param(faults, 'error_step').get('message') or ERROR_STEP_TEXT)
