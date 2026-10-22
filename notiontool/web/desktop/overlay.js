@@ -380,6 +380,20 @@
     });
   }
 
+  // Archive: old chats replaced by a context switch (state.archived_chats), newest first.
+  function archivedChatRows(state) {
+    var seen = {};
+    return list(state && state.archived_chats).map(function (c) {
+      c = c || {};
+      return { kind: 'archived', name: cleanName(c.name || c.title) || 'Old chat',
+        thread_id: String(c.thread_id || ''), thread: threadKey(c.thread_id || ''), url: String(c.url || '') };
+    }).filter(function (row) {
+      if (!row.thread || seen[row.thread]) return false;
+      seen[row.thread] = true;
+      return true;
+    });
+  }
+
   function mainChatInfo(main) {
     main = main || {};
     return { kind: 'main', name: cleanName(main.title || main.label) || 'Main', chat_id: String(main.chat_id || ''),
@@ -390,6 +404,8 @@
   function chatMenuItems(info) {
     var items = [{ id: 'rename', label: 'Rename' }];
     if (info && info.kind === 'main') {
+      items.push({ id: 'switch', label: 'Switch context',
+        title: 'Hand this Main over to a fresh Welcome chat (asks first)' });
       items.push({ id: 'demote', label: 'Remove Main rights', danger: true, disabled: !!info.operator,
         title: info.operator ? 'The Operator Main always keeps its Main rights' : '' });
     } else {
@@ -399,7 +415,7 @@
   }
 
   window.__ntDesk.newChatUtil = { newRequestId: newRequestId, cleanName: cleanName, nameError: nameError,
-    createArgs: createArgs, renameArgs: renameArgs, promoteArgs: promoteArgs, privateChatRows: privateChatRows,
+    createArgs: createArgs, renameArgs: renameArgs, promoteArgs: promoteArgs, privateChatRows: privateChatRows, archivedChatRows: archivedChatRows,
     mainChatInfo: mainChatInfo, chatMenuItems: chatMenuItems, CHAT_NAME_MAX: CHAT_NAME_MAX };
 
   window.__ntDesk.sidebar = function (ctx) {
@@ -868,9 +884,32 @@
       var props = { cls: 'nt-desk-coworker', 'data-nt-desk': 'coworker', 'data-nt-desk-thread': row.thread, title: row.task };
       props.role = 'button';
       props.tabindex = '0';
+      var sw = el('button', { cls: 'nt-desk-chip nt-desk-switch', type: 'button', 'data-nt-desk': 'switch',
+        text: '\u21BB', title: 'Switch context: fresh chat before the next task', 'aria-label': 'Switch context of ' + row.label });
+      ['pointerdown', 'mousedown', 'mouseup', 'pointerup'].forEach(function (type) {
+        sw.addEventListener(type, function (ev) { ev.stopPropagation(); });
+      });
+      sw.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        switchCoworker(row);
+      });
+      kids.push(sw);
       var node = el('div', props, kids);
       node.addEventListener('click', function (ev) { openThread(ev, row); });
       return node;
+    }
+
+    function switchCoworker(row) {
+      Promise.resolve().then(function () {
+        return ctx.call('chat_context_switch', { worker_id: row.id });
+      }).then(function (result) {
+        checkResult(result);
+        schedule();
+        ctx.toast(row.label + ' gets a fresh chat before its next task', 'info');
+      }, function (err) {
+        ctx.toast('Could not switch ' + row.label + ': ' + failText(err), 'error');
+      });
     }
 
     function applyCoworkers(state, root) {
@@ -1225,8 +1264,8 @@
         role: 'link', tabindex: '0', title: row.name }, [
         mk('span', { cls: 'nt-desk-chat-icon', 'aria-hidden': 'true' }),
         mk('span', { cls: 'nt-desk-chat-name', text: row.name }),
-        gearButton(row)
-      ]);
+        row.kind === 'archived' ? null : gearButton(row)
+      ].filter(Boolean));
       function go(ev) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -1257,6 +1296,9 @@
       var rows = privateChatRows(state).filter(function (r) {
         return !document.querySelector('[data-nt-desk="chat-row"][data-nt-desk-thread="' + r.thread + '"]');
       });
+      var have = {};
+      rows.forEach(function (r) { have[r.thread] = true; });
+      archivedChatRows(state).forEach(function (r) { if (!have[r.thread]) rows.push(r); });
       var sig = JSON.stringify(rows);
       if (section.getAttribute('data-nt-desk-sig') === sig) return;
       if (menu && section.contains(menu.button)) closeMenu(false);
@@ -1265,7 +1307,7 @@
       var head = mk('button', { cls: 'nt-desk-section-head', 'data-nt-desk': 'chats-head', type: 'button',
         'aria-expanded': String(!collapsed), 'aria-controls': 'nt-desk-chats-list' }, [
         mk('span', { cls: 'nt-desk-chevron', 'aria-hidden': 'true' }),
-        mk('span', { cls: 'nt-desk-coworkers-title', text: 'Chats' }),
+        mk('span', { cls: 'nt-desk-coworkers-title', text: 'Archive' }),
         mk('span', { cls: 'nt-desk-chip nt-desk-count', text: String(rows.length) })
       ]);
       head.addEventListener('click', function (ev) {
@@ -1277,7 +1319,7 @@
         head.setAttribute('aria-expanded', String(!next));
       });
       var body = mk('div', { cls: 'nt-desk-chat-list', id: 'nt-desk-chats-list', 'data-nt-desk': 'chats-list' });
-      if (!rows.length) body.appendChild(mk('div', { cls: 'nt-desk-chat-empty', text: 'No private chats' }));
+      if (!rows.length) body.appendChild(mk('div', { cls: 'nt-desk-chat-empty', text: 'No archived chats' }));
       rows.forEach(function (row) { body.appendChild(privateRow(row)); });
       section.appendChild(head);
       section.appendChild(body);
@@ -1426,6 +1468,18 @@
           + ' delegate work to coworkers. You can make it a Main again later.', submit: 'Remove Main rights',
           busyText: 'Removing...', danger: true, opener: btn,
           onSubmit: function () { return promote(info, false); } });
+      } else if (id === 'switch') {
+        openDialog({ title: 'Switch context?', sub: '"' + info.name + '" hands over to a fresh Welcome chat.'
+          + ' A coworker writes the handoff, then the new chat takes over. The old chat moves to Archive.',
+          submit: 'Switch context', busyText: 'Starting...', opener: btn,
+          onSubmit: function () {
+            return ctx.call('chat_context_switch', { chat_id: info.chat_id }).then(function (result) {
+              checkResult(result);
+              schedule();
+              ctx.toast(result && result.duplicate ? 'A context switch is already running'
+                : 'Context switch started for "' + info.name + '"', 'info');
+            });
+          } });
       }
     }
 

@@ -53,7 +53,8 @@ class DesktopNewChatStaticTests(unittest.TestCase):
         for name in ACTIONS:
             self.assertIn("ctx.call('" + name + "'", self.part)
         calls = set(re.findall(r"ctx\.call\('([\w]+)'", self.part))
-        self.assertEqual(calls, set(ACTIONS))
+        # chat_context_switch (Switch context button) is tested in test_desktop_archive_switch.py.
+        self.assertEqual(calls - {'chat_context_switch'}, set(ACTIONS))
         self.assertIn('createArgs(values.name, values.main, requestId)', self.part)
         self.assertIn("{ name: cleanName(name), main: !!main, request_id: String(requestId || '') }", self.helpers)
         # Notion's own New chat routing stays untouched.
@@ -78,7 +79,7 @@ class DesktopNewChatStaticTests(unittest.TestCase):
 
     def test_english_ui_texts(self):
         for text in ("'Chat name'", "label: 'Main'", "'Main chats can delegate work to coworkers'", "submit: 'Create'",
-                     "text: 'Cancel'", "'Creating chat...'", "text: 'Chats'", "'No private chats'",
+                     "text: 'Cancel'", "'Creating chat...'", "text: 'Archive'", "'No archived chats'", "'Switch context'",
                      "'Remove Main rights?'", "'New chat: choose a name'", "'Chat settings'"):
             self.assertIn(text, self.part)
         for text in ("label: 'Rename'", "label: 'Make Main'", "label: 'Remove Main rights'"):
@@ -207,9 +208,10 @@ class DesktopNewChatNodeTests(unittest.TestCase):
         self.assertEqual([r['name'] for r in out['fromWorkers']], ['Notes'])  # coworkers never show as Chats
         self.assertEqual(out['none'], [])
         self.assertEqual([i['label'] for i in out['priv']], ['Rename', 'Make Main'])
-        self.assertEqual([i['label'] for i in out['main']], ['Rename', 'Remove Main rights'])
-        self.assertFalse(out['main'][1].get('disabled'))
-        self.assertTrue(out['op'][1]['disabled'])
+        self.assertEqual([i['label'] for i in out['main']], ['Rename', 'Switch context', 'Remove Main rights'])
+        self.assertFalse(out['main'][2].get('disabled'))
+        self.assertFalse(out['op'][1].get('disabled'))  # Switch context works for the Operator Main too
+        self.assertTrue(out['op'][2]['disabled'])
 
 
 class DesktopNewChatBackendContractTests(unittest.TestCase):

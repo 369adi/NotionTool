@@ -39,7 +39,8 @@ PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'setti
 MOUNT_ORDER = ('theme', 'chrome', 'declutter', 'sidebar', 'shell', 'live', 'settings', 'extras', 'studio')
 DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_schema', 'app_settings_get',
                                               'app_settings_set', 'main_switch_start', 'app_chat_create',
-                                              'app_chat_rename', 'app_chat_promote', 'main_refresh')
+                                              'app_chat_rename', 'app_chat_promote', 'main_refresh',
+                                              'chat_context_switch')
 CREATE_WAIT = 150.0
 SWITCH_ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
 
@@ -438,6 +439,31 @@ def _main_title(worker, chat=None):
     return label or title or 'Main'
 
 
+ARCHIVE_MAX = 40
+
+
+def archived_chats(all_workers, account='', limit=ARCHIVE_MAX):
+    """Old chats replaced by a context switch (worker retired_threads), newest first, for the sidebar
+    'Archive' section. Read only: nothing is sent to Notion; a click only opens the old chat."""
+    rows, seen = [], set()
+    for worker in all_workers:
+        if account and worker.get('account_id') not in ('', None, account):
+            continue
+        label = str(worker.get('label') or ('Main' if worker.get('purpose') in ('main', 'operator') else 'Coworker'))[:60]
+        threads = [t for t in (worker.get('retired_threads') or []) if t]
+        total = len(threads)
+        for index, thread in enumerate(threads):
+            if thread in seen:
+                continue
+            seen.add(thread)
+            rows.append(dict(thread_id=thread, url=chat_url(thread), worker_id=worker.get('id', ''),
+                             name='%s - old %d' % (label, index + 1), order=(float(worker.get('created') or 0), index - total)))
+    rows.sort(key=lambda r: r['order'], reverse=True)
+    for row in rows:
+        row.pop('order', None)
+    return rows[:limit]
+
+
 def collect_mains(chats, all_workers, account=''):
     """All non-archived Mains of the account: chat records, operator chat and Main workers without a
     chat record (also user-renamed ones). Deduplicated by thread_id; coworkers are never listed."""
@@ -640,8 +666,9 @@ def desktop_state(server, app_settings=None, now=None):
         private = own_chats.private_chats(store, account)
     except Exception:
         private = []
+    archived = archived_chats(all_workers, account)
     return dict(ts=round(float(now), 3), connected=True, account_id=account,
-                mains=mains, private_chats=private, hidden_threads=sorted(hidden),
+                mains=mains, private_chats=private, archived_chats=archived, hidden_threads=sorted(hidden),
                 app_chat_filter=app.get('app_chat_filter') or 'mains_only', app_hide=hide,
                 declutter=app.get('app_declutter', True) is not False,
                 done_sound=app.get('app_done_sound', True) is not False,
@@ -753,8 +780,26 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
         return server.action('/api/app/chat/promote',
                              {k: args.get(k) for k in ('main', 'thread_id', 'chat_id') if k in args})
 
+    def chat_context_switch(args):
+        # Context switch button (sidebar): a Coworker gets a fresh chat before its next task
+        # (/api/chat/compress, nothing sent now); a Main starts the ask-first Main switch.
+        args = args or {}
+        worker_id = str(args.get('worker_id') or '')
+        if worker_id:
+            worker = store.get('workers', worker_id) or {}
+            if worker.get('purpose') == 'worker':
+                return dict(server.action('/api/chat/compress', {'worker_id': worker_id,
+                            'reason': 'Context switch button'}) or {}, kind='coworker')
+        for record in store.all('main_switches'):
+            if record.get('state') in SWITCH_ACTIVE:
+                return dict(record, duplicate=True, kind='main')
+        body = {'request_id': 'desk-switch-' + time.strftime('%Y%m%d-%H%M%S')}
+        if args.get('chat_id'):
+            body['chat_id'] = str(args['chat_id'])
+        return dict(server.action('/api/main/switch/start', body) or {}, kind='main')
+
     handlers.update(app_chat_create=app_chat_create, app_chat_rename=app_chat_rename,
-                    app_chat_promote=app_chat_promote)
+                    app_chat_promote=app_chat_promote, chat_context_switch=chat_context_switch)
     handlers.update(state=state, runs=lambda args: state(args)['runs'], new_welcome_chat=new_welcome_chat,
                     settings_schema=settings_schema, app_settings_get=app_settings_get,
                     app_settings_set=app_settings_set, main_switch_start=main_switch_start,
