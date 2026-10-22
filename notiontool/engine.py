@@ -1630,6 +1630,17 @@ class Engine:
         claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id'], task=task) if task['role'] in ('planner', 'executor') else ''
         tools_available = bool(account.get('bridge_connected') and self.store.settings().get('advertise_project_tools', False))
         prompt_task = dict(task, prompt=task['prompt'] + PATCH_NOTE % (task['patch_worktree'], task.get('patch_branch', ''))) if task.get('patch_worktree') else task
+        # Context pack: the named code goes straight into the prompt (fewer read/search steps).
+        pack = dict(added=False, chars=0, blocks=0, skipped=0, tests=0)
+        if task['role'] in ('executor', 'reviewer') and self.store.settings().get('context_pack', True):
+            from . import context_pack
+            try:
+                packed, pack = context_pack.expand(prompt_task['prompt'], task.get('files') or [],
+                                                   task.get('patch_worktree') or self._project_root(run))
+                if pack['added']:
+                    prompt_task = dict(prompt_task, prompt=packed)
+            except Exception as error:  # never block a start because of the pack
+                pack = dict(pack, error=str(error)[:200])
         if task.get('review_of'):
             prompt_task = dict(prompt_task, prompt=prompt_task['prompt'] + review_note(self.store.get('tasks', task['review_of'], None)))
         prompt = make_prompt(prompt_task, dict(run, file_claims=claims) if claims else run, context, task['lease'], tools_available)
@@ -1644,7 +1655,8 @@ class Engine:
         self.store.put('workers', worker)
         # Committed together with task_started right after the submit.
         self.store.event('context_built', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'], attempt=task['attempts'],
-                         context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt))
+                         context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt),
+                         pack_chars=pack['chars'], pack_blocks=pack['blocks'], pack_skipped=pack['skipped'])
         cancel = threading.Event()
         future = self.pool.submit(run_with_priority, 'critical', self.adapter.run, worker, task, prompt, cancel,
                                   lambda text: self._partial(task['id'], task['lease'], text))
