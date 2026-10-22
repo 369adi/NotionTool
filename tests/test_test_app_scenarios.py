@@ -43,6 +43,7 @@ def _with_deadline(label, seconds, func, *args, **kw):
     if worker.is_alive():
         frame = sys._current_frames().get(worker.ident)
         stack = ''.join(traceback.format_stack(frame)) if frame is not None else '(no stack)'
+        test_app.HALT.set()  # the stuck call may still run: start() now opens no process until setUp clears it
         if label != 'stop':
             try:
                 _with_deadline('stop', STOP_TIMEOUT, test_app.stop)  # free port and processes for the next test
@@ -84,6 +85,7 @@ class TestAppScenarios(unittest.TestCase):
 
     def setUp(self):
         _stop()  # only test-app processes (own handles + work/test-app.json); never the real app
+        test_app.HALT.clear()  # a timeout in an earlier test set the stop flag
 
     def tearDown(self):
         _stop()
@@ -118,6 +120,7 @@ class TestPlainTestInstance(unittest.TestCase):
 
     def setUp(self):
         _stop()
+        test_app.HALT.clear()
 
     def tearDown(self):
         _stop()

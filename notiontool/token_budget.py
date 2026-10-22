@@ -133,6 +133,43 @@ def ledger_enabled(store):
     return bool(value) if value is not None else True
 
 
+LEDGER_KEEP_DAYS = 14
+
+
+def ledger_keep_days(store):
+    """Setting token_ledger_keep_days (default 14, at least 1)."""
+    try:
+        value = (store.settings() or {}).get('token_ledger_keep_days')
+        return max(1, int(value)) if value not in (None, '') else LEDGER_KEEP_DAYS
+    except Exception:
+        return LEDGER_KEEP_DAYS
+
+
+def ledger_prune(store, now=None):
+    """Delete token_ledger buckets whose end is older than token_ledger_keep_days. Never raises.
+
+    Only record kind LEDGER_KIND is touched; token_budget and token_rate records never are.
+    Returns the number of deleted buckets.
+    """
+    try:
+        delete = getattr(store, 'delete', None)
+        if delete is None:
+            return 0
+        now = time.time() if now is None else float(now)
+        cutoff = now - ledger_keep_days(store) * 86400
+        removed = 0
+        for bucket in store.all(LEDGER_KIND) or []:
+            try:
+                if float(bucket.get('end') or 0) < cutoff:
+                    delete(LEDGER_KIND, bucket['id'])
+                    removed += 1
+            except Exception:
+                continue
+        return removed
+    except Exception:
+        return 0
+
+
 def _ledger_label(value):
     value = str(value or '').strip()
     return value[:80] if value else LEDGER_NONE
@@ -156,8 +193,11 @@ def ledger_add(store, worker, record, input_tokens=0, output_tokens=0, turn=Fals
         mod = _ledger_label(model if model is not None else worker.get('model'))
         start = int(now // LEDGER_BUCKET_SECONDS) * LEDGER_BUCKET_SECONDS
         with store.lock:
-            bucket = store.get(LEDGER_KIND, str(start)) or dict(id=str(start), start=start,
-                                                               end=start + LEDGER_BUCKET_SECONDS, rows={})
+            bucket = store.get(LEDGER_KIND, str(start))
+            if bucket is None:
+                # A new hourly bucket starts: drop the expired ones (at most once per hour, not per charge).
+                ledger_prune(store, now)
+                bucket = dict(id=str(start), start=start, end=start + LEDGER_BUCKET_SECONDS, rows={})
             key = LEDGER_KEY_SEP.join((task, who, mod))
             row = bucket['rows'].setdefault(key, dict(task_id=task, role=who, model=mod,
                                                       input=0, output=0, tokens=0, turns=0))

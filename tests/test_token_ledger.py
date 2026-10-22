@@ -37,6 +37,9 @@ class FakeStore:
     def event(self, kind, run_id='', **fields):
         self.events.append((kind, fields))
 
+    def delete(self, kind, ident):
+        self.docs.pop((kind, str(ident)), None)
+
     def settings(self):
         return dict(self._settings)
 
@@ -214,6 +217,104 @@ class TokenLedgerTests(unittest.TestCase):
                 store.put('settings', dict(id='app', token_ledger_enabled=False))
                 token_budget.charge(store, COWORKER, 5, now=NOW + 2, task_id='t1', role='executor', model='opus')
                 self.assertEqual(token_budget.usage_by_task(store)['by_task']['t1']['tokens'], 1020)
+            finally:
+                store.close()
+
+    # ---- retention (token_ledger_keep_days) ------------------------------------------------------
+    def test_old_ledger_buckets_are_deleted_after_keep_days(self):
+        store = FakeStore()
+        day = 86400
+        token_budget.charge(store, COWORKER, 100, turn=True, now=NOW, task_id='old')
+        token_budget.charge(store, COWORKER, 50, turn=True, now=NOW + 10 * day, task_id='mid')
+        budget_before = store.kind(token_budget.KIND)
+        self.assertEqual(len(store.kind(token_budget.LEDGER_KIND)), 2)
+        # 15 days later: the first bucket (ended NOW + 1 h) is older than 14 days, the 10-day one is not.
+        token_budget.charge(store, COWORKER, 7, turn=True, now=NOW + 15 * day, task_id='new')
+        self.assertEqual(set(token_budget.usage_by_task(store)['by_task']), {'mid', 'new'})
+        # token_budget window records and the rolling token_rate record are never deleted.
+        for ident, record in budget_before.items():
+            self.assertIn(ident, store.kind(token_budget.KIND))
+        self.assertIn('rolling', store.kind(token_budget.RATE_KIND))
+
+    def test_keep_days_setting_and_default(self):
+        self.assertEqual(token_budget.ledger_keep_days(FakeStore()), 14)
+        self.assertEqual(token_budget.ledger_keep_days(FakeStore(token_ledger_keep_days='30')), 30)
+        self.assertEqual(token_budget.ledger_keep_days(FakeStore(token_ledger_keep_days=0)), 1)
+        self.assertEqual(token_budget.ledger_keep_days(FakeStore(token_ledger_keep_days='x')), 14)
+        store = FakeStore(token_ledger_keep_days=30)
+        token_budget.charge(store, MAIN, 100, now=NOW, task_id='old')
+        token_budget.charge(store, MAIN, 7, now=NOW + 15 * 86400, task_id='new')
+        self.assertEqual(set(token_budget.usage_by_task(store)['by_task']), {'old', 'new'})
+        token_budget.charge(store, MAIN, 7, now=NOW + 31 * 86400, task_id='newest')
+        self.assertEqual(set(token_budget.usage_by_task(store)['by_task']), {'new', 'newest'})
+
+    def test_prune_runs_once_per_new_bucket_and_never_raises(self):
+        store = FakeStore()
+        calls = []
+        original = token_budget.ledger_prune
+        try:
+            token_budget.ledger_prune = lambda s, now=None: calls.append(now) or 0
+            for second in range(5):
+                token_budget.charge(store, MAIN, 10, now=NOW + second)
+            token_budget.charge(store, MAIN, 10, now=NOW + 3600)
+        finally:
+            token_budget.ledger_prune = original
+        self.assertEqual(len(calls), 2)  # only when an hourly bucket is new, not per charge
+
+        class NoDelete(FakeStore):
+            delete = None
+        self.assertEqual(token_budget.ledger_prune(NoDelete(), NOW), 0)
+        self.assertEqual(token_budget.ledger_prune(None, NOW), 0)
+
+    def test_retention_off_ledger_and_limits_unchanged(self):
+        on, off = FakeStore(token_ledger_keep_days=1), FakeStore(token_ledger_enabled=False)
+        for store in (on, off):
+            token_budget.charge(store, COWORKER, 100, turn=True, now=NOW)
+            token_budget.charge(store, COWORKER, 100, turn=True, now=NOW + 3 * 86400)
+        for kind in (token_budget.KIND, token_budget.RATE_KIND):
+            self.assertEqual(on.kind(kind), off.kind(kind), kind)
+        self.assertEqual(off.kind(token_budget.LEDGER_KIND), {})
+
+    # ---- real send and reply path ----------------------------------------------------------------
+    def test_fake_task_through_send_and_reply_path(self):
+        from unittest import mock
+        from notiontool import fake_notion
+        from notiontool.fake_notion import FakeState
+        from notiontool.store import Store
+        root = Path(__file__).resolve().parent / '.test-data'
+        root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root) as temp:
+            state = FakeState(path=str(Path(temp) / 'fake.json'))
+            directory = Path(temp) / 'app'
+            directory.mkdir()
+            store = Store(directory)
+            try:
+                adapter = fake_notion.FakeNotionAdapter(store, state=state, force=True)
+                adapter.refresh_on_login = False
+                adapter.stream_turn_poll_s = 0.05
+                adapter.verify_response_model = mock.Mock(return_value=[])
+                fake_notion.seed_scenario(store, state)
+                thread = state.threads_of('ready', 'coworker')[0]['id']
+                worker = store.get('workers', 'ready:' + thread)
+                client = adapter.client('ready')
+                store.put('thread_configs', dict(id=thread, key=[thread, worker.get('generation', 0),
+                                                                 client.model('opus')], at=NOW))
+                store.put('tasks', {'id': 't1', 'run_id': 'r1', 'role': 'executor', 'lease': 'assignment',
+                                    'state': 'running', 'model': 'opus'})
+                reply = adapter.run(worker, store.get('tasks', 't1'), 'Say hello', threading.Event(), lambda text: None)
+                self.assertTrue(str(reply).strip())
+                usage = token_budget.usage_by_task(store)
+                window = token_budget.public(store)
+                # Every token of the sent turn and its reply is in the ledger, exactly as in the window total.
+                self.assertGreater(usage['total']['output'], 0)
+                self.assertGreater(usage['total']['input'], 0)
+                self.assertEqual(usage['total']['tokens'], window['used'])
+                self.assertEqual(usage['total']['turns'], 1)
+                rows = [row for task in usage['by_task'].values() for row in [task]]
+                self.assertEqual(sum(r['tokens'] for r in rows), window['used'])
+                if 't1' in usage['by_task']:  # the charge points pass task / role / model (notion.py fix)
+                    self.assertEqual(set(usage['by_task']['t1']['by_role']), {'executor'})
+                    self.assertEqual(usage['by_task']['t1']['tokens'], window['used'])
             finally:
                 store.close()
 

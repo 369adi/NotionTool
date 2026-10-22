@@ -22,6 +22,12 @@ CREATE_NO_WINDOW = 0x08000000
 FAKE_ENV = 'NOTIONTOOL_FAKE_NOTION'
 FAKE_READY_EVENT = 'fake_notion_ready'
 _PROCS = {}  # pid -> Popen handle opened by start(); stop() waits for, kills and releases every one
+# Stop flag: the scenario tests' deadline guard sets it after a timeout. While it is set start() opens no new
+# process and _wait() returns at once, so a timed-out scenario thread cannot start an app behind the next test.
+HALT = threading.Event()
+TREE_KILL_SECONDS = 15  # fallback taskkill /T /F after kill() or after a hung taskkill
+REMOVE_SECONDS = 10     # fresh start: retry removing the old data folder this long
+_LAST_RESTART = {}      # pid, port, boot_seconds of the latest scenario restart (evidence for a failure)
 # Every wait in this module is bounded (a hung tasklist/taskkill or child must never block a test run).
 CMD_SECONDS = 15        # tasklist / taskkill
 STOP_WAIT_SECONDS = 10  # graceful end of a process tree before kill()
@@ -116,14 +122,34 @@ def _alive(pid):
         return False
 
 
-def _kill_tree(pid):
+def _kill_tree(pid, timeout=CMD_SECONDS):
+    """taskkill /PID pid /T /F (Windows) or SIGTERM; None when the command hung or could not run."""
     if os.name == 'nt':
-        _run(['taskkill', '/PID', str(pid), '/T', '/F'])
-    else:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
+        return _run(['taskkill', '/PID', str(pid), '/T', '/F'], timeout=timeout)
+    try:
+        os.kill(pid, 15)
+        return b''
+    except OSError:
+        return None
+
+
+def _children(pid):
+    """Running child processes of pid (Windows: by ParentProcessId, bounded by CMD_SECONDS); [] if unknown."""
+    if os.name != 'nt' or not pid:
+        return []
+    out = _run(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                "Get-CimInstance Win32_Process -Filter 'ParentProcessId=%d' | ForEach-Object { $_.ProcessId }"
+                % int(pid)])
+    return [int(x) for x in (out or b'').split() if x.isdigit() and int(x) != os.getpid()]
+
+
+def _leftover_children(pid):
+    """Children of an ended test-app tree that still run (a console host may need a moment to go)."""
+    kids = _children(pid)
+    if kids:
+        time.sleep(1.0)
+        kids = _children(pid)
+    return kids
 
 
 def _close_pipes(proc):
@@ -136,27 +162,41 @@ def _close_pipes(proc):
 
 
 def _end(pid, proc=None):
-    """End one test-app process tree: terminate, wait (bounded), kill if still there, close its pipes."""
+    """End one test-app process tree: terminate, wait (bounded), kill if still there, close its pipes.
+
+    After proc.kill() or a hung taskkill, taskkill /PID pid /T /F runs once more (at most TREE_KILL_SECONDS)
+    so no child of the tree survives. Returns (gone, leftover child pids that still run).
+    """
     if proc is not None:
-        if proc.poll() is None:
-            _kill_tree(pid)
+        ran = proc.poll() is None
+        if ran:
+            fallback = _kill_tree(pid) is None  # None: taskkill hung or could not run
             try:
                 proc.wait(timeout=STOP_WAIT_SECONDS)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                fallback = True
                 try:
                     proc.wait(timeout=KILL_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
                     pass
+            if fallback:
+                _kill_tree(pid, timeout=TREE_KILL_SECONDS)
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
         _close_pipes(proc)
-        return proc.poll() is not None
+        return proc.poll() is not None, _leftover_children(pid)
     if not _alive(pid):
-        return True
-    _kill_tree(pid)
+        return True, []
+    fallback = _kill_tree(pid) is None
     deadline = time.time() + STOP_WAIT_SECONDS
     while _alive(pid) and time.time() < deadline:  # release the database before it is reused
         time.sleep(0.3)
-    return not _alive(pid)
+    if fallback or _alive(pid):
+        _kill_tree(pid, timeout=TREE_KILL_SECONDS)
+    return not _alive(pid), _leftover_children(pid)
 
 
 def _port_free(port, seconds=PORT_FREE_SECONDS):
@@ -230,10 +270,12 @@ def stop(root=None):
     for p, (proc, port) in targets.items():
         if p == os.getpid():
             continue
-        if _end(p, proc):
+        gone, kids = _end(p, proc)
+        if gone:
             _PROCS.pop(p, None)  # reaped: no 'subprocess is still running' ResourceWarning left behind
         else:
             left.append(p)  # stays in _PROCS so the next stop() tries again
+        left.extend(k for k in kids if k not in left)  # children of the tree that survived the tree kill
         if port and int(port) != REAL_PORT:
             ports.add(int(port))
     busy = [port for port in sorted(ports) if not _port_free(port)]
@@ -245,17 +287,80 @@ def stop(root=None):
             'port_free': not busy, 'busy_ports': busy}
 
 
+def _remove_data(data, seconds=REMOVE_SECONDS):
+    """Fresh start: remove the old data folder, retrying (bounded) while a closing process still holds a file.
+    Returns '' when it is gone, else the reason (the folder or notiontool.db is still there)."""
+    data = Path(data)
+    deadline = time.time() + seconds
+    error = ''
+    while True:
+        try:
+            if data.exists():
+                shutil.rmtree(data)
+        except OSError as exc:  # a file is still held open: retry until the deadline
+            error = '%s: %s' % (type(exc).__name__, exc)
+        if not data.exists():
+            return ''
+        if time.time() >= deadline:
+            db = data / 'notiontool.db'
+            return '%s still exists after %d s (%s)' % (db if db.exists() else data, seconds, error or 'no error')
+        time.sleep(0.5)
+
+
+def _last_seq(data):
+    """Highest event seq in the test database (0 if there is none yet)."""
+    db = Path(data) / 'notiontool.db'
+    if not db.is_file():
+        return 0
+    try:
+        con = sqlite3.connect(str(db), timeout=5)
+        try:
+            row = con.execute('SELECT MAX(seq) FROM events').fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _ready_since(data, after_seq, began):
+    """The fake_notion_ready event written by this boot: seq above the last one before the start and not older
+    than the start; an older ready event of the previous boot never counts."""
+    db = Path(data) / 'notiontool.db'
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(str(db), timeout=5)
+        try:
+            return con.execute('SELECT seq FROM events WHERE kind=? AND seq>? AND ts>=? ORDER BY seq DESC LIMIT 1',
+                               (FAKE_READY_EVENT, int(after_seq), float(began) - 1)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
 def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, fake=True):
     """Start the test app. fresh=False keeps the data folder (a restart); fake=False is the plain test app."""
     root, data, info, log = _paths(root)
+    if HALT.is_set():
+        return {'ok': False, 'reason': 'start refused: the stop flag is set (a scenario timed out)'}
     stop(root)
+    db = data / 'notiontool.db'
     if fresh:
-        shutil.rmtree(data, ignore_errors=True)
+        gone = _remove_data(data)
+        if gone:
+            return {'ok': False, 'reason': 'fresh start: the old test data could not be removed: ' + gone}
+    elif fake and not db.is_file():
+        return {'ok': False, 'reason': 'restart refused: the expected test database %s is missing' % db}
     data.mkdir(parents=True, exist_ok=True)
     port = int(port or DEFAULT_PORT)
     if port == REAL_PORT:
         raise ValueError('port %d belongs to the real NotionTool; the test app never uses it' % REAL_PORT)
     port = _free(port)
+    before = _last_seq(data)
+    if HALT.is_set():  # set while stop() or the removal ran: open no process
+        return {'ok': False, 'reason': 'start refused: the stop flag is set (a scenario timed out)', 'port': port}
     env = dict(os.environ, NOTIONTOOL_TEST_INSTANCE='1', PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1')
     env.pop('NOTIONTOOL_FAKE_STATE', None)  # the simulated state always lives in the test data folder
     if fake:
@@ -276,11 +381,18 @@ def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, f
         if proc.poll() is not None:
             return {'ok': False, 'reason': 'The test app exited while starting (code %s)' % proc.returncode,
                     'port': port, 'log_tail': _tail(log)}
-        if _serving(port) and (not fake or _events(data, began - 1, (FAKE_READY_EVENT,))):
+        if HALT.is_set():  # a scenario timed out meanwhile: give up the boot, stop() reaps proc
+            return {'ok': False, 'reason': 'boot abandoned: the stop flag was set', 'pid': proc.pid, 'port': port}
+        if _serving(port) and (not fake or _ready_since(data, before, began)):
+            if fake and not db.is_file():
+                return {'ok': False, 'reason': 'the expected test database %s is gone after the boot' % db,
+                        'pid': proc.pid, 'port': port, 'log_tail': _tail(log)}
             return {'ok': True, 'pid': proc.pid, 'port': port, 'boot_seconds': round(time.time() - began, 1),
                     'url': 'http://127.0.0.1:%d/' % port, 'fake_notion': bool(fake)}
         time.sleep(0.5)
-    return {'ok': False, 'reason': 'The test app did not answer within %d s' % boot_seconds, 'pid': proc.pid,
+    why = ('no %s event from this boot (last seq before the start: %d)' % (FAKE_READY_EVENT, before)
+           if fake and _serving(port) else 'the test app did not answer')
+    return {'ok': False, 'reason': '%s within %d s' % (why, boot_seconds), 'pid': proc.pid,
             'port': port, 'log_tail': _tail(log)}
 
 
@@ -390,7 +502,7 @@ def _wait(probe, seconds, interval=2.0):
             value = probe()
         except (OSError, ValueError, sqlite3.Error):
             value = None
-        if value or time.time() >= deadline:
+        if value or time.time() >= deadline or HALT.is_set():  # stop flag: a timed-out scenario ends at once
             return value
         time.sleep(interval)
 
@@ -437,7 +549,10 @@ def _post(port, key, path, body, timeout=60):
 
 
 def _restart(root, port):
-    return start(root, port, fresh=False)
+    result = start(root, port, fresh=False)
+    _LAST_RESTART.clear()  # kept for the failure evidence of scenario()
+    _LAST_RESTART.update({k: result.get(k) for k in ('ok', 'pid', 'port', 'boot_seconds', 'reason')})
+    return result
 
 
 def _result(passed, reasons, events, **details):
@@ -596,11 +711,14 @@ def scenario(name, root=None, port=DEFAULT_PORT, keep=False):
     from .fake_notion import FakeState
     root, data, _, log = _paths(root)
     began = time.time()
+    _LAST_RESTART.clear()
     first = start(root, port, fresh=True)
     if not first.get('ok'):
+        tail = first.get('log_tail') or _tail(log)
+        details = dict(first_start=first, events_since_start=_events(data, began), log_tail=tail)
         stop(root)
         return dict(scenario=name, verdict='failed', events=[], reasons=['the test app did not start: '
-                    + str(first.get('reason', ''))], log_tail=first.get('log_tail', ''))
+                    + str(first.get('reason', ''))], details=details, log_tail=tail)
     fs = FakeState(path=data / 'fake_notion.json')
     try:
         outcome = SCENARIO_FUNCS[name](root, first['port'], data, fs)
@@ -609,6 +727,12 @@ def scenario(name, root=None, port=DEFAULT_PORT, keep=False):
     tail = _tail(log)
     if 'Traceback (most recent call last)' in tail and outcome['passed']:
         outcome = dict(outcome, passed=False, reasons=['traceback in the test app log'])
+    if not outcome['passed']:  # evidence: both boots, every event since the scenario began, the log tail
+        outcome = dict(outcome, details=dict(
+            outcome.get('details') or {},
+            first_start={k: first.get(k) for k in ('pid', 'port', 'boot_seconds')},
+            restart=dict(_LAST_RESTART) or {'ok': None, 'reason': 'no restart was reached'},
+            events_since_start=_events(data, began), log_tail=tail))
     if not keep:
         stop(root)
     return dict(scenario=name, verdict='passed' if outcome['passed'] else 'failed', events=outcome['events'],
