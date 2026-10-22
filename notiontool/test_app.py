@@ -20,6 +20,7 @@ BOOT_SECONDS = 60
 CREATE_NO_WINDOW = 0x08000000
 FAKE_ENV = 'NOTIONTOOL_FAKE_NOTION'
 FAKE_READY_EVENT = 'fake_notion_ready'
+_PROCS = {}  # pid -> Popen handle opened by start(); stop() waits for and releases it
 SCENARIOS = ('restart_cut', 'too_large', 'deleted_chat', 'wake')
 # Upper bounds per scenario after the restart (turn watch checks every 30 s, grace 150 s for the cut).
 SCENARIO_SECONDS = dict(restart_cut=150, too_large=110, deleted_chat=90, wake=90)
@@ -139,6 +140,14 @@ def stop(root=None):
         began = time.time()
         while _alive(pid) and time.time() - began < 10:  # release the database before it is reused
             time.sleep(0.3)
+    proc = _PROCS.pop(pid, None) if pid else None
+    if proc is not None:
+        # Reap the handle start() opened, so no 'subprocess is still running' ResourceWarning is left behind.
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
     try:
         Path(info).unlink()
     except OSError:
@@ -165,6 +174,7 @@ def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, f
         proc = subprocess.Popen([python_exe(), str(root / 'main.py'), '--serve', '--data-dir', str(data),
                                  '--port', str(port)], cwd=str(root), env=env, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
+    _PROCS[proc.pid] = proc  # stop() reaps it
     Path(info).write_text(json.dumps({'pid': proc.pid, 'port': port, 'started': began, 'fake': bool(fake)}),
                           encoding='utf-8')
     while time.time() - began < boot_seconds:

@@ -748,6 +748,16 @@ class NotionAdapter:
                 managed.setdefault(str(uuid.UUID(str((item or {}).get('id') or ''))), role)
             except (ValueError, TypeError, AttributeError):
                 pass
+        # Chats the app is creating right now (open create_main operations, e.g. a private 'Project notes' chat)
+        # are not in team_threads and may be listed only as guessed ids; they get the operation's purpose.
+        created = {}
+        for op in self.store.all('operations'):
+            if (op.get('kind') == 'create_main' and op.get('account_id') == account_id and op.get('thread_id')
+                    and op.get('state') not in ('done', 'failed')):
+                try:
+                    created[str(uuid.UUID(str(op['thread_id'])))] = op.get('purpose') or 'main'
+                except (ValueError, TypeError, AttributeError):
+                    pass
         seen = set()
         for thread in client.threads():
             tid = thread.get('id') or thread.get('thread_id') or thread.get('threadId')
@@ -757,7 +767,7 @@ class NotionAdapter:
             seen.add(tid)
             if tid in archived:
                 continue
-            if thread.get('guessed') and tid not in existing and tid not in managed:
+            if thread.get('guessed') and tid not in existing and tid not in managed and tid not in created:
                 continue  # a guessed id outside the team ledger may be the user's own chat: never a worker
             with self.store.lock:
                 # Re-read under the lock: client.threads() is slow, and a context switch may have moved this
@@ -774,7 +784,7 @@ class NotionAdapter:
                     worker = next((w for w in self.store.all('workers') if w.get('account_id') == account_id
                                    and w.get('thread_id') == tid), None)
                 worker = worker or dict(id=account_id+':'+tid,account_id=account_id,thread_id=tid,
-                    purpose='main' if managed.get(tid) == 'main' else 'worker',
+                    purpose=created.get(tid) or ('main' if managed.get(tid) == 'main' else 'worker'),
                     enabled=False,state='ready',lease='',last_used=0)
                 worker['label'] = thread.get('title') or (worker.get('label') if thread.get('guessed') else '') or 'Untitled chat'
                 if worker['state'] in ('missing','error') and not worker.get('lease'):
