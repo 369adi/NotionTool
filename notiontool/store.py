@@ -186,7 +186,7 @@ class Store:
         return f'{row[0]}:{row[1]}'
 
     def settings(self):
-        defaults = dict(id='app', max_workers=40, per_account=10, coworker_max_age_hours=22,
+        defaults = dict(id='app', max_workers=40, per_account=5, coworker_max_age_hours=22,
                        automatic_setup=False, background_remote=False, bridge_auto=False,
                        remote_mcp_enabled=False, advertise_project_tools=False,
                        max_attempts=3, task_timeout=900, max_fix_rounds=2, tool_parallelism=4,

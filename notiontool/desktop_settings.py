@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - keeps the schema usable without the poli
     REASONING_ORDER = ('low', 'medium', 'high', 'xhigh', 'max')
 
 # Default team size (Coworkers per account); team_size.py and store.py use the same value.
-DEFAULT_COWORKERS = 10
+DEFAULT_COWORKERS = 5
 
 
 def _int(key, label, group, low, high, default, help_text):

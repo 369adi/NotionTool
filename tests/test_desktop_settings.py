@@ -32,7 +32,7 @@ class DesktopSettingsTests(unittest.TestCase):
     def test_defaults_when_missing(self):
         entries = self.by_key(ds.settings_schema({}))
         self.assertEqual(entries['max_workers']['value'], 40)
-        self.assertEqual(entries['per_account']['value'], 10)
+        self.assertEqual(entries['per_account']['value'], 5)
         self.assertEqual(entries['max_runs_per_chat']['value'], 3)
         self.assertEqual(entries['main_context_policy']['value'], 'hint')
         self.assertIs(entries['main_auto_continue']['value'], True)

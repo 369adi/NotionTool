@@ -1136,7 +1136,7 @@
   window.__ntDesk = window.__ntDesk || {};
 
   var TEAM_MAX = 40;
-  var DEFAULT_COWORKERS = 10;
+  var DEFAULT_COWORKERS = 5;
   var POLL_MS = 1000;
   var POLL_MAX = 300;
   var TAB_ID = 'settings';
