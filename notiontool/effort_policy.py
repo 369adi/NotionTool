@@ -7,8 +7,12 @@ settings that never go down from one level to the next:
 decomposition_depth, context_budget_tokens, review_rounds, max_fix_rounds.
 
 route_for_request() decides direct vs. role-team run from difficulty.classify();
-it is not yet called by operator_roles.choose_quality(), so it does not change
-real routing yet. The effort levels are not wired into engine.py yet.
+team_route.py uses it as the base of the real per-delegation route. The effort
+levels are not wired into engine.py yet.
+
+Coworker reasoning effort (owner rule 2026-10-22) stays in the band
+medium..high: see coworker_band(), cap_coworker() and band_effort(). Main
+chats keep the full range up to max.
 """
 
 from __future__ import annotations
@@ -111,23 +115,38 @@ def escalate(level, failure, reason):
 # Evidence for the names and the request field: work/effort_field.md.
 REASONING_ORDER = ("low", "medium", "high", "xhigh", "max")
 
-# Rule I47 (user 2026-10-21): no Coworker request ever runs on 'max'; their top level is 'xhigh'.
-# Only Main chats (the user's own pick) keep the full range.
-COWORKER_TOP_EFFORT = "xhigh"
+# Owner rule (2026-10-22, replaces I47): every Coworker request runs on 'medium' or 'high', never on
+# 'low', 'xhigh' or 'max'. Only Main chats (the user's own pick) keep the full range.
+COWORKER_TOP_EFFORT = "high"
+COWORKER_MIN_EFFORT = "medium"
 MAIN_PURPOSES = ("main", "operator", "spare_main", "external")
 
 
+def coworker_band():
+    """The levels a Coworker request may use, weakest to strongest: ('medium', 'high')."""
+    lo = REASONING_ORDER.index(COWORKER_MIN_EFFORT)
+    hi = REASONING_ORDER.index(COWORKER_TOP_EFFORT)
+    return REASONING_ORDER[lo:hi + 1]
+
+
 def cap_coworker(effort, purpose=""):
-    """Levels above COWORKER_TOP_EFFORT become COWORKER_TOP_EFFORT for every non-Main request."""
+    """Clamp a level into the Coworker band for every non-Main request: low -> medium,
+    xhigh/max -> high; in-band levels come back normalized (stripped, lower case).
+    Main purposes, non-strings and unknown names are returned unchanged."""
     if purpose in MAIN_PURPOSES or not isinstance(effort, str):
         return effort
     level = effort.strip().lower()
-    if level in REASONING_ORDER and REASONING_ORDER.index(level) > REASONING_ORDER.index(COWORKER_TOP_EFFORT):
+    if level not in REASONING_ORDER:
+        return effort
+    index = REASONING_ORDER.index(level)
+    if index < REASONING_ORDER.index(COWORKER_MIN_EFFORT):
+        return COWORKER_MIN_EFFORT
+    if index > REASONING_ORDER.index(COWORKER_TOP_EFFORT):
         return COWORKER_TOP_EFFORT
-    return effort
+    return level
 
 # task_class groups for the reasoning effort rule (task_router class names).
-# User 2026-10-21: xhigh only for the hardest work (risk high); reviews run on high, never lower.
+# Owner rule 2026-10-22: Coworkers run light work on medium, everything else (reviews, risk high) on high.
 TOP_EFFORT_CLASSES = ()
 STEADY_EFFORT_CLASSES = ("review",)
 LIGHT_EFFORT_CLASSES = ("routine", "docs", "test")
@@ -167,15 +186,48 @@ def clamp_effort(target, supported):
     return below[-1] if below else supported[0]
 
 
+def band_effort(target, supported, purpose=""):
+    """(effort or None, note): target banded for Coworkers, then clamped to the supported levels.
+
+    - No supported levels -> (None, '').
+    - Main purposes -> (clamp_effort(target, supported), ''): the full range, unchanged.
+    - Coworkers: target goes into the band (medium..high) first, then the strongest supported
+      in-band level not above it, else the weakest supported in-band level.
+    - A model with no supported level in the band gets the supported level closest to the banded
+      target (a tie goes to the weaker level); note says so. That is the only way a Coworker
+      request can leave the band, and only because the model offers nothing else.
+    """
+    supported = _levels(supported)
+    if not supported:
+        return None, ""
+    if purpose in MAIN_PURPOSES:
+        return clamp_effort(target, supported), ""
+    wanted = cap_coworker(target, purpose)
+    wanted = wanted.strip().lower() if isinstance(wanted, str) else ""
+    if wanted not in REASONING_ORDER:
+        wanted = COWORKER_MIN_EFFORT
+    band = coworker_band()
+    inside = tuple(level for level in supported if level in band)
+    if inside:
+        return clamp_effort(wanted, inside), ""
+    index = REASONING_ORDER.index(wanted)
+    closest = min(supported, key=lambda level: (abs(REASONING_ORDER.index(level) - index),
+                                                REASONING_ORDER.index(level)))
+    note = ("no level in the Coworker band (%s) among supported: %s; closest supported level %s"
+            % (", ".join(band), ", ".join(supported), closest))
+    return closest, note
+
+
 def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), default=None):
     """Pick the reasoning effort for one request. Returns (effort or None, reason).
 
     - Main chat                                 -> the highest supported level.
-    - risk high (only the hardest work)         -> COWORKER_TOP_EFFORT (xhigh), never max.
-    - task_class review                         -> high (never lower, never xhigh unless risk high).
-    - routine/docs/test, or risk low            -> the model's default, else low.
+    - risk high (only the hardest work)         -> COWORKER_TOP_EFFORT (high), never xhigh/max.
+    - task_class review                         -> high.
+    - routine/docs/test, or risk low            -> COWORKER_MIN_EFFORT (medium) for Coworkers;
+      the model default is NOT used (it may be low). Other Main purposes keep default, else low.
     - everything else (code/research/design/unclassified, medium risk) -> high.
-    The result is always clamped to the supported levels of the model.
+    Coworker results stay in the band medium..high (band_effort), then are clamped to the model.
     """
     supported = _levels(supported)
     default = default if default in supported else None
@@ -193,17 +245,22 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
         rule, target = "task_class %s: high effort" % cls, "high"
     elif cls in LIGHT_EFFORT_CLASSES or rk == "low":
         what = ("task_class " + cls) if cls in LIGHT_EFFORT_CLASSES else "risk low"
-        if default:
+        if purpose not in MAIN_PURPOSES:
+            # Owner rule 2026-10-22: the model default (often low) is never used for Coworkers.
+            rule, target = "%s: Coworker light effort (model default not used)" % what, COWORKER_MIN_EFFORT
+        elif default:
             rule, target = "%s: model default effort" % what, default
         else:
             rule, target = "%s: low effort (model has no default)" % what, "low"
     else:
         rule, target = "%s, risk %s: high effort" % ("task_class " + cls if cls else "no task_class",
                                                     rk or "medium"), "high"
-    effort = clamp_effort(cap_coworker(target, purpose), supported)
+    effort, note = band_effort(target, supported, purpose)
     reason = rule + " -> " + effort
     if effort != target:
         reason += " (clamped from %s)" % target
+    if note:
+        reason += "; " + note
     return effort, reason + "; supported: " + ", ".join(supported)
 
 

@@ -92,9 +92,12 @@ class ChooseTaskEffortTest(unittest.TestCase):
         client = fake_client()
         self.assertEqual(notion.choose_task_effort(client, 'albuquerque-quinn', 'worker',
                                                    {'requested_effort': 'xhigh', 'task_class': 'docs'}),
-                         ('xhigh', 'set by Main: xhigh'))
+                         ('high', 'set by Main: xhigh, clamped to high'))
+        self.assertEqual(notion.choose_task_effort(client, 'albuquerque-quinn', 'worker', {'requested_effort': 'high'}),
+                         ('high', 'set by Main: high'))
+        # Owner rule 2026-10-22: Coworker effort stays in medium..high.
         self.assertEqual(notion.choose_task_effort(client, 'albuquerque-quinn', 'worker', {'requested_effort': 'low'}),
-                         ('low', 'set by Main: low'))
+                         ('medium', 'set by Main: low, clamped to medium'))
 
     def test_clamped_when_unsupported(self):
         self.assertEqual(notion.choose_task_effort(fake_client(), 'apple-danish', 'worker', {'requested_effort': 'max'}),
@@ -125,7 +128,8 @@ class ChooseTaskEffortTest(unittest.TestCase):
         source = inspect.getsource(notion)
         self.assertIn("effort, effort_reason = choose_task_effort(client, model, worker.get('purpose', ''),", source)
         self.assertIn('effort=effort, effort_reason=effort_reason', source)
-        self.assertIn("effort=task.get('effort'))", source)
+        # Owner rule 2026-10-22: the stored task effort passes the Coworker band guard before it is sent.
+        self.assertIn("effort=final_effort(client, model, task.get('effort'), worker.get('purpose', '')))", source)
 
 
 if __name__ == '__main__':
