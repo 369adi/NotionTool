@@ -682,7 +682,24 @@ def desktop_state(server, app_settings=None, now=None):
                 awaiting_main=base.get('awaiting_main'), stalled=base.get('stalled'),
                 stale_context_tasks=base.get('stale_context_tasks'),
                 token_budget=_token_budget(store, now), ai_disable=_ai_disable(store),
+                steps_hour=_steps_hour(store, account, now),
                 idle_mode=bool(store.settings().get('idle_mode', True)))
+
+
+def _steps_hour(store, account, now):
+    """AI steps used / left in the last 60 min of this account (step_guard inf_hard_60m, owner 2026-10-22)."""
+    try:
+        from . import step_guard
+        st = step_guard.state(store, now, account=account) if account else step_guard.state(store, now)
+        lim = st.get('limits') or step_guard.DEFAULTS
+        limit = int(lim.get('inf_hard_60m') or 450)
+        used = int(st.get('ai_steps_60m') or 0)
+        s15 = int(st.get('steps_15m') or 0)
+        limit15 = int(lim.get('step_hard_15m') or 1000)
+        return dict(used=used, limit=limit, left=max(0, limit - used), steps_15m=s15, limit_15m=limit15,
+                    level=str(st.get('level') or 'ok'), wait=int(st.get('wait') or 0))
+    except Exception:
+        return None
 
 
 def _token_budget(store, now):

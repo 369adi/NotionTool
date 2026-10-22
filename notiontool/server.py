@@ -1474,10 +1474,11 @@ class Application:
                     if w.get('account_id') != ident or w.get('purpose', 'worker') != 'worker':
                         continue
                     if w.get('state') == 'missing':
-                        if w.get('label') in titles:
+                        if w.get('label') in titles or re.match(r'^Coworker \d+$', str(w.get('label') or '')):
                             self.store.delete('workers', w['id']); dropped.append(w['thread_id'])
                         continue
-                    if w.get('label') not in titles:
+                    # 'Coworker N' = renamed pool chats (I41 naming); user-named chats stay untouched.
+                    if w.get('label') not in titles and not re.match(r'^Coworker \d+$', str(w.get('label') or '')):
                         continue
                     if w['id'] in busy:
                         skipped.append(w['thread_id']); continue

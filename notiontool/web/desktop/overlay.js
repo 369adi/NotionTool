@@ -912,6 +912,19 @@
       });
     }
 
+    // AI steps left in the last 60 min (limit inf_hard_60m, owner 2026-10-22). Hidden without data.
+    function stepsChip(state) {
+      var s = state && state.steps_hour;
+      if (!s || typeof s.limit !== 'number' || !s.limit) return null;
+      var left = Math.max(0, Number(s.left) || 0);
+      var cls = 'nt-desk-chip nt-desk-steps' + (left <= s.limit * 0.1 ? ' nt-desk-steps-low' : '');
+      return el('span', { cls: cls, 'data-nt-desk': 'steps-chip',
+        text: 'AI steps left: ' + left + '/' + s.limit,
+        title: 'AI steps used in the last 60 min: ' + (s.used || 0) + ' of ' + s.limit
+          + '. Last 15 min: ' + (s.steps_15m || 0) + ' of ' + (s.limit_15m || 1000) + ' steps.'
+          + (s.level === 'pause' ? ' All chats are paused now.' : '') });
+    }
+
     function applyCoworkers(state, root) {
       var section = document.querySelector('[data-nt-desk="coworkers"]');
       var anchor = sectionAnchor(root);
@@ -930,7 +943,8 @@
       var collapsed = coworkersCollapsed();
       section.classList.toggle('nt-desk-collapsed', collapsed);
       var rows = coworkerRows(state);
-      var sig = JSON.stringify(rows);
+      var sh = (state && state.steps_hour) || null;
+      var sig = JSON.stringify([rows, sh ? [sh.left, sh.limit, sh.level] : null]);
       if (section.getAttribute('data-nt-desk-sig') === sig) return;
       section.setAttribute('data-nt-desk-sig', sig);
       Array.prototype.slice.call(section.childNodes).forEach(dropOwn);
@@ -939,7 +953,8 @@
         el('span', { cls: 'nt-desk-chevron', 'aria-hidden': 'true' }),
         el('span', { cls: 'nt-desk-coworkers-title', text: 'Coworkers' }),
         el('span', { cls: 'nt-desk-chip nt-desk-count', text: String(typeof window.__ntDesk.counts === 'function'
-          ? window.__ntDesk.counts(state).coworkers : rows.length) })
+          ? window.__ntDesk.counts(state).coworkers : rows.length) }),
+        stepsChip(state)
       ]);
       head.addEventListener('click', function (ev) {
         ev.preventDefault();
@@ -1349,19 +1364,42 @@
     }
 
     // Main rows get a gear (Rename, Remove Main rights); other rows lose a stale one.
+    // Visible Switch context button on every Main row (owner 2026-10-22: the gear menu alone was not found).
+    function mainSwitchButton(info) {
+      var btn = mk('button', { cls: 'nt-desk-cw-switch nt-desk-main-switch', 'data-nt-desk': 'main-switch', type: 'button',
+        text: '\u21BB', title: 'Switch context: hand this Main over to a fresh chat', 'aria-label': 'Switch context of ' + info.name });
+      btn.__ntChat = info;
+      guard(btn, ['pointerdown', 'mousedown', 'mouseup', 'pointerup']);
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        runMenuItem('switch', btn.__ntChat || info, btn);
+      });
+      return btn;
+    }
+
     function styleGear(row, main) {
-      var gear = null;
+      var gear = null, sw = null;
       for (var i = 0; i < row.children.length; i++) {
-        if (row.children[i].getAttribute('data-nt-desk') === 'gear') gear = row.children[i];
+        var mark = row.children[i].getAttribute('data-nt-desk');
+        if (mark === 'gear') gear = row.children[i];
+        else if (mark === 'main-switch') sw = row.children[i];
       }
       if (!main) {
         if (gear) {
           if (menu && menu.button === gear) closeMenu(false);
           dropOwn(gear);
         }
+        if (sw) dropOwn(sw);
         return;
       }
       var info = mainChatInfo(main);
+      if (!sw) {
+        sw = mainSwitchButton(info);
+        row.appendChild(sw);
+      } else {
+        sw.__ntChat = info;
+      }
       if (!gear) {
         gear = gearButton(info);
         row.appendChild(gear);
