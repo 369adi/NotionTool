@@ -592,6 +592,24 @@ class AdapterSeedCliTests(FakeNotionTestCase):
         self.assertEqual(welcome_after, [])
         self.assertEqual(sorted(store.get('accounts', 'ready')['team_threads']), ['main', 'worker1', 'worker2', 'worker3'])
 
+    def test_seed_sets_team_size_over_existing_settings_without_per_account(self):
+        store = self.store()
+        store.put('settings', dict(id='app', harness_account_id='ready', coworker_target=3, sample='keep'))
+        fake_notion.seed_scenario(store, self.state)
+        settings = store.get('settings', 'app')
+        self.assertEqual(settings['per_account'], 3)
+        self.assertEqual(settings['sample'], 'keep')  # existing values stay
+        store.put('settings', dict(settings, per_account=5))
+        fake_notion.seed_scenario(store, self.state)
+        self.assertEqual(store.get('settings', 'app')['per_account'], 5)  # an explicit value is not overwritten
+        store.put('settings', dict(settings, per_account=3))
+        adapter = self.adapter(store)
+        adapter.welcome_gap_s = 0
+        before = {key: sorted(t['id'] for t in self.state.threads_of(key)) for key in ('ready', 'noai')}
+        adapter.ensure_team('ready')
+        after = {key: sorted(t['id'] for t in self.state.threads_of(key)) for key in ('ready', 'noai')}
+        self.assertEqual(after, before)  # team setup found all roles filled: no new thread
+
     def run_main(self, *argv):
         import contextlib
         import io

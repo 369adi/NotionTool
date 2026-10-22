@@ -1023,9 +1023,13 @@ def seed_scenario(store, state=None, name='default'):
             store.put('accounts', account)
     store.raise_counter('main', 1)
     settings = store.get('settings', 'app', {}) or {}
+    wanted = {}
     if 'harness_account_id' not in settings:
-        store.put('settings', dict(settings, id='app', harness_account_id='ready', coworker_target=3,
-                                   per_account=3))  # team size 3: team setup finds all roles filled
+        wanted.update(harness_account_id='ready', coworker_target=3)
+    if 'per_account' not in settings:
+        wanted['per_account'] = 3  # team size 3: team setup finds all roles filled (default would be 10)
+    if wanted:
+        store.put('settings', dict(settings, id='app', **wanted))
     return dict(added, scenario=name, state=str(state.path))
 
 
