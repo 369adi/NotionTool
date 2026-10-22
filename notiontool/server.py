@@ -339,6 +339,11 @@ class Application:
             self.engine.start()
             from .turn_watch import TurnWatch
             self.turn_watch=TurnWatch(self.store,self.adapter,self.engine)
+            if __import__('os').environ.get('NOTIONTOOL_FAKE_NOTION')=='1':
+                # Simulated Notion (fake_notion.py): seeded fake accounts and chats plus the real loops that
+                # need Notion data (turn watch, main wake, coworker upkeep). Without the env var nothing changes.
+                from .test_app import boot_fake_notion
+                boot_fake_notion(self)
             from . import ai_disable_detector, restart_guard, problems, templates
             restart_guard.install_desk_actions(); problems.install_desk_actions(); templates.install_desk_actions()
             self.store.event('test_instance_started', message=f'Test app serving on port {self.port}')
