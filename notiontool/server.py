@@ -434,7 +434,7 @@ class Application:
             marker = self.store.message_marker(chat['id'])
             chats.append(dict(chat, state=chat.get('state', 'active'), worker_state=worker.get('state', 'missing'),
                 generation=int(worker.get('generation', 0)) + 1, context_usage=worker.get('context_usage', {}),
-                active_run=next((r['id'] for r in reversed(runs) if r['state'] not in ('done', 'failed', 'blocked', 'cancelled')), ''),
+                active_run=next((r['id'] for r in reversed(runs) if r['state'] not in ('done', 'failed', 'blocked', 'cancelled', 'stale')), ''),
                 awaiting_main=[r['id'] for r in runs if r.get('state') == 'awaiting_main'],
                 message_marker=marker))
         return sorted(chats, key=lambda c: c.get('main_number') or 0)
@@ -476,7 +476,7 @@ class Application:
                                 state=task['state'], text=text, complete=False), ensure_ascii=False) + '\n\n')
                             sent[key] = len(text)
                     run = self.store.get('runs', run_filter, {})
-                    if run.get('state') in ('done', 'failed', 'blocked', 'cancelled'):
+                    if run.get('state') in ('done', 'failed', 'blocked', 'cancelled', 'stale'):
                         write('event: run_finished\ndata: ' + json.dumps(dict(run_id=run_filter, state=run['state'],
                             summary=run.get('summary', ''), error=run.get('error', ''))) + '\n\n')
                         break

@@ -314,6 +314,42 @@ class AutoCleanupTests(unittest.TestCase):
         self.assertIn('"state": "cancelled"', text)
         self.assertIn('event: auto_cleanup', text)
 
+    def test_server_treats_literal_stale_state_as_finished(self):
+        """Records written by an earlier build with state 'stale': chat_list skips them, stream ends."""
+        import io
+        from types import SimpleNamespace
+        from notiontool.server import Application
+
+        class Handler:
+            def __init__(self):
+                self.headers = {}
+                self.wfile = io.BytesIO()
+                self.close_connection = False
+
+            def send_response(self, code):
+                self.code = code
+
+            def send_header(self, key, value):
+                pass
+
+            def end_headers(self):
+                pass
+
+        self.worker('m', purpose='main')
+        self.run_('rs', 'stale', age=48 * H, stale=True, stale_from='blocked', summary='old stale run')
+        self.task('d1', 'rs', 'done', age=48 * H)
+        app = SimpleNamespace(store=self.store, engine=self.engine)
+        chat = [c for c in Application.chat_list(app) if c['id'] == 'c'][0]
+        self.assertEqual(chat['active_run'], '')  # a 'stale' run is never the active run
+        handler = Handler()
+        started = time.time()
+        Application.stream(app, handler, {'run_id': ['rs'], 'timeout': ['5']})
+        self.assertLess(time.time() - started, 4)  # ended by run_finished, not by the 5 s timeout
+        text = handler.wfile.getvalue().decode('utf-8')
+        self.assertIn('event: run_finished', text)
+        self.assertIn('"state": "stale"', text)
+        self.assertEqual(self.state('runs', 'rs'), 'stale')  # the sweep and the server leave it as it is
+
     def test_e_run_with_live_task_or_recent_update_is_kept(self):
         self.run_('live', 'blocked', age=48 * H)
         self.task('u', 'live', 'uncertain', age=48 * H, sent_at=self.now - 60, worker_id='w1', lease='L1')
