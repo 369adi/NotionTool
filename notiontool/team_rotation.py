@@ -27,6 +27,7 @@ import uuid
 from .team_size import team_roles
 
 CHECK_S = 300
+NAME_CHECK_S = 60  # naming pass between full checks (cheap; skipped when nothing to rename)
 BACKOFF_S = 900
 DEFAULT_MAX_AGE_HOURS = 22
 MIN_AGE_HOURS, MAX_AGE_HOURS = 1, 72
@@ -105,8 +106,18 @@ class TeamRotator:
         """Called from the engine loop: at startup, then at most every CHECK_S seconds. Never raises."""
         now = self.clock()
         if self.next_check is not None and now < self.next_check:
+            # fast naming: a new chat after a context switch gets its name within NAME_CHECK_S,
+            # not only at the next 5-min check (measured 22.10: up to 5 min delay)
+            next_name = getattr(self, 'next_name', None)
+            if next_name is None or now >= next_name:
+                self.next_name = now + NAME_CHECK_S
+                try:
+                    self.name_pass()
+                except Exception:
+                    pass
             return []
         self.next_check = now + CHECK_S
+        self.next_name = now + NAME_CHECK_S
         try:
             started = self.check()
         except Exception as exc:
