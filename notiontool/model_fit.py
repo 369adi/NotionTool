@@ -226,16 +226,27 @@ def choose(task):
     return done('sonnet', effort, '; '.join(why))
 
 
-def notion_effort(effort, supported=NOTION_EFFORTS, escalation=0):
-    """Effort string to send to Notion. The first try sends the chosen effort unchanged;
-    escalation raises ANY effort by one step per failed attempt of the same task
-    (low -> medium -> high -> xhigh -> max), capped at max. Clamped to `supported`
+def notion_effort(effort, supported=NOTION_EFFORTS, escalation=0, purpose=''):
+    """Effort string to send to Notion.
+
+    Coworkers (any purpose that is not a Main purpose, owner rule 2026-10-22): the choice goes
+    into the band medium..high first (low -> medium), escalation adds one step per failed attempt
+    of the same task, and the result stays in the band (never xhigh or max); then it is clamped
+    to `supported` with effort_policy.band_effort.
+    Main purposes keep the full range: escalation raises ANY effort by one step
+    (low -> medium -> high -> xhigh -> max), capped at max, clamped to `supported`
     (the highest supported level not above the wanted one, else the lowest supported)."""
+    from .effort_policy import MAIN_PURPOSES, band_effort, cap_coworker
     effort = effort if effort in NOTION_EFFORTS else 'medium'
-    idx = NOTION_EFFORTS.index(effort)
-    idx += max(0, int(escalation or 0))
-    idx = min(idx, len(NOTION_EFFORTS) - 1)
+    steps = max(0, int(escalation or 0))
     sup = [e for e in NOTION_EFFORTS if e in tuple(supported or ())]
+    if purpose not in MAIN_PURPOSES:
+        idx = NOTION_EFFORTS.index(cap_coworker(effort, purpose)) + steps
+        wanted = cap_coworker(NOTION_EFFORTS[min(idx, len(NOTION_EFFORTS) - 1)], purpose)
+        if not sup:
+            return wanted
+        return band_effort(wanted, sup, purpose)[0]
+    idx = min(NOTION_EFFORTS.index(effort) + steps, len(NOTION_EFFORTS) - 1)
     if not sup:
         return NOTION_EFFORTS[idx]
     below = [e for e in sup if NOTION_EFFORTS.index(e) <= idx]

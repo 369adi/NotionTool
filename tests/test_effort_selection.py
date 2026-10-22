@@ -51,11 +51,11 @@ class RuleTest(unittest.TestCase):
 
     def test_main_review_and_high_risk_get_highest(self):
         self.assertEqual(self.pick('main')[0], 'max')
-        # Rule I47: Coworkers top out at xhigh, and xhigh only for the hardest work (risk high).
+        # Owner rule 2026-10-22 (replaces I47): Coworkers top out at high, even for risk high.
         self.assertEqual(self.pick(cls='review', risk='low')[0], 'high')
         self.assertEqual(self.pick(cls='review')[0], 'high')
-        self.assertEqual(self.pick(cls='review', risk='high')[0], 'xhigh')
-        self.assertEqual(self.pick(cls='code', risk='high')[0], 'xhigh')
+        self.assertEqual(self.pick(cls='review', risk='high')[0], 'high')
+        self.assertEqual(self.pick(cls='code', risk='high')[0], 'high')
         self.assertEqual(self.pick('main', sup=('low', 'medium', 'high'))[0], 'high')
 
     def test_code_research_medium_get_high(self):
@@ -63,10 +63,12 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(self.pick(cls='research')[0], 'high')
         self.assertEqual(self.pick()[0], 'high')  # unclassified work
 
-    def test_light_work_gets_default_or_low(self):
+    def test_light_work_gets_medium(self):
+        # Owner rule 2026-10-22: light Coworker work runs on medium, never low or the model default.
         self.assertEqual(self.pick(cls='docs', risk='low')[0], 'medium')
         self.assertEqual(self.pick(cls='routine')[0], 'medium')
-        self.assertEqual(self.pick(cls='test', risk='low', default=None)[0], 'low')
+        self.assertEqual(self.pick(cls='test', risk='low', default=None)[0], 'medium')
+        self.assertEqual(self.pick(cls='test', risk='low', default='low')[0], 'medium')
         self.assertEqual(self.pick(cls='code', risk='low')[0], 'medium')
 
     def test_clamped_and_reasoned(self):

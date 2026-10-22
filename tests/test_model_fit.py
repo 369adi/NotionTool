@@ -399,22 +399,31 @@ class ChooseTest(unittest.TestCase):
         self.assertEqual(model_fit.choose({'title': 'Parser', 'prompt': prompt})[0], S)
 
     def test_notion_effort_decision(self):
+        # Main purposes keep the full escalation ladder.
+        self.assertEqual(model_fit.notion_effort('high', purpose='main'), 'high')
+        self.assertEqual(model_fit.notion_effort('high', escalation=1, purpose='main'), 'xhigh')
+        self.assertEqual(model_fit.notion_effort('high', escalation=2, purpose='main'), 'max')
+        self.assertEqual(model_fit.notion_effort('high', escalation=5, purpose='main'), 'max')
+        self.assertEqual(model_fit.notion_effort('high', ('low', 'medium', 'high'), escalation=2, purpose='main'), 'high')
+        # Owner rule 2026-10-22: Coworkers (default purpose) stay in medium..high.
         self.assertEqual(model_fit.notion_effort('high'), 'high')
-        self.assertEqual(model_fit.notion_effort('high', escalation=1), 'xhigh')
-        self.assertEqual(model_fit.notion_effort('high', escalation=2), 'max')
-        self.assertEqual(model_fit.notion_effort('high', escalation=5), 'max')
-        self.assertEqual(model_fit.notion_effort('high', ('low', 'medium', 'high'), escalation=2), 'high')
+        self.assertEqual(model_fit.notion_effort('high', escalation=1), 'high')
+        self.assertEqual(model_fit.notion_effort('high', escalation=5), 'high')
         self.assertEqual(model_fit.notion_effort('low', ('medium', 'high')), 'medium')
         self.assertEqual(model_fit.notion_effort('medium', ('low', 'medium', 'high', 'xhigh', 'max')), 'medium')
         for case in CASES + HOLD:
             self.assertNotIn(model_fit.choose(as_task(case))[1], ('xhigh', 'max'))
 
     def test_escalation_raises_any_effort_one_step(self):
-        self.assertEqual(model_fit.notion_effort('low', escalation=1), 'medium')
+        self.assertEqual(model_fit.notion_effort('low', escalation=1, purpose='main'), 'medium')
+        self.assertEqual(model_fit.notion_effort('medium', escalation=1, purpose='main'), 'high')
+        self.assertEqual(model_fit.notion_effort('medium', escalation=2, purpose='main'), 'xhigh')
+        self.assertEqual(model_fit.notion_effort('low', escalation=0, purpose='main'), 'low')
+        self.assertEqual(model_fit.notion_effort('medium', escalation=-3, purpose='main'), 'medium')
         self.assertEqual(model_fit.notion_effort('medium', escalation=1), 'high')
-        self.assertEqual(model_fit.notion_effort('medium', escalation=2), 'xhigh')
-        self.assertEqual(model_fit.notion_effort('low', escalation=0), 'low')
-        self.assertEqual(model_fit.notion_effort('medium', escalation=-3), 'medium')
+        for level in ('low', 'medium', 'high', 'xhigh', 'max'):
+            for steps in range(-1, 4):
+                self.assertIn(model_fit.notion_effort(level, escalation=steps), ('medium', 'high'))
 
     def test_effort_ignores_difficulty_route(self):
         # A difficulty version that calls everything 'team' must not raise Sonnet effort.

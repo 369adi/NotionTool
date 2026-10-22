@@ -292,20 +292,33 @@ def choose_task_effort(client, model_id, purpose='', task=None):
     The effort the Main set on the task (requested_effort, from operator_main.delegate) wins, clamped to
     the model's supportedReasoningEfforts; otherwise the automatic choose_effort. Turns of the Main chat
     itself (purpose 'main') always keep the automatic choice."""
-    from .effort_policy import REASONING_ORDER, cap_coworker, catalog_efforts, clamp_effort
+    from .effort_policy import REASONING_ORDER, band_effort, catalog_efforts
     task = task if isinstance(task, dict) else {}
     asked = task.get('requested_effort')
     asked = asked.strip().lower() if isinstance(asked, str) else ''
     if purpose != 'main' and asked in REASONING_ORDER:
         supported, _default = catalog_efforts(catalog_entry(client, model_id))
-        effort = clamp_effort(cap_coworker(asked, purpose), supported)
+        # Owner rule 2026-10-22: a Coworker effort set by the Main stays in the band medium..high.
+        effort, note = band_effort(asked, supported, purpose)
         if effort is None:
             return None, ('set by Main: %s; not sent: no supportedReasoningEfforts for this model '
                           'in the cached catalog' % asked)
-        if effort == asked:
-            return effort, 'set by Main: ' + asked
-        return effort, 'set by Main: %s, clamped to %s' % (asked, effort)
+        reason = ('set by Main: ' + asked) if effort == asked else ('set by Main: %s, clamped to %s' % (asked, effort))
+        return effort, reason + ('; ' + note if note else '')
     return choose_effort(client, model_id, purpose, task.get('task_class', ''), task.get('risk', ''))
+
+
+def final_effort(client, model_id, effort, purpose=''):
+    """Last guard before an effort is sent for a Coworker (owner rule 2026-10-22): a stored or stale
+    value (older tasks, resumes) is put into the band medium..high and clamped to the model.
+    Main purposes and empty/non-string values pass through unchanged."""
+    from .effort_policy import MAIN_PURPOSES, band_effort, cap_coworker, catalog_efforts
+    if purpose in MAIN_PURPOSES or not isinstance(effort, str) or not effort.strip():
+        return effort
+    supported, _default = catalog_efforts(catalog_entry(client, model_id))
+    if supported:
+        return band_effort(effort, supported, purpose)[0]
+    return cap_coworker(effort.strip().lower(), purpose)
 
 
 MAIN_OWN_CONFIG = ('main', 'operator', 'spare_main', 'external')  # external = the user's own chats (Test chat)
@@ -1582,7 +1595,7 @@ class NotionAdapter:
             raise ValueError('Assignment cancelled before submission')
         # The assignment token is only offered when tools are needed (project, files, visual work).
         body = self.body(client,worker['thread_id'],task['step_id'],prompt,model,computer='assignment_token' in prompt,
-                         effort=task.get('effort'))
+                         effort=final_effort(client, model, task.get('effort'), worker.get('purpose', '')))
         if worker.get('context_reset'):
             body['isPartialTranscript'] = False  # replace the context inside the same chat
             with self.store.lock:
@@ -2018,6 +2031,8 @@ class NotionAdapter:
             inherited = inherit_main_config(client, worker['thread_id'])
             if inherited is not None:
                 model, effort = inherited[1], inherited[2]
+        # Owner rule 2026-10-22: a stored Coworker effort (older task, stale value) stays in medium..high.
+        effort = final_effort(client, model, effort, worker.get('purpose', ''))
         body = self.body(client, worker['thread_id'], step_id, text, model, computer=True, effort=effort)
         timeout = float(self.store.settings().get('task_timeout') or 1800)
         try:
