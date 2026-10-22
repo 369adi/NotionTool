@@ -4,12 +4,22 @@
 /* Notion's top icon row (Home, Chat, Meetings, Inbox, Search), replaced by our tab bar. */
 .nt-shell-hide { display: none !important; }
 
+/* Notion header wrapper around that row: no leftover padding/height (no gap under the brand). */
+html.nt-shell-on .nt-shell-tight {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  margin-top: 0 !important;
+  min-height: 0 !important;
+  height: auto !important;
+  gap: 0 !important;
+}
+
 /* ---- tab bar ---- */
 .nt-shell-tabs {
   display: flex;
   gap: 4px;
-  margin: 2px 8px 6px;
-  padding: 3px;
+  margin: 0 8px 8px;
+  padding: 4px;
   border-radius: var(--nt-radius, 12px);
   background: var(--nt-surface, #12151d);
   border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.06));
@@ -24,9 +34,9 @@
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 5px 2px 4px;
+  padding: 4px 2px;
   border: 0;
-  border-radius: 9px;
+  border-radius: 8px;
   background: transparent;
   color: var(--nt-muted, #9aa3b8);
   font: 600 11px/1.1 var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
@@ -35,14 +45,14 @@
 }
 
 .nt-shell-tab:hover { background: var(--nt-raised, #181c26); color: var(--nt-text, #e8eaf2); }
-.nt-shell-tab:focus-visible { outline: 2px solid #22d3ee; outline-offset: 1px; }
+.nt-shell-tab:focus-visible { outline: 2px solid var(--nt-accent, #7c5cff); outline-offset: 1px; }
 
-/* Active tab: accent pill. */
+/* Active tab: one solid accent, no glow. */
 .nt-shell-tab.nt-shell-tab-active,
 .nt-shell-tab.nt-shell-tab-active:hover {
-  background: var(--nt-accent-gradient, linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%));
+  background: var(--nt-accent, #7c5cff);
   color: #ffffff;
-  box-shadow: 0 0 12px var(--nt-accent-glow, rgba(124, 92, 255, 0.4));
+  box-shadow: none;
 }
 
 .nt-shell-tab-icon svg {
@@ -68,14 +78,14 @@
   padding: 0 4px;
   border-radius: 8px;
   box-sizing: border-box;
-  background: #f59e0b;
-  color: #0b0d12;
+  background: var(--nt-accent, #7c5cff);
+  color: #ffffff;
   font: 700 10px/16px var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
   text-align: center;
 }
 
 .nt-shell-tab.nt-shell-has-badge .nt-shell-tab-badge { display: block; }
-.nt-shell-tab[data-nt-shell-tab="chat"] .nt-shell-tab-badge { background: #22d3ee; }
+.nt-shell-tab.nt-shell-tab-active .nt-shell-tab-badge { background: #ffffff; color: var(--nt-accent, #7c5cff); }
 
 /* ---- view layer: covers the main Notion frame (left is set to the sidebar width), not a modal ---- */
 .nt-shell-layer {
@@ -102,8 +112,8 @@ html.nt-shell-view-open .nt-shell-layer { display: block; }
 .nt-shell-btn {
   padding: 8px 14px;
   border: 0;
-  border-radius: var(--nt-radius, 12px);
-  background: var(--nt-accent-gradient, linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%));
+  border-radius: 8px;
+  background: var(--nt-accent, #7c5cff);
   color: #ffffff;
   font: 600 13px/1.2 var(--nt-font, -apple-system, "Segoe UI", Roboto, sans-serif);
   cursor: pointer;
@@ -111,10 +121,10 @@ html.nt-shell-view-open .nt-shell-layer { display: block; }
 
 /* ---- compact brand header: logo mark + wordmark + connection dot, no box ---- */
 html.nt-shell-on .nt-desk-brand.nt-shell-brand {
-  margin: 6px 8px 2px;
-  padding: 6px 6px;
+  margin: 8px 8px 8px;
+  padding: 0 8px;
   gap: 8px;
-  min-height: 0;
+  min-height: 32px;
   background: transparent;
   border-color: transparent;
   box-shadow: none;
@@ -124,7 +134,7 @@ html.nt-shell-on .nt-shell-brand .nt-desk-brand-mark {
   width: 18px;
   height: 18px;
   border-radius: 6px;
-  box-shadow: 0 0 10px var(--nt-accent-glow, rgba(124, 92, 255, 0.35));
+  box-shadow: none;
 }
 
 html.nt-shell-on .nt-shell-brand .nt-desk-brand-name { font-size: 13.5px; font-weight: 700; letter-spacing: 0.01em; }
@@ -172,3 +182,13 @@ html.nt-shell-on .nt-desk-composer-empty::after {
   content: none !important;
   display: none !important;
 }
+
+/* ---- sidebar: the whole 'Coworkers' header row is one toggle with a rotating chevron ---- */
+.nt-desk-coworkers .nt-desk-coworkers-head { width: 100%; text-align: left; cursor: pointer; user-select: none; }
+.nt-desk-coworkers .nt-desk-coworkers-head > * { pointer-events: none; }
+.nt-desk-coworkers .nt-desk-coworkers-head:focus-visible { outline: 2px solid rgba(124, 92, 255, 0.8); outline-offset: 1px; border-radius: 6px; }
+.nt-desk-coworkers .nt-desk-chevron { display: inline-block; transition: transform 0.15s ease; }
+.nt-desk-coworkers .nt-desk-chevron::before,
+.nt-desk-coworkers.nt-desk-collapsed .nt-desk-chevron::before { content: '\25BE'; }
+.nt-desk-coworkers.nt-desk-collapsed .nt-desk-chevron { transform: rotate(-90deg); }
+.nt-desk-coworkers.nt-desk-collapsed .nt-desk-coworker-list { display: none; }

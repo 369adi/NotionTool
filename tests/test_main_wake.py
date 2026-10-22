@@ -188,5 +188,264 @@ class StepIdTests(unittest.TestCase):
         self.assertNotEqual(wake_step_id(["a", "b"]), wake_step_id(["a", "c"]))
 
 
+# ---- MainWake loop (fake store / adapter / client / clock, no network) ----
+
+T0 = 1_000_000.0
+THREAD = "thr1"
+
+
+class WkStore:
+    def __init__(self):
+        self.data, self.events, self.conf = {}, [], {}
+
+    def get(self, kind, ident, default=None):
+        doc = self.data.get(kind, {}).get(str(ident))
+        return copy.deepcopy(doc) if doc is not None else default
+
+    def all(self, kind):
+        return [copy.deepcopy(d) for d in self.data.get(kind, {}).values()]
+
+    def put(self, kind, doc):
+        self.data.setdefault(kind, {})[str(doc["id"])] = copy.deepcopy(doc)
+        return doc
+
+    def event(self, kind, run_id="", *, commit=True, **fields):
+        self.events.append((kind, run_id, fields))
+
+    def settings(self):
+        return dict(self.conf)
+
+    def kinds(self, kind):
+        return [e for e in self.events if e[0] == kind]
+
+
+class WkTransport:
+    def __init__(self, client):
+        self.client = client
+
+    def stream(self, name, body, headers, timeout=None, cancel=None):
+        assert name == "runInferenceTranscript"
+        if self.client.fail:
+            raise RuntimeError("boom")
+        self.client.sent.append(body)
+        return iter(["{}"])
+
+
+class WkClient:
+    def __init__(self):
+        self.info = {"space_id": "space"}
+        self.status, self.pending, self.fail = "idle", False, False
+        self.sent = []
+        self.transport = WkTransport(self)
+
+    def transcript(self, thread, limit=100):
+        return {"session": {"status": self.status}, "session_pending": self.pending}
+
+    def model(self, label=None):
+        return "model-1"
+
+    def headers(self):
+        return {}
+
+
+class WkAdapter:
+    def __init__(self):
+        self.cl = WkClient()
+        self.ids = 0
+
+    def client(self, account_id):
+        return self.cl
+
+    def new_id(self, space_id, tail="00aa"):
+        self.ids += 1
+        return "step%d" % self.ids
+
+    def body(self, client, thread, step_id, prompt, model, create=False, computer=False, effort=None):
+        return dict(thread=thread, step=step_id, prompt=prompt, computer=computer, effort=effort)
+
+
+class WkClock:
+    def __init__(self, t=T0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def wk_run(rid, state="done", updated=T0 - 60, **extra):
+    item = dict(id=rid, state=state, updated=updated, operator=True, main_worker="acc:" + THREAD,
+                chat_id="c1", account_id="acc", summary="Summary of " + rid)
+    item.update(extra)
+    return item
+
+
+def wk_task(tid, run_id, state="done"):
+    return dict(id=tid, run_id=run_id, state=state)
+
+
+class MainWakeLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.store, self.adapter, self.clock = WkStore(), WkAdapter(), WkClock()
+        self.store.put("workers", dict(id="acc:" + THREAD, account_id="acc", thread_id=THREAD, purpose="operator"))
+        self.store.put("chats", dict(id="c1", operator=True, state="active", main_worker="acc:" + THREAD))
+        self.wake = main_wake.MainWake(self.store, self.adapter, None, clock=self.clock)
+
+    def add(self, rid, state="done", tasks=("done",), **extra):
+        self.store.put("runs", wk_run(rid, state, **extra))
+        for i, task_state in enumerate(tasks):
+            self.store.put("tasks", wk_task("%s-t%d" % (rid, i), rid, task_state))
+
+    @property
+    def sent(self):
+        return self.adapter.cl.sent
+
+    def test_one_message_for_a_finished_run(self):
+        self.add("r1", tasks=("done", "done", "failed"))
+        self.assertEqual(self.wake.tick(), ["r1"])
+        self.assertEqual(len(self.sent), 1)
+        body = self.sent[0]
+        self.assertEqual((body["thread"], body["computer"]), (THREAD, True))
+        self.assertTrue(body["effort"])
+        self.assertTrue(body["prompt"].startswith("NotionTool (automatic): Cowork run finished."))
+        self.assertIn("- r1 done: Summary of r1; tasks 2/3, not accepted r1-t2", body["prompt"])
+        self.assertIn("GET /api/run?id=r1", body["prompt"])
+        self.assertEqual(self.store.kinds("main_wake_sent")[0][2]["run_ids"], ["r1"])
+        self.assertEqual(self.store.get("main_wakes", "r1:done")["status"], "sent")
+
+    def test_no_accepted_problem_says_none(self):
+        self.add("r1")
+        self.wake.tick()
+        self.assertIn("tasks 1/1, not accepted none", self.sent[0]["prompt"])
+
+    def test_nothing_while_review_or_fix_task_is_open(self):
+        for open_state in ("queued", "ready", "retry", "running", "executing", "fixing", "uncertain",
+                           "recovering", "cancelling"):
+            self.store.data.clear()
+            self.setUp()
+            self.add("r1", tasks=("done", open_state))
+            self.assertEqual(self.wake.tick(), [], open_state)
+            self.assertEqual(self.sent, [])
+        self.store.put("tasks", wk_task("r1-t1", "r1", "done"))
+        self.assertEqual(self.wake.tick(), ["r1"])
+
+    def test_run_not_terminal_yet(self):
+        self.add("r1", state="fixing")
+        self.assertEqual(self.wake.tick(), [])
+
+    def test_waits_while_chat_busy_then_sends_when_idle(self):
+        self.add("r1")
+        self.adapter.cl.status = "running"
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.store.kinds("main_wake_wait_busy")), 1)  # at most once per run
+        self.assertIsNone(self.store.get("main_wakes", "r1:done"))  # stays pending
+        self.adapter.cl.status = "idle"
+        self.assertEqual(self.wake.tick(), ["r1"])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_pending_session_counts_as_busy(self):
+        self.add("r1")
+        self.adapter.cl.pending = True
+        self.assertEqual(self.wake.tick(), [])
+        self.adapter.cl.pending = False
+        self.assertEqual(self.wake.tick(), ["r1"])
+
+    def test_no_second_message_for_same_run_and_state(self):
+        self.add("r1")
+        self.wake.tick()
+        self.clock.t += 600
+        self.assertEqual(self.wake.tick(), [])
+        fresh = main_wake.MainWake(self.store, self.adapter, None, clock=self.clock)  # after a restart
+        self.assertEqual(fresh.tick(), [])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_new_state_of_same_run_is_a_new_message(self):
+        self.add("r1", state="awaiting_main")
+        self.wake.tick()
+        self.store.put("runs", wk_run("r1", "failed", updated=self.clock.t))
+        self.clock.t += 120
+        self.assertEqual(self.wake.tick(), ["r1"])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_baseline_skips_old_runs_but_not_recent_ones(self):
+        self.add("old", updated=T0 - 31 * 60)
+        self.add("recent", updated=T0 - 29 * 60)
+        self.assertEqual(self.wake.tick(), ["recent"])
+        self.assertEqual(self.store.get("main_wakes", "old:done")["status"], "baseline")
+        self.assertIn("recent", self.sent[0]["prompt"])
+        self.assertNotIn("old", self.sent[0]["prompt"].replace("Cowork", ""))
+        self.clock.t += 600
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_baseline_only_runs_at_start_not_later(self):
+        self.assertEqual(self.wake.tick(), [])
+        self.add("late", updated=T0 - 31 * 60)  # finishes after start: still reported
+        self.assertEqual(self.wake.tick(), ["late"])
+
+    def test_two_runs_in_one_tick_make_one_message(self):
+        self.add("r1", updated=T0 - 20)
+        self.add("r2", state="failed", updated=T0 - 10)
+        self.assertEqual(self.wake.tick(), ["r1", "r2"])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("- r1 done", self.sent[0]["prompt"])
+        self.assertIn("- r2 failed", self.sent[0]["prompt"])
+        self.assertTrue(self.sent[0]["prompt"].startswith("NotionTool (automatic): Cowork runs finished."))
+
+    def test_at_most_one_message_per_minute_per_chat(self):
+        self.add("r1")
+        self.wake.tick()
+        self.add("r2")
+        self.clock.t += 30
+        self.assertEqual(self.wake.tick(), [])
+        self.clock.t += 31
+        self.assertEqual(self.wake.tick(), ["r2"])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_disabled_setting_sends_nothing(self):
+        self.store.conf["main_wake_enabled"] = False
+        self.add("r1")
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.sent, [])
+        self.store.conf["main_wake_enabled"] = True
+        self.assertEqual(self.wake.tick(), ["r1"])
+
+    def test_confirmed_and_non_operator_runs_send_nothing(self):
+        self.add("r1", confirmed_at=T0 - 5)
+        self.add("r2", operator=False)
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.sent, [])
+
+    def test_interval_setting_default_and_override(self):
+        self.assertEqual(self.wake.interval(), 15.0)
+        self.store.conf["main_wake_interval_s"] = 40
+        self.assertEqual(self.wake.interval(), 40.0)
+
+    def test_failed_send_is_recorded_first_and_never_resent(self):
+        self.add("r1")
+        self.adapter.cl.fail = True
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.store.get("main_wakes", "r1:done")["status"], "failed")
+        self.assertEqual(len(self.store.kinds("main_wake_failed")), 1)
+        self.adapter.cl.fail = False
+        self.clock.t += 600
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.sent, [])
+
+    def test_never_creates_chats_or_agents(self):
+        self.add("r1")
+        self.wake.tick()
+        self.assertEqual(sorted(self.store.data), ["chats", "main_wakes", "runs", "tasks", "workers"])
+
+    def test_message_stays_short_for_many_runs(self):
+        for i in range(12):
+            self.add("run%02d" % i, summary="x" * 400, updated=T0 - 100 + i)
+        self.wake.tick()
+        prompt = self.sent[0]["prompt"]
+        self.assertIn("... and 7 more runs", prompt)
+        self.assertLess(len(prompt), 1500)
+
+
 if __name__ == "__main__":
     unittest.main()

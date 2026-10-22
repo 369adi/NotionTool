@@ -70,12 +70,16 @@ class DesktopSidebarTests(unittest.TestCase):
         self.assertIn("'Could not create a Welcome chat: '", self.js)
 
     def test_never_removes_notion_nodes_or_uses_network(self):
-        for text in ('.remove()', 'fetch(', 'XMLHttpRequest', 'WebSocket', 'setInterval',
+        for text in ('.remove()', 'fetch(', 'XMLHttpRequest', 'WebSocket',
                      '127.0.0.1', 'Bearer', 'localhost', 'innerHTML', 'outerHTML', 'insertAdjacentHTML',
                      'nodeValue =', 'textContent = \'Mains\''):
             self.assertNotIn(text, self.js)
         # The single removal is dropOwn, guarded so it only touches our own inserted nodes.
         self.assertEqual(self.js.count('removeChild'), 1)
+        # One interval only: the 5 s sidebar watchdog (empty Mains list after a PC restart), cleared in stop().
+        self.assertEqual(self.js.count('setInterval('), 1)
+        self.assertIn('watchdog = setInterval(', self.js)
+        self.assertIn('clearInterval(watchdog)', self.js)
         self.assertIn('if (isOwn(node) && node.parentNode) node.parentNode.removeChild(node);', self.js)
         self.assertIn("node.setAttribute('data-nt-desk-own', '1');", self.js)
 
@@ -301,7 +305,10 @@ class DesktopSidebarTests(unittest.TestCase):
         run = self.section('function run()', 'function schedule')
         gate = run.index('if (!online(state)) {')
         offline = run[gate:run.index('applied = true;')]
-        self.assertIn('if (applied) resetMarks();', offline)
+        # Offline undoes earlier marks (the New chat dialog also closes its menu/dialog there).
+        self.assertIn('if (applied) {', offline)
+        undo = offline[offline.index('if (applied) {'):]
+        self.assertIn('resetMarks();', undo[:undo.index('}')])
         self.assertIn('return;', offline)
         for text in ('applyFilter', 'applyHeading', 'applyBrand', 'applyRows', 'CLS_HIDDEN', 'Mains'):
             self.assertNotIn(text, offline)

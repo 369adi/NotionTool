@@ -106,6 +106,7 @@ class StallReportTests(unittest.TestCase):
         self.assertEqual(events[0][2]['task_id'], 't1')
         self.assertIn('Coworker Ada stalled', events[0][2]['message'])
         self.assertIn('report only, nothing was stopped or resent', events[0][2]['message'])
+        self.assertIn('Continue prompt', events[0][2]['message'])
         self.assertEqual(self.store.data, before)
         self.assertEqual(self.store.writes, writes)
         self.assertEqual(app.engine.calls, [])

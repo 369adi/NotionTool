@@ -15,7 +15,9 @@ added newest first, and adding stops at the first entry that would push the
 prompt over token_budget. That entry and every older one are dropped whole.
 """
 import copy
+import json
 import math
+import os
 
 from .context_archive import estimate_tokens
 
@@ -127,13 +129,69 @@ def result_id(entry, index):
     return f'#{index}'
 
 
-def result_body(entry):
+def plain_body(entry):
     """First string of 'result', 'text', 'content' or 'summary', or ''."""
     for field in RESULT_TEXT_FIELDS:
         value = entry.get(field)
         if isinstance(value, str):
             return value.strip()
     return ''
+
+
+def json_result(entry):
+    """The first result text field as a dict when it is a dict or a JSON object string, else None."""
+    for field in RESULT_TEXT_FIELDS:
+        value = entry.get(field)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip().startswith('{'):
+            try:
+                data = json.loads(value)
+            except ValueError:
+                return None
+            return data if isinstance(data, dict) else None
+    return None
+
+
+def valid_result_file(path):
+    """path stripped when it resolves to an existing file inside result_files.ROOT, else ''."""
+    if not isinstance(path, str) or not path.strip():
+        return ''
+    from . import result_files
+    try:
+        real = os.path.normcase(os.path.realpath(path.strip()))
+        root = os.path.normcase(os.path.realpath(result_files.ROOT))
+        inside = real != root and os.path.commonpath([real, root]) == root
+    except (OSError, ValueError):
+        return ''
+    return path.strip() if inside and os.path.isfile(real) else ''
+
+
+def result_file_of(entry):
+    """Path of a real result file ('result_file' field or inside the JSON result), else ''."""
+    path = entry.get('result_file')
+    if not isinstance(path, str):
+        data = json_result(entry)
+        path = data.get('result_file') if data else None
+    return valid_result_file(path)
+
+
+def short_result(entry, path):
+    """Short summary plus the result file path, for a result whose full text is in a file."""
+    data = json_result(entry) or {}
+    summary = data.get('summary')
+    if not isinstance(summary, str) or not summary.strip():
+        summary = entry.get('summary') if isinstance(entry.get('summary'), str) else ''
+    if not summary.strip():
+        from .result_files import summary_of
+        summary = summary_of(plain_body(entry))
+    return f'{summary.strip()}\nFull result: {path}'.strip()
+
+
+def result_body(entry):
+    """Short summary plus result file path when the file exists, else the first result text field."""
+    path = result_file_of(entry)
+    return short_result(entry, path) if path else plain_body(entry)
 
 
 def result_block(entry, ident):

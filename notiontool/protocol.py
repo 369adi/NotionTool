@@ -85,6 +85,8 @@ def prompt_for(task, run, context, token, tools_available=False):
     if tools_available:
         header += 'Check your actual tool list. If a listed tool requires assignment_token, use '+token+'. This does not confirm any MCP connection.\n'
     header += 'Please describe only actions and checks you actually performed. If something is unavailable, say so.\n\n'
+    from .agent_guard import with_rule  # I12
+    header += with_rule('', coworker=task['role'] != 'planner') + '\n\n'
     if task['role'] == 'planner':
         return header + f'''Please combine the approach suggestions into an execution plan. There are {run.get('capacity', 0)} contributors available.
 Use independent tasks where useful, with dependencies for work that must happen in order.

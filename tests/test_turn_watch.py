@@ -136,13 +136,16 @@ class TurnWatchTests(unittest.TestCase):
 
     def test_chain_of_automatic_resumes_is_capped(self):
         user = 'u0'
-        for _ in range(MAX_CHAIN + 2):
+        from notiontool.turn_watch import MAX_CHAIN_OPERATOR
+        # Idle mode: a Main chat keeps going for the long operator chain (coworkers keep MAX_CHAIN).
+        for _ in range(MAX_CHAIN_OPERATOR + 2):
             self.interrupt(user=user)
             self.now += GRACE_SECONDS + 1
             step = self.watch.check(self.worker())
             if step:
                 user = step  # the next interruption follows our own continue message
-        self.assertEqual(len(self.adapter.sent), MAX_CHAIN)
+        self.assertEqual(len(self.adapter.sent), MAX_CHAIN_OPERATOR)
+        self.assertGreater(MAX_CHAIN_OPERATOR, MAX_CHAIN)
         self.assertEqual(self.kinds().count('turn_resume_exhausted'), 1)
 
     def test_a_real_user_message_starts_a_new_chain(self):
@@ -178,7 +181,12 @@ class TurnWatchTests(unittest.TestCase):
     def test_checks_read_only_a_small_window(self):
         self.interrupt()
         self.watch.check(self.worker())
-        self.assertEqual(self.adapter.reads, [('main-thread', turn_watch.WINDOW)])
+        # The Main is measured for the 6 h budget too: at most one larger usage read, then only the small window.
+        self.assertEqual(self.adapter.reads[0], ('main-thread', turn_watch.WINDOW))
+        self.assertTrue(all(limit in (turn_watch.WINDOW, turn_watch.USAGE_FIRST_WINDOW) for _t, limit in self.adapter.reads))
+        before = len(self.adapter.reads)
+        self.watch.check(self.worker())  # within the usage throttle
+        self.assertEqual(self.adapter.reads[before:], [('main-thread', turn_watch.WINDOW)])
 
 
 

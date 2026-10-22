@@ -51,8 +51,11 @@ class RuleTest(unittest.TestCase):
 
     def test_main_review_and_high_risk_get_highest(self):
         self.assertEqual(self.pick('main')[0], 'max')
-        self.assertEqual(self.pick(cls='review', risk='low')[0], 'max')
-        self.assertEqual(self.pick(cls='code', risk='high')[0], 'max')
+        # Rule I47: Coworkers top out at xhigh, and xhigh only for the hardest work (risk high).
+        self.assertEqual(self.pick(cls='review', risk='low')[0], 'high')
+        self.assertEqual(self.pick(cls='review')[0], 'high')
+        self.assertEqual(self.pick(cls='review', risk='high')[0], 'xhigh')
+        self.assertEqual(self.pick(cls='code', risk='high')[0], 'xhigh')
         self.assertEqual(self.pick('main', sup=('low', 'medium', 'high'))[0], 'high')
 
     def test_code_research_medium_get_high(self):
@@ -99,15 +102,26 @@ class NotionWiringTest(unittest.TestCase):
                                              'user_id': 'u', 'email': 'e@x', 'records': {}})
         return cls.body(fake, client, 'thread', 'step', 'hi', 'albuquerque-quinn', effort=effort)
 
-    def test_body_carries_effort_in_workflow_config(self):
-        value = self._body('max')['transcript'][0]['value']
-        self.assertEqual(value['reasoningEffort'], 'max')
-        self.assertEqual(value['model'], 'albuquerque-quinn')
+    def test_body_carries_effort_in_updated_config_step(self):
+        # Live proof 2026-10-20: model/effort only work in the 'updated-config' step; the config step
+        # keeps the base model and no effort.
+        body = self._body('max')
+        value = body['transcript'][0]['value']
+        self.assertNotIn('reasoningEffort', value)
+        self.assertEqual(value['model'], notion.BASE_CONFIG_MODEL)
         self.assertTrue(value['modelFromUser'])
-        self.assertNotIn('reasoningEffort', self._body(None))
+        steps = [s for s in body['transcript'] if s.get('type') == 'updated-config']
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]['value'], {'model': 'albuquerque-quinn', 'reasoningEffort': 'max'})
+        self.assertEqual(body['transcript'][-1]['type'], 'user')
+        self.assertEqual(body['transcript'][-2]['type'], 'updated-config')
 
     def test_body_without_effort_sends_no_field(self):
-        self.assertNotIn('reasoningEffort', self._body(None)['transcript'][0]['value'])
+        body = self._body(None)
+        self.assertNotIn('reasoningEffort', body['transcript'][0]['value'])
+        for step in body['transcript']:
+            if step.get('type') == 'updated-config':
+                self.assertNotIn('reasoningEffort', step['value'])
 
 
 class RoutingReasonTest(unittest.TestCase):
