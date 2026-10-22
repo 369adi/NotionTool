@@ -59,10 +59,11 @@ class BridgeWorktreeTests(unittest.TestCase):
         self.assertEqual((self.copy / 'pkg' / 'abs.py').read_bytes(), b'abs main\n')
         self.assertFalse((self.project / 'pkg' / 'abs.py').exists())
 
-    def test_unlisted_file_in_the_copy_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "not in this task's files list"):
-            self.write('build', 'pkg/other.py')
-        self.assertFalse((self.copy / 'pkg' / 'other.py').exists())
+    def test_unlisted_file_in_the_copy_is_allowed(self):
+        # Owner rule 2026-10-22: the own copy is merged and tested at the end, so any file in it is writable.
+        self.write('build', 'pkg/other.py', 'other\n')
+        self.assertEqual((self.copy / 'pkg' / 'other.py').read_bytes(), b'other\n')
+        self.assertFalse((self.project / 'pkg' / 'other.py').exists())
 
     def test_reviewer_reads_the_reviewed_copy(self):
         text = self.bridge.call('read_file', {'path': 'pkg/mod.py'}, 'review')
@@ -87,8 +88,9 @@ class BridgeWorktreeTests(unittest.TestCase):
         self.assertEqual((self.copy / 'pkg' / 'abs.py').read_bytes(), b'op abs\n')
         self.assertEqual((self.project / 'pkg' / 'mod.py').read_bytes(), b'main\n')
         self.assertFalse((self.project / 'pkg' / 'abs.py').exists())
-        with self.assertRaisesRegex(ValueError, "not in this task's files list"):
-            self.op_write('build', 'pkg/other.py')
+        self.op_write('build', 'pkg/other.py', 'op other\n')
+        self.assertEqual((self.copy / 'pkg' / 'other.py').read_bytes(), b'op other\n')
+        self.assertFalse((self.project / 'pkg' / 'other.py').exists())
 
 if __name__ == '__main__':
     unittest.main()
