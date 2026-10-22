@@ -318,8 +318,10 @@ class Engine:
                 except Exception as exc:
                     # Name and text: 'ImportError' alone hid the missing chat_pool.name_coworkers for hours.
                     self.store.event('team_grow_check_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+            cleanup = getattr(self, '_auto_cleanup_maybe', None)
             try:
-                self._auto_cleanup_maybe()
+                if callable(cleanup):
+                    cleanup()
             except Exception as exc:
                 self.store.event('auto_cleanup_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
 
