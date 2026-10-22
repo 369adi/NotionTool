@@ -16,12 +16,13 @@ import threading
 import time
 import unittest
 import urllib.request
+from concurrent.futures import Future
 from pathlib import Path
 from unittest import mock
 
 from notiontool import fake_notion, token_budget
 from notiontool.edge_transport import EdgeTransport
-from notiontool.engine import PendingRemote, RateLimited
+from notiontool.engine import Engine, PendingRemote, RateLimited
 from notiontool.fake_notion import FakeNotionAdapter, FakeState, FakeTransport, seed_scenario
 from notiontool.network_budget import HARD_LIMIT_PER_MINUTE, WINDOW_SECONDS, NetworkBudget, clamp_limit
 from notiontool.notion import NotionAdapter, NotionClient
@@ -220,6 +221,67 @@ class BacktestLimits(unittest.TestCase):
                                         limit_per_minute=500))
         self.assertEqual(NetworkBudget(self.store, clock=clock.now, sleep=clock.sleep).limit_per_minute, 180)
 
+    def test_1b_request_cap_through_the_fake_adapter(self):
+        # Hook missing in the fake: FakeTransport.request does not use the request budget, and
+        # fake_notion.py may not be changed in this task. So the test routes FakeTransport.request
+        # through the adapter's own NetworkBudget the same way NativeNotionTransport.request
+        # (acquire before, release after) and EdgeTransport._start do; the budget itself is real.
+        clock = FakeClock(200_000.0)
+        budget = self.adapter.network_budget = NetworkBudget(self.store, clock=clock.now, sleep=clock.sleep)
+        original = FakeTransport.request
+        starts = []
+
+        def budgeted(transport, path, *args, **kwargs):
+            ticket = self.adapter.network_budget.acquire(source=str(path))
+            starts.append(clock.t)
+            status = 0
+            try:
+                status, text = original(transport, path, *args, **kwargs)
+                return status, text
+            finally:
+                self.adapter.network_budget.release(ticket, 'ok' if status == 200 else 'invalid', status=status,
+                                                    account_id=transport.account_key)
+        patch = mock.patch.object(FakeTransport, 'request', budgeted)
+        patch.start()
+        self.addCleanup(patch.stop)
+        before = len(self.state.calls('loadUserContent'))
+        client = self.adapter.client('ready')
+        for _ in range(250):  # more than 180 requests asked for through the adapter at once
+            client.call('loadUserContent', {})
+        self.assertEqual(len(starts), 250)
+        self.assertEqual(len(self.state.calls('loadUserContent')) - before, 250)  # all reached the fake
+        low, peak = 0, 0
+        for i, start in enumerate(starts):
+            while start - starts[low] >= WINDOW_SECONDS:
+                low += 1
+            peak = max(peak, i - low + 1)
+        self.assertEqual(peak, HARD_LIMIT_PER_MINUTE, 'more than 180 starts inside one sliding 60 s window')
+        self.assertEqual(sum(1 for s in starts if s < starts[0] + WINDOW_SECONDS), 180)  # the rest waited
+        self.assertGreaterEqual(starts[180] - starts[0], WINDOW_SECONDS)
+        self.assertGreaterEqual(budget.window_waits, 1)
+
+    # ---- 0) the guard itself ------------------------------------------------------------------
+    def test_0_guard_blocks_and_logs_app_port_and_real_db(self):
+        real_db = ROOT / 'data' / 'notiontool.db'
+        stamp = lambda: (real_db.stat().st_mtime_ns, real_db.stat().st_size) if real_db.exists() else None
+        before = stamp()
+        with self.assertRaisesRegex(AssertionError, 'real network touched'):
+            socket.create_connection(('127.0.0.1', APP_PORT), timeout=1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with self.assertRaisesRegex(AssertionError, 'real network touched'):
+                sock.connect(('127.0.0.1', APP_PORT))
+        finally:
+            sock.close()
+        with self.assertRaisesRegex(AssertionError, 'real DB touched'):
+            sqlite3.connect(str(real_db))
+        self.assertEqual(len(self.touched), 3, self.touched)
+        self.assertTrue(all('(NotionTool app port)' in entry for entry in self.touched[:2]), self.touched)
+        self.assertEqual(self.touched[2], 'sqlite ' + os.path.normcase(os.path.realpath(real_db)))
+        self.assertIn(os.path.normcase(os.path.realpath(real_db)), REAL_DBS)
+        self.assertEqual(stamp(), before, 'data/notiontool.db was created or changed')
+        self.touched.clear()  # the violations were deliberate; tearDown checks the log is empty again
+
     # ---- 2) throttle --------------------------------------------------------------------------
     def test_2_throttle_spaces_coworker_turns(self):
         spacing = LIMITS['burst_spacing_s']
@@ -292,13 +354,10 @@ class BacktestLimits(unittest.TestCase):
 
     # ---- 5) limit stop of running coworker turns ----------------------------------------------
     def test_5_limit_stop_cancels_running_coworker_turns(self):
-        source = (ROOT / 'notiontool' / 'engine.py').read_text(encoding='utf-8')
-        if "'limit_stop'" not in source and '"limit_stop"' not in source:
-            self.skipTest('limit_stop not built yet')
-        from notiontool.engine import Engine
+        # The limit stop is built (engine.py, commit 2fec8a6), so this test is never skipped. It drives
+        # the stop through Engine._limit_check(), the path tick() uses, which calls Engine._limit_stop;
+        # that works with the built _limit_stop(state) and with the design's _limit_stop(now).
         engine = Engine(self.store, self.adapter)
-        if not hasattr(engine, '_limit_stop'):
-            self.skipTest('limit_stop exists but Engine._limit_stop (design interface) is missing')
         self.state.set_fault(self.coworker['thread_id'], 'hang', seconds=30)
         cancels, results = {}, {}
         for worker, task_id in ((self.coworker, 't_cw'), (self.main, 't_main')):
@@ -313,22 +372,33 @@ class BacktestLimits(unittest.TestCase):
                     results[task['id']] = (type(exc).__name__, exc)
             thread = threading.Thread(target=go, daemon=True)
             thread.start()
-            engine.inflight[object()] = dict(task_id=task_id, lease='assignment', worker_id=worker['id'],
+            engine.inflight[Future()] = dict(task_id=task_id, lease='assignment', worker_id=worker['id'],
                                              cancel=cancel, recovery=False)
         deadline = time.time() + 5
         while self.sends() < 2 and time.time() < deadline:
             time.sleep(0.02)
         self.charge(self.coworker, LIMITS['burst_hard_15m'] + 100_000, time.time())
         started = time.time()
-        stopped = engine._limit_stop(engine.clock())
-        self.assertIn('t_cw', stopped)
+        latch = engine._limit_check()  # the tick() path; it calls Engine._limit_stop
+        self.assertIsNotNone(latch, 'the hard limit did not set the limit latch')
+        self.assertEqual(list(latch.get('task_ids') or []), ['t_cw'])  # the stopped task ids
         self.assertTrue(cancels['t_cw'].is_set())
-        self.assertFalse(cancels['t_main'].is_set())
+        self.assertFalse(cancels['t_main'].is_set())  # the Main is never cancelled
         while 't_cw' not in results and time.time() - started < 2:
             time.sleep(0.02)
         self.assertIn('t_cw', results, 'the running coworker turn did not stop at once')
         self.assertEqual(results['t_cw'][0], 'PendingRemote')
-        self.assertEqual(len(self.events('limit_stop')), 1)
+        self.assertLess(time.time() - started, 2.0)
+        # A second check while the limit still holds writes no second limit_stop event.
+        engine._limit_checked = None
+        engine._limit_check()
+        events = self.events('limit_stop')
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]['count'], events[0]['task_ids'], events[0]['main_kept']), (1, ['t_cw'], 1))
+        self.assertEqual(self.events('limit_stop_more'), [])
+        stopper = getattr(engine, '_limit_stop_thread', None)
+        if stopper is not None:
+            stopper.join(5)
 
 
 if __name__ == '__main__':
