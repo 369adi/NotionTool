@@ -1574,6 +1574,9 @@ class NotionAdapter:
         self.store.event('presend_timing', run_id, commit=False, **trace, **{k: round(v, 2) for k, v in _phase.items()})
         self.store.event('remote_sent', run_id, prompt_chars=len(prompt), **trace)
         charge_send(self.store, worker, prompt)  # counted even if the chat is deleted later
+        from . import step_guard
+        step_guard.note_start(self.store, worker)  # start spacing / starts per 5 min
+        counted = 0  # steps of this turn already counted by the step guard (live, not only at the end)
         seen_output, lines, reported = False, 0, []
         def remote_done(outcome, error_class='', detail=''):
             if not reported:
@@ -1605,7 +1608,15 @@ class NotionAdapter:
                 if time.monotonic()-last_update>0.6:
                     update(stream_text(steps))
                     last_update = time.monotonic()
+                    counted = step_guard.count_new(self.store, worker, steps, counted)
             errors = [s for s in steps if isinstance(s,dict) and s.get('type')=='error']
+            counted = step_guard.count_new(self.store, worker, steps, counted)
+            for err in errors:
+                # Notion's fair-use limit (UserRateLimitResponse / AI disabled): every chat of the account pauses.
+                detail = json.dumps(err, default=str)
+                if step_guard.is_provider_limit(detail):
+                    step_guard.note_provider_limit(self.store, worker, detail, key='%s:%s' % (
+                        worker.get('thread_id', ''), err.get('id') or task.get('step_id') or task['id']))
             text = stream_text(steps)
             charge_reply(self.store, worker, text)
             from .chat_pool import script_mode_failure

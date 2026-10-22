@@ -455,12 +455,57 @@ class TurnWatch:
                     pass
             return None
 
+    def count_steps(self, worker, transcript):
+        """Step guard (step_guard.py) for chats NotionTool does not stream itself. Never raises.
+
+        - every watched chat: a Notion rate-limit / AI-disabled error entry pauses all chats of the account
+          (each entry once; entries older than the cooldown are ignored),
+        - Main chats only (coworker steps are counted live from the stream in notion.py): new step entries
+          since the last check count as steps. The first look at a chat only sets the baseline.
+        """
+        try:
+            from . import step_guard
+            now = self.clock()
+            entities = [p.get('entity') or {} for p in (transcript.get('patches') or []) if p.get('op') == 'put']
+            cooldown = step_guard.limits(self.store)['provider_cooldown_s']
+            for entity in entities:
+                kind = str(entity.get('kind') or entity.get('type') or '').lower()
+                if 'error' not in kind:
+                    continue
+                when = stamp(entity)
+                if when and now - when > cooldown:
+                    continue
+                detail = repr(entity)
+                if step_guard.is_provider_limit(detail):
+                    step_guard.note_provider_limit(self.store, worker, detail[:300], now=now,
+                                                   key='%s:%s' % (worker.get('thread_id', ''), entity.get('id') or when))
+            if worker.get('purpose') not in (OPERATOR, 'main'):
+                return 0
+            ids = set()
+            for entity in entities:
+                kind = str(entity.get('kind') or entity.get('type') or '').lower()
+                if entity.get('id') and _role(entity) in ('assistant_message', 'tool', 'error') and 'result' not in kind:
+                    ids.add(str(entity['id']))
+            seen_map = self.__dict__.setdefault('step_seen', {})
+            key = worker['id'] + ':' + str(worker.get('thread_id', ''))
+            seen = seen_map.get(key)
+            seen_map[key] = set(list((seen or set()) | ids)[-2000:])
+            if seen is None:
+                return 0
+            new = len(ids - seen)
+            if new:
+                step_guard.add_steps(self.store, worker, new, now=now)
+            return new
+        except Exception:
+            return 0
+
     def check(self, worker):
         if worker['id'] in self.sending:
             return None
         client = self.adapter.client(worker['account_id'])
         transcript = client.transcript(worker['thread_id'], limit=WINDOW)
         self.measure_usage(worker, client, transcript)
+        self.count_steps(worker, transcript)
         found = interrupted_turn(transcript, now=self.clock())
         if not found:
             return self.check_restart(worker, transcript)

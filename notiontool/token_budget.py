@@ -304,6 +304,12 @@ def _hard_stop_compute(store, purpose, now):
         return dict(stop=True, source='6h', wait=wait,
                     reason='6 h token budget of %d tokens used up; resets in about %d min'
                            % (limit(store), wait // 60 + 1))
+    # Step guard (step_guard.py): Notion's fair-use limit counts the whole account, so the step limit and a
+    # Notion rate-limit error stop EVERY chat, the Main too (Jens 22.10.: 'auch main stoppen').
+    steps = _step_state(store, now)
+    if steps.get('level') == 'pause':
+        return dict(stop=True, source='steps', wait=max(1, int(steps.get('wait') or 60)),
+                    reason='all chats paused: ' + str(steps.get('reason') or 'step limit'))
     if purpose == 'worker':
         # The burst guard only slows coworkers (B42): level pause stops coworker tools, never the Main.
         burst = burst_state(store, now)
@@ -359,7 +365,8 @@ def limit_stop_text(wait, source='6h'):
         minutes = max(0, int(wait or 0)) // 60 + 1
     except (TypeError, ValueError):
         minutes = 1
-    why = 'coworker burst pause, very high usage' if source == 'burst' else '6 h token budget used up'
+    why = {'burst': 'coworker burst pause, very high usage',
+           'steps': 'step limit or Notion rate limit, all chats pause'}.get(source, '6 h token budget used up')
     return (LIMIT_STOP_PREFIX + ' hard usage limit reached (%s). Stop now, do no further work and tell '
             'the user that the usage limit is reached. It resets in about %d min. Read-only tools still work.'
             % (why, minutes))
@@ -390,6 +397,14 @@ def _rate_add(store, now, tokens, purpose, turn):
         store.put(RATE_KIND, record)
     except Exception:
         pass
+
+
+def _step_state(store, now=None):
+    try:
+        from . import step_guard
+        return step_guard.state(store, now)
+    except Exception:
+        return {}
 
 
 def burst_limits(store):
@@ -427,14 +442,23 @@ def burst_state(store, now=None):
         reason = 'high usage: %.1fM in 15 min, %d coworker turns in 5 min' % (t15 / 1e6, turns5)
         last = float(record.get('last_worker_turn') or 0)
         wait = max(0, int(lim['burst_spacing_s'] - (now - last)))
+    steps = _step_state(store, now)  # steps x context of ALL chats: what Notion's fair-use limit counts
+    if steps.get('level') == 'pause' and level != 'pause':
+        level, reason, wait = 'pause', str(steps.get('reason') or ''), max(wait, int(steps.get('wait') or 60))
+    elif steps.get('level') == 'throttle' and level == 'ok':
+        level, reason = 'throttle', str(steps.get('reason') or '')
+        last = float(record.get('last_worker_turn') or 0)
+        wait = max(0, int(lim['burst_spacing_s'] - (now - last)))
     return dict(level=level, reason=reason, wait=wait, tokens_15m=t15, tokens_60m=t60,
-                coworker_turns_5m=turns5, limits=lim)
+                coworker_turns_5m=turns5, limits=lim, steps=steps)
 
 
 def refuse_if_burst(store, worker, now=None):
     """Raise RateLimited (nothing sent) for a coworker turn while usage is too high for a short time."""
     if (worker or {}).get('purpose') != 'worker':
         return
+    from . import step_guard
+    step_guard.refuse_start(store, worker, now)  # step pause, max parallel turns, start spacing
     state = burst_state(store, now)
     if state['level'] == 'ok' or (state['level'] == 'throttle' and not state['wait']):
         return
@@ -468,4 +492,5 @@ def public(store, now=None):
                 resets_in=max(0, int(start + WINDOW_SECONDS - now)), blocked=used >= cap,
                 main_tokens=sum(int(r.get('tokens') or 0) for r in rows if r.get('purpose') != 'worker'),
                 coworker_tokens=sum(int(r.get('tokens') or 0) for r in rows if r.get('purpose') == 'worker'),
-                by_worker=rows[:40], history=history, estimate=True, burst=burst_state(store, now))
+                by_worker=rows[:40], history=history, estimate=True, burst=burst_state(store, now),
+                steps=_step_state(store, now))
