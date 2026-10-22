@@ -286,6 +286,24 @@ TOOLS_FIRST = ('Before anything else: load your NotionTool tools now (connect to
                'what failed.\n\n')
 
 
+# Owner wish (22 Oct 2026): coworkers report weaknesses and optimisations of NotionTool itself; the engine
+# collects every 'NotionTool note:' line (event coworker_note) and the Main reports them at the end.
+NOTES_HINT = ('\nIf you noticed a real weakness or a concrete improvement of NotionTool itself (tools, prompts, '
+              'speed, tokens, reliability, UI), add it at the very end as one line per point starting with '
+              '"NotionTool note:". Skip this when nothing stood out.')
+NOTE_RE = re.compile(r'^[\s>*\-]*NotionTool note:\s*(.+)$', re.I | re.M)
+
+
+def notes_from(text, limit=5):
+    """The 'NotionTool note:' lines of a coworker reply (at most limit, each up to 400 chars)."""
+    seen = []
+    for match in NOTE_RE.finditer(str(text or '')):
+        note = match.group(1).strip()[:400]
+        if note and note not in seen:
+            seen.append(note)
+    return seen[:limit]
+
+
 def tools_first(task, run, tools_available):
     """True when the turn needs project tools, so the tool load must be the first thing in the message."""
     if not tools_available or run.get('allocation', {}).get('mode') == 'direct':
@@ -310,7 +328,7 @@ def _prompt_body(task,run,context,token,tools_available):
     if run.get('allocation',{}).get('mode')=='direct':
         return goal+memory+'\nReply naturally in my language.'
     if task.get('stage_role')=='design':
-        return 'I would like a design for this request before it is built:\n'+goal+'\n'+task['prompt']+memory+project+adviser_tools
+        return 'I would like a design for this request before it is built:\n'+goal+'\n'+task['prompt']+memory+project+adviser_tools+NOTES_HINT
     if task['role'] in ('architect','researcher','quality_planner'):
         angle={'architect':'a clear method and useful independent parts','researcher':'facts, calculations and practical constraints',
                'quality_planner':'specific checks and possible mistakes'}[task['role']]
@@ -325,4 +343,4 @@ def _prompt_body(task,run,context,token,tools_available):
         return 'Please check these completed results against my request:\n'+goal+focus+reference+project+tools+screen_tools+READ_FULL_HINT+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='integrator':
         return 'Please combine these checked results into a complete answer to my request:\n'+goal+reference+memory+screen_tools+'\nUse my language. State what was actually checked and any remaining limitations.'
-    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+_result_file_hint(task,run,tools_available and bool(tools))+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'
+    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+_result_file_hint(task,run,tools_available and bool(tools))+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'+NOTES_HINT

@@ -29,8 +29,9 @@ def _blocks(run):
         found.append('\nFor reference, our completed earlier work:\n' + memory + '\n')
     found += [GUARD_RULE, COWORKER_RULE]
     try:
-        from .plain_protocol import SCREEN_TOOLS_LINE
+        from .plain_protocol import SCREEN_TOOLS_LINE, NOTES_HINT
         found.append(SCREEN_TOOLS_LINE)
+        found.append(NOTES_HINT)  # asked once per chat; the NOTE line says earlier rules stay valid
     except Exception:
         pass
     return [b for b in found if b and len(b.strip()) >= MIN_CHARS]

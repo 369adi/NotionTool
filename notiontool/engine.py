@@ -1865,6 +1865,10 @@ class Engine:
                     self._no_tool_access(task, info['worker_id'])
                 elif task['state'] == 'done':
                     self._tool_access_ok(info['worker_id'])
+                for note in plain_protocol.notes_from(text):
+                    # Owner wish: every weakness/optimisation a coworker notices is kept for the Main's final report.
+                    self.store.event('coworker_note', task['run_id'], commit=False, task_id=task['id'],
+                                     worker_id=info['worker_id'], message=note)
             if task.get('paused_by') == LIMIT_PAUSED_BY:
                 self._limit_charge_reply(task, info, text)
             task['finished'] = time.time()
