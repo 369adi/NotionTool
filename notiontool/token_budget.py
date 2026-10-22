@@ -42,8 +42,22 @@ def _record(store, start):
                                           used=0, input=0, output=0, turns=0, by_worker={})
 
 
-def charge(store, worker, input_tokens=0, output_tokens=0, turn=False, now=None):
-    """Add tokens to the current window. Never raises (bookkeeping must not break a turn)."""
+def charge(store, worker, input_tokens=0, output_tokens=0, turn=False, now=None, *,
+           task_id=None, role=None, model=None):
+    """Add tokens to the current window. Never raises (bookkeeping must not break a turn).
+
+    task_id, role and model are optional and only feed the token ledger (see ledger_add); they
+    never change the window totals, the rolling burst ledger or any limit check.
+    """
+    record = _charge_totals(store, worker, input_tokens, output_tokens, turn, now)
+    if record is not None:
+        ledger_add(store, worker, record, input_tokens, output_tokens, turn, now,
+                   task_id=task_id, role=role, model=model)
+    return record
+
+
+def _charge_totals(store, worker, input_tokens=0, output_tokens=0, turn=False, now=None):
+    """The unchanged totals bookkeeping of charge (window record + rolling burst ledger)."""
     try:
         now = time.time() if now is None else now
         worker = worker or {}
@@ -82,7 +96,7 @@ def context_cap(store):
     return max(10_000, value)
 
 
-def charge_send(store, worker, prompt, now=None):
+def charge_send(store, worker, prompt, now=None, *, task_id=None, role=None, model=None):
     """One sent turn: Notion reads the whole chat context again plus the new prompt."""
     context = 0
     try:
@@ -90,11 +104,109 @@ def charge_send(store, worker, prompt, now=None):
     except (TypeError, ValueError, AttributeError):
         context = 0
     context = min(context, context_cap(store))
-    return charge(store, worker, context + tokens_of(prompt), 0, turn=True, now=now)
+    return charge(store, worker, context + tokens_of(prompt), 0, turn=True, now=now,
+                  task_id=task_id, role=role, model=model)
 
 
-def charge_reply(store, worker, text, now=None):
-    return charge(store, worker, 0, tokens_of(text), now=now)
+def charge_reply(store, worker, text, now=None, *, task_id=None, role=None, model=None):
+    return charge(store, worker, 0, tokens_of(text), now=now, task_id=task_id, role=role, model=model)
+
+
+# ---- Token ledger (who used the tokens: task, role, model) ------------------------------------
+# Setting token_ledger_enabled (default True). Every charge also adds its tokens to an hourly
+# bucket of record kind 'token_ledger' in the existing objects table (no new file, no schema
+# change). The ledger is pure reporting: it is written after the totals, never read by
+# exhausted / refuse_if_exhausted / burst_state, and any error in it is swallowed.
+LEDGER_KIND = 'token_ledger'
+LEDGER_BUCKET_SECONDS = 3600
+LEDGER_KEY_SEP = '\x1f'
+LEDGER_NONE = '(none)'
+
+
+def ledger_enabled(store):
+    try:
+        value = (store.settings() or {}).get('token_ledger_enabled', True)
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ('0', 'false', 'off', 'no', '')
+    return bool(value) if value is not None else True
+
+
+def _ledger_label(value):
+    value = str(value or '').strip()
+    return value[:80] if value else LEDGER_NONE
+
+
+def ledger_add(store, worker, record, input_tokens=0, output_tokens=0, turn=False, now=None, *,
+               task_id=None, role=None, model=None):
+    """Add one charge to the token ledger. Never raises; does nothing when the setting is off.
+
+    Explicit task_id / role / model win; otherwise the worker's own 'task_id', 'role' (or its
+    purpose) and 'model' fields are used when present, so old callers still get useful rows.
+    """
+    try:
+        if not ledger_enabled(store):
+            return None
+        worker = worker if isinstance(worker, dict) else {}
+        now = float((record or {}).get('updated') or (time.time() if now is None else now))
+        inp, out = max(0, int(input_tokens or 0)), max(0, int(output_tokens or 0))
+        task = _ledger_label(task_id if task_id is not None else worker.get('task_id'))
+        who = _ledger_label(role if role is not None else (worker.get('role') or worker.get('purpose')))
+        mod = _ledger_label(model if model is not None else worker.get('model'))
+        start = int(now // LEDGER_BUCKET_SECONDS) * LEDGER_BUCKET_SECONDS
+        with store.lock:
+            bucket = store.get(LEDGER_KIND, str(start)) or dict(id=str(start), start=start,
+                                                               end=start + LEDGER_BUCKET_SECONDS, rows={})
+            key = LEDGER_KEY_SEP.join((task, who, mod))
+            row = bucket['rows'].setdefault(key, dict(task_id=task, role=who, model=mod,
+                                                      input=0, output=0, tokens=0, turns=0))
+            row['input'] += inp
+            row['output'] += out
+            row['tokens'] += inp + out
+            row['turns'] += 1 if turn else 0
+            bucket['updated'] = now
+            store.put(LEDGER_KIND, bucket)
+        return row
+    except Exception:
+        return None
+
+
+def _ledger_sum(target, key, row):
+    total = target.setdefault(key, dict(input=0, output=0, tokens=0, turns=0))
+    for name in ('input', 'output', 'tokens', 'turns'):
+        total[name] += int(row.get(name) or 0)
+    return total
+
+
+def usage_by_task(store, since=None):
+    """Ledger totals grouped by task, by role and by model (read-only, no side effects).
+
+    since (epoch seconds) keeps the hourly buckets that end after it, so the cut is per hour.
+    by_task rows also carry by_role and by_model for that task.
+    """
+    out = dict(by_task={}, by_role={}, by_model={}, total=dict(input=0, output=0, tokens=0, turns=0),
+               since=since, bucket_seconds=LEDGER_BUCKET_SECONDS, estimate=True)
+    try:
+        buckets = store.all(LEDGER_KIND) or []
+    except Exception:
+        return out
+    for bucket in buckets:
+        try:
+            if since is not None and float(bucket.get('end') or 0) <= float(since):
+                continue
+            for row in (bucket.get('rows') or {}).values():
+                task = row.get('task_id') or LEDGER_NONE
+                item = _ledger_sum(out['by_task'], task, row)
+                _ledger_sum(item.setdefault('by_role', {}), row.get('role') or LEDGER_NONE, row)
+                _ledger_sum(item.setdefault('by_model', {}), row.get('model') or LEDGER_NONE, row)
+                _ledger_sum(out['by_role'], row.get('role') or LEDGER_NONE, row)
+                _ledger_sum(out['by_model'], row.get('model') or LEDGER_NONE, row)
+                for name in ('input', 'output', 'tokens', 'turns'):
+                    out['total'][name] += int(row.get(name) or 0)
+        except Exception:
+            continue
+    return out
 
 
 def exhausted(store, now=None):
