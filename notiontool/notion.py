@@ -31,7 +31,7 @@ def pending_tool_label(entity):
     return match.group(0) if match else str(entity.get('name') or 'a tool call')[:80]
 
 
-APPROVAL_WAIT_SECONDS = 90  # a tool call pending this long really waits for a click
+APPROVAL_WAIT_SECONDS = 90  # kept for importers only: no timer decides the approval label any more (H5, approval_evidence)
 REMOTE_QUIET_SECONDS = 600  # B46: a running turn without a new step for this long counts as stalled, not working
 
 class ThreadMissing(ValueError):
@@ -78,6 +78,10 @@ EMPTY_PROOF_STATUSES = ('idle',)  # 'completed' is unproven as a session status 
 APPROVAL_STATUSES = ('awaiting_approval', 'needs_approval', 'requires_approval', 'waiting_for_approval',
                      'awaiting_confirmation', 'needs_confirmation', 'requires_confirmation')
 PENDING_TOOL_TEXT = 'A tool call in the coworker chat has not finished yet'
+# H5: honest labels for a pending tool call; only explicit evidence in the entry says 'approval'.
+APPROVAL_WAIT_TEXT = 'waiting for approval'
+TOOL_RUNNING_TEXT = 'tool running, no result yet'
+TOOL_NOT_STARTED_TEXT = 'tool not started'
 
 
 def session_state(transcript):
@@ -95,8 +99,13 @@ def record_state(thread):
     """Same vocabulary for a thread record: 'running', 'finished' or 'unknown' (no record)."""
     if not isinstance(thread, dict) or not thread:
         return 'unknown'
-    latest = thread.get('latest_user_or_trigger_time') or 0
-    done = (thread.get('last_turn_outcome') or {}).get('completed_time') or 0
+    data = thread.get('data') if isinstance(thread.get('data'), dict) else {}
+    outcome = data.get('last_turn_outcome') or thread.get('last_turn_outcome') or {}
+    try:
+        latest = float(thread.get('latest_user_or_trigger_time') or data.get('latest_user_or_trigger_time') or 0)
+        done = float(outcome.get('completed_time') or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 'unknown'  # an unreadable record proves nothing
     return 'running' if latest > done else 'finished'
 
 
@@ -113,6 +122,21 @@ def approval_evidence(entity):
         return True
     keys = ('requires_approval', 'needs_approval', 'awaiting_approval', 'requires_confirmation')
     return any(src.get(key) is True for src in (entity, payload) for key in keys)
+
+
+def tool_waiting(entity):
+    """True for a tool call of the own turn that has no result yet (pending, or an explicit approval wait)."""
+    return str(entity.get('interaction_status') or '').lower() == 'pending' or approval_evidence(entity)
+
+
+def pending_tool_state(entity):
+    """Honest label of a pending tool call (H5): approval only with evidence, never guessed from time."""
+    if approval_evidence(entity):
+        return APPROVAL_WAIT_TEXT
+    payload = entity.get('payload') if isinstance(entity.get('payload'), dict) else {}
+    if any(src.get(key) for src in (entity, payload) for key in ('started_at', 'startedAt')):
+        return TOOL_RUNNING_TEXT
+    return TOOL_NOT_STARTED_TEXT
 
 
 def turn_state(transcript, task, resumes=()):
@@ -163,7 +187,7 @@ def turn_state(transcript, task, resumes=()):
             return dict(out, state='unknown', reason='session status missing')
         return dict(out, state='running', reason='session pending' if transcript.get('session_pending') else
                     'session status %s' % session.get('status'))
-    if any(e.get('interaction_status') == 'pending' for e in own_turn):
+    if any(tool_waiting(e) for e in own_turn):
         return dict(out, state='tool_pending', reason=PENDING_TOOL_TEXT)
     if any('error' in str(e.get('kind') or e.get('type') or '').lower() for e in own_turn):
         return dict(out, state='done_error', reason='own turn has an error step and no reply')
@@ -1743,7 +1767,7 @@ class NotionAdapter:
         # Only the chat that ran this task may confirm it; never read another chat's transcript.
         thread_id = str(task.get('thread_id') or '')
         if not thread_id:
-            raise PendingRemote()
+            raise PendingRemote(state='unknown', reason='task has no chat id')
         if prefetch is True:
             prefetch = self._prefetch_thread(worker) if worker.get('thread_id') == thread_id and worker.get('account_id') else None
         _rt_wall, _rt0 = time.time(), time.monotonic()
@@ -1756,7 +1780,7 @@ class NotionAdapter:
             # B46: a failed read was silently swallowed, so a finished coworker could stay 'uncertain' forever.
             transcript = self.recover_native(worker, thread_id, limit or self.RECOVER_WINDOW, task, exc)
             if transcript is None:
-                raise PendingRemote() from None
+                raise PendingRemote(state='unknown', reason='transcript read failed') from None
         from .chat_context import ChatContext
         observed_worker = dict(worker, thread_id=thread_id)
         _rt1 = time.monotonic()
@@ -1893,21 +1917,32 @@ class NotionAdapter:
         Notion ends the stream and keeps the turn open until someone approves; without this the task
         looked like an unconfirmed completion and silently blocked its run.
         """
-        pending = [e for e in own_turn if e.get('interaction_status') == 'pending']
+        pending = [e for e in own_turn if tool_waiting(e)]
         stored = self.store.get('tasks', task.get('id', ''), {}) or {}
         if not pending:
-            if stored.get('awaiting_approval') or stored.get('approval_seen'):
-                self.mark_task(task['id'], awaiting_approval='', approval_seen=None)  # the turn moved on
+            if stored.get('awaiting_approval') or stored.get('approval_seen') or stored.get('pending_tool'):
+                self.mark_task(task['id'], awaiting_approval='', approval_seen=None, approval_evidence=False,
+                               pending_tool='', pending_tool_state='')  # the turn moved on
             return None
         entity = max(pending, key=lambda e: e.get('sequence', 0))
         label = pending_tool_label(entity)
-        # Auto-run tools are 'pending' for a moment too: only a call that stays pending is a real approval wait.
+        # H5: the honest state (approval only with evidence) is stored and shown; the engine treats a task as
+        # an approval wait only when approval_evidence is True.
+        evidence, state = approval_evidence(entity), pending_tool_state(entity)
         key = str(entity.get('id') or entity.get('sequence') or label)
         seen = stored.get('approval_seen') or {}
         if seen.get('key') != key:
-            self.mark_task(task['id'], approval_seen={'key': key, 'at': time.time()})
-            return None
-        if time.time() - float(seen.get('at') or 0) < APPROVAL_WAIT_SECONDS:
+            self.mark_task(task['id'], approval_seen={'key': key, 'at': time.time()}, pending_tool=label,
+                           pending_tool_state=state, approval_evidence=evidence)
+            self.store.event('turn_tool_pending', task.get('run_id', ''), task_id=task.get('id', ''), tool=label,
+                             state=state, message=PENDING_TOOL_TEXT + ' (' + label + ': ' + state +
+                             '); the request is not resent.')
+            if not evidence:
+                return None
+        elif stored.get('pending_tool_state') != state or bool(stored.get('approval_evidence')) != evidence:
+            self.mark_task(task['id'], pending_tool=label, pending_tool_state=state, approval_evidence=evidence)
+        # Auto-run tools are 'pending' for a moment too: without evidence only a call that stays pending gets the label.
+        if not evidence and time.time() - float(seen.get('at') or 0) < APPROVAL_WAIT_SECONDS:
             return None
         if stored.get('awaiting_approval') != label:
             self.mark_task(task['id'], awaiting_approval=label, awaiting_approval_at=time.time())
@@ -1960,9 +1995,8 @@ class NotionAdapter:
         """
         client = self.client(worker['account_id'])
         transcript = client.transcript(worker['thread_id'], limit=10)
-        session = transcript.get('session') or {}
-        if transcript.get('session_pending') or session.get('status') not in (None, 'idle', 'completed'):
-            return False
+        if session_state(transcript) == 'running':
+            return False  # shared rule; a missing status stays allowed here as before (the chat is read again below)
         account = self.store.get('accounts', worker['account_id']) or {}
         model = (task or {}).get('assigned_model_id')
         if not model and (task or {}).get('model'):
@@ -2000,7 +2034,7 @@ class NotionAdapter:
         try:
             latest, done, _status = self.turn_outcome(client, thread_id)
         except Exception:
-            return False  # The session checks still apply when the record cannot be read.
+            return None  # unknown, never 'finished': callers treat None as not proven idle; session checks still apply
         # A turn without an outcome for longer than the task timeout counts as abandoned.
         limit = window if window is not None else self.store.settings()['task_timeout']
         return latest > done and time.time() * 1000 - latest < limit * 1000

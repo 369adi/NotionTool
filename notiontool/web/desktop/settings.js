@@ -49,7 +49,7 @@
       desc: 'MCP servers Notion can use through NotionTool, their tools and remote access.' }
   ];
   var SECTION_OF_KEY = {
-    main_auto_continue: 'general', turn_watch: 'general', main_context_policy: 'general', app_chat_filter: 'general',
+    main_auto_continue: 'general', auto_continue_on_done: 'general', turn_watch: 'general', main_context_policy: 'general', app_chat_filter: 'general',
     token_budget_6h: 'team', burst_soft_15m: 'team', burst_hard_15m: 'team', burst_hard_60m: 'team', burst_turns_5m: 'team', burst_spacing_s: 'team',
     max_workers: 'team', per_account: 'team', max_runs_per_chat: 'team', coworker_fresh_context: 'team',
     coworker_delete_old_chat: 'team', coworker_max_age_hours: 'team',

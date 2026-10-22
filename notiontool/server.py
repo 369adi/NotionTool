@@ -1283,7 +1283,7 @@ class Application:
                 for key in ('harness_enabled', 'mcp_full_access', 'mcp_browser_access',
                             'automatic_setup', 'background_remote', 'bridge_auto',
                             'remote_mcp_enabled', 'advertise_project_tools',
-                            'turn_watch', 'main_auto_continue', 'idle_mode', 'api_run_compact') + LOCAL_SETTINGS:
+                            'turn_watch', 'main_auto_continue', 'auto_continue_on_done', 'idle_mode', 'api_run_compact') + LOCAL_SETTINGS:
                     if key in body:
                         settings[key] = str(body[key]).lower() in ('true', '1', 'on', 'yes')
                 if 'browser_path' in body:

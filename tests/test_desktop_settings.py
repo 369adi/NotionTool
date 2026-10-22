@@ -14,7 +14,7 @@ SERVER_CLAMPS = {'max_workers': (1, 40), 'per_account': (1, 40), 'coworker_max_a
                  'token_budget_6h': (1000000, 500000000), 'burst_soft_15m': (100000, 100000000),
                  'burst_hard_15m': (100000, 200000000), 'burst_hard_60m': (100000, 500000000),
                  'burst_turns_5m': (5, 1000), 'burst_spacing_s': (1, 600)}
-SERVER_BOOLS = {'coworker_delete_old_chat', 'main_auto_continue', 'turn_watch'}
+SERVER_BOOLS = {'coworker_delete_old_chat', 'main_auto_continue', 'turn_watch', 'auto_continue_on_done'}
 SERVER_CHOICES = {'coworker_fresh_context': ['threshold', 'every_task'], 'main_context_policy': ['hint', 'auto', 'ask']}
 
 
