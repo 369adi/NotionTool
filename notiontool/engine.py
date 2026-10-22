@@ -1793,18 +1793,34 @@ class Engine:
                 worker.pop('heal_step', None)
             self.store.put('workers', worker)
 
+    NO_ACCESS_STRIKES = 2  # Notion AI often skips the tool load once; only a repeat means the chat really lacks it
+
     def _no_tool_access(self, task, worker_id):
-        """A coworker reported it cannot reach the project at all: take its chat out of the pool and give the
-        task once more to another coworker (the reply changed nothing, so the retry is safe)."""
+        """A coworker reported it cannot reach the project. First time: keep the chat and retry (every prompt
+        now opens with 'load your NotionTool tools'). Second time in a row: take its chat out of the pool.
+        The reply changed nothing, so the retry is safe."""
         worker = self.store.get('workers', worker_id)
+        removed = False
         if worker and worker.get('purpose') == 'worker':
-            worker.update(enabled=False, tool_access_lost=time.time())
+            strikes = int(worker.get('no_access_strikes') or 0) + 1
+            worker['no_access_strikes'] = strikes
+            if strikes >= self.NO_ACCESS_STRIKES:
+                worker.update(enabled=False, tool_access_lost=time.time())
+                removed = True
             self.store.put('workers', worker)
         self.store.event('coworker_no_tool_access', task['run_id'], commit=False, task_id=task['id'], worker_id=worker_id,
-                         message='The coworker reported no access to the project; its chat is taken out of the pool')
+                         message=('The coworker again reported no access to the project; its chat is taken out of the pool'
+                                  if removed else 'The coworker did not load its tools; the task is tried again'))
         if not task.get('no_access_retried'):
             task.update(no_access_retried=True, state='retry', next_at=time.time(), error='')
             task['attempts'] = max(0, task.get('attempts', 1) - 1)
+
+    def _tool_access_ok(self, worker_id):
+        """A finished task proves the chat has its tools: forget earlier 'no access' strikes."""
+        worker = self.store.get('workers', worker_id)
+        if worker and worker.get('no_access_strikes'):
+            worker['no_access_strikes'] = 0
+            self.store.put('workers', worker)
 
     def _complete(self, future, info):
         task = self.store.get('tasks', info['task_id'])
@@ -1847,6 +1863,8 @@ class Engine:
                 task['error'] = data.get('summary', '') if task['state'] != 'done' else ''
                 if task['role'] == 'executor' and reports_no_tool_access(data.get('summary', '')):
                     self._no_tool_access(task, info['worker_id'])
+                elif task['state'] == 'done':
+                    self._tool_access_ok(info['worker_id'])
             if task.get('paused_by') == LIMIT_PAUSED_BY:
                 self._limit_charge_reply(task, info, text)
             task['finished'] = time.time()

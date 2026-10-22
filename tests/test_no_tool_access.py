@@ -36,18 +36,36 @@ def _engine(store):
     return engine
 
 
-def test_worker_leaves_the_pool_and_task_retries_once():
+def test_first_miss_keeps_the_chat_and_retries_the_task():
     store = _Store({'w1': {'id': 'w1', 'purpose': 'worker', 'enabled': True}})
     engine = _engine(store)
     task = {'id': 't1', 'run_id': 'r1', 'state': 'done', 'attempts': 1}
     engine._no_tool_access(task, 'w1')
-    assert store.workers['w1']['enabled'] is False
-    assert store.workers['w1']['tool_access_lost']
+    assert store.workers['w1']['enabled'] is True  # Notion AI often just skipped the tool load once
+    assert store.workers['w1']['no_access_strikes'] == 1
     assert task['state'] == 'retry' and task['attempts'] == 0
     assert store.events == ['coworker_no_tool_access']
+
+
+def test_second_miss_in_a_row_takes_the_chat_out():
+    store = _Store({'w1': {'id': 'w1', 'purpose': 'worker', 'enabled': True}})
+    engine = _engine(store)
+    task = {'id': 't1', 'run_id': 'r1', 'state': 'done', 'attempts': 1}
+    engine._no_tool_access(task, 'w1')
     task['state'] = 'done'
     engine._no_tool_access(task, 'w1')
-    assert task['state'] == 'done'  # second time: no endless loop
+    assert store.workers['w1']['enabled'] is False
+    assert store.workers['w1']['tool_access_lost']
+    assert task['state'] == 'done'  # the task itself is retried only once: no endless loop
+
+
+def test_success_clears_the_strikes():
+    store = _Store({'w1': {'id': 'w1', 'purpose': 'worker', 'enabled': True, 'no_access_strikes': 1}})
+    engine = _engine(store)
+    engine._tool_access_ok('w1')
+    assert store.workers['w1']['no_access_strikes'] == 0
+    engine._no_tool_access({'id': 't2', 'run_id': 'r1', 'state': 'done', 'attempts': 1}, 'w1')
+    assert store.workers['w1']['enabled'] is True
 
 
 def test_main_chat_is_never_disabled():
