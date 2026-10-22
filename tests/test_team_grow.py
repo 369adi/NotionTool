@@ -177,7 +177,8 @@ class TeamGrowTests(unittest.TestCase):
                                tick=lambda: None, team_grower=grower, store=Mock())
         Engine._loop(fake)
         self.assertEqual(grower.maybe_check.call_count, 2)
-        fake.store.event.assert_called_once_with('team_grow_check_failed', message='RuntimeError')
+        # Name and text: the bare type name hid the missing chat_pool.name_coworkers (live 22 Oct).
+        fake.store.event.assert_called_once_with('team_grow_check_failed', message='RuntimeError: x')
 
     def test_state_team_from_application(self):
         self.assertIsNone(Application.team_state(SimpleNamespace()))

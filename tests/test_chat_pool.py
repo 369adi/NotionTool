@@ -110,13 +110,11 @@ class AdapterPool(unittest.TestCase):
         self.a.apply_chat_pool('r', self.client)
         res = name_coworkers(self.a, self.client, 'r', None, now=1000.0)
         w = lambda i: self.store.get('workers', 'r:' + T(i))
-        # Legacy 'Cowork joined' migrated, joined Welcome named; the pool-admitted pending slot T(2) is
-        # managed and named as well (cowork_names.rename_plan, Fix 1). NotionTool and Main untouched.
-        self.assertEqual(sorted(self.client.renamed),
-                         sorted([(T(1), 'Coworker 1'), (T(2), 'Coworker 2'), (T(4), 'Coworker 3')]))
+        # Legacy 'Cowork joined' migrated, joined Welcome named; not-joined, NotionTool and Main untouched.
+        self.assertEqual(sorted(self.client.renamed), sorted([(T(1), 'Coworker 1'), (T(4), 'Coworker 3')]))
         self.assertEqual((w(1)['label'], w(1)['harness_title']), ('Coworker 1', 'Coworker 1'))
         self.assertEqual(w(4)['label'], 'Coworker 3')
-        self.assertEqual((w(2)['label'], w(3)['label'], w(5)['label']), ('Coworker 2', 'NotionTool', 'Main'))
+        self.assertEqual((w(2)['label'], w(3)['label'], w(5)['label']), ('Cowork joined', 'NotionTool', 'Main'))
         self.assertEqual(self.store.get('accounts', 'r')['cowork_numbers'], res['numbers'])
         self.assertIn('coworker_renamed', self.store.events)
         # Next pass: nothing left to do (no loop).
@@ -139,7 +137,7 @@ class AdapterPool(unittest.TestCase):
         name_coworkers(self.a, self.client, 'r', None, now=1500.0)
         self.assertEqual(calls, [])  # still backing off
         name_coworkers(self.a, self.client, 'r', None, now=1901.0)
-        self.assertEqual(sorted(calls), sorted([T(1), T(2), T(4)]))
+        self.assertEqual(sorted(calls), sorted([T(1), T(4)]))
 
     def test_budget_paused_no_calls(self):
         self.a.apply_chat_pool('r', self.client)

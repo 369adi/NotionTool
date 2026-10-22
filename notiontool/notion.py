@@ -725,14 +725,35 @@ class NotionAdapter:
                 continue
             if thread.get('guessed') and tid not in existing:
                 continue  # a guessed id may be the user's own chat: never register it as a worker
-            worker = existing.get(tid) or dict(id=account_id+':'+tid,account_id=account_id,thread_id=tid,
-                purpose='worker',enabled=False,state='ready',lease='',last_used=0)
-            worker['label'] = thread.get('title') or (worker.get('label') if thread.get('guessed') else '') or 'Untitled chat'
-            if worker['state'] in ('missing','error') and not worker.get('lease'):
-                worker['state'] = 'ready'
-            self.store.put('workers',worker)
+            with self.store.lock:
+                # Re-read under the lock: client.threads() is slow, and a context switch may have moved this
+                # worker to a new chat meanwhile. Writing the old snapshot back reverted Coworker 9 to its
+                # deleted chat (live bug 22 Oct 04:42) and left the new chat as an unnamed Welcome chat.
+                worker = existing.get(tid)
+                if worker:
+                    worker = self.store.get('workers', worker['id']) or worker
+                    if worker.get('thread_id') != tid:
+                        continue
+                else:
+                    # A worker moved to this chat after the snapshot (context switch) owns it; never add a
+                    # second, unnamed 'Welcome to Notion' worker record for the same chat.
+                    worker = next((w for w in self.store.all('workers') if w.get('account_id') == account_id
+                                   and w.get('thread_id') == tid), None)
+                worker = worker or dict(id=account_id+':'+tid,account_id=account_id,thread_id=tid,
+                    purpose='worker',enabled=False,state='ready',lease='',last_used=0)
+                worker['label'] = thread.get('title') or (worker.get('label') if thread.get('guessed') else '') or 'Untitled chat'
+                if worker['state'] in ('missing','error') and not worker.get('lease'):
+                    worker['state'] = 'ready'
+                self.store.put('workers',worker)
         for tid,worker in existing.items():
-            if tid not in seen and worker['state'] not in ('busy','recovering'):
+            if tid in seen:
+                continue
+            with self.store.lock:
+                worker = self.store.get('workers', worker['id'])
+                # Same stale-snapshot guard; a retired worker stays retired (no missing/retire loop every 3 min).
+                if (not worker or worker.get('thread_id') != tid or worker.get('state') in ('busy','recovering','retired')
+                        or worker.get('retired')):
+                    continue
                 worker.update(state='missing',enabled=False)
                 self.store.put('workers',worker)
         try:
@@ -1438,8 +1459,13 @@ class NotionAdapter:
                 extra = dict(detail=str(detail)[:200]) if detail else {}
                 self.store.event('remote_done', run_id, outcome=outcome, error_class=error_class, lines=lines,
                                  seconds=round(time.monotonic()-started, 3), **extra, **trace)
+        # The stream gets its own cancel: the stall watch may end a frozen stream without cancelling the task.
+        stream_cancel, stream_alive, last_chunk = threading.Event(), [True], [time.monotonic()]
+        threading.Thread(target=self._stall_watch, name='stream-stall-watch', daemon=True,
+                         args=(client, worker, cancel, stream_cancel, stream_alive, last_chunk, run_id, trace)).start()
         try:
-            for line in client.transport.stream('runInferenceTranscript',body,client.headers(),timeout=60,cancel=cancel):
+            for line in client.transport.stream('runInferenceTranscript',body,client.headers(),timeout=60,cancel=stream_cancel):
+                last_chunk[0] = time.monotonic()
                 if cancel.is_set() or time.monotonic()-started>task_limit(self.store.settings(), task):
                     raise PendingRemote()
                 if not str(line).strip():
@@ -1485,6 +1511,43 @@ class NotionAdapter:
         except PendingRemote:
             remote_done('unconfirmed', 'REMOTE_UNKNOWN')
             raise
+        finally:
+            stream_alive[0] = False
+
+    def _stall_watch(self, client, worker, cancel, stream_cancel, alive, last_chunk, run_id='', trace=None):
+        """A frozen Edge stream never yields again (live 22 Oct 05:42, Coworker 4): the turn was finished in Notion,
+        but the task waited forever and the Main was never woken. After a long silence this reads the chat itself;
+        only when its turn is over does it end the stream, so the normal reconcile reads our committed reply.
+        It never resends and never ends a running turn."""
+        trace = trace or {}
+        check_after = float(getattr(self, 'stream_stall_check_s', 120))
+        recheck = float(getattr(self, 'stream_stall_recheck_s', 60))
+        poll = float(getattr(self, 'stream_stall_poll_s', 1.0))
+        checked = 0.0
+        while alive[0] and not stream_cancel.is_set():
+            if cancel is not None and cancel.wait(poll):
+                stream_cancel.set()  # the task itself was cancelled: pass it on to the stream
+                return
+            if cancel is None:
+                time.sleep(poll)
+            now = time.monotonic()
+            if not alive[0] or now - last_chunk[0] < check_after or now - checked < recheck:
+                continue
+            checked = now
+            try:
+                transcript = client.transcript(worker['thread_id'], limit=30)
+                session = transcript.get('session') or {}
+                over = (not transcript.get('session_pending') and session.get('status') in (None, 'idle', 'completed')
+                        and not self.thread_busy(client, worker['thread_id']))
+            except Exception as exc:
+                self.store.event('stream_stall_check_failed', run_id,
+                                 message=(type(exc).__name__ + ': ' + str(exc))[:200], **trace)
+                continue
+            if over and alive[0]:
+                self.store.event('stream_stall_turn_done', run_id, idle_s=round(now - last_chunk[0], 1),
+                                 message='Stream frozen but the chat turn is over; reading the reply from the chat', **trace)
+                stream_cancel.set()
+                return
 
     def mark_task(self, task_id, **fields):
         # Persist telemetry timestamps on the task without touching its state.

@@ -272,7 +272,8 @@ class Engine:
                 try:
                     grower.maybe_check()
                 except Exception as exc:
-                    self.store.event('team_grow_check_failed', message=type(exc).__name__)
+                    # Name and text: 'ImportError' alone hid the missing chat_pool.name_coworkers for hours.
+                    self.store.event('team_grow_check_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
 
     def tasks(self, run_id):
         return [t for t in self.store.all('tasks') if t['run_id'] == run_id]
