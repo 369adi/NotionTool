@@ -261,6 +261,20 @@ def _request_route(route, tasks):
     return chosen or 'auto', notes
 
 
+def design_skip_reason(settings, plan_tasks, ui):
+    """Why the quality-high design task is skipped, or '' to keep it.
+
+    Setting skip_design_when_specified (default True): skipped only for non-UI work where every task already
+    names its files and has an acceptance text. UI work and the setting off keep the design task.
+    """
+    if not (settings or {}).get('skip_design_when_specified', True) or ui:
+        return ''
+    for t in plan_tasks:
+        if not [f for f in (t.get('files') or []) if str(f).strip()] or not str(t.get('acceptance') or '').strip():
+            return ''
+    return 'every task has files and acceptance and the work is not UI'
+
+
 def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality='', route=''):
     """Queue the operator's own plan as executor tasks for the Coworkers; no Main turn is ever sent.
 
@@ -376,20 +390,25 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
             if changed:
                 store.put('tasks', task)
         team_design = any(stage_role_of(t) == 'design' for t in plan['tasks'])
+        design_skipped = ''
         if quality == 'high' and not team_design:
             ui = is_ui(goal, plan['tasks'])
-            design = engine.add_task(run, 'architect', design_prompt(goal, plan['tasks'], ui),
-                                     'Design: visual spec' if ui else 'Design: approach',
-                                     specialty='designer' if ui else 'architect')
-            design.update(stage_role='design', read_only=True)  # no files: holds no lock
-            store.put('tasks', design)
-            for task in created:
-                task['deps'] = list(task['deps']) + [design['id']]  # its result is injected via the deps context
-                store.put('tasks', task)
-        run['stage'] = 'Designing' if quality == 'high' or team_design else 'Building'
+            design_skipped = design_skip_reason(settings, plan['tasks'], ui)
+            if not design_skipped:
+                design = engine.add_task(run, 'architect', design_prompt(goal, plan['tasks'], ui),
+                                         'Design: visual spec' if ui else 'Design: approach',
+                                         specialty='designer' if ui else 'architect')
+                design.update(stage_role='design', read_only=True)  # no files: holds no lock
+                store.put('tasks', design)
+                for task in created:
+                    task['deps'] = list(task['deps']) + [design['id']]  # its result is injected via the deps context
+                    store.put('tasks', task)
+        run['stage'] = 'Designing' if (quality == 'high' and not design_skipped) or team_design else 'Building'
         store.put('runs', run)
         store.message(chat['id'], 'user', goal, run['id'])
         store.event('run_created', run['id'], message='Operator delegated %d task(s)' % len(plan['tasks']))
+        if design_skipped:
+            store.event('design_skipped', run['id'], message=design_skipped)
         warnings = _warnings(store, chat, plan['tasks']) + notes
         if unmatched:
             warnings.append('Plan task(s) %s matched no created Coworker task: their summary, effort and team keys '
