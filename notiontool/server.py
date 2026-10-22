@@ -1696,3 +1696,42 @@ class Application:
                 self.store.put('accounts',fresh)
                 errors.append({'slot':account['slot'],'error':str(exc)[:250]})
         return dict(result,connected_accounts=connected,errors=errors)
+
+
+# ---- Usage by task/role/model and the compact run view (token savings) ----
+def usage_response(store):
+    """GET /api/usage: the existing report unchanged plus by_task, by_role and by_model from the token ledger."""
+    from .backup import usage_report
+    from . import token_budget
+    report = usage_report(store)
+    try:
+        ledger = token_budget.usage_by_task(store)
+    except Exception:
+        ledger = {}
+    report['by_task'] = ledger.get('by_task', {})
+    report['by_role'] = ledger.get('by_role', {})
+    report['by_model'] = ledger.get('by_model', {})
+    return report
+
+
+COMPACT_TASK_KEYS = ('id', 'title', 'role', 'state', 'stage', 'review_state', 'patch_state', 'model', 'worker_id', 'summary')
+
+
+def compact_run_response(engine, run):
+    """GET /api/run?compact=1: per task only the listed keys; no prompts, results, proofs or events."""
+    from .operator_main import plain_task_summary
+    from .operator_roles import stage_of
+    tasks = []
+    for t in engine.tasks(run['id']):
+        model = t.get('model')
+        if isinstance(model, dict):
+            model = model.get('name') or model.get('id')
+        try:
+            stage = stage_of(t)
+        except Exception:
+            stage = ''
+        tasks.append(dict(id=t.get('id', ''), title=t.get('title', ''), role=t.get('role', ''), state=t.get('state', ''),
+                          stage=stage, review_state=t.get('review_state', ''), patch_state=t.get('patch_state', ''),
+                          model=str(model or ''), worker_id=t.get('worker_id', ''),
+                          summary=' '.join(str(plain_task_summary(t) or '').split())[:200]))
+    return {'run': {k: run.get(k) for k in ('id', 'state', 'title', 'stage') if k in run}, 'tasks': tasks}
