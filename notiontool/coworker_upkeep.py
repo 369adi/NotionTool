@@ -31,6 +31,24 @@ def _coworker(worker):
                                                        or worker.get('was_coworker'))
 
 
+def trim_plan(workers, tasks, account_id, target, keep_threads=()):
+    """Worker ids above the target that may be deleted (owner 2026-10-22: at most 5 coworkers).
+
+    Only idle pool coworkers (no lease, no busy or queued task, not a ledger role) are candidates;
+    the user's own chats (_coworker False) are never touched. Newest first, at most MAX_NEW_PER_CYCLE."""
+    mine = [w for w in workers if w.get('account_id') == account_id and w.get('purpose') == 'worker'
+            and _coworker(w) and w.get('state') not in GONE]
+    extra = len(mine) - int(target)
+    if extra <= 0:
+        return []
+    held = {t.get('worker_id') for t in tasks if t.get('state') in BUSY_TASK_STATES + QUEUED_TASK_STATES}
+    keep = set(keep_threads or ())
+    free = [w for w in mine if not w.get('lease') and w['id'] not in held and w.get('thread_id') not in keep
+            and w.get('state') == 'ready']
+    free.sort(key=lambda w: -float(w.get('welcome_at') or w.get('created') or 0))
+    return [w['id'] for w in free[:min(extra, MAX_NEW_PER_CYCLE)]]
+
+
 def plan(workers, tasks, account_id, target, now):
     """Pure decision: {'mark': [ids], 'retire': [ids], 'requeue': [task ids], 'create': n, 'alive': n}."""
     mine = [w for w in workers if w.get('account_id') == account_id and w.get('purpose') == 'worker']
@@ -113,6 +131,7 @@ class CoworkerUpkeep:
                 t = self.store.get('tasks', ident)
                 t['worker_id'] = ''
                 self.store.put('tasks', t)
+        trimmed = self.trim(account, settings, target) if not decision['create'] else []
         created = 0
         if decision['create'] and now >= self.blocked_until:
             try:
@@ -125,7 +144,36 @@ class CoworkerUpkeep:
                 self.blocked_until = now + FAIL_BACKOFF
                 self.store.event('coworker_refill_failed', message=type(exc).__name__ + ': ' + str(exc)[:200])
         self.admit_refill_chats(account['id'])
-        return dict(decision, created=created)
+        return dict(decision, created=created, trimmed=trimmed)
+
+    def trim(self, account, settings, target):
+        """Delete idle pool coworkers above the target (setting coworker_trim, default on)."""
+        if not settings.get('coworker_trim', True):
+            return []
+        keep = [(item or {}).get('id') for item in (account.get('team_threads') or {}).values()]
+        with self.engine.lock:
+            ids = trim_plan(self.store.all('workers'), self.store.all('tasks'), account['id'], target, keep)
+        done = []
+        if not ids:
+            return done
+        try:
+            client = self.adapter.client(account['id'])
+        except Exception as exc:
+            self.store.event('coworker_trim_failed', message=type(exc).__name__ + ': ' + str(exc)[:200])
+            return done
+        for ident in ids:
+            w = self.store.get('workers', ident)
+            if not w:
+                continue
+            try:
+                self.adapter.delete_thread(client, w['thread_id'])
+                self.store.delete('workers', ident)
+                done.append(ident)
+            except Exception as exc:
+                self.store.event('coworker_trim_failed', worker_id=ident, message=type(exc).__name__ + ': ' + str(exc)[:200])
+        if done:
+            self.store.event('coworker_trim', message='Deleted %d idle coworker chat(s) above the target %d' % (len(done), target))
+        return done
 
     def admit_refill_chats(self, account_id):
         """Refill (provision) chats are pool coworkers too: give them pool_admitted so they get a 'Coworker N' name."""

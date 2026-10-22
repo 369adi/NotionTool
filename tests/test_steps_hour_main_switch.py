@@ -68,5 +68,45 @@ class UpkeepTargetTest(unittest.TestCase):
         self.assertEqual(out['create'], 0)
 
 
+class TrimTest(unittest.TestCase):
+    def test_trim_plan_only_idle_extras(self):
+        from notiontool import coworker_upkeep as cu
+        from tests import test_coworker_upkeep as tcu
+        ws = [tcu.w('c%d' % i, welcome_at=i) for i in range(7)]
+        ws.append(tcu.w('own', welcome=False, enabled=False))  # the user's own chat never counts or goes
+        ws[6]['lease'] = 'x'  # leased: kept
+        tasks = [dict(id='t', worker_id='c5', state='queued')]  # has a task: kept
+        ids = cu.trim_plan(ws, tasks, tcu.ACC, 5, keep_threads=['c4'])  # ledger role: kept
+        self.assertEqual(ids, ['c3', 'c2'])
+        self.assertEqual(cu.trim_plan(ws[:5], [], tcu.ACC, 5), [])
+
+    def test_once_deletes_extras(self):
+        from notiontool import coworker_upkeep as cu
+        from tests import test_coworker_upkeep as tcu
+
+        class Store5(tcu.Store):
+            def settings(self):
+                return {'harness_account_id': tcu.ACC, 'per_account': 5}
+
+            def delete(self, kind, ident):
+                self.data[kind].pop(ident, None)
+
+        class Adapter5(tcu.Adapter):
+            deleted = []
+
+            def client(self, account_id):
+                return 'client'
+
+            def delete_thread(self, client, thread_id):
+                self.deleted.append(thread_id)
+
+        store = Store5([tcu.w('c%d' % i, welcome_at=i) for i in range(7)])
+        adapter = Adapter5()
+        out = cu.CoworkerUpkeep(store, adapter, tcu.Engine(), clock=lambda: 1000.0).once()
+        self.assertEqual(sorted(out['trimmed']), ['c5', 'c6'])
+        self.assertEqual(len(store.data['workers']), 5)
+        self.assertEqual(out['create'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
