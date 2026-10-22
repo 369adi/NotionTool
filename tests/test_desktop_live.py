@@ -128,7 +128,8 @@ def test_css_selectors_prefixed():
 def test_dashboard_structure():
     js = read(JS)
     assert "text: 'Live'" in js
-    assert "['needs', 'working', 'team', 'history', 'details']" in js
+    # The token budget card (45M / 6 h) is the first section since 2026-10-21.
+    assert "['budget', 'needs', 'working', 'team', 'history', 'details']" in js
     for needle in ('nt-desk-lv-conn', 'nt-desk-lv-dot', 'nt-desk-lv-card', 'nt-desk-lv-progress', 'nt-desk-lv-bar-fill',
                    'nt-desk-lv-step', 'nt-desk-lv-task-head', 'nt-desk-lv-member', 'nt-desk-lv-fold',
                    'nt-desk-lv-events', 'nt-desk-lv-confirm', 'nt-desk-live-pill'):
