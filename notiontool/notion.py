@@ -739,6 +739,15 @@ class NotionAdapter:
         gens = [g for g in self.store.all('thread_generations') if g.get('account_id') == account_id]
         # Fix S: chats retired by a new-Welcome context switch never re-enter the pool.
         archived = {g['id'] for g in gens} | {g['thread_id'] for g in gens if g.get('mode') == 'new_welcome'}
+        # Chats the app created itself (team_threads ledger: Main and Coworker roles) may be listed only as
+        # guessed ids; they are registered with their ledger role. Any other guessed id may be the user's own
+        # chat and stays skipped.
+        managed = {}
+        for role, item in (account.get('team_threads') or {}).items():
+            try:
+                managed.setdefault(str(uuid.UUID(str((item or {}).get('id') or ''))), role)
+            except (ValueError, TypeError, AttributeError):
+                pass
         seen = set()
         for thread in client.threads():
             tid = thread.get('id') or thread.get('thread_id') or thread.get('threadId')
@@ -748,8 +757,8 @@ class NotionAdapter:
             seen.add(tid)
             if tid in archived:
                 continue
-            if thread.get('guessed') and tid not in existing:
-                continue  # a guessed id may be the user's own chat: never register it as a worker
+            if thread.get('guessed') and tid not in existing and tid not in managed:
+                continue  # a guessed id outside the team ledger may be the user's own chat: never a worker
             with self.store.lock:
                 # Re-read under the lock: client.threads() is slow, and a context switch may have moved this
                 # worker to a new chat meanwhile. Writing the old snapshot back reverted Coworker 9 to its
@@ -765,7 +774,8 @@ class NotionAdapter:
                     worker = next((w for w in self.store.all('workers') if w.get('account_id') == account_id
                                    and w.get('thread_id') == tid), None)
                 worker = worker or dict(id=account_id+':'+tid,account_id=account_id,thread_id=tid,
-                    purpose='worker',enabled=False,state='ready',lease='',last_used=0)
+                    purpose='main' if managed.get(tid) == 'main' else 'worker',
+                    enabled=False,state='ready',lease='',last_used=0)
                 worker['label'] = thread.get('title') or (worker.get('label') if thread.get('guessed') else '') or 'Untitled chat'
                 if worker['state'] in ('missing','error') and not worker.get('lease'):
                     worker['state'] = 'ready'
