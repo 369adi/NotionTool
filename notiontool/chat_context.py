@@ -23,6 +23,79 @@ def excerpt(text, cap):
     return text[:cap // 2] + '\n[Full source retained locally]\n' + text[-cap // 2:]
 
 
+# Measured Coworker switch rule (docs/CONTEXT_SWITCH_BENCH.md, 'Defaults 2026-10-22'). Integer settings:
+# T0 switch_base_tokens, C switch_cost_s, b switch_slope_ms_per_100k / 1000 (s per task per 100k),
+# e switch_error_permille_per_100k / 1000, R switch_retry_s, floor switch_min_tokens, N = tasks ahead from the
+# worker's real queue (switch_remaining_tasks only as fallback). Defaults rest on the step-gap measurement
+# (docs/context_sweet_spot.md): C 76 s, b 0.251 s/step/100k x 14 steps = 3514 ms, e 0 (error share is an
+# upper bound from <=150k data), flat up to 400k -> floor 400k. T* = 2174778 / 732926 / 444556 for N 1/3/5.
+SWITCH_DEFAULTS = dict(coworker_switch_policy='measured', switch_min_tokens=400000, switch_base_tokens=12000,
+                       switch_cost_s=76, switch_slope_ms_per_100k=3514, switch_error_permille_per_100k=0,
+                       switch_retry_s=60, switch_remaining_tasks=3)
+QUEUED_TASK_STATES = ('queued', 'ready', 'retry')
+
+
+def queued_ahead(tasks, worker, task):
+    """Queued tasks ahead of this worker, without the task about to be sent: tasks assigned to the worker, plus
+    unassigned queued tasks of the same run (they may land here). None when the queue cannot be read."""
+    if tasks is None:
+        return None
+    run, own = task.get('run_id'), set()
+    for t in tasks:
+        if t.get('id') == task.get('id') or t.get('state') not in QUEUED_TASK_STATES:
+            continue
+        if t.get('worker_id') == worker.get('id') or (run and t.get('run_id') == run and not t.get('worker_id')):
+            own.add(t.get('id'))
+    return len(own)
+
+
+def switch_decision(settings, usage, purpose='worker', queued=None):
+    """Decide whether a chat switches before its next task (pure, so tests and rotate() agree).
+
+    measured (Coworkers only): extra_s = N x (b + e x R) x (tokens - T0) / 100k is the estimated extra time of
+    continuing for the next N tasks. Switch when extra_s > C and tokens >= the floor, i.e. above
+    max(floor, T*) with T* = T0 + C x 100k / (N x (b + e x R)). N = 1 + queued (the task about to be sent plus
+    the queued ones); switch_remaining_tasks is used only when queued is None. context_token_limit and
+    context_turn_limit stay hard limits in both policies; threshold keeps the old behaviour exactly.
+    """
+    s = dict(SWITCH_DEFAULTS)
+    s.update({k: v for k, v in (settings or {}).items() if k in SWITCH_DEFAULTS and v is not None})
+    tokens, turns = int(usage.get('estimated_tokens') or 0), int(usage.get('turns') or 0)
+    limit, turn_limit = int(usage.get('token_limit') or 1200000), int(usage.get('turn_limit') or 600)
+    policy = 'measured' if s['coworker_switch_policy'] == 'measured' and purpose == 'worker' else 'threshold'
+    if queued is None:
+        n, n_source = max(1, int(s['switch_remaining_tasks'])), 'setting'
+    else:
+        n, n_source = min(50, 1 + max(0, int(queued))), 'queue'
+    per_100k = n * (max(0, int(s['switch_slope_ms_per_100k'])) / 1000 +
+                    max(0, int(s['switch_error_permille_per_100k'])) / 1000 * max(0, int(s['switch_retry_s'])))
+    t0, cost = max(0, int(s['switch_base_tokens'])), max(0, int(s['switch_cost_s']))
+    floor = max(0, int(s['switch_min_tokens']))
+    extra = per_100k * max(0, tokens - t0) / 100000
+    t_star = math.ceil(t0 + cost * 100000 / per_100k) if per_100k > 0 else None
+    at = min(limit, max(floor, t_star)) if (policy == 'measured' and t_star is not None) else limit
+    if tokens >= limit:
+        reason = 'token_limit'
+    elif turns >= turn_limit:
+        reason = 'turn_limit'
+    elif policy == 'measured' and t_star is not None and tokens >= floor and extra > cost:
+        reason = 'measured'
+    else:
+        reason = ''
+    return dict(switch=bool(reason), reason=reason, policy=policy, tokens=tokens, turns=turns,
+                extra_s=round(extra, 1), switch_cost_s=cost, switch_at_tokens=at, t_star_tokens=t_star,
+                min_tokens=floor, remaining_tasks=n, remaining_source=n_source, queued_tasks=queued,
+                token_limit=limit, turn_limit=turn_limit)
+
+
+def switch_message(reason, d):
+    return ('Context switch (%s, policy %s): %d tokens, %d turns, estimated extra %.1f s for the next %d tasks (%s) '
+            'vs switch cost %d s; switch point %d tokens (T* %s, floor %d, hard limit %d)'
+            % (reason, d['policy'], d['tokens'], d['turns'], d['extra_s'], d['remaining_tasks'],
+               d.get('remaining_source', 'setting'), d['switch_cost_s'], d['switch_at_tokens'], d['t_star_tokens'],
+               d['min_tokens'], d['token_limit']))
+
+
 class ChatContext:
     def __init__(self, store):
         self.store = store
@@ -31,13 +104,21 @@ class ChatContext:
         ident = worker['account_id'] + ':' + worker['thread_id']
         record = self.store.get('thread_context', ident, dict(id=ident, observations=0, entities={}))
         entities = record['entities']
+        # 'latest' duplicated the whole transcript (up to ~28 MB per chat) and was never read.
+        changed = record.pop('latest', None) is not None or 'estimated_tokens' not in record
         for patch in transcript.get('patches', []):
             entity = patch.get('entity') or {}
             if patch.get('op') == 'put' and entity:
                 key = entity.get('id') or str(entity.get('sequence', '')) or hashlib.sha256(
                     json.dumps(entity, sort_keys=True).encode()).hexdigest()
-                entities[key] = entity
-        record.update(observations=record['observations'] + 1, latest=transcript, updated=time.time())
+                if entities.get(key) != entity:
+                    entities[key] = entity
+                    changed = True
+        record['observations'] = record['observations'] + 1
+        if not changed:
+            # Same transcript as last time (e.g. presend after recover): skip the multi-MB rewrite.
+            return record
+        record['updated'] = time.time()
         # Deduplicate snapshots but keep every observed entity and its latest version.
         record['estimated_tokens'] = max(estimate_tokens(entities), estimate_tokens(transcript))
         self.store.put('thread_context', record)
@@ -57,13 +138,22 @@ class ChatContext:
         native = record.get('native_tokens', 0) if archived_at > base_at else 0
         if base_seq:
             observed = estimate_tokens({k: e for k, e in record['entities'].items() if e.get('sequence', 0) > base_seq})
+        elif base_at and not self.new_chat(worker, base_at):
+            observed = 0
         else:
-            observed = 0 if base_at else record['estimated_tokens']
+            # Never reset, or a new Welcome chat: its whole transcript is this generation's context
+            # (prompt + reply alone was about 43x too low after a new_welcome switch).
+            observed = record['estimated_tokens']
         tokens = max(local, observed, native + since_archive)
         turns = sum(bool(t.get('sent_at')) for t in tasks)
         return dict(estimated_tokens=tokens, turns=turns,
                     token_limit=int(settings.get('context_token_limit', 1200000)),
                     turn_limit=int(settings.get('context_turn_limit', 600)))
+
+    def new_chat(self, worker, base_at):
+        """True when context_base_at marks the switch into this new Welcome chat, not a same-chat reset."""
+        return any(g.get('successor') == worker['thread_id'] and g.get('mode') == 'new_welcome' and
+                   abs(float(g.get('archived_at') or 0) - base_at) < 120 for g in self.store.all('thread_generations'))
 
     def archive_native(self, client, worker):
         """Read the complete saved workflow message list using the existing record protocol."""
@@ -124,7 +214,10 @@ class ChatContext:
             saved.update(sent_at=time.time(), submitted_prompt=prompt)
             self.store.put('tasks', saved)
             try:
-                body = adapter.body(client, worker['thread_id'], saved['step_id'], prompt, saved['assigned_model_id'])
+                from .notion import MAIN_OWN_CONFIG, user_effort
+                effort = user_effort(client, worker['thread_id']) if worker.get('purpose') in MAIN_OWN_CONFIG else None
+                body = adapter.body(client, worker['thread_id'], saved['step_id'], prompt, saved['assigned_model_id'],
+                                    effort=effort)
                 for _ in client.transport.stream('runInferenceTranscript', body, client.headers(), timeout=180, cancel=cancel):
                     pass
             except NotionHttpError as exc:
@@ -212,7 +305,15 @@ class ChatContext:
         pending = self.store.get('rotations', worker['id'])
         fresh_due = (worker.get('purpose') == 'worker' and self.store.settings().get('coworker_fresh_context') == 'every_task'
                      and usage['turns'] > 0 and bool(worker.get('prev_task_id')))
-        if not pending and not fresh_due and not worker.get('compress_requested') and usage['estimated_tokens'] < usage['token_limit'] and usage['turns'] < usage['turn_limit']:
+        # Switch rule (threshold or measured); context_token_limit/context_turn_limit stay hard limits.
+        # N = tasks ahead from the worker's real queue (worker or run); the setting is only the fallback.
+        try:
+            queued = queued_ahead(self.store.all('tasks'), worker, task)
+        except Exception:
+            queued = None
+        decision = switch_decision(self.store.settings(), usage, worker.get('purpose'), queued)
+        usage = dict(usage, switch=decision)
+        if not pending and not fresh_due and not worker.get('compress_requested') and not decision['switch']:
             worker['context_usage'] = usage
             self.store.put('workers', worker)
             return worker
@@ -248,7 +349,13 @@ class ChatContext:
         if not pending:
             pending = dict(id=worker['id'], old_thread=worker['thread_id'],
                 handoff=self.handoff(worker, task), state='reserved', created=time.time(), task_id=task['id'])
+            reason = ('every_task' if fresh_due else 'compress_requested' if worker.get('compress_requested')
+                      else decision['reason'] or 'pending')
+            pending['reason'] = reason
             self.store.put('rotations', pending)
+            # One event per switch, written once when the switch is reserved (between tasks, before the send).
+            self.store.event('context_switch', task.get('run_id', ''), worker_id=worker['id'], task_id=task['id'],
+                             reason=reason, message=switch_message(reason, decision), decision=decision)
         # Fix R: coworkers get each task's context from the harness; a model-written JSON checkpoint
         # is not needed there and failed repeatedly ('not structured JSON'). Only non-coworkers use it.
         if getattr(adapter, 'semantic_context', False) and worker.get('purpose') != 'worker':
@@ -270,7 +377,8 @@ class ChatContext:
         base_seq = (transcript.get('session') or {}).get('sequence', 0)
         base_seq = base_seq if isinstance(base_seq, (int, float)) and not isinstance(base_seq, bool) else 0
         try:
-            head = (client.transcript(worker['thread_id']).get('session') or {}).get('sequence', base_seq)
+            # Only the session head is needed; a full window of a long chat can exceed the 32 MB Edge cap.
+            head = (client.transcript(worker['thread_id'], limit=5).get('session') or {}).get('sequence', base_seq)
             if isinstance(head, (int, float)) and not isinstance(head, bool):
                 base_seq = head
         except Exception:

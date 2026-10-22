@@ -115,8 +115,9 @@ class RemoteTimeoutTests(EngineFaultBase):
         timeout = self.store.settings()['task_timeout']
         self.task(started=time.time() - timeout - 200)  # overdue: past task_timeout + 120 s
         task = self.complete(failed(PendingRemote()))
-        self.assertEqual(task['state'], 'blocked')
-        self.assertTrue(task['remote_unknown'])
+        # No time-based stop: an overdue task stays 'uncertain' and is only checked more slowly (300 s).
+        self.assertEqual(task['state'], 'uncertain')
+        self.assertFalse(task['remote_unknown'])
         self.assertGreater(task['reconcile_at'], time.time() + 200)
         self.assertEqual(self.store.get('workers', 'w1')['state'], 'recovering')
         for _ in range(5):

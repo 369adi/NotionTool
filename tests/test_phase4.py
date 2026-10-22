@@ -188,7 +188,7 @@ class BusyChatTests(unittest.TestCase):
         for transcript in ({'session': {'status': 'running'}}, {'session': {}, 'session_pending': True}):
             adapter = object.__new__(NotionAdapter)
             adapter.store = case.store
-            adapter.client = lambda account_id, t=transcript: type('Client', (), {'transcript': lambda self, tid: t})()
+            adapter.client = lambda account_id, t=transcript: type('Client', (), {'transcript': lambda self, tid, **kw: t})()
             with self.assertRaises(RateLimited) as caught:
                 adapter.run(case.store.get('workers', 'main'), {'id': 't'}, 'prompt', None, None)
             self.assertEqual((caught.exception.scope, caught.exception.free), ('thread', True))

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import urllib.error
 
 from notiontool.store import Store
+from notiontool import notion
 from notiontool.notion import NotionAdapter,NotionClient,apply_patch,stream_text
 from notiontool.vendor.transport import NativeNotionTransport
 from notiontool.server import Application
@@ -65,6 +66,17 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(adapter.network_budget.status()['paused'])
         self.assertTrue(adapter.clear_account_pause('a'))
         self.assertFalse(adapter.network_budget.status()['paused'])
+    def test_verified_sign_in_of_another_account_lifts_the_pause_but_keeps_the_blocked_one_out(self):
+        adapter = self.adapter()
+        other = adapter.create_account('other@example.com')
+        blocked = self.store.get('accounts', 'a'); blocked['state'] = 'ready'; self.store.put('accounts', blocked)
+        adapter.network_budget.pause('HTTP 401', account_id='a', status=401)
+        self.assertFalse(adapter.clear_account_pause(other['id']))  # not verified: stays paused
+        self.assertTrue(adapter.network_budget.status()['paused'])
+        self.assertTrue(adapter.clear_account_pause(other['id'], verified=True))
+        self.assertFalse(adapter.network_budget.status()['paused'])
+        self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
+
     def test_exactly_five_welcome_workers_and_one_welcome_main(self):
         adapter=self.adapter();result=adapter.ensure_team('a', create_main=True)
         self.assertEqual(result['welcome_chats'],6)
@@ -85,10 +97,16 @@ class NativeTests(unittest.TestCase):
         adapter=self.adapter()
         normal=adapter.body(self.client,'thread','step','Question','verified-opus-codename')
         welcome=adapter.welcome_body(self.client,'thread','verified-opus-codename')
-        for body in (normal,welcome):
-            config=body['transcript'][0]['value']
-            self.assertEqual(config['model'],'verified-opus-codename')
-            self.assertIs(config['modelFromUser'],True)
+        # Normal turns: config step keeps the base model, the requested model rides in 'updated-config'
+        # (live proof 2026-10-20). The Welcome creation body still names the model in its config step.
+        config=normal['transcript'][0]['value']
+        self.assertEqual(config['model'],notion.BASE_CONFIG_MODEL)
+        self.assertIs(config['modelFromUser'],True)
+        update=[s for s in normal['transcript'] if s.get('type')=='updated-config']
+        self.assertEqual(update[0]['value']['model'],'verified-opus-codename')
+        config=welcome['transcript'][0]['value']
+        self.assertEqual(config['model'],'verified-opus-codename')
+        self.assertIs(config['modelFromUser'],True)
 
     def test_mcp_connection_attaches_enabled_workspace_module_without_touching_other_modules(self):
         adapter=self.adapter();calls=[]
@@ -216,7 +234,7 @@ class NativeTests(unittest.TestCase):
         from unittest.mock import Mock
         adapter=self.adapter()
         adapter.verify_response_model=Mock(return_value=['verified-opus'])
-        self.client.transcript=lambda thread:{'session':{'status':'idle'},'patches':[
+        self.client.transcript=lambda thread, limit=100:{'session':{'status':'idle'},'patches':[
             {'op':'put','entity':{'kind':'user_message','sequence':10,'client_message_id':'own-step'}},
             {'op':'put','entity':{'kind':'assistant_message','sequence':11,'content':[{'type':'text','text':'Own result'}]}},
             {'op':'put','entity':{'kind':'user_message','sequence':12,'client_message_id':'other-step'}},
@@ -228,7 +246,7 @@ class NativeTests(unittest.TestCase):
         import threading
         from notiontool.engine import PendingRemote
         adapter=self.adapter()
-        self.client.transcript=lambda thread:{'session':{'status':'idle'},'patches':[
+        self.client.transcript=lambda thread, limit=100:{'session':{'status':'idle'},'patches':[
             {'op':'put','entity':{'kind':'user_message','sequence':10,'client_message_id':'own-step'}},
             {'op':'put','entity':{'kind':'user_message','sequence':12,'client_message_id':'other-step'}},
             {'op':'put','entity':{'kind':'assistant_message','sequence':13,'content':[{'type':'text','text':'Other result'}]}}]}
@@ -238,7 +256,7 @@ class NativeTests(unittest.TestCase):
         import threading
         from notiontool.engine import PendingRemote
         adapter=self.adapter()
-        self.client.transcript=lambda thread:{'session':{'status':'idle'},'session_pending':True,'patches':[
+        self.client.transcript=lambda thread, limit=100:{'session':{'status':'idle'},'session_pending':True,'patches':[
             {'op':'put','entity':{'kind':'user_message','sequence':10,'client_message_id':'own-step'}},
             {'op':'put','entity':{'kind':'assistant_message','sequence':11,'content':[{'type':'text','text':'Draft answer'}]}}]}
         with self.assertRaises(PendingRemote):adapter.recover({'account_id':'a','thread_id':'w'},

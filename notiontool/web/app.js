@@ -102,6 +102,7 @@ function render(){
   }).join('');
   $('worker-grid').innerHTML=state.workers.filter(w=>w.enabled||w.state==='recovering').map(w=>`<button class="worker-cell ${escape(w.state)}" data-worker-report="${escape(w.id)}" title="${escape(w.label)} · ${escape(w.state)}"></button>`).join('')||'<p class="help">No workers connected yet.</p>';
   renderWorkerDashboard();
+  renderTokenBudget();
   renderAttention();
   const tasks=state.tasks.filter(t=>t.run_id===run?.id);
   $('task-list').innerHTML=tasks.slice(-24).map(t=>taskRow(t,run)).join('');
@@ -438,3 +439,26 @@ async function addCoworkerChat(){
   finally{done();}
 }
 if($('add-coworker-chat'))$('add-coworker-chat').onclick=addCoworkerChat;
+
+// 6 h token budget (Main + coworkers, local estimates, persisted apart from chats) and AI-disabled detector.
+function fmtTokens(n){n=Number(n)||0;return n>=1e6?(n/1e6).toFixed(n>=1e7?1:2)+' M':n>=1e3?Math.round(n/1e3)+' k':String(n);}
+function fmtLeft(s){s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return `${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}`;}
+function renderTokenBudget(){
+  const el=$('token-budget');if(!el)return;const b=state&&state.token_budget;
+  if(!b){el.innerHTML='<p class="help">No budget data yet.</p>';return;}
+  const pct=Math.min(100,Number(b.percent)||0),left=b.window_end-Date.now()/1000;
+  const cls=b.blocked?'full':pct>=80?'warn':'';
+  const t=s=>new Date(s*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  const top=(b.by_worker||[]).slice(0,5).map(r=>`<div class="tb-row"><span>${escape(r.label||r.id)}</span><span>${fmtTokens(r.tokens)} · ${r.turns||0} turns</span></div>`).join('');
+  const rep=(state.ai_disable_reports||[])[0];
+  const alert=rep?`<div class="tb-alert" title="${escape((rep.causes||[]).map(c=>c.cause).join(' | '))}"><strong>AI disabled · ${escape(rep.account||'')}</strong><small>${new Date(rep.detected_at*1000).toLocaleString()} · ~${fmtTokens(rep.usage?.windows?.['6h']?.estimated_tokens)} in 6 h<br>Probable: ${escape(rep.causes?.[0]?.cause||'unknown')}</small></div>`:'';
+  el.innerHTML=`<div class="tb-head"><strong>${fmtTokens(b.used)}</strong><span>/ ${fmtTokens(b.limit)}</span><span class="tb-pct ${cls}">${pct.toFixed(1)}%</span></div>
+  <div class="tb-bar"><div class="tb-fill ${cls}" style="width:${pct}%"></div></div>
+  <div class="tb-row"><span>Main ${fmtTokens(b.main_tokens)} · Coworker ${fmtTokens(b.coworker_tokens)}</span><span>${b.turns} turns</span></div>
+  <div class="tb-row"><span>Window ${t(b.window_start)}–${t(b.window_end)}</span><span>Reset in <b id="tb-left">${fmtLeft(left)}</b></span></div>
+  ${b.blocked?'<div class="tb-row tb-blocked">Budget used up: nothing is sent until the reset.</div>':''}
+  ${top?`<details class="tb-details"><summary>Per chat</summary>${top}</details>`:''}${alert}
+  <small class="help">Estimate: context + prompt + reply, about 3 bytes per token. Kept when chats are deleted.</small>`;
+}
+setInterval(()=>{const b=state&&state.token_budget,el=document.getElementById('tb-left');if(!b||!el)return;const left=b.window_end-Date.now()/1000;el.textContent=fmtLeft(left);if(left<=0&&!pollBusy&&typeof refresh==='function')refresh();},1000);
+setInterval(()=>{if(!document.hidden&&!pollBusy&&typeof refresh==='function')refresh();},10000);

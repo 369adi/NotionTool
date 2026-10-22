@@ -22,7 +22,8 @@ class FixedPool(unittest.TestCase):
         ch, rn, ev = pool_decision({'label': WELCOME_TITLE, 'enabled': True, 'join_state': 'pending'}, DONE)
         self.assertEqual((ch['enabled'], ch['join_state'], ev), (True, 'joined', 'coworker_joined'))
         ch, rn, _ = pool_decision({'label': 'Cowork joined', 'enabled': True}, DONE)
-        self.assertTrue(ch['enabled']); self.assertEqual(rn, WELCOME_TITLE)
+        # Rule I41: pool_decision never renames; name_coworkers does the naming.
+        self.assertTrue(ch['enabled']); self.assertIsNone(rn)
         ch, _, ev = pool_decision({'label': 'Mein Chat', 'enabled': True, 'join_state': 'joined'}, DONE)
         self.assertEqual((ch['enabled'], ch['join_state'], ev), (False, 'released', 'coworker_released'))
 

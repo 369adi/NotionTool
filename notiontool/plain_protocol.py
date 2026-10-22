@@ -5,6 +5,7 @@ system agent. Machine contracts are normalized outside the model.
 """
 from html import unescape
 from html.parser import HTMLParser
+import json
 import re
 
 from .protocol import ContractError,validate_plan
@@ -96,6 +97,20 @@ def table_plan(text):
     return plan
 
 
+def _reported_object(text):
+    """The coworker's own JSON report ({status, summary}) inside the answer, or None."""
+    decoder=json.JSONDecoder()
+    for match in re.finditer(r'\{', str(text or '')):
+        try:
+            value,_=decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if (isinstance(value,dict) and isinstance(value.get('summary'),str)
+                and str(value.get('status')).lower() in ('done','partial','blocked','failed')):
+            return value
+    return None
+
+
 def normalize(task,text):
     if provider_error(text):raise ProviderReplyError('Notion returned a provider error instead of an answer')
     failure_line=inference_error(text)
@@ -120,6 +135,17 @@ def normalize(task,text):
         passed=match.group(1).lower() in ('approved','pass','all checks passed')
         return dict(passed=passed,summary=readable,fixes=[] if passed else table_plan(text)['tasks'])
     if task['role']=='executor':
+        inner=_reported_object(text)
+        if inner:
+            # The coworker answered with its own (often fenced) JSON report: keep its status and summary
+            # instead of nesting the whole block inside a summary string. 'partial' is a finished turn
+            # with incomplete coverage: done, but marked for the Main's review.
+            state=str(inner.get('status')).lower()
+            summary=inner['summary'].strip() or readable
+            extra={k:inner[k] for k in ('files','tests','evidence','artifacts','result_file') if k in inner}
+            return dict(extra,status='done' if state=='partial' else state,summary=summary,
+                        evidence=inner.get('evidence') or [],artifacts=inner.get('artifacts') or [],
+                        context=readable[:6000],requires_review=candidate or state=='partial',partial=state=='partial')
         match=re.search(r'(?im)^\s*(?:#+\s*)?(DONE|BLOCKED|FAILED)\b',readable)
         if not readable:raise ContractError('Empty execution response')
         # A contribution is reported here, not globally verified. The separate
@@ -232,6 +258,10 @@ def _result_file_hint(task,run,tools_available):
     """Result-file instruction for a coworker part ('' without tools or ids, or if the path is unsafe)."""
     if not tools_available or not run.get('id') or not task.get('id'):
         return ''
+    # Read-only parts answer in the chat: writing a result file contradicts "change and save no files"
+    # and costs an extra tool round trip per coworker.
+    if task.get('read_only') or re.search(r'\bread[- ]only\b', str(task.get('prompt') or ''), re.I):
+        return ''
     try:
         from . import result_files
         path=result_files.path_for(run['id'],task['id'])
@@ -275,4 +305,4 @@ def _prompt_text(task,run,context,token,tools_available):
         return 'Please check these completed results against my request:\n'+goal+focus+reference+project+tools+screen_tools+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='integrator':
         return 'Please combine these checked results into a complete answer to my request:\n'+goal+reference+memory+screen_tools+'\nUse my language. State what was actually checked and any remaining limitations.'
-    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+_result_file_hint(task,run,tools_available)+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'
+    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+_result_file_hint(task,run,tools_available and bool(tools))+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'

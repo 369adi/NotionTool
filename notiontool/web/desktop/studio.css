@@ -1,7 +1,9 @@
 /* NotionTool Studio part: status strip, notification bell + drawer, compact mode. */
 .nt-desk-strip {
   position: fixed;
-  z-index: 2147481000;
+  /* read-only status: never catches clicks, stays below Notion's menus and dialogs */
+  pointer-events: none;
+  z-index: 90;
   display: flex;
   align-items: center;
   flex-wrap: nowrap;

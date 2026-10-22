@@ -50,6 +50,7 @@
   ];
   var SECTION_OF_KEY = {
     main_auto_continue: 'general', turn_watch: 'general', main_context_policy: 'general', app_chat_filter: 'general',
+    token_budget_6h: 'team', burst_soft_15m: 'team', burst_hard_15m: 'team', burst_hard_60m: 'team', burst_turns_5m: 'team', burst_spacing_s: 'team',
     max_workers: 'team', per_account: 'team', max_runs_per_chat: 'team', coworker_fresh_context: 'team',
     coworker_delete_old_chat: 'team', coworker_max_age_hours: 'team',
     context_token_limit: 'advanced', main_context_ask_tokens: 'advanced', main_context_ask_turns: 'advanced'
@@ -616,6 +617,11 @@
       for (var i = 0; i < dialogs.length; i++) {
         var dialog = dialogs[i];
         if (ours(dialog)) continue;
+        // Only the big settings modal. The workspace switcher popup also lists 'Settings'; injecting our
+        // nav entry there re-rendered Notion's popup and closed it (switcher only opened on the 2nd/3rd click).
+        var box = dialog.getBoundingClientRect ? dialog.getBoundingClientRect() : null;
+        if (!box || box.width < 560 || box.height < 360) continue;
+        if (dialog.querySelector('[role="menuitem"]') && !dialog.querySelector('[role="tab"],[role="tablist"]') && box.width < 720) continue;
         var anchors = rowsByLabel(dialog, ANCHORS);
         if (!anchors.length) continue;
         // Climb from the entry to the element that is one child of the sidebar list.
@@ -1076,7 +1082,7 @@
       window.addEventListener('resize', onResize);
       if (typeof MutationObserver === 'function' && document.documentElement) {
         // childList only: our own class and style changes do not trigger it.
-        observer = new MutationObserver(schedule);
+        observer = new MutationObserver((window.__ntIdle2 || (window.__ntIdle2 = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); w.addEventListener('keydown', function () { w.__ntLastKey = Date.now(); }, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = Math.max((w.__ntLastScroll || 0) + 400, (w.__ntLastKey || 0) + 1200) - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 4000 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
         observer.observe(document.documentElement, { childList: true, subtree: true });
       }
       if (typeof ctx.onState === 'function') unsubscribe = ctx.onState(schedule);
@@ -1130,7 +1136,7 @@
   window.__ntDesk = window.__ntDesk || {};
 
   var TEAM_MAX = 40;
-  var DEFAULT_COWORKERS = 10;
+  var DEFAULT_COWORKERS = 5;
   var POLL_MS = 1000;
   var POLL_MAX = 300;
   var TAB_ID = 'settings';
@@ -1518,6 +1524,29 @@
         view.nav.appendChild(btn);
       });
       extraCards(view);
+      mainCard(view);
+    }
+
+    // Main chat card: 'Refresh Main' makes a fresh Main; the old one is retired only when the new one is ready.
+    function mainCard(view) {
+      var c = card(view, 'main', 'Main chat',
+        'Refresh Main makes a fresh Main chat. The old Main is removed from the app only after the new one is ready.');
+      var status = node('p', 'nt-desk-stab-sub', '');
+      var b = node('button', 'nt-desk-stab-main-refresh', '\u21bb Refresh Main');
+      b.type = 'button';
+      b.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        if (b.disabled) return;
+        b.disabled = true;
+        status.textContent = 'Creating a new Main... the old one stays until the new one is ready.';
+        call('main_refresh', { request_id: 'main-refresh-' + Date.now() }).then(function (res) {
+          status.textContent = ((res && res.title) || 'New Main') + ' is being created. The old Main is removed as soon as it is ready.';
+        }, function (err) {
+          status.textContent = 'Refresh failed: ' + ((err && err.message) || String(err));
+        }).then(function () { setTimeout(function () { b.disabled = false; }, 8000); });
+      });
+      c.appendChild(b);
+      c.appendChild(status);
     }
 
     function card(view, id, title, help) {

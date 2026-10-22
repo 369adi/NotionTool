@@ -77,6 +77,7 @@
   function taskStatus(t) {
     t = obj(t);
     var s = token(t.state);
+    if (t.remote_working && s === 'uncertain') return 'Working';  // B46: still working in Notion after the stream ended
     if (t.remote_unknown || s === 'uncertain' || s === 'failed' || s === 'blocked' || s === 'remote_unknown') return 'Problem';
     if (s === 'done' || s === 'completed' || s === 'accepted') return t.checked ? 'Checked' : 'Done';
     if (s === 'running' || s === 'sending' || s === 'reviewing' || s === 'cancelling') return 'Working';
@@ -188,7 +189,7 @@
     list(s.tasks).forEach(function (t) {
       t = obj(t);
       if (!t.id) return;
-      if (t.remote_unknown || token(t.state) === 'uncertain') {
+      if ((t.remote_unknown || token(t.state) === 'uncertain') && !t.remote_working) {
         out.push({ key: 'accept-' + t.id, text: 'A coworker finished ' + quote(taskSummary(t)) + ', but the answer got lost.', def: acceptDef(t) });
       }
     });
@@ -204,9 +205,11 @@
   }
 
   function teamRows(s, now) {
+    var working = {};  // B46: coworkers still working in Notion after the live stream ended
+    list(obj(s).tasks).forEach(function (t) { t = obj(t); if (t.remote_working && t.worker_id && token(t.state) === 'uncertain') working[t.worker_id] = 1; });
     return list(obj(s).workers).filter(function (w) { return obj(w).purpose === 'worker'; }).map(function (w) {
       var st = token(w.state), word = 'Off', cls = 'off';
-      if (BUSY.indexOf(st) >= 0 || w.task_id) { word = 'Busy'; cls = 'busy'; }
+      if (BUSY.indexOf(st) >= 0 || w.task_id || working[w.id]) { word = 'Busy'; cls = 'busy'; }
       else if (st === 'ready' || st === 'idle') { word = 'Idle'; cls = 'idle'; }
       else if (st === 'recovering' || st === 'starting' || st === 'creating') { word = 'Restarting'; cls = 'wait'; }
       else if (st === 'blocked' || st === 'failed' || st === 'error') { word = 'Problem'; cls = 'bad'; }
@@ -247,7 +250,13 @@
       if (!r.id) return;
       var st = token(r.state), at = r.finished || r.created;
       if (st === 'awaiting_main') {
-        add({ key: 'ok-' + r.id, what: quote(runSummary(r)) + ' is finished and waits for your OK.',
+        var why = [];
+        Object.keys(obj(r.needs_main_reasons)).forEach(function (k) {
+          var v = String(obj(r.needs_main_reasons)[k] || '').trim();
+          if (v && why.indexOf(v) < 0) why.push(v);
+        });
+        add({ key: 'ok-' + r.id, what: quote(runSummary(r)) + ' is finished and waits for your OK' +
+            (why.length ? ': ' + clip(why.join('; '), 160) : '.'),
           todo: 'Check the result, then confirm it.', def: confirmDef(r), at: at });
       } else if (st === 'blocked') {
         add({ key: 'retry-' + r.id, what: 'Some steps of ' + quote(runSummary(r)) + ' ran into a problem.',
@@ -258,7 +267,7 @@
       t = obj(t);
       if (!t.id) return;
       var st = token(t.state), at = t.finished || t.last_output_at || t.started || t.created;
-      if ((t.remote_unknown || st === 'uncertain') && !t.checked) {
+      if ((t.remote_unknown || st === 'uncertain') && !t.checked && !t.remote_working) {
         add({ key: 'accept-' + t.id, what: 'A coworker finished ' + quote(taskSummary(t)) + ', but the answer got lost.',
           todo: 'Check the work, then accept it if it looks right. Nothing is sent again.', def: acceptDef(t), at: at });
       } else if (PROBLEM_TASK_STATES.indexOf(st) >= 0) {
@@ -280,10 +289,35 @@
       if (WARN_EVENTS.indexOf(kind) >= 0) {
         add({ key: 'ev-' + kind + '-' + msg, what: msg || 'Creating a chat or coworker did not work.',
           todo: 'Check the chats under Team. NotionTool does not try again on its own.', def: null, at: ev.ts });
+      } else if (kind === 'machine_check_failed') {
+        add({ key: 'ev-mc-' + str(ev.task_id || msg), what: 'An automatic check failed: ' + (msg || 'a step did not pass the machine check.'),
+          todo: 'Open the request under Working and check the result before you confirm it.', def: null, at: ev.ts });
       } else if (kind === 'ui_error') {
         add({ key: 'ev-ui-' + msg, what: msg || 'A part of the NotionTool overlay hit an error.',
           todo: 'Usually harmless. If Live looks wrong, close it and open it again.', def: null, at: ev.ts });
       }
+    });
+    // Attention lists from the harness (notion_shell attention): stalled steps and steps tied to a gone chat.
+    function attentionItems(v) {
+      if (Array.isArray(v)) return v;
+      v = obj(v);
+      return Object.keys(v).map(function (k) { var e = obj(v[k]); if (!e.task_id) e.task_id = k; return e; });
+    }
+    attentionItems(s.stalled).forEach(function (e) {
+      e = obj(e);
+      var id = str(e.task_id || e.id);
+      if (!id) return;
+      var mins = Math.round((Number(e.stall_age_s) || 0) / 60);
+      add({ key: 'stall-' + id, what: 'The step ' + quote(e.title || id) + ' has written nothing' + (mins ? ' for ' + mins + ' min' : '') +
+        (e.worker_label ? ' (' + clip(e.worker_label, 40) + ')' : '') + '.',
+        todo: 'Open it under Working. If it stays stuck, stop its request.', def: null, at: null });
+    });
+    attentionItems(s.stale_context_tasks).forEach(function (e) {
+      e = obj(e);
+      var id = str(e.id || e.task_id);
+      if (!id) return;
+      add({ key: 'stale-' + id, what: 'The step ' + quote(e.title || id) + ' still belongs to an old coworker chat.',
+        todo: 'Stop or retry its request so it runs in a current chat.', def: null, at: null });
     });
     var c = opts.connection;
     if (c && (c.cls === 'off' || c.cls === 'warn')) {
@@ -378,7 +412,7 @@
     function sig(value) { try { return JSON.stringify(value); } catch (e) { return String(Math.random()); } }
 
     var root = el('div', { cls: 'nt-desk-lv', 'data-nt-desk': 'live-view' });
-    ['needs', 'working', 'team', 'history', 'details'].forEach(function (name) {
+    ['budget', 'needs', 'working', 'team', 'history', 'details'].forEach(function (name) {
       slots[name] = root.appendChild(el('div', { cls: 'nt-desk-lv-slot nt-desk-lv-slot-' + name }));
     });
     var confirmBox = el('div', { cls: 'nt-desk-lv-confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-label': 'Please confirm' });
@@ -612,6 +646,42 @@
       return section('needs', 'Problems', items.length ? items : [empty('No problems right now.')], items.length);
     }
 
+    // Token budget (token_budget.py): estimated tokens of Main + coworkers in the current 6-hour window.
+    function mega(n) { n = num(n) || 0; return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n); }
+    function budgetSection(s, now) {
+      var b = obj(s.token_budget);
+      if (!num(b.limit)) return section('budget', 'Token budget (6 h)', [empty('No token data yet.')]);
+      var pct = Math.max(0, Math.min(100, num(b.percent) || 0));
+      var left = Math.max(0, Math.round((num(b.window_end) * 1000 - now) / 60000));
+      var bar = el('div', { cls: 'nt-desk-lv-budget-bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(Math.round(pct)),
+        style: 'height:8px;border-radius:4px;background:rgba(255,255,255,.12);overflow:hidden;margin:6px 0' },
+        [el('div', { style: 'height:100%;width:' + pct + '%;background:' + (b.blocked ? '#e5484d' : pct >= 80 ? '#f5a524' : '#7c5cff') })]);
+      var kids = [
+        el('p', { cls: 'nt-desk-lv-need-text', text: mega(b.used) + ' of ' + mega(b.limit) + ' tokens used (' + pct.toFixed(1) + '%)' }),
+        bar,
+        detail('Main', mega(b.main_tokens)), detail('Coworkers', mega(b.coworker_tokens)),
+        detail('Turns', String(num(b.turns) || 0)), detail('Resets in', Math.floor(left / 60) + ' h ' + (left % 60) + ' min')];
+      var bu = obj(b.burst);
+      if (bu.level) {
+        var bl = obj(bu.limits);
+        kids.push(detail('Short-term', mega(bu.tokens_15m) + ' / 15 min \u00b7 ' + mega(bu.tokens_60m) + ' / 60 min \u00b7 ' +
+          (num(bu.coworker_turns_5m) || 0) + ' coworker turns / 5 min'));
+        kids.push(el('p', { cls: 'nt-desk-lv-problem-todo',
+          style: 'color:' + (bu.level === 'pause' ? '#e5484d' : bu.level === 'throttle' ? '#f5a524' : '#46a758'),
+          text: bu.level === 'pause' ? 'Burst guard: coworkers paused (' + bu.reason + ')' :
+            bu.level === 'throttle' ? 'Burst guard: coworkers slowed (' + bu.reason + ')' :
+            'Burst guard: ok (slows at ' + mega(bl.burst_soft_15m) + ' / 15 min, pauses at ' + mega(bl.burst_hard_15m) + ' / 15 min or ' + mega(bl.burst_hard_60m) + ' / 60 min)' }));
+      }
+      if (b.blocked) kids.unshift(el('p', { cls: 'nt-desk-lv-problem-todo', style: 'color:#e5484d', text: 'Limit reached: sending is blocked until the reset.' }));
+      list(s.ai_disable).slice(0, 1).forEach(function (r) {
+        r = obj(r);
+        kids.push(el('p', { cls: 'nt-desk-lv-problem-todo', style: 'color:#f5a524',
+          text: 'Notion AI was disabled' + (r.account ? ' (' + r.account + ')' : '') + (r.at ? ', ' + ago(r.at, now) : '') +
+            (r.tokens_6h ? ' \u00b7 ' + mega(r.tokens_6h) + ' tokens in 6 h' : '') + (r.cause ? ' \u00b7 probable cause: ' + r.cause : '') }));
+      });
+      return section('budget', 'Token budget (6 h, estimate)', kids);
+    }
+
     function taskDetails(t, workers) {
       var w = obj(workers[t.worker_id]);
       var files = list(t.files).map(str).filter(Boolean);
@@ -832,7 +902,9 @@
       var raw = state(), s = obj(raw), now = Date.now(), tick = Math.floor(now / REFRESH_MS);
       updateConnection(raw, now);
       try {
-        paint('needs', sig([s.runs, s.tasks, list(s.events).slice(-EVENT_LIMIT), connection(raw, now, lastPush).cls, Object.keys(dismissed).length, tick]),
+        paint('budget', sig([s.token_budget && [s.token_budget.used, s.token_budget.limit, s.token_budget.blocked, s.token_budget.window_start, s.token_budget.burst && [s.token_budget.burst.level, s.token_budget.burst.tokens_15m, s.token_budget.burst.coworker_turns_5m]], s.ai_disable, Math.floor(now / 60000)]),
+          function () { return budgetSection(s, now); });
+        paint('needs', sig([s.runs, s.tasks, s.stalled, s.stale_context_tasks, list(s.events).slice(-EVENT_LIMIT), connection(raw, now, lastPush).cls, Object.keys(dismissed).length, tick]),
           function () { return needsSection(raw, now); });
         paint('working', sig([s.runs, s.tasks, s.workers, tick, Object.keys(expanded)]), function () { return workingSection(s, now); });
         paint('team', sig([s.workers, tick]), function () { return teamSection(s, now); });
@@ -967,8 +1039,11 @@
       ['registerTab', 'registerView', 'register'].forEach(function (k) { if (!fn && typeof sh[k] === 'function') fn = sh[k]; });
       if (!fn) return false;
       try {
-        shellHandle = fn.call(sh, { id: 'live', label: 'Live', title: 'Live', order: 20,
-          mount: shellMount, unmount: shellUnmount, show: shellMount, hide: shellUnmount });
+        var liveView = { id: 'live', label: 'Live', title: 'Live', order: 20,
+          mount: shellMount, unmount: shellUnmount, show: shellMount, hide: shellUnmount };
+        // shell.js register(tab, view) takes the tab id first; an object-only call registered nothing
+        // (the Live tab then showed the 'still loading' placeholder with a dead Open button).
+        shellHandle = fn === sh.register ? fn.call(sh, 'live', liveView) : fn.call(sh, liveView);
         registered = true;
       } catch (e) { registered = false; }
       return registered;
@@ -1034,7 +1109,8 @@
       var sh = window.__ntShell;
       if (registered && sh) {
         try {
-          if (shellHandle && typeof shellHandle.unregister === 'function') shellHandle.unregister();
+          if (typeof shellHandle === 'function') shellHandle();
+          else if (shellHandle && typeof shellHandle.unregister === 'function') shellHandle.unregister();
           else if (typeof sh.unregister === 'function') sh.unregister('live');
         } catch (e) { /* shell already gone */ }
       }

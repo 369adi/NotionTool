@@ -9,4 +9,5 @@ a = Analysis([str(root / 'main.py')], pathex=[str(root)],
                             'notiontool.autopilot', 'notiontool.context_archive', 'notiontool.dag', 'notiontool.role_policy'], hookspath=[], runtime_hooks=[], excludes=[])
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, name='NotionTool', debug=False,
-          bootloader_ignore_signals=False, strip=False, upx=False, console=False)
+          bootloader_ignore_signals=False, strip=False, upx=False, console=False,
+          icon=str(root / 'assets' / 'notiontool.ico'))

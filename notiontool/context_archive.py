@@ -142,3 +142,64 @@ def prune_plan(records, now, keep_s=KEEP_S_DEFAULT):
         plan.append((ident, 'slim' if slim_reason(record, now, keep_s) else 'keep'))
     plan.sort()
     return plan
+
+
+PRUNE_KEEP_S = 6 * 3600
+OPEN_TASK_STATES = ('queued', 'retry', 'running', 'uncertain', 'cancelling', 'awaiting_main')
+GONE_WORKER_STATES = ('missing', 'retired', 'disabled')
+
+
+def _thread_key(worker):
+    account, thread = worker.get('account_id'), worker.get('thread_id')
+    return '%s:%s' % (account, thread) if account and thread else ''
+
+
+def prune_ids(records, workers, chats, tasks, now, keep_s=PRUNE_KEEP_S):
+    """Sorted ids of thread_context records that nobody needs any more (pure, nothing is written).
+
+    A record is kept when its thread belongs to an enabled worker of any purpose that is not
+    missing, retired or disabled, to the main_worker of any chat, or to a task in an open state
+    (by thread_id or by worker_id), or when it was updated less than keep_s seconds ago. Every
+    other record is deleted, including those of retired, missing or disabled workers and of
+    threads no worker knows. records is a list of records or a dict of id to record; only id and
+    updated are read. A record without a numeric updated counts as old. When now is not a
+    number nothing is deleted.
+    """
+    if not _is_number(now):
+        return []
+    if not _is_number(keep_s) or keep_s < 0:
+        keep_s = PRUNE_KEEP_S
+    workers = [w for w in (workers or ()) if isinstance(w, dict)]
+    by_id = {str(w['id']): w for w in workers if w.get('id')}
+    owners = [w for w in workers if w.get('enabled') and w.get('state') not in GONE_WORKER_STATES]
+    task_threads = set()
+    for chat in chats or ():
+        owner = by_id.get(str(chat.get('main_worker') or '')) if isinstance(chat, dict) else None
+        if owner:
+            owners.append(owner)
+    for task in tasks or ():
+        if not isinstance(task, dict) or task.get('state') not in OPEN_TASK_STATES:
+            continue
+        if task.get('thread_id'):
+            task_threads.add(str(task['thread_id']))
+        owner = by_id.get(str(task.get('worker_id') or ''))
+        if owner:
+            owners.append(owner)
+    keep = set()
+    for owner in owners:
+        keep.add(_thread_key(owner))
+        keep.add(str(owner.get('id')))
+    keep.discard('')
+    items = list(records.values()) if isinstance(records, dict) else list(records or ())
+    doomed = []
+    for record in items:
+        ident = record.get('id') if isinstance(record, dict) else None
+        if not isinstance(ident, str) or not ident:
+            continue
+        if ident in keep or ident.split(':', 1)[-1] in task_threads:
+            continue
+        updated = record.get('updated')
+        if _is_number(updated) and now - updated < keep_s:
+            continue
+        doomed.append(ident)
+    return sorted(set(doomed))

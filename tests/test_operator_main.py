@@ -113,8 +113,7 @@ class OperatorMainTest(unittest.TestCase):
         self.assertEqual(len([r for r in self.store.all('runs') if r.get('operator')]), 1)
 
     def test_delegate_refusals(self):
-        with self.assertRaisesRegex(ValueError, 'Register this chat'):
-            delegate(self.engine, 'c4', 'Goal', tasks('a'))
+        # Build 19: every Main chat may delegate, so an unregistered chat is no longer refused here.
         chat_id = self.register()['chat_id']
         bad = tasks('a')
         bad[0]['acceptance'] = ''

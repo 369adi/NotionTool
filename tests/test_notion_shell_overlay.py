@@ -11,7 +11,8 @@ ASSETS = ROOT / 'notiontool' / 'web' / 'notion_shell'
 JS_PATH = ASSETS / 'overlay.js'
 CSS_PATH = ASSETS / 'overlay.css'
 SHARED_ACTIONS = ('state', 'runs', 'run_pause', 'run_cancel', 'run_retry', 'task_reconcile', 'settings_get',
-                  'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm')
+                  'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm', 'mcp_add', 'mcp_bridge', 'host_key',
+                  'bridge_tunnel')
 FORBIDDEN = ('Bearer', '127.0.0.1', 'fetch(', 'X-NotionTool-Token', 'token_v2')
 NODE_CANDIDATES = ('C:/Program Files/nodejs/node.exe',)
 

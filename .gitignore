@@ -2,7 +2,8 @@
 
 # Local data: SQLite DB, Notion sessions (data/sessions holds Notion cookies and the host API key),
 # browser profiles with Notion cookies, handoffs, snapshots, runtime files, desktop_app.json.
-data/
+# Only the top-level data/ folder: tests/data holds versioned test fixtures.
+/data/
 **/browser-profile/
 **/browser-profiles/
 **/sessions/
@@ -59,3 +60,7 @@ Desktop.ini
 .idea/
 # Local agent memory: holds personal email, Notion account and space ids, local paths
 project-memory/
+
+# Editor/agent backups
+*.bak*
+*.bak_*

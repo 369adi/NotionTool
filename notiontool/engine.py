@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import re
 import secrets
 import threading
 import time
@@ -12,6 +13,7 @@ from .store import uid
 from . import plain_protocol
 from . import prompt_once
 from . import file_registry
+from . import coworker_age_guard
 from .allocation import allocation, parallel_width, validate_allocation
 from .team_size import coworker_capacity
 from .model_routing import DEFAULT_MODEL, MODELS, validate_models, with_reason
@@ -19,13 +21,54 @@ from .model_verification import ModelVerificationError
 from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, run_with_priority
 from . import proof as task_proof
 from . import patch_mode as patch_mod
+from . import stale_tasks as stale_mod
 import subprocess
+from .timeouts import task_limit
+
+# Late done detection (done_dig / crit_done): Notion often closes or breaks the reply stream minutes before
+# the coworker turn really ends. With the old backoff (5, 10, 20, 40, 60, 60 s) the real end was seen
+# 60-80 s late. After this attempt's stream has closed or broken, a task is now re-checked at least every
+# DONE_POLL_SECONDS. The old backoff stays for approval waits, restart recovery (no stream in this attempt),
+# cancelled or over-limit attempts, overdue tasks (300 s) and tasks beyond the slot cap.
+# Rate limit: at most DONE_POLL_MAX_TASKS x 60/DONE_POLL_SECONDS = 24 checks per minute (1-3 transcript
+# reads each, so <= 72 requests/min) inside network_budget.HARD_LIMIT_PER_MINUTE = 180, which still caps all.
+DONE_POLL_SECONDS = 15
+DONE_POLL_MAX_TASKS = 6
+DONE_POLL_WINDOW_SECONDS = 1200  # turns of 14-19 min exist (see _empty_remote_reply); later the old backoff applies
+
+
+def _setting_number(settings, key, default, low, high):
+    try:
+        value = float((settings or {}).get(key, default))
+    except (TypeError, ValueError, AttributeError):
+        return default
+    return max(low, min(high, value))
+
+
+def reconcile_backoff(checks):
+    """The unchanged backoff: 5, 10, 20, 40, 60, 60 ... seconds for check 1, 2, 3 ..."""
+    return min(60, 5 * 2 ** min(max(int(checks), 1) - 1, 4))
+
+
+def reconcile_delay(checks, now, done_poll_since=0, approval=False, slot_free=True, settings=None):
+    """Seconds until the next reconcile check of an unconfirmed task (never longer than the old backoff)."""
+    base = reconcile_backoff(checks)
+    window = _setting_number(settings, 'done_poll_window_seconds', DONE_POLL_WINDOW_SECONDS, 0, 7200)
+    if approval or not done_poll_since or not slot_free or now - float(done_poll_since) > window:
+        return base
+    return min(base, _setting_number(settings, 'done_poll_seconds', DONE_POLL_SECONDS, 5, 60))
 
 # Patch mode (patch_mode.py): on by default for git projects with a main branch; the setting turns it off.
 PATCH_MODE_DEFAULT = True
 # Merge results that are worth one more try later; anything else stays 'failed' for the operator.
-PATCH_RETRY = ('main_moved', 'main_busy')
+# 'main_red': the same tests also fail on clean main, so the task is not to blame. It waits until main
+# moves (a fix landed) and is then merged again; these waits never use up PATCH_RETRY_LIMIT.
+PATCH_RETRY = ('main_moved', 'main_busy', 'main_red')
 PATCH_RETRY_LIMIT = 3
+# A transport error before anything was sent moves the task to another coworker at most this often.
+PRESEND_RETRY_LIMIT = 2
+# Failed merges that /api/task/remerge may put back to 'waiting' (only with an existing worktree).
+REMERGE_STATUSES = ('red', 'main_red')
 PATCH_NOTE = ('\n\nWork only inside this folder: %s\nIt is your own copy of the project (a git worktree on branch %s). '
               'Read and edit files only there, never in the main project folder. Do not commit, merge or push: '
               'NotionTool commits, tests and merges your change when you are done.')
@@ -77,8 +120,33 @@ LIVE_TASK_STATES = ('running', 'uncertain')
 # Streaming telemetry (Engine._partial): at most one task store write per task in this window.
 TELEMETRY_SECONDS = 5
 
+# notion.turn_state states that prove 'own turn finished without reply text' from ONE transcript read.
+EMPTY_PROOF_STATES = ('done_empty', 'done_error')
+
+
+# B46: a coworker whose turn Notion still runs and that keeps adding steps is working, not hung.
+REMOTE_LIVE_FIELDS = ('remote_running', 'remote_steps', 'remote_checked_at', 'remote_newest_seq',
+                      'remote_progress_at', 'remote_working', 'remote_stall_noted')
+REMOTE_WORKING_POLL_SECONDS = 15
+REMOTE_QUIET_MINUTES = 10  # mirrors notion.REMOTE_QUIET_SECONDS
+
+
+def working_text(stored, now):
+    """B46: honest status line for a coworker that is still working after the live stream ended."""
+    stored = stored or {}
+    ago = max(0, int(now - float(stored.get('remote_progress_at') or now)))
+    return ('Coworker is still working in Notion (%d steps, last step %ds ago); watching, nothing is resent'
+            % (int(stored.get('remote_steps') or 0), ago))
+
+
 class PendingRemote(Exception):
-    """Upstream acceptance/completion is unknown. Never automatically resend."""
+    """Upstream acceptance/completion is unknown. Never automatically resend.
+
+    state/reason come from notion.turn_state of the same transcript read. Only EMPTY_PROOF_STATES
+    (own turn provably finished, no reply text) may lead to a retry; '' means no proof either way."""
+    def __init__(self, *args, state='', reason=''):
+        super().__init__(*args)
+        self.state, self.reason = state, reason
 
 
 class ResetNotAccepted(Exception):
@@ -114,6 +182,14 @@ class TransientInference(Exception):
 
 CANCELLED_BEFORE_SUBMISSION = 'Assignment cancelled before submission'
 HEAL_BASE, HEAL_CAP = 60, 600  # seconds: 60, 120, 240, 480, 600, 600, ...
+# Owner rule: at the hard token limit (burst level 'pause' or the 6 h budget used up) every RUNNING
+# coworker turn stops at once, not only new ones. The stop is local (Notion has no verified stop
+# endpoint): the stream is closed, a sent turn is reconciled (I5, never resent), an unsent one waits.
+LIMIT_STOP_EVENT = 'limit_stop'
+LIMIT_RESUME_EVENT = 'limit_resume'
+LIMIT_PAUSED_BY = 'token_limit'
+LIMIT_CHECK_SECONDS = 1.0   # cheap ledger check at most every 1 s (engine clock; design cache <= 1 s)
+LIMIT_CLEAR_SECONDS = 5.0   # hysteresis: two clear checks at least 5 s apart before the latch clears
 
 
 def cancelled_before_submission(exc):
@@ -138,11 +214,24 @@ class Engine:
         self.thread = None
         self.clock = time.time  # injectable for the worker heal backoff
         self.team_grower = None  # team_grow.TeamGrower, set by the Application (automatic team growth)
+        # Token hard-limit latch (memory only; rebuilt from the ledger by the next check after a restart).
+        self.limit_latch = None
+        self._limit_checked = None
+        self._limit_clear_since = 0.0
         self._restore()
 
     def _restore(self):
         # Persisted assignment IDs fence old reports even after an app restart.
         for task in self.store.all('tasks'):
+            if task.get('paused_by') == LIMIT_PAUSED_BY and task['state'] == 'retry':
+                # The token-limit latch lives in memory only: after a restart the first check rebuilds it from
+                # the ledger (and the dispatch gate holds coworker tasks again while the limit is still hit).
+                # A stale pause mark and stop message must not survive the restart.
+                task.pop('paused_by', None)
+                if str(task.get('error') or '').startswith('Stopped by token limit'):
+                    task['error'] = ''
+                self.store.put('tasks', task)
+                continue
             if task['state'] in ('running', 'cancelling'):
                 if task.get('submission_phase') == 'preparing':
                     cancelled = self.store.get('runs', task.get('run_id'), {}).get('state') == 'cancelled'
@@ -162,11 +251,26 @@ class Engine:
             self.store.put('workers', worker)
 
     def start(self):
+        self.wake_event = getattr(self, 'wake_event', None) or threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True, name='coordinator')
         self.thread.start()
 
+    def _wake(self):
+        """Run the next tick now instead of after the 0.25 s poll."""
+        event = getattr(self, 'wake_event', None)
+        if event is not None:
+            event.set()
+
+    def _watch(self, future, info):
+        """A finished remote call wakes the coordinator; done_at measures the wait until _complete."""
+        def done(_future, info=info):
+            info['done_at'] = time.time()
+            self._wake()
+        future.add_done_callback(done)
+
     def close(self):
         self.stop_event.set()
+        self._wake()
         with self.lock:
             for future, info in list(self.inflight.items()):
                 info['cancel'].set()
@@ -175,7 +279,12 @@ class Engine:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _loop(self):
-        while not self.stop_event.wait(0.25):
+        wake = getattr(self, 'wake_event', None) or threading.Event()
+        while not self.stop_event.is_set():
+            if wake.wait(0.25):
+                wake.clear()  # a finished remote call: tick right away
+            if self.stop_event.is_set():
+                break
             try:
                 self.tick()
             except Exception as exc:
@@ -185,7 +294,44 @@ class Engine:
                 try:
                     grower.maybe_check()
                 except Exception as exc:
-                    self.store.event('team_grow_check_failed', message=type(exc).__name__)
+                    # Name and text: 'ImportError' alone hid the missing chat_pool.name_coworkers for hours.
+                    self.store.event('team_grow_check_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+            try:
+                self._auto_cleanup_maybe()
+            except Exception as exc:
+                self.store.event('auto_cleanup_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+
+    def _auto_cleanup_maybe(self):
+        """Owner rule 2026-10-22: stale or broken runs and tasks end without asking the owner.
+
+        Starts stale_tasks.sweep every auto_cleanup_seconds (default 120 s; the first sweep runs 60 s after
+        start, so restart recovery settles first). It runs on the I/O pool because rule (d) may read Notion's
+        thread record; it never sends anything (I5). Setting auto_cleanup=False turns it off.
+        Returns the submitted future, or None."""
+        now = self.clock()
+        due = self.__dict__.get('_auto_cleanup_at')
+        if due is None:
+            self._auto_cleanup_at = now + stale_mod.CLEANUP_FIRST_DELAY
+            return None
+        if now < due:
+            return None
+        running = self.__dict__.get('_auto_cleanup_future')
+        if running is not None and not running.done():
+            return None
+        settings = self.store.settings()
+        self._auto_cleanup_at = now + _setting_number(settings, 'auto_cleanup_seconds', stale_mod.CLEANUP_INTERVAL,
+                                                      30, 86400)
+        if settings.get('auto_cleanup', True) is False:
+            return None
+        self._auto_cleanup_future = self.pool.submit(self._auto_cleanup_run)
+        return self._auto_cleanup_future
+
+    def _auto_cleanup_run(self):
+        try:
+            return stale_mod.sweep(self)
+        except Exception as exc:
+            self.store.event('auto_cleanup_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+            return []
 
     def tasks(self, run_id):
         return [t for t in self.store.all('tasks') if t['run_id'] == run_id]
@@ -345,16 +491,32 @@ class Engine:
                               "AND kind IN ('tool_started','file_claimed') AND ts>=?", (task['id'], begun)).fetchall()
         return any(name is None or str(name) not in READ_ONLY_TOOLS for (name,) in rows)
 
-    def _empty_remote_reply(self, task, info, run):
-        """Hang fix: Notion finished the turn but no text reached the harness. After 3 checks and 60 s, retry."""
-        done_at = float(task.get('remote_done_at') or 0)
-        if not done_at or str(task.get('result') or '').strip() or str(task.get('partial') or '').strip():
+    def _empty_remote_reply(self, task, info, run, exc=None):
+        """Retry only when ONE transcript read proved the own turn finished without reply text.
+
+        False-empty fix (t3ec11e437, 2026-10-20 22:41:57): the old rule retried after 3 checks and 60 s
+        when a second signal (the thread record) said 'not busy', although recover had just said the turn
+        was not finished. Now only exc.state in EMPTY_PROOF_STATES from notion.turn_state may retry; elapsed
+        time and check counts never decide (they only set the next check time)."""
+        if getattr(exc, 'state', '') not in EMPTY_PROOF_STATES:
             return False
-        if int(task.get('reconcile_checks') or 0) < 3 or time.time() - done_at < 60:
+        if str(task.get('result') or '').strip() or str(task.get('partial') or '').strip():
             return False
         if self._attempt_side_effects(task):
             self._hold_for_reconcile(task, info)
             return False
+        # Live bug t41585b6a7 (effort max): Notion closed the stream after a few minutes while the
+        # model kept thinking for 14-19 min. The 'empty' turn was resent 6 times to other coworkers.
+        # A turn Notion has not finished yet is never empty: keep reconciling instead of resending.
+        running = getattr(self.adapter, 'turn_running', None)
+        worker = self.store.get('workers', info['worker_id'])
+        if running and worker:
+            # Veto only: True (busy) or None (unknown) keeps reconciling; it can never turn 'running' into 'empty'.
+            try:
+                if running(worker) is not False:
+                    return False
+            except Exception:
+                return False  # unknown is not empty; never resend on a failed check
         self._release(info['worker_id'], info['lease'])
         task.pop('remote_unknown', None)
         task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry', next_at=time.time() + 5,
@@ -363,6 +525,34 @@ class Engine:
         self.store.event('empty_reply_retry', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
                          message='Notion finished with an empty reply; the task is retried')
         return True
+
+    def _done_poll_since(self, task, info, now, settings):
+        """When this attempt's reply stream closed or broke; 0 keeps the old backoff.
+
+        Case (a) stream_end sets remote_done_at; case (b) a broken stream leaves first_output and
+        remote_done at 0. Both reach this point from the attempt itself (recovery=False), so neither
+        timestamp is needed and remote_done_at is never written here (the empty-reply retry stays as before).
+        """
+        since = float(task.get('done_poll_since') or 0)
+        if since and since >= float(task.get('sent_at') or task.get('started') or 0):
+            return since  # still the same attempt
+        cancel = info.get('cancel')
+        if info.get('recovery') or (cancel is not None and cancel.is_set()):
+            return 0  # restart recovery or a cancel: no stream close in this attempt
+        if now - float(task.get('started') or now) > task_limit(settings, task):
+            return 0  # stopped at the task time limit, not by a stream close
+        return now
+
+    def _done_poll_slot_free(self, task_id, now, settings):
+        """Cap the fast done poll to DONE_POLL_MAX_TASKS tasks so it stays far below 180 requests/min."""
+        limit = int(_setting_number(settings, 'done_poll_max_tasks', DONE_POLL_MAX_TASKS, 0, DONE_POLL_MAX_TASKS))
+        window = _setting_number(settings, 'done_poll_window_seconds', DONE_POLL_WINDOW_SECONDS, 0, 7200)
+        busy = 0
+        for other in self.store.all('tasks'):
+            if (other.get('id') != task_id and other.get('state') == 'uncertain' and other.get('done_poll_fast')
+                    and now - float(other.get('done_poll_since') or 0) <= window):
+                busy += 1
+        return busy < limit
 
     def _main_compressing(self, run):
         # Phase 4 Fix P: a Main with a requested compress waits for its rotation; its tasks go to coworkers.
@@ -425,10 +615,29 @@ class Engine:
                 elif task['state'] == 'running':
                     task['state'] = 'cancelling'
                     self.store.put('tasks', task)
+                elif task['state'] in ('blocked', 'uncertain') and self._worker_ai_disabled(task):
+                    # Notion AI is off on the worker account, so Notion can never confirm this turn.
+                    # Nothing is resent (I5); the task just ends with its cancelled run.
+                    if task.get('worker_id'):
+                        self._release(task['worker_id'], task.get('lease', ''))
+                    for key in ('remote_unknown', 'side_effect_hold', 'reconcile_at'):
+                        task.pop(key, None)
+                    task.update(state='cancelled', error='Cancelled with its run: the worker account has Notion AI '
+                                'disabled, so Notion can never confirm this turn. Nothing was resent.')
+                    self.store.put('tasks', task)
             for info in self.inflight.values():
                 if info['run_id'] == run_id:
                     info['cancel'].set()
             self.store.event('run_cancelled', run_id, message='Local work stopped; upstream chats are reconciled before reuse')
+
+    def _worker_ai_disabled(self, task):
+        worker_id = task.get('worker_id', '') or ''
+        worker = self.store.get('workers', worker_id, {}) if worker_id else {}
+        account_id = (worker or {}).get('account_id') or worker_id.split(':')[0]
+        if not account_id:
+            return False
+        account = self.store.get('accounts', account_id, {}) or {}
+        return account.get('state') == 'ai_disabled' or (account.get('ai_access') or {}).get('state') == 'disabled'
 
     def pause(self, run_id, paused=True):
         with self.lock:
@@ -517,9 +726,64 @@ class Engine:
         run['needs_main_reasons'], run['machine_check_failed'] = reasons, machine
         return list(reasons)
 
+    def _record_outcomes(self, run, tasks):
+        """Honest result counts. Sets task['outcome'] on every finished task and run['outcomes'], run['fixes'],
+        run['reviews']; no state value changes. Operator executors are 'not_done' without a final RESULT: DONE line.
+        Stage roles (reviewer, architect, ...) answer in JSON, so they are 'accepted' when finished.
+        'not_done' wins over 'check_failed' (the task itself said it did not finish)."""
+        from .operator_main import result_done
+        machine = run.get('machine_check_failed') or {}
+        counts = dict(accepted=0, not_done=0, check_failed=0)
+        for t in tasks:
+            if t['state'] != 'done':
+                continue
+            if t['role'] != 'executor':
+                outcome = 'accepted'
+            elif run.get('operator') and not result_done(t.get('result', '')):
+                outcome = 'not_done'
+            elif t['id'] in machine or t.get('agent_red_flag'):
+                outcome = 'check_failed'
+            else:
+                outcome = 'accepted'
+            if t.get('outcome') != outcome:
+                t['outcome'] = outcome
+                self.store.put('tasks', t)
+            if t['role'] == 'executor' and not t.get('fixed_by'):  # the same tasks the run summary counts
+                counts[outcome] += 1
+        reviews = dict(approved=0, changes_requested=0, skipped=0)
+        for t in tasks:
+            if t['role'] == 'executor':
+                if t.get('review_skipped'):  # marker set by operator_roles.step; never counted as approved
+                    reviews['skipped'] += 1
+                elif t.get('review_state') == 'approved':
+                    reviews['approved'] += 1
+            elif t['role'] == 'reviewer' and t['state'] == 'done':
+                try:
+                    data = json.loads(t.get('result') or '{}')
+                except ValueError:
+                    data = {}
+                if isinstance(data, dict) and data.get('passed') is False:
+                    reviews['changes_requested'] += 1
+        fixes = sum(1 for t in tasks if t.get('fix_of'))
+        run['outcomes'], run['reviews'] = counts, reviews
+        # max(): the non-operator fix-round counter (run['fixes'] < max_fix_rounds) must never go backwards.
+        run['fixes'] = max(int(run.get('fixes') or 0), fixes)
+
+    @staticmethod
+    def _outcome_text(run):
+        """Plain English counts for the run summary; empty when everything is accepted with no fix and no review."""
+        o, r, fixes = run.get('outcomes') or {}, run.get('reviews') or {}, run.get('fixes') or 0
+        if not (o.get('not_done') or o.get('check_failed') or fixes or any(r.values())):
+            return ''
+        return ('; outcomes: %d accepted, %d not done, %d check failed; fixes: %d; reviews: %d approved, '
+                '%d changes requested, %d skipped') % (
+            o.get('accepted', 0), o.get('not_done', 0), o.get('check_failed', 0), fixes,
+            r.get('approved', 0), r.get('changes_requested', 0), r.get('skipped', 0))
+
     def _finish(self, run, tasks):
         # Three-stage acceptance: machine check -> Main -> done. Fully passing runs finish at once.
         needs = self._main_decisions(run, tasks)
+        self._record_outcomes(run, tasks)
         for task_id, reason in run['machine_check_failed'].items():
             self.store.event('machine_check_failed', run['id'], task_id=task_id, message=reason)
         if needs:
@@ -543,22 +807,61 @@ class Engine:
             self.store.event('stage_changed', run_id, message='done')
             return dict(id=run_id, state='done', confirmed_at=now)
 
+    def _unsent_proof(self, task_id):
+        """Notion's own thread record proves that our prompt never arrived. Live 22 Oct 2026 (task te4de127): the
+        thread's latest user/trigger turn was hours older than our send and that turn had completed, so nothing
+        of ours ran, but remote_done_at stayed 0 and the task blocked every restart.
+
+        Proof = latest_user_ms < (sent_at - 60) * 1000 and completed_ms >= latest_user_ms (and latest_user_ms > 0).
+        Thread: the task's thread_id, else the worker's; account: the worker's. This is a network read, so the
+        caller runs it before taking self.lock. A missing task/worker/thread/send time, a missing adapter method or
+        any read error returns None, which keeps the old refusal."""
+        task = self.store.get('tasks', task_id)
+        if not task or task.get('remote_done_at'):
+            return None
+        sent = float(task.get('sent_at') or 0)
+        worker = (self.store.get('workers', task['worker_id']) if task.get('worker_id') else None) or {}
+        thread_id = task.get('thread_id') or worker.get('thread_id') or ''
+        account_id = worker.get('account_id') or ''
+        outcome = getattr(self.adapter, 'turn_outcome', None)
+        client = getattr(self.adapter, 'client', None)
+        if sent <= 0 or not thread_id or not account_id or not callable(outcome) or not callable(client):
+            return None
+        try:
+            latest, completed, status = outcome(client(account_id), thread_id)
+            latest, completed = float(latest or 0), float(completed or 0)
+        except Exception as exc:
+            self.store.event('unsent_proof_failed', task.get('run_id', ''), task_id=task_id,
+                             message=(type(exc).__name__ + ': ' + str(exc))[:200])
+            return None
+        if not (0 < latest < (sent - 60) * 1000 and completed >= latest):
+            return None
+        return dict(thread_id=thread_id, sent_at=sent, latest_user_ms=latest, completed_ms=completed,
+                    status=str(status or ''))
+
     def resolve_uncertain(self, task_id, resolution, note=''):
         """The Main decides a task whose Notion turn finished but whose answer never reached the harness.
 
         Nothing is sent again (I5). 'accept': the Main checked the work directly and takes it as the result
         (RESULT: DONE). 'abandon': the task ends as failed, so its run stops for the Main. Either way the
-        reserved thread is released and the task no longer holds its files."""
+        reserved thread is released and the task no longer holds its files. 'accept' always needs Notion's
+        confirmation (remote_done_at); 'abandon' also works without it when Notion's thread record proves the
+        prompt never arrived (_unsent_proof, read before the lock)."""
         if resolution not in ('accept', 'abandon'):
             raise ValueError("resolution must be 'accept' or 'abandon'")
+        proof = self._unsent_proof(task_id) if resolution == 'abandon' else None
         with self.lock:
             task = self.store.get('tasks', task_id)
             if not task:
                 raise ValueError('Task not found')
             if task.get('state') != 'uncertain' and not task.get('remote_unknown'):
                 raise ValueError('Only an unconfirmed task can be resolved by the Main (state: %s)' % task.get('state', ''))
+            unsent = None
             if not task.get('remote_done_at'):
-                raise ValueError('Notion has not confirmed that the turn finished; wait for it or stop the turn first')
+                # Only 'abandon' may skip the confirmation, and only with Notion's proof for this very send.
+                if not proof or float(task.get('sent_at') or 0) != proof['sent_at']:
+                    raise ValueError('Notion has not confirmed that the turn finished; wait for it or stop the turn first')
+                unsent = proof
             if any(info.get('task_id') == task_id for info in self.inflight.values()):
                 raise ValueError('A reconciliation check is running for this task; try again in a few seconds')
             note = ' '.join(str(note or '').split())[:2000]
@@ -574,15 +877,25 @@ class Engine:
                     summary += ' ' + note
                 task.update(state='done', requires_review=False, error='',
                             result=json.dumps(dict(status='done', summary=summary + '\nRESULT: DONE'), ensure_ascii=False))
+            elif unsent:
+                why = ('Notion proves the prompt never arrived: thread %s has its latest user turn at %d ms, more than '
+                       '60 s before the send at %d s, and that turn completed at %d ms (status %s)'
+                       % (unsent['thread_id'], unsent['latest_user_ms'], unsent['sent_at'], unsent['completed_ms'],
+                          unsent['status'] or '-'))
+                task.update(state='failed', unsent_proof=unsent,
+                            error=('Abandoned by the Main; %s; nothing was resent. %s' % (why, note)).strip()[:600])
             else:
                 task.update(state='failed',
                             error=('Abandoned by the Main after reconciliation; nothing was resent. ' + note).strip()[:400])
             task.update(main_resolution=resolution, resolved_at=now, finished=now)
             self.store.put('tasks', task)
+            extra = dict(proof=unsent) if unsent else {}
             self.store.event('task_resolved_by_main', task['run_id'], task_id=task_id, worker_id=task.get('worker_id', ''),
                              resolution=resolution,
-                             message='The Main %s the unconfirmed task without resending it'
-                                     % ('accepted' if resolution == 'accept' else 'abandoned'))
+                             message='The Main %s the unconfirmed task without resending it%s'
+                                     % ('accepted' if resolution == 'accept' else 'abandoned',
+                                        ' (Notion proves the prompt never arrived)' if unsent else ''),
+                             **extra)
             return dict(id=task_id, state=task['state'], resolution=resolution)
 
     def coordination(self):
@@ -767,12 +1080,24 @@ class Engine:
 
     def _start_merges_locked(self):
         merging = self.__dict__.setdefault('_patch_merging', set())
+        heads = {}  # project root -> current main commit (only asked when a task waits for a red main)
         for task in self.store.all('tasks'):
             if task.get('patch_state') != 'waiting' or task['id'] in merging or not task.get('patch_worktree'):
                 continue
             run = self.store.get('runs', task['run_id'])
             if not run:
                 continue
+            red_at = task.get('patch_main_red')
+            if red_at:
+                root = str(self._project_root(run))
+                if root not in heads:
+                    try:
+                        patcher = self._patcher(run)
+                        heads[root] = patcher.rev(getattr(patcher, 'base', patch_mod.BASE))
+                    except Exception:
+                        heads[root] = None
+                if heads[root] == red_at:
+                    continue  # main is still the red commit: wait for a fix before merging again
             merging.add(task['id'])
             try:
                 future = self._patcher(run).submit(dict(task))
@@ -799,18 +1124,35 @@ class Engine:
                 merging.discard(task_id)
                 return
             status = str(result.get('status') or 'error')
-            tries = task.get('patch_tries', 0) + 1
+            main_red = status == 'main_red'
+            # A red main is not the task's fault: waiting for it never uses up the retry limit.
+            tries = task.get('patch_tries', 0) + (0 if main_red else 1)
             if status in ('merged', 'nothing'):
                 state = 'merged'
             elif status == 'conflict':
                 state = 'conflict'
+            elif main_red:
+                state = 'waiting'
             elif status in PATCH_RETRY and tries < PATCH_RETRY_LIMIT:
                 state = 'waiting'
             else:
                 state = 'failed'
             task.update(patch_state=state, patch_tries=tries,
                         patch_result=dict(status=status, message=str(result.get('message') or '')[:600], at=time.time(),
-                                          main_after=str(result.get('main_after') or ''), pushed=bool(result.get('pushed'))))
+                                          main_after=str(result.get('main_after') or ''), pushed=bool(result.get('pushed')),
+                                          failing=[str(n) for n in (result.get('failing') or [])][:20],
+                                          tests=patch_mod.test_tail(result)))
+            if main_red:
+                red_at = str(result.get('main_red_commit') or result.get('main_before') or '')
+                task['patch_main_red'] = red_at
+                seen = self.__dict__.setdefault('_main_red_seen', set())
+                # One operator event per red main commit, not one per task; the stored events keep this across restarts.
+                if red_at not in seen and not self._main_red_reported(red_at):
+                    seen.add(red_at)
+                    self.store.event('main_red', task['run_id'], commit=False, task_id=task_id, main_commit=red_at,
+                                     failing=task['patch_result']['failing'], message=task['patch_result']['message'][:300])
+            else:
+                task.pop('patch_main_red', None)
             run = self.store.get('runs', task['run_id'])
             if state == 'conflict' and run and not task.get('patch_follow_up'):
                 follow = result.get('follow_up') or {}
@@ -842,6 +1184,74 @@ class Engine:
                     conflicts_waiting=sum(1 for t in tasks if t.get('patch_state') == 'conflict'),
                     waiting_to_merge=sum(1 for t in tasks if t.get('patch_state') == 'waiting'),
                     labels={t['id']: PATCH_LABELS[t['patch_state']] for t in tasks if t.get('patch_state') in PATCH_LABELS})
+
+    def _main_red_reported(self, main_commit):
+        """True when the store already holds a 'main_red' event for this main commit (survives restarts)."""
+        db = getattr(self.store, 'db', None)
+        if not main_commit or db is None:
+            return False
+        try:
+            with self.store.lock:
+                row = db.execute("SELECT 1 FROM events WHERE kind='main_red' AND json_extract(doc,'$.main_commit')=? "
+                                 "LIMIT 1", (main_commit,)).fetchone()
+        except Exception:
+            return False
+        return row is not None
+
+    def _remerge_refusal(self, task):
+        """Why a task may not be merged again, or None. Tasks without their worktree are never touched."""
+        if task.get('state') != 'done':
+            return 'The task is not done'
+        if task.get('patch_state') != 'failed':
+            return 'The merge of this task did not fail'
+        status = (task.get('patch_result') or {}).get('status')
+        if status not in REMERGE_STATUSES:
+            return 'The merge failed with status %r, not red or main_red' % status
+        folder = task.get('patch_worktree')
+        if not folder or not (Path(folder) / '.git').exists():
+            return 'The task has no worktree any more; nothing to merge again'
+        return None
+
+    def remerge(self, task_id=None, since=None):
+        """Put merges rejected as red/main_red back to 'waiting' (tries reset); tick() merges them again.
+
+        task_id: one task (refusal raises ValueError). since: all such tasks whose merge failed at or after
+        this unix time; refused candidates are listed in 'skipped'. The task itself is never re-run (I5).
+        """
+        if task_id is None and since is None:
+            raise ValueError('Give a task id or since (unix time)')
+        with self.lock:
+            skipped = []
+            if task_id is not None:
+                task = self.store.get('tasks', str(task_id))
+                if not task:
+                    raise ValueError('Task not found')
+                reason = self._remerge_refusal(task)
+                if reason:
+                    raise ValueError(reason)
+                picked = [task]
+            else:
+                since = float(since)
+                picked = []
+                for task in self.store.all('tasks'):
+                    result = task.get('patch_result') or {}
+                    if task.get('patch_state') != 'failed' or result.get('status') not in REMERGE_STATUSES \
+                            or float(result.get('at') or 0) < since:
+                        continue
+                    reason = self._remerge_refusal(task)
+                    if reason:
+                        skipped.append(dict(id=task['id'], reason=reason))
+                    else:
+                        picked.append(task)
+            ids = []
+            for task in picked:
+                old = (task.get('patch_result') or {}).get('status')
+                task.update(patch_state='waiting', patch_tries=0, patch_remerged_at=time.time())
+                task.pop('patch_main_red', None)
+                self.store.put('tasks', task)
+                self.store.event('patch_remerge', task['run_id'], commit=False, task_id=task['id'], status=old)
+                ids.append(task['id'])
+            return dict(tasks=ids, count=len(ids), skipped=skipped)
 
     def claim_file(self, task_id, lease, relative):
         with self.lock:
@@ -887,21 +1297,193 @@ class Engine:
                 raise ValueError('Another active task owns this PC path; request a dependency instead')
             self.store.put('tasks',trial)
 
+    # ---- Token hard limit: stop running coworker turns ------------------------------------------
+    def limit_state(self, now=None):
+        """Read-only: dict(hard, source '6h'|'burst'|'', wait, level, reason). The throttle level is never hard."""
+        from . import token_budget
+        now = self.clock() if now is None else now
+        try:
+            wait = float(token_budget.exhausted(self.store, now) or 0)
+        except Exception:
+            wait = 0.0
+        if wait > 0:
+            return dict(hard=True, source='6h', wait=wait, level='pause', reason='6 h token budget used up')
+        try:
+            burst = token_budget.burst_state(self.store, now) or {}
+        except Exception:
+            burst = {}
+        level = str(burst.get('level') or 'ok')
+        if level == 'pause':
+            return dict(hard=True, source='burst', wait=float(burst.get('wait') or 120), level=level,
+                        reason=str(burst.get('reason') or 'token burst hard limit'))
+        return dict(hard=False, source='', wait=0.0, level=level, reason='')
+
+    def _limit_check(self):
+        """Called by tick() under the lock; cheap (two ledger reads) and at most every LIMIT_CHECK_SECONDS."""
+        now = self.clock()
+        last = getattr(self, '_limit_checked', None)
+        if last is not None and 0 <= now - last < LIMIT_CHECK_SECONDS:
+            return getattr(self, 'limit_latch', None)
+        self._limit_checked = now
+        state = self.limit_state(now)
+        latch = getattr(self, 'limit_latch', None)
+        if state['hard']:
+            self._limit_clear_since = 0.0
+            stopped, kept = self._limit_stop(state)
+            task_ids = [info['task_id'] for info, _ in stopped]
+            worker_ids = [info['worker_id'] for info, _ in stopped]
+            if latch is None:
+                self.limit_latch = dict(since=now, source=state['source'], wait=state['wait'],
+                                        reason=state['reason'], task_ids=task_ids)
+                self.store.event(LIMIT_STOP_EVENT, '', source=state['source'], reason=state['reason'],
+                                 wait_s=round(state['wait'], 1), count=len(stopped), task_ids=task_ids,
+                                 worker_ids=worker_ids, main_kept=kept,
+                                 message='Token hard limit reached (%s): %d running coworker turn(s) stopped; '
+                                         'Main chats untouched' % (state['reason'], len(stopped)))
+            else:
+                latch.update(source=state['source'], wait=state['wait'], reason=state['reason'])
+                if stopped:
+                    latch['task_ids'] = list(latch.get('task_ids') or []) + task_ids
+                    self.store.event('limit_stop_more', '', source=state['source'], count=len(stopped),
+                                     task_ids=task_ids, worker_ids=worker_ids,
+                                     message='Token limit still reached: %d more coworker turn(s) stopped' % len(stopped))
+            if stopped:
+                self._limit_stop_turns(stopped)
+        elif latch is not None:
+            # Hysteresis: two clear checks in a row, at least LIMIT_CLEAR_SECONDS apart.
+            if not self._limit_clear_since:
+                self._limit_clear_since = now
+            elif now - self._limit_clear_since >= LIMIT_CLEAR_SECONDS:
+                self._limit_resume(latch, now)
+        return self.limit_latch
+
+    def _limit_stop(self, state):
+        """Set the cancel Event of every running coworker turn. Main/operator turns and recovery reads stay."""
+        stopped, kept = [], 0
+        for future, info in list(self.inflight.items()):
+            if info.get('recovery') or info.get('limit_stop') or future.done():
+                continue  # a turn that already finished counts as done
+            worker = self.store.get('workers', info.get('worker_id')) or {}
+            if worker.get('purpose') != 'worker':
+                kept += 1
+                continue
+            info.update(limit_stop=True, limit_wait=float(state.get('wait') or 0))
+            cancel = info.get('cancel')
+            if cancel is not None:
+                cancel.set()
+            stopped.append((info, worker))
+        return stopped, kept
+
+    def _limit_stop_turns(self, stopped):
+        """Ask the adapter to stop the remote turns, off the engine lock; every answer is logged."""
+        stop = getattr(self.adapter, 'stop_turn', None)
+        if not callable(stop):
+            return None
+        jobs = []
+        for info, worker in stopped:
+            task = self.store.get('tasks', info['task_id']) or {}
+            jobs.append((info['task_id'], info.get('run_id') or '', info['worker_id'],
+                         task.get('thread_id') or worker.get('thread_id') or '', dict(worker)))
+
+        def call():
+            for task_id, run_id, worker_id, thread_id, worker in jobs:
+                try:
+                    answer = stop(thread_id, worker)
+                except Exception as exc:
+                    answer = dict(ok=False, reason='error: %s' % str(exc)[:200])
+                if not isinstance(answer, dict):
+                    answer = dict(ok=bool(answer), reason='')
+                try:
+                    self.store.event('limit_stop_turn', run_id, task_id=task_id, worker_id=worker_id,
+                                     thread_id=thread_id, ok=bool(answer.get('ok')),
+                                     reason=str(answer.get('reason') or ''),
+                                     message='Remote stop for a limit-stopped turn: %s' %
+                                             ('ok' if answer.get('ok') else str(answer.get('reason') or 'not stopped')))
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=call, name='limit-stop-turn', daemon=True)
+        self._limit_stop_thread = thread
+        thread.start()
+        return thread
+
+    def _limit_hold(self, task, info, exc):
+        """Outcome of a limit-stopped turn that ended with an exception (never failed, never resent)."""
+        now = self.clock()
+        wait = float(info.get('limit_wait') or 0) or 120.0
+        started = float(task.get('started') or 0)
+        sent = (task.get('submission_phase') not in (None, '', 'preparing')
+                or float(task.get('sent_at') or 0) >= started > 0)
+        if str(exc).startswith('Assignment cancelled before') or not sent:
+            # Nothing reached Notion: the chat is fine, the attempt is not used, the task waits for the limit.
+            self._release(info['worker_id'], info['lease'])
+            task.pop('remote_unknown', None)
+            task.update(state='retry', attempts=max(0, task['attempts'] - 1), next_at=now + wait,
+                        paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
+                        error='Stopped by token limit before anything was sent; waits until the limit clears '
+                              '(about %d s)' % int(wait))
+        else:
+            # I5: the turn may have left; it is read back by reconcile, never resent.
+            task.update(state='uncertain', remote_unknown=False, reconcile_checks=task.get('reconcile_checks', 0) + 1,
+                        reconcile_at=time.time() + 5, paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
+                        error='Stopped locally by token limit; the Notion turn is read back, never resent')
+            worker = self.store.get('workers', info['worker_id'])
+            if worker:
+                worker['state'] = 'recovering'
+                self.store.put('workers', worker)
+
+    def _limit_resume(self, latch, now):
+        self.limit_latch = None
+        self._limit_clear_since = 0.0
+        resumed = 0
+        for task in self.store.all('tasks'):
+            if task.get('paused_by') != LIMIT_PAUSED_BY or task.get('state') != 'retry':
+                continue
+            task.pop('paused_by', None)
+            task.update(next_at=min(float(task.get('next_at') or 0), now), error='')
+            self.store.put('tasks', task)
+            resumed += 1
+        self.store.event(LIMIT_RESUME_EVENT, '', source=latch.get('source', ''), reason=latch.get('reason', ''),
+                         stopped_s=round(max(0.0, now - float(latch.get('since') or now)), 1), resumed=resumed,
+                         message='Token limit cleared: %d waiting coworker task(s) resume' % resumed)
+
+    def _limit_charge_reply(self, task, info, text):
+        """A limit-stopped turn read back as done: its reply was never charged (the stream was cancelled)."""
+        task.pop('paused_by', None)
+        if not info.get('recovery') or task.get('limit_reply_charged'):
+            return
+        from . import token_budget
+        try:
+            token_budget.charge_reply(self.store, self.store.get('workers', info['worker_id']) or {}, text)
+        except Exception:
+            pass
+        task['limit_reply_charged'] = True
+
     def tick(self):
         with self.lock:
             for future, info in list(self.inflight.items()):
                 if future.done():
                     del self.inflight[future]
+                    if info.get('done_at'):
+                        # Seconds from the finished remote call to its completion here (lock wait + tick start).
+                        info['complete_wait_s'] = round(max(0.0, time.time() - info['done_at']), 3)
                     self._complete(future, info)
+            # Owner rule: at the hard token limit every running coworker turn stops at once (Main untouched).
+            limit_latch = self._limit_check()
             self._start_merges()
             self._reconcile()
             self._heal_workers()
+            try:
+                from .account_failover import rehome_runs
+                rehome_runs(self.store)  # B41: runs of dead/AI-disabled accounts move to a working Main
+            except Exception as exc:  # never let failover stop dispatch
+                self.store.event('run_rehome_failed', '', error=str(exc)[:300])
             runs = self.store.all('runs')
             if getattr(self.adapter, 'single_account_harness', False):
-                from .harness_account import selected_account, main_chat
-                selected = selected_account(self.store)
-                # Every Main of the selected harness account may run; each chat stays strictly ordered.
-                runs = [r for r in runs if selected and self.store.get('workers', r.get('main_worker'), {}).get('account_id') == selected]
+                from .harness_account import runnable_accounts
+                # B39: every Main of every account may run while at least one account is ready (its executor
+                # tasks go to coworkers of ready accounts); each chat stays strictly ordered.
+                runs = runs if runnable_accounts(self.store) else []
             for run in runs:
                 if run['state'] == 'queued' and self._run_slot_free(run, runs):
                     run['state'] = 'approach'
@@ -943,6 +1525,10 @@ class Engine:
                             task['ready_at'] = time.time()
                             self.store.event('task_ready', run['id'], commit=False, task_id=task['id'], deps=len(task['deps']))
                         worker = self._choose_worker(task, run, settings)
+                        if worker and limit_latch is not None and worker.get('purpose') == 'worker':
+                            # Token hard limit: no new coworker turn until the latch clears; next_at is not
+                            # changed, so nothing piles up. Main tasks still dispatch (run() keeps its checks).
+                            worker = None
                         if worker:
                             self._dispatch(task, run, worker)
                             assigned = True
@@ -955,14 +1541,17 @@ class Engine:
     def _choose_worker(self, task, run, settings):
         workers = self.store.all('workers')
         if getattr(self.adapter, 'single_account_harness', False):
-            from .harness_account import selected_account
-            selected = selected_account(self.store)
-            workers = [w for w in workers if w['account_id'] == selected]
+            from .harness_account import runnable_accounts
+            usable = runnable_accounts(self.store)
+            workers = [w for w in workers if w['account_id'] in usable]  # B39: coworkers of every ready account
         main_role = task['role'] in ('planner', 'integrator') or task.get('use_main', False)
         # A Main that was just found busy (usually the operator's own chat) hands Main tasks to a free joined coworker.
         main_busy = main_role and (task.get('main_busy_at', 0) > time.time() - MAIN_BUSY_FALLBACK_S
                                    or self._main_compressing(run))
         main_account = self.store.get('workers', run['main_worker'], {}).get('account_id')
+        if main_account:
+            # B45: Coworkers only on the account the Main is logged in with; never borrowed from other accounts.
+            workers = [w for w in workers if w.get('account_id') == main_account]
         choices = [w for w in workers if w.get('enabled') and w['state'] == 'ready'
                    and w.get('cooldown_until', 0) <= time.time()
                    and (w['id'] == run['main_worker'] if main_role and not main_busy else
@@ -973,6 +1562,8 @@ class Engine:
                    self.store.get('tasks', pending_rotations[w['id']]['task_id'], {}).get('state') in TERMINAL]
         if not choices and not main_role and run['capacity'] == 0:
             choices = [w for w in workers if w['id'] == run['main_worker'] and w.get('enabled') and w['state'] == 'ready']
+        # I32: a Coworker chat 23 h or older gets no new task in any branch (executor, reviewer, fixer, fallbacks).
+        choices = coworker_age_guard.young(self.store, choices, time.time(), run.get('id', ''))
         counts = {}
         checkpoint_workers = {ident for ident, rotation in pending_rotations.items()
                               if rotation.get('state') == 'submitted' or
@@ -1021,6 +1612,7 @@ class Engine:
         choices = [w for w in choices if not pending_rotations.get(w['id'], {}).get('task_id') or
                    pending_rotations[w['id']]['task_id'] == task['id'] or
                    self.store.get('tasks', pending_rotations[w['id']]['task_id'], {}).get('state') in TERMINAL]
+        choices = [w for w in choices if not (coworker_age_guard.is_coworker(w) and coworker_age_guard.too_old(w, time.time()))]
         choices.sort(key=lambda w: (w.get('last_used', 0), counts.get(w['account_id'], 0)))
         preferred = [w for w in choices if task.get('prefer_worker') and w['id'] == task['prefer_worker']]
         return (preferred or choices)[0] if choices else None
@@ -1034,14 +1626,23 @@ class Engine:
         task.update(state='running', worker_id=worker['id'], lease=secrets.token_urlsafe(32),
                     step_id=uid(), started=time.time(), attempts=task['attempts']+1, error='', partial='',
                     thread_id=worker['thread_id'], submission_phase='preparing')
+        if task.get('paused_by') == LIMIT_PAUSED_BY:
+            task.pop('paused_by', None)  # a fresh attempt after a token-limit wait (nothing was sent before)
+        # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
+        task.update(reconcile_checks=0, remote_done_at=0, reconcile_at=0, approval_seen=None, awaiting_approval='',
+                    approval_evidence=False, pending_tool='', pending_tool_state='', turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False,
+                        remote_working=False, remote_running=False, remote_progress_at=0, remote_newest_seq=0,
+                        remote_steps=0, remote_stall_noted=False)
         # Every attempt keeps its own timing record for the metrics.
         task['attempt_log'] = (task.get('attempt_log') or [])[-19:] + [
             dict(attempt=task['attempts'], worker_id=worker['id'], started=task['started'])]
         if task.get('files') and not task.get('proof_base'):
             # Proof: base snapshot of the write scope, taken once when the task starts (proof.py).
             task['proof_base'] = task_proof.start(task['id'], task['files'], self._project_root(run))
-        if task['role'] == 'executor' and self._patch_on(run):
-            self._patch_prepare(task, run)  # own git worktree before dispatch (patch_mode.py)
+        read_only = bool(task.get('read_only')) or bool(re.search(r'\bread[- ]only\b', task.get('prompt') or '', re.I))
+        if task['role'] == 'executor' and self._patch_on(run) and not read_only:
+            # own git worktree before dispatch (patch_mode.py); read-only audits skip it (dispatch spread)
+            self._patch_prepare(task, run)
         self.store.put('tasks', task)  # Commit the submission marker BEFORE the API can accept it.
         worker.update(state='busy', lease=task['lease'], last_used=time.time(),
                       prev_task_id=worker.get('last_task_id', ''), last_task_id=task['id'])
@@ -1066,6 +1667,17 @@ class Engine:
         claims = file_registry.summary(self.store, run.get('project_path', ''), exclude_task=task['id'], task=task) if task['role'] in ('planner', 'executor') else ''
         tools_available = bool(account.get('bridge_connected') and self.store.settings().get('advertise_project_tools', False))
         prompt_task = dict(task, prompt=task['prompt'] + PATCH_NOTE % (task['patch_worktree'], task.get('patch_branch', ''))) if task.get('patch_worktree') else task
+        # Context pack: the named code goes straight into the prompt (fewer read/search steps).
+        pack = dict(added=False, chars=0, blocks=0, skipped=0, tests=0)
+        if task['role'] in ('executor', 'reviewer') and self.store.settings().get('context_pack', True):
+            from . import context_pack
+            try:
+                packed, pack = context_pack.expand(prompt_task['prompt'], task.get('files') or [],
+                                                   task.get('patch_worktree') or self._project_root(run))
+                if pack['added']:
+                    prompt_task = dict(prompt_task, prompt=packed)
+            except Exception as error:  # never block a start because of the pack
+                pack = dict(pack, error=str(error)[:200])
         if task.get('review_of'):
             prompt_task = dict(prompt_task, prompt=prompt_task['prompt'] + review_note(self.store.get('tasks', task['review_of'], None)))
         prompt = make_prompt(prompt_task, dict(run, file_claims=claims) if claims else run, context, task['lease'], tools_available)
@@ -1080,12 +1692,14 @@ class Engine:
         self.store.put('workers', worker)
         # Committed together with task_started right after the submit.
         self.store.event('context_built', run['id'], commit=False, task_id=task['id'], worker_id=worker['id'], attempt=task['attempts'],
-                         context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt))
+                         context_chars=len(context), context_tasks=sum(1 for t in context_tasks if t), prompt_chars=len(prompt),
+                         pack_chars=pack['chars'], pack_blocks=pack['blocks'], pack_skipped=pack['skipped'])
         cancel = threading.Event()
         future = self.pool.submit(run_with_priority, 'critical', self.adapter.run, worker, task, prompt, cancel,
                                   lambda text: self._partial(task['id'], task['lease'], text))
         self.inflight[future] = dict(task_id=task['id'], lease=task['lease'], worker_id=worker['id'],
                                     run_id=run['id'], cancel=cancel, recovery=False)
+        self._watch(future, self.inflight[future])
         self.store.event('task_started', run['id'], task_id=task['id'], worker=worker['label'], worker_id=worker['id'],attempt=task['attempts'],role=task['role'], message=task['title'])
 
     def _context(self, tasks):
@@ -1194,12 +1808,15 @@ class Engine:
                 task['result'] = json.dumps(data, ensure_ascii=False)
                 task['requires_review']=bool(data.get('requires_review'))
                 task['error'] = data.get('summary', '') if task['state'] != 'done' else ''
+            if task.get('paused_by') == LIMIT_PAUSED_BY:
+                self._limit_charge_reply(task, info, text)
             task['finished'] = time.time()
             # Proof record: changed files in the write scope, reported tests, screenshot (proof.py, never raises).
             task['proof'] = task_proof.record(task, text, self._project_root(run)) if task.get('proof_base') else task_proof.record(dict(task, id=''), text, None)
             if task.get('patch_worktree') and task['state'] == 'done':
                 task['patch_state'] = 'waiting'  # tick() starts collect -> verify -> merge
-            self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'])
+            self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'],
+                             complete_wait_s=info.get('complete_wait_s'))
         except ModelVerificationError as exc:
             failure=exc
             self._release(info['worker_id'],info['lease'])
@@ -1278,15 +1895,16 @@ class Engine:
             info['verified_fallback'] = True
         except (CircuitOpen, RemotePaused) as exc:
             failure=exc
-            if task.get('submission_phase') == 'inference' and self._empty_remote_reply(task, info, run):
-                pass
+            if task.get('submission_phase') == 'inference' and self._empty_remote_reply(task, info, run, exc):
+                pass  # never true: a circuit/pause error carries no done_empty proof
             elif task.get('submission_phase') == 'inference':
                 # Phase 3 / I5: the inference may already have left; never resend, reconcile instead.
-                overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
+                # The task limit only slows the checks down; it never blocks, resends or abandons.
+                overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue, reconcile_checks=checks,
+                task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks,
                             reconcile_at=time.time()+(300 if overdue else max(min(60,5*2**min(checks-1,4)), getattr(exc,'seconds',0))),
-                            error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                            error='Awaiting confirmation from Notion; request will not be resent')
                 worker = self.store.get('workers', info['worker_id'])
                 worker['state'] = 'recovering'
                 self.store.put('workers', worker)
@@ -1302,19 +1920,50 @@ class Engine:
                             attempts=max(0, task['attempts']-1), paused_by='account_blocked', error=str(exc)[:400])
         except PendingRemote as exc:
             failure=exc
-            if self._empty_remote_reply(task, info, run):
+            task.update(turn_state=getattr(exc, 'state', '') or 'unknown', turn_state_reason=getattr(exc, 'reason', ''))
+            if self._empty_remote_reply(task, info, run, exc):
                 pass
             else:
-                overdue = time.time()-task['started'] > self.store.settings()['task_timeout']+120
+                # The task limit only slows the checks down; it never blocks, resends or abandons (no time-based stop).
+                now = time.time()
+                settings = self.store.settings()
+                overdue = now-task['started'] > task_limit(settings, task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='blocked' if overdue else 'uncertain', remote_unknown=overdue,
-                            reconcile_checks=checks,reconcile_at=time.time()+(300 if overdue else min(60,5*2**min(checks-1,4))), error='Notion completion is unconfirmed; thread is reserved until reconciled' if overdue else 'Awaiting confirmation from Notion; request will not be resent')
+                # crit_done: read the approval state before the delay is chosen; approval waits keep the old backoff.
                 stored = self.store.get('tasks', task['id'], {}) or {}
-                if stored.get('awaiting_approval'):
-                    # Known cause: the turn is paused on an approval click, not lost. Say so plainly.
-                    task.update(awaiting_approval=stored['awaiting_approval'],
-                                error='Waiting for approval of ' + stored['awaiting_approval'] +
-                                      ' in the coworker chat; the request is not resent')
+                approval = bool(stored.get('awaiting_approval') or stored.get('approval_seen'))
+                since = 0 if overdue else self._done_poll_since(task, info, now, settings)
+                slot_free = bool(since) and not approval and self._done_poll_slot_free(task['id'], now, settings)
+                delay = 300 if overdue else reconcile_delay(checks, now, since, approval, slot_free, settings)
+                # B46: keep the liveness fields recover() just stored (this put would overwrite them otherwise).
+                for key in REMOTE_LIVE_FIELDS:
+                    if key in stored:
+                        task[key] = stored[key]
+                working = getattr(exc, 'reason', '') == 'remote_working' and not approval
+                if working:
+                    delay = min(delay, REMOTE_WORKING_POLL_SECONDS)  # near-live finish detection, also when overdue
+                elif stored.get('remote_running') and stored.get('remote_progress_at') and not stored.get('remote_stall_noted'):
+                    task['remote_stall_noted'] = True
+                    self.store.event('remote_stalled', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
+                                     message='The coworker chat shows no new step for %d min; nothing is resent'
+                                             % (REMOTE_QUIET_MINUTES,))
+                task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks, reconcile_at=now+delay,
+                            done_poll_since=since, done_poll_fast=slot_free, remote_working=working,
+                            error=(working_text(stored, now) if working else
+                                   'Awaiting confirmation from Notion; request will not be resent'))
+                tool = stored.get('awaiting_approval') or stored.get('pending_tool')
+                if tool:
+                    # Honest label (H5): 'approval' only with explicit evidence in the transcript entry
+                    # (notion.approval_evidence); otherwise the neutral 'tool running / not started' label.
+                    evidence = bool(stored.get('approval_evidence') and stored.get('awaiting_approval'))
+                    detail = stored.get('pending_tool_state') or ''
+                    task.update(awaiting_approval=stored.get('awaiting_approval') or '', approval_evidence=evidence,
+                                pending_tool=stored.get('pending_tool') or tool, pending_tool_state=detail,
+                                approval_seen=stored.get('approval_seen'),
+                                error=('Waiting for approval of ' + tool + ' in the coworker chat; the request is not resent'
+                                       if evidence else
+                                       'A tool call in the coworker chat has not finished yet (' + tool +
+                                       (': ' + detail if detail else '') + '); the request is not resent'))
                 worker = self.store.get('workers', info['worker_id'])
                 worker['state'] = 'recovering'
                 self.store.put('workers', worker)
@@ -1370,15 +2019,42 @@ class Engine:
                 task['prompt'] += '\nPlease correct this problem in the response: '+str(exc)
         except Exception as exc:
             failure=exc
-            if cancelled_before_submission(exc):
+            if info.get('limit_stop') and (run or {}).get('state') == 'cancelled':
+                # The run was cancelled while the token limit held this turn: the run cancel wins (not retry,
+                # not blocked, no presend failover).
+                failure=None
+                self._release(info['worker_id'], info['lease'])
+                task.pop('paused_by', None)
+                task.update(state='cancelled', error='')
+            elif info.get('limit_stop'):
+                # Token hard limit stopped this turn: never failed, never the presend failover, never resent.
+                failure=None
+                self._limit_hold(task, info, exc)
+            elif cancelled_before_submission(exc):
                 # Fix M: a cancel that won the race is not a chat failure; nothing was sent.
                 failure=None
                 self._release(info['worker_id'], info['lease'])
                 task.update(state='cancelled' if (run or {}).get('state') == 'cancelled' else 'retry',
                             attempts=max(0, task['attempts']-1), next_at=time.time(), error='')
+            elif (not task.get('sent_at') and task.get('submission_phase') == 'preparing'
+                  and task.get('presend_retries', 0) < PRESEND_RETRY_LIMIT
+                  and (run or {}).get('state') != 'cancelled'):
+                # Live bug t531ad0a (Coworker 9): an Edge error before anything was sent blocked the whole run.
+                # Nothing reached Notion, so the task moves to another coworker; this chat is marked 'error'.
+                self._release(info['worker_id'], info['lease'], 'error')
+                skip = [w for w in task.get('exclude_workers') or [] if w != info['worker_id']] + [info['worker_id']]
+                task.update(state='retry', attempts=max(0, task['attempts'] - 1), next_at=time.time() + 2,
+                            presend_retries=task.get('presend_retries', 0) + 1, exclude_workers=skip,
+                            error='')
+                self.store.event('presend_failover', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
+                                 message='Nothing was sent; moved to another coworker: ' + str(exc)[:200])
             else:
                 self._release(info['worker_id'], info['lease'], 'error')
                 task.update(state='blocked', error=str(exc)[:400])
+        if info.get('limit_stop') and task['state'] == 'uncertain':
+            # Sent before the stop (PendingRemote / inference path): read back by reconcile, never resent (I5).
+            task.update(paused_by=LIMIT_PAUSED_BY, limit_stopped_at=self.clock(),
+                        error='Stopped locally by token limit; the Notion turn is read back, never resent')
         from .telemetry import classify
         error_class = classify(failure) or ('TASK_FAILED' if task['state'] in ('failed', 'blocked') else '')
         if error_class == 'ACCOUNT_BLOCKED' and task['state'] == 'blocked' and not task.get('remote_unknown'):
@@ -1453,6 +2129,7 @@ class Engine:
             self.store.put('tasks', task)
             self.inflight[future] = dict(task_id=task['id'], lease=task['lease'], worker_id=worker['id'],
                                         run_id=task['run_id'], cancel=cancel, recovery=True)
+            self._watch(future, self.inflight[future])
 
     def _import_plan(self, run, plan, prefix=''):
         tasks = validate_plan(plan)
@@ -1517,6 +2194,7 @@ class Engine:
                     if unaccepted:
                         summary += '; not accepted: ' + ', '.join('%s (%s)' % (t['id'], t.get('title', '')) for t in unaccepted)
                     self._finish(run, tasks)
+                    summary += self._outcome_text(run)  # plain counts: outcomes, fixes, reviews
                     if run.get('state') == 'awaiting_main':
                         # Nobody reads the reports yet: the run waits for the Main's confirmation.
                         run['summary'] = summary + '; waiting for the Main: ' + ', '.join(run.get('needs_main') or [])
