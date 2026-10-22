@@ -100,6 +100,43 @@ class ThemePartTests(unittest.TestCase):
         node = NODE if os.path.exists(NODE) else shutil.which('node')
         out = subprocess.run([node, '--check', str(JS)], capture_output=True, text=True, timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
+    def test_tool_groups_js(self):
+        for marker in ('nt-desk-toolgroup-head', 'nt-desk-toolgroup-member', 'nt-desk-toolgroup-open',
+                       'data-nt-tool-count', 'TOOL_MIN_GROUP', "addEventListener('click', onClick, true)",
+                       "removeEventListener('click', onClick, true)", 'data-agent-chat-user-step-id'):
+            self.assertIn(marker, self.js, marker)
+        marks = self.js[self.js.index('var MARKS'):]
+        marks = marks[:marks.index(';')]
+        for name in ('GROUP_HEAD', 'GROUP_MEMBER', 'GROUP_OPEN'):
+            self.assertIn(name, marks, name)
+
+    def test_tool_groups_css(self):
+        self.assertIn('.nt-desk-toolgroup-member:not(.nt-desk-toolgroup-open)', self.css)
+        self.assertIn('.nt-desk-toolgroup-head:not(.nt-desk-toolgroup-open) > *', self.css)
+        self.assertIn("attr(data-nt-tool-count) ' tool steps'", self.css)
+
+    def test_calm_theme(self):
+        # No glow on every button hover and no hover lift; the glow is only on the composer.
+        self.assertNotIn('button:hover {\n  box-shadow', self.css)
+        self.assertNotIn('translateY(-1px)', self.css)
+        self.assertNotIn('var(--nt-accent-gradient) border-box', self.css)
+        self.assertNotIn('inset: -10px', self.css)
+        glow = self.css[self.css.index('[data-notion-chat-input-container]::before {'):]
+        glow = glow[:glow.index('}')]
+        self.assertIn('pointer-events: none;', glow)
+        self.assertIn('inset: 4px 16px 2px 16px;', glow)
+
+    @unittest.skipUnless(os.path.exists(NODE) or shutil.which('node'), 'node not installed')
+    def test_tool_helpers_runtime(self):
+        node = NODE if os.path.exists(NODE) else shutil.which('node')
+        script = (
+            'global.window = {}; require(process.argv[1]); var u = window.__ntDesk.themeUtil;'
+            'console.log(JSON.stringify([u.isToolLabel("NNotionTool / nt_shell"), u.isToolLabel("Hello world"),'
+            'u.toolRuns([true, true, true, false, true, true], 3), u.toolRuns([true, true, true, true], 3)]));'
+        )
+        out = subprocess.run([node, '-e', script, str(JS)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), '[true,false,[[0,3]],[[0,4]]]')
 
 
 if __name__ == '__main__':

@@ -6,7 +6,9 @@ Levels are ordered low < standard < high < max. Each level maps to four
 settings that never go down from one level to the next:
 decomposition_depth, context_budget_tokens, review_rounds, max_fix_rounds.
 
-Not wired into engine.py yet.
+route_for_request() decides direct vs. role-team run from difficulty.classify();
+it is not yet called by operator_roles.choose_quality(), so it does not change
+real routing yet. The effort levels are not wired into engine.py yet.
 """
 
 from __future__ import annotations
@@ -109,8 +111,25 @@ def escalate(level, failure, reason):
 # Evidence for the names and the request field: work/effort_field.md.
 REASONING_ORDER = ("low", "medium", "high", "xhigh", "max")
 
+# Rule I47 (user 2026-10-21): no Coworker request ever runs on 'max'; their top level is 'xhigh'.
+# Only Main chats (the user's own pick) keep the full range.
+COWORKER_TOP_EFFORT = "xhigh"
+MAIN_PURPOSES = ("main", "operator", "spare_main", "external")
+
+
+def cap_coworker(effort, purpose=""):
+    """Levels above COWORKER_TOP_EFFORT become COWORKER_TOP_EFFORT for every non-Main request."""
+    if purpose in MAIN_PURPOSES or not isinstance(effort, str):
+        return effort
+    level = effort.strip().lower()
+    if level in REASONING_ORDER and REASONING_ORDER.index(level) > REASONING_ORDER.index(COWORKER_TOP_EFFORT):
+        return COWORKER_TOP_EFFORT
+    return effort
+
 # task_class groups for the reasoning effort rule (task_router class names).
-TOP_EFFORT_CLASSES = ("review",)
+# User 2026-10-21: xhigh only for the hardest work (risk high); reviews run on high, never lower.
+TOP_EFFORT_CLASSES = ()
+STEADY_EFFORT_CLASSES = ("review",)
 LIGHT_EFFORT_CLASSES = ("routine", "docs", "test")
 
 
@@ -151,7 +170,9 @@ def clamp_effort(target, supported):
 def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), default=None):
     """Pick the reasoning effort for one request. Returns (effort or None, reason).
 
-    - Main chat, task_class review or risk high -> the highest supported level.
+    - Main chat                                 -> the highest supported level.
+    - risk high (only the hardest work)         -> COWORKER_TOP_EFFORT (xhigh), never max.
+    - task_class review                         -> high (never lower, never xhigh unless risk high).
     - routine/docs/test, or risk low            -> the model's default, else low.
     - everything else (code/research/design/unclassified, medium risk) -> high.
     The result is always clamped to the supported levels of the model.
@@ -167,7 +188,9 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
     elif cls in TOP_EFFORT_CLASSES:
         rule, target = "task_class %s: highest supported effort" % cls, supported[-1]
     elif rk == "high":
-        rule, target = "risk high: highest supported effort", supported[-1]
+        rule, target = "risk high (hardest work): top Coworker effort", COWORKER_TOP_EFFORT
+    elif cls in STEADY_EFFORT_CLASSES:
+        rule, target = "task_class %s: high effort" % cls, "high"
     elif cls in LIGHT_EFFORT_CLASSES or rk == "low":
         what = ("task_class " + cls) if cls in LIGHT_EFFORT_CLASSES else "risk low"
         if default:
@@ -177,8 +200,46 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
     else:
         rule, target = "%s, risk %s: high effort" % ("task_class " + cls if cls else "no task_class",
                                                     rk or "medium"), "high"
-    effort = clamp_effort(target, supported)
+    effort = clamp_effort(cap_coworker(target, purpose), supported)
     reason = rule + " -> " + effort
     if effort != target:
         reason += " (clamped from %s)" % target
     return effort, reason + "; supported: " + ", ".join(supported)
+
+
+# ---- Request difficulty -> route ----------------------------------------------------------
+# route_for_request() decides whether a request goes to the full role-team run
+# (plan/critique/review) or directly to single coworkers, from the CONTENT of the request
+# (notiontool.difficulty.classify), never from its length. A 'team' result only ever raises
+# the route; a route that is already 'team' is never lowered. Not yet called by
+# operator_roles.choose_quality(): until that wiring lands, real routing is unchanged.
+ROUTES = ("direct", "team")
+
+
+def route_for_request(text, context=None, current=None):
+    """Return {'route', 'raised', 'score', 'reasons', 'reason'} for one operator request.
+
+    current is the route decided so far ('direct', 'team' or None = 'direct').
+    - classify -> team: the route becomes 'team' (raised is True if it was 'direct').
+    - classify -> direct: the route stays as current.
+    Unknown current values raise EffortPolicyError; bad text/context raise TypeError.
+    """
+    from . import difficulty
+
+    if current is not None and current not in ROUTES:
+        raise EffortPolicyError(
+            "unknown route %r; expected one of %s" % (current, ", ".join(ROUTES))
+        )
+    base = current or "direct"
+    verdict = difficulty.classify(text, context)
+    to_team = verdict["route"] == "team"
+    route = "team" if to_team else base
+    raised = to_team and base != "team"
+    if raised:
+        reason = "difficulty %.3f -> team: raised %s -> team" % (verdict["score"], base)
+    elif route == "team" and not to_team:
+        reason = "route already team, kept (difficulty %.3f -> direct)" % verdict["score"]
+    else:
+        reason = "difficulty %.3f -> %s: route %s" % (verdict["score"], verdict["route"], route)
+    return {"route": route, "raised": raised, "score": verdict["score"],
+            "reasons": list(verdict["reasons"]), "reason": reason}

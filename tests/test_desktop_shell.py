@@ -93,6 +93,16 @@ class DesktopShellTests(unittest.TestCase):
         self.assertEqual(state['rate']['limit_per_min'], 180)
         json.dumps(state)
 
+    def test_state_skips_mains_of_other_accounts(self):
+        # Chats without account_id: the Main worker's account decides (no 'keinen Zugriff' rows).
+        store = self.server.store
+        store.put('workers', dict(id='other:main', account_id='other', purpose='main', thread_id='t-other'))
+        store.put('chats', dict(id='c9', main_worker='other:main', title='Slot 1'))
+        store.put('workers', dict(id='acc:m2', account_id='acc', purpose='main', thread_id='t-m2'))
+        store.put('chats', dict(id='c8', main_worker='acc:m2', title='Main 2'))
+        state = ds.desktop_state(self.server, ds.load_app_settings(self.tmp.name), now=100.0)
+        self.assertEqual(sorted(m['chat_id'] for m in state['mains']), ['c1', 'c8'])
+
     def test_new_welcome_chat_uses_main_create_with_request_id(self):
         handlers = ds.desktop_handlers(self.server, self.tmp.name, sleep=lambda s: None)
         result = handlers['new_welcome_chat']({})
@@ -139,6 +149,93 @@ class DesktopShellTests(unittest.TestCase):
             stdout = '11|C:\\Notion.exe --user-data-dir=C:\\Prof\\X\n12|C:\\Notion.exe\n'
         pids = ds.our_processes('C:\\prof\\x', run=lambda *a, **k: Out())
         self.assertEqual(pids, [11])
+
+
+# ---- MCP section: same harness routes as the old app's 'MCP servers' view -----------------------
+SECRET = 'SECRET-HOST-KEY-123456'
+
+
+class McpServer(FakeServer):
+    port = 8765
+
+    def action(self, path, body):
+        res = super().action(path, body)
+        if path == '/api/host/key':
+            return {'api_key': SECRET, 'port': 8765}
+        if path == '/api/mcp/refresh':
+            return {'ok': True, 'servers': []}
+        return res or {'ok': True}
+
+
+class DesktopMcpTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.server = McpServer()
+        seed(self.server.store)
+        self.handlers = ds.desktop_handlers(self.server, self.tmp.name, sleep=lambda s: None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_actions_are_allowed(self):
+        from notiontool import notion_shell
+        for name in ('mcp_list', 'mcp_refresh', 'mcp_add', 'mcp_bridge', 'host_key', 'bridge_tunnel'):
+            self.assertIn(name, notion_shell.ACTIONS)
+            self.assertIn(name, ds.DESK_ACTIONS)
+            self.assertIn(name, self.handlers)
+
+    def test_handlers_use_old_app_routes(self):
+        self.handlers['mcp_add']({'name': 'Ramp', 'url': 'https://ramp.example/mcp', 'token': 'tok',
+                                  'write_auto': 'true', 'evil': 1})
+        self.assertEqual(self.server.actions[-1], ('/api/mcp/add', {'name': 'Ramp', 'url': 'https://ramp.example/mcp',
+                                                                   'token': 'tok', 'write_auto': 'true'}))
+        with self.assertRaises(ValueError):
+            self.handlers['mcp_add']({'name': '', 'url': ''})
+        self.handlers['mcp_refresh']({})
+        self.assertEqual(self.server.actions[-1][0], '/api/mcp/refresh')
+        self.handlers['bridge_tunnel']({})
+        self.assertEqual(self.server.actions[-1][0], '/api/bridge/tunnel')
+        self.handlers['host_key']({'rotate': False})
+        self.assertEqual(self.server.actions[-1], ('/api/host/key', {'rotate': False}))
+        self.handlers['host_key']({'rotate': True})
+        self.assertEqual(self.server.actions[-1], ('/api/host/key', {'rotate': True}))
+        bridge = self.handlers['mcp_bridge']({})
+        self.assertEqual(bridge['local_url'], 'http://127.0.0.1:8765/mcp')
+        self.assertIn('public_url', bridge)
+
+    def test_host_key_is_masked_and_copied_on_this_pc(self):
+        from notiontool import notion_shell
+        res = self.handlers['host_key']({'rotate': False})
+        self.assertNotIn(SECRET, json.dumps(res))
+        self.assertTrue(res['masked'].endswith('3456'))
+        self.assertTrue(res['has_key'])
+        copied = []
+        handlers = notion_shell.default_handlers(self.server, copy_text=copied.append)
+        res = handlers['host_key']({'rotate': True, 'copy': True})
+        self.assertEqual(copied, [SECRET])
+        self.assertTrue(res['copied'])
+        self.assertTrue(res['rotated'])
+        self.assertEqual(self.server.host_api_key, SECRET)
+        self.assertNotIn(SECRET, json.dumps(res))
+
+    def test_key_never_in_desktop_state(self):
+        self.server.host_api_key = SECRET
+        state = ds.desktop_state(self.server, ds.load_app_settings(self.tmp.name), now=100.0)
+        self.assertNotIn(SECRET, json.dumps(state, default=str))
+
+    def test_dispatch_reply_has_no_key(self):
+        replies = []
+
+        class App:
+            pid = None
+
+        shell = ds.DesktopShell(App(), 'acc', self.handlers)
+        shell._reply = lambda ident, payload: replies.append(payload)
+        shell.dispatch(json.dumps({'id': 1, 'action': 'host_key', 'args': {'rotate': False}}))
+        shell.dispatch(json.dumps({'id': 2, 'action': 'mcp_bridge', 'args': {}}))
+        self.assertEqual(len(replies), 2)
+        for reply in replies:
+            self.assertNotIn(SECRET, json.dumps(reply, default=str))
 
 
 # ---- re-attach: build id, teardown of an older overlay (fake CDP client) -----------------------
@@ -457,5 +554,481 @@ console.log(JSON.stringify({ out: out, stopped: stopped,
 """
 
 
+SHELL_UI_HARNESS = r"""
+const fs = require('fs'), vm = require('vm');
+let doc;
+function parse(sel) {
+  return sel.split(',').map(function (part) {
+    part = part.trim();
+    const m = /^([a-zA-Z]*)((?:\.[\w-]+)*)((?:\[[^\]]+\])*)$/.exec(part);
+    if (!m) throw new Error('selector ' + part);
+    const attrs = []; const re = /\[([\w-]+)(?:="([^"]*)")?\]/g; let a;
+    while ((a = re.exec(m[3]))) attrs.push([a[1], a[2]]);
+    return { tag: m[1].toUpperCase(), cls: m[2].split('.').filter(Boolean), attrs: attrs };
+  });
+}
+function El(tag) {
+  this.tagName = String(tag).toUpperCase(); this.attrs = {}; this.children = []; this.parentNode = null;
+  this.style = {}; this._text = ''; this.listeners = {}; this.rect = 0; this.innerHTML = '';
+  const cl = [];
+  cl.add = function () { for (const x of arguments) if (cl.indexOf(x) < 0) cl.push(x); };
+  cl.remove = function () { for (const x of arguments) { const i = cl.indexOf(x); if (i >= 0) cl.splice(i, 1); } };
+  cl.contains = function (x) { return cl.indexOf(x) >= 0; };
+  this.classList = cl;
+}
+Object.defineProperty(El.prototype, 'className', { get() { return this.classList.join(' '); },
+  set(v) { this.classList.length = 0; String(v).split(/\s+/).filter(Boolean).forEach((c) => this.classList.add(c)); } });
+Object.defineProperty(El.prototype, 'textContent', { get() { return this._text + this.children.map((c) => c.textContent).join(''); },
+  set(v) { this.children.forEach((c) => { c.parentNode = null; }); this.children = []; this._text = String(v == null ? '' : v); } });
+Object.defineProperty(El.prototype, 'parentElement', { get() { return this.parentNode instanceof El ? this.parentNode : null; } });
+Object.defineProperty(El.prototype, 'firstChild', { get() { return this.children[0] || null; } });
+Object.defineProperty(El.prototype, 'lastChild', { get() { return this.children[this.children.length - 1] || null; } });
+Object.defineProperty(El.prototype, 'nextSibling', { get() { const p = this.parentNode; return p ? p.children[p.children.indexOf(this) + 1] || null : null; } });
+Object.defineProperty(El.prototype, 'previousSibling', { get() { const p = this.parentNode; return p ? p.children[p.children.indexOf(this) - 1] || null : null; } });
+Object.defineProperty(El.prototype, 'isConnected', { get() { let n = this; while (n.parentNode) n = n.parentNode; return n === doc.documentElement; } });
+El.prototype.setAttribute = function (n, v) { this.attrs[n] = String(v); };
+El.prototype.hasAttribute = function (n) { return Object.prototype.hasOwnProperty.call(this.attrs, n); };
+El.prototype.getAttribute = function (n) { return this.hasAttribute(n) ? this.attrs[n] : null; };
+El.prototype.removeAttribute = function (n) { delete this.attrs[n]; };
+El.prototype.matches = function (sel) {
+  const el = this;
+  return parse(sel).some(function (s) {
+    if (s.tag && el.tagName !== s.tag) return false;
+    if (!s.cls.every(function (c) { return el.classList.contains(c); })) return false;
+    return s.attrs.every(function (p) { const v = el.getAttribute(p[0]); return p[1] === undefined ? v !== null : v === p[1]; });
+  });
+};
+El.prototype.querySelectorAll = function (sel) {
+  const out = [];
+  (function walk(n) { n.children.forEach(function (c) { if (c.matches(sel)) out.push(c); walk(c); }); })(this);
+  return out;
+};
+El.prototype.querySelector = function (sel) { return this.querySelectorAll(sel)[0] || null; };
+El.prototype.closest = function (sel) { let n = this; while (n && n.matches) { if (n.matches(sel)) return n; n = n.parentNode; } return null; };
+El.prototype.appendChild = function (c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.children.push(c); return c; };
+El.prototype.insertBefore = function (c, ref) {
+  if (!ref) return this.appendChild(c);
+  if (c.parentNode) c.parentNode.removeChild(c);
+  c.parentNode = this; this.children.splice(this.children.indexOf(ref), 0, c); return c;
+};
+El.prototype.removeChild = function (c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); c.parentNode = null; return c; };
+El.prototype.addEventListener = function (t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); };
+El.prototype.removeEventListener = function (t, f) { const l = this.listeners[t] || []; const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); };
+El.prototype.fire = function (t, extra) {
+  const ev = Object.assign({ target: this, defaultPrevented: false, stopped: false,
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; } }, extra || {});
+  let n = this;
+  while (n && !ev.stopped) { (n.listeners[t] || []).slice().forEach((f) => f(ev)); n = n.parentNode; }
+  return ev;
+};
+El.prototype.click = function () { return this.fire('click'); };
+El.prototype.focus = function () { doc.activeElement = this; };
+El.prototype.getBoundingClientRect = function () { return { left: 0, top: 0, right: this.rect, bottom: 0, width: this.rect, height: 0 }; };
+
+const html = new El('html'), body = new El('body'); html.appendChild(body);
+doc = { documentElement: html, body: body, activeElement: null, createElement: (t) => new El(t),
+  querySelector: (s) => html.querySelector(s), querySelectorAll: (s) => html.querySelectorAll(s) };
+function mkEl(tag, attrs, text) {
+  const e = new El(tag);
+  Object.keys(attrs || {}).forEach((k) => { if (k === 'cls') e.className = attrs[k]; else e.setAttribute(k, attrs[k]); });
+  if (text) e.textContent = text;
+  return e;
+}
+let chatClicks = 0;
+function buildSidebar() {
+  const sb = mkEl('div', { cls: 'notion-sidebar' });
+  const brand = mkEl('div', { cls: 'nt-desk-brand', 'data-nt-desk': 'brand', 'data-nt-desk-own': '1' });
+  brand.appendChild(mkEl('span', { cls: 'nt-desk-brand-name' }, 'NotionTool'));
+  sb.appendChild(brand);
+  const wrap = mkEl('div', { cls: 'header-wrap' });
+  const row = mkEl('div', { cls: 'top-row' });
+  const items = [];
+  const home = mkEl('div', { role: 'tab', 'aria-label': 'Home', 'aria-selected': 'true' }, 'Home');
+  const chat = mkEl('div', { role: 'tab', 'aria-selected': 'false' }, 'Chat 3');
+  const meet = mkEl('div', { role: 'tab', 'aria-label': 'Meetings', 'aria-selected': 'false' }, 'Meetings');
+  [home, chat, meet].forEach((x) => { items.push(x); row.appendChild(x); });
+  chat.addEventListener('click', function () { chatClicks++; items.forEach((x) => x.setAttribute('aria-selected', x === chat ? 'true' : 'false')); });
+  row.appendChild(mkEl('div', { role: 'button', 'aria-label': 'Search' }, 'Search'));
+  wrap.appendChild(row); sb.appendChild(wrap);
+  sb.appendChild(mkEl('div', { cls: 'chat-list' }, 'Chats'));
+  return { sb: sb, wrap: wrap, row: row, chat: chat };
+}
+const winL = {};
+global.window = { __ntDesk: {},
+  addEventListener(t, f) { (winL[t] = winL[t] || []).push(f); },
+  removeEventListener(t, f) { const l = winL[t] || []; const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); } };
+global.document = doc;
+console.warn = function () {};
+vm.runInThisContext(fs.readFileSync(__SHELL__, 'utf8'));
+
+const box = mkEl('div', { cls: 'notion-sidebar-container' }); box.rect = 260; body.appendChild(box);
+const S = buildSidebar(); box.appendChild(S.sb);
+const stale = mkEl('div', { 'data-nt-desk': 'tabbar', 'data-nt-desk-own': '1' });
+S.wrap.insertBefore(stale, S.row);
+const ctx = { getState: () => ({ connected: true, attention: [1, 2] }), onState: () => function () {} };
+const out = {};
+const util = window.__ntDesk.shellUtil;
+out.nativeChat = util.nativeTab(S.row, 'chat') === S.chat;
+out.step = [util.tabStep('chat', 'ArrowRight'), util.tabStep('chat', 'ArrowLeft'), util.tabStep('notes', 'Home'),
+  util.tabStep('live', 'End'), util.tabStep('live', 'x')];
+const calls = { live: 0, liveOff: 0, notes: 0 };
+let handle = window.__ntDesk.shell(ctx);
+const api = window.__ntShell;
+api.register('live', { mount(b) { calls.live++; b.appendChild(mkEl('div', {}, 'Live view')); return () => { calls.liveOff++; }; } });
+api.register('notes', { mount(b) { calls.notes++; b.appendChild(mkEl('div', {}, 'Notes view')); } });
+function bars() { return doc.querySelectorAll('[data-nt-desk="tabbar"]'); }
+function bar() { return bars()[0]; }
+function btn(id) { return bar().querySelector('[data-nt-shell-tab="' + id + '"]'); }
+function tabs() { return bar().children.map((b) => [b.getAttribute('data-nt-shell-tab'), b.getAttribute('aria-selected'),
+  b.getAttribute('tabindex'), b.classList.contains('nt-shell-tab-active')]); }
+function active() { return tabs().filter((t) => t[3]).map((t) => t[0]); }
+function layerEl() { return doc.querySelector('[data-nt-desk="shell-layer"]'); }
+function viewIds() { const l = layerEl(); return l ? l.children.map((c) => c.getAttribute('data-nt-desk-view')) : []; }
+const isOpen = () => html.classList.contains('nt-shell-view-open');
+
+out.mount = { bars: bars().length, stale: bar() === stale, staleGone: !stale.isConnected, inWrap: bar().parentNode === S.wrap,
+  beforeRow: bar().nextSibling === S.row, tight: S.wrap.classList.contains('nt-shell-tight'),
+  wrapMark: S.wrap.getAttribute('data-nt-shell'), chatBadge: btn('chat').lastChild.textContent, tabs: tabs() };
+btn('live').click();
+out.live = { current: api.current, tabs: tabs(), views: viewIds(), open: isOpen(), left: layerEl().style.left,
+  chatListShown: !S.sb.querySelector('.chat-list').classList.contains('nt-shell-hide') };
+btn('notes').click(); btn('settings').click(); btn('live').click(); btn('notes').click();
+out.fast = { current: api.current, views: viewIds(), text: layerEl().textContent, calls: Object.assign({}, calls), active: active() };
+let ev = btn('notes').fire('keydown', { key: 'ArrowRight' });
+out.kRight = { current: api.current, focus: doc.activeElement === btn('settings'), prevented: ev.defaultPrevented, active: active() };
+btn('settings').fire('keydown', { key: 'ArrowRight' });
+out.kWrap = { current: api.current, clicks: chatClicks, open: isOpen(), views: viewIds(), active: active() };
+btn('chat').fire('keydown', { key: 'End' }); out.kEnd = api.current;
+btn('settings').fire('keydown', { key: 'Home' }); out.kHome = api.current;
+ev = btn('live').fire('keydown', { key: 'Enter' });
+out.kEnter = { current: api.current, prevented: ev.defaultPrevented, views: viewIds() };
+btn('live').fire('keydown', { key: 'ArrowLeft' }); out.kLeft = api.current;
+ev = btn('chat').fire('keydown', { key: 'a' }); out.kOther = { current: api.current, prevented: ev.defaultPrevented };
+box.rect = 0; S.sb.rect = 0; api.open('notes'); out.leftKeep = layerEl().style.left;
+S.sb.rect = 300; api.open('live'); out.leftSb = layerEl().style.left;
+box.rect = 260;
+let reCleanup = 0;
+api.register('settings', { mount() { window.__ntShell.open('notes'); return () => { reCleanup++; }; } });
+api.open('settings');
+out.reenter = { current: api.current, views: viewIds(), cleanup: reCleanup, active: active() };
+const S2 = buildSidebar(); box.removeChild(S.sb); box.appendChild(S2.sb);
+api.refresh();
+setTimeout(function () {
+  out.rerender = { bars: bars().length, inWrap2: bar().parentNode === S2.wrap, beforeRow2: bar().nextSibling === S2.row,
+    tight2: S2.wrap.classList.contains('nt-shell-tight'), row2Hidden: S2.row.classList.contains('nt-shell-hide'),
+    current: api.current, active: active(), views: viewIds() };
+  handle = window.__ntDesk.shell(ctx);
+  out.remount = { bars: bars().length, layers: doc.querySelectorAll('[data-nt-desk="shell-layer"]').length,
+    current: window.__ntShell.current, views: viewIds(), keyL: (winL.keydown || []).length, active: active() };
+  btn('live').click();
+  out.remountClick = { current: window.__ntShell.current, views: viewIds(), active: active() };
+  handle.stop();
+  out.stop = { bars: bars().length, tight: S2.wrap.classList.contains('nt-shell-tight'), mark: S2.wrap.getAttribute('data-nt-shell'),
+    hidden: S2.row.classList.contains('nt-shell-hide'), rowKept: S2.row.isConnected, wrapKept: S2.wrap.isConnected };
+  console.log(JSON.stringify(out));
+}, 250);
+"""
+
+
+class ShellTabsUiTest(unittest.TestCase):
+    """shell.js tab bar in a fake sidebar: one bar, one view, keyboard, re-render, no gap wrapper."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = Path(__file__).resolve().parents[1] / 'notiontool' / 'web' / 'desktop' / 'shell.js'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'shell_ui.js'
+            path.write_text(SHELL_UI_HARNESS.replace('__SHELL__', json.dumps(str(src))), encoding='utf-8')
+            proc = subprocess.run([NODE, str(path)], capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise AssertionError('harness failed: %s %s' % (proc.stdout[-2000:], proc.stderr[-2000:]))
+        cls.out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_native_chat_tab_with_unread_count(self):
+        self.assertTrue(self.out['nativeChat'])
+        self.assertEqual(self.out['mount']['chatBadge'], '3')
+
+    def test_tab_step_keys(self):
+        self.assertEqual(self.out['step'], ['live', 'settings', 'chat', 'settings', None])
+
+    def test_stale_bar_not_adopted(self):
+        m = self.out['mount']
+        self.assertEqual(m['bars'], 1)
+        self.assertFalse(m['stale'])
+        self.assertTrue(m['staleGone'])
+        self.assertTrue(m['inWrap'])
+        self.assertTrue(m['beforeRow'])
+
+    def test_header_wrapper_collapsed_no_gap(self):
+        self.assertTrue(self.out['mount']['tight'])
+        self.assertEqual(self.out['mount']['wrapMark'], 'wrap')
+        self.assertTrue(self.out['rerender']['tight2'])
+
+    def test_click_shows_exactly_its_view_and_highlight_follows(self):
+        live = self.out['live']
+        self.assertEqual(live['current'], 'live')
+        self.assertEqual(live['views'], ['live'])
+        self.assertTrue(live['open'])
+        self.assertEqual(live['left'], '260px')
+        self.assertTrue(live['chatListShown'])
+        self.assertEqual(live['tabs'], [['chat', 'false', '-1', False], ['live', 'true', '0', True],
+                                        ['notes', 'false', '-1', False], ['settings', 'false', '-1', False]])
+        self.assertEqual(self.out['mount']['tabs'][0], ['chat', 'true', '0', True])
+
+    def test_fast_switching_leaves_one_view(self):
+        fast = self.out['fast']
+        self.assertEqual(fast['current'], 'notes')
+        self.assertEqual(fast['views'], ['notes'])
+        self.assertNotIn('Live view', fast['text'])
+        self.assertEqual(fast['calls'], {'live': 2, 'liveOff': 2, 'notes': 2})
+        self.assertEqual(fast['active'], ['notes'])
+
+    def test_keyboard(self):
+        out = self.out
+        self.assertEqual(out['kRight'], {'current': 'settings', 'focus': True, 'prevented': True, 'active': ['settings']})
+        self.assertEqual(out['kWrap'], {'current': 'chat', 'clicks': 1, 'open': False, 'views': [], 'active': ['chat']})
+        self.assertEqual(out['kEnd'], 'settings')
+        self.assertEqual(out['kHome'], 'chat')
+        self.assertEqual(out['kEnter'], {'current': 'live', 'prevented': True, 'views': ['live']})
+        self.assertEqual(out['kLeft'], 'chat')
+        self.assertEqual(out['kOther'], {'current': 'chat', 'prevented': False})
+
+    def test_layer_never_covers_sidebar(self):
+        self.assertEqual(self.out['leftKeep'], '260px')
+        self.assertEqual(self.out['leftSb'], '300px')
+
+    def test_reentrant_mount_keeps_one_view(self):
+        self.assertEqual(self.out['reenter'], {'current': 'notes', 'views': ['notes'], 'cleanup': 1, 'active': ['notes']})
+
+    def test_sidebar_rerender_and_remount(self):
+        r = self.out['rerender']
+        self.assertEqual(r['bars'], 1)
+        self.assertTrue(r['inWrap2'])
+        self.assertTrue(r['beforeRow2'])
+        self.assertTrue(r['row2Hidden'])
+        self.assertEqual((r['current'], r['active'], r['views']), ('notes', ['notes'], ['notes']))
+        m = self.out['remount']
+        self.assertEqual((m['bars'], m['layers'], m['keyL']), (1, 1, 1))
+        self.assertEqual((m['current'], m['views'], m['active']), ('notes', ['notes'], ['notes']))
+        self.assertEqual(self.out['remountClick'], {'current': 'live', 'views': ['live'], 'active': ['live']})
+
+    def test_stop_restores_wrapper(self):
+        s = self.out['stop']
+        self.assertEqual(s['bars'], 0)
+        self.assertFalse(s['tight'])
+        self.assertIsNone(s['mark'])
+        self.assertFalse(s['hidden'])
+        self.assertTrue(s['rowKept'])
+        self.assertTrue(s['wrapKept'])
+
+
 if __name__ == '__main__':
     unittest.main()
+
+
+# ---- Sidebar 'Coworkers' section toggle (shell.js createCoworkerToggle) -------------------------------
+import os as _os
+import shutil as _shutil
+import subprocess as _subprocess
+
+_DESK = Path(__file__).resolve().parents[1] / 'notiontool' / 'web' / 'desktop'
+_NODE = _shutil.which('node') or r'C:\Program Files\nodejs\node.exe'
+
+_COWORKER_HARNESS = r"""
+global.window = { __ntDesk: {} };
+global.document = {};
+require(process.argv[2]);
+const U = window.__ntDesk.shellUtil;
+class El {
+  constructor(tag, attrs) {
+    this.tagName = tag; this.attrs = Object.assign({}, attrs || {}); this.children = []; this.parentNode = null;
+    this.nodeType = 1; this.listeners = {};
+    const self = this;
+    this.classList = {
+      contains: (c) => self.cls().includes(c),
+      toggle: (c, on) => { const s = self.cls().filter((x) => x !== c); if (on) s.push(c); self.attrs['class'] = s.join(' '); return on; }
+    };
+  }
+  cls() { return (this.attrs['class'] || '').split(/\s+/).filter(Boolean); }
+  getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  append(c) { c.parentNode = this; this.children.push(c); return c; }
+  matches(sel) { const m = /^\[data-nt-desk="([^"]+)"\]$/.exec(sel); return !!m && this.attrs['data-nt-desk'] === m[1]; }
+  closest(sel) { let n = this; while (n && n.matches) { if (n.matches(sel)) return n; n = n.parentNode; } return null; }
+  all(sel, out) { out = out || []; this.children.forEach((c) => { if (c.matches(sel)) out.push(c); c.all(sel, out); }); return out; }
+  querySelector(sel) { return this.all(sel)[0] || null; }
+  addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); }
+}
+function makeStore(broken) {
+  const data = {};
+  return {
+    data: data,
+    getItem: (k) => { if (broken) throw new Error('blocked'); return k in data ? data[k] : null; },
+    setItem: (k, v) => { if (broken) throw new Error('blocked'); data[k] = String(v); }
+  };
+}
+function makeWin(store) {
+  return { localStorage: store, cap: {},
+    addEventListener(t, f, c) { if (c) (this.cap[t] = this.cap[t] || []).push(f); },
+    removeEventListener(t, f, c) { if (c && this.cap[t]) this.cap[t] = this.cap[t].filter((g) => g !== f); },
+    count() { return Object.keys(this.cap).reduce((n, t) => n + this.cap[t].length, 0); } };
+}
+// Notion sidebar (not ours) holding our section; Notion's root swallows every click in its capture phase.
+function build(root) {
+  const section = root.append(new El('div', { 'data-nt-desk': 'coworkers', 'data-nt-desk-own': '1' }));
+  const head = section.append(new El('button', { 'data-nt-desk': 'coworkers-head', 'data-nt-desk-own': '1', 'aria-expanded': 'true' }));
+  const chevron = head.append(new El('span', { 'class': 'nt-desk-chevron', 'data-nt-desk-own': '1' }));
+  section.append(new El('div', { 'data-nt-desk': 'coworker-list', 'data-nt-desk-own': '1' }));
+  head.ownClicks = 0;
+  head.addEventListener('click', () => { head.ownClicks++; });
+  return { section, head, chevron };
+}
+function fire(win, target, type, extra) {
+  const ev = Object.assign({ type: type, target: target, detail: 1, defaultPrevented: false, stopped: false,
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; },
+    stopImmediatePropagation() { this.stopped = true; } }, extra || {});
+  // keydown reaches the toggle through the shell's own window keydown listener (onKey).
+  if (type === 'keydown' && win.onKey) win.onKey(ev);
+  (win.cap[type] || []).slice().forEach((f) => { if (!ev.stopped) f(ev); });
+  if (!ev.stopped && type === 'click') ev.notionSwallowed = true;   // Notion's capture handler
+  else if (!ev.stopped) { let n = target; while (n) { (n.listeners[type] || []).forEach((f) => f(ev)); n = n.parentNode; } }
+  return ev;
+}
+const out = {};
+const store = makeStore(false);
+const win = makeWin(store);
+const root = new El('nav', { 'class': 'notion-sidebar' });
+const notionRow = root.append(new El('div', { role: 'treeitem' }));
+const doc = { querySelectorAll: (sel) => root.all(sel) };
+let S = build(root);
+const T = U.createCoworkerToggle(win, doc);
+T.start();
+win.onKey = (ev) => T.handle(ev);
+const state = () => ({ collapsed: S.section.classList.contains('nt-desk-collapsed'), aria: S.head.getAttribute('aria-expanded'),
+  title: S.head.getAttribute('title'), stored: store.data[U.COWORKERS_KEY] });
+let ev = fire(win, S.chevron, 'click');
+out.click1 = Object.assign(state(), { prevented: ev.defaultPrevented, ownClicks: S.head.ownClicks, swallowed: !!ev.notionSwallowed });
+fire(win, S.head, 'click');
+out.click2 = state();
+out.down = fire(win, S.head, 'pointerdown').stopped;
+fire(win, S.head, 'keydown', { key: 'Enter' });
+const afterEnter = state();
+fire(win, S.head, 'click', { detail: 0 });
+fire(win, S.head, 'keyup', { key: 'Enter' });
+out.enter = { after: afterEnter, settled: state() };
+fire(win, S.head, 'keydown', { key: ' ' });
+const up = fire(win, S.head, 'keyup', { key: ' ' });
+out.space = Object.assign(state(), { upPrevented: up.defaultPrevented });
+fire(win, S.head, 'keydown', { key: 'Enter', repeat: true });
+out.repeat = state();
+out.otherKey = fire(win, S.head, 'keydown', { key: 'a' }).defaultPrevented;
+// Notion re-render: the old section is gone, a fresh one (expanded, no class) appears; state comes back.
+fire(win, S.head, 'click');
+root.children = root.children.filter((c) => c !== S.section);
+S = build(root);
+out.rebuilt = state();
+T.syncAll();
+out.synced = state();
+fire(win, S.head, 'click');
+out.afterRerender = state();
+// Notion's own nodes: never handled, never removed.
+const before = root.children.length;
+const fake = root.append(new El('div', { 'data-nt-desk': 'coworkers-head' }));
+out.notion = { handled: fire(win, fake, 'click').defaultPrevented, rowKept: root.children.includes(notionRow) };
+root.children.pop();
+out.notion.count = root.children.length === before;
+// A second instance (e.g. an older build still listening) never toggles twice.
+const T2 = U.createCoworkerToggle(win, doc);
+T2.start();
+const was = state().collapsed;
+fire(win, S.head, 'click');
+out.single = state().collapsed !== was;
+T2.stop();
+// Remembered: a fresh instance reads localStorage.
+out.remembered = U.createCoworkerToggle(makeWin(store), doc).read() === (store.data[U.COWORKERS_KEY] === '1');
+// Blocked localStorage: memory keeps the state.
+const bw = makeWin(makeStore(true));
+const B = U.createCoworkerToggle(bw, doc);
+B.start();
+const b0 = B.read();
+fire(bw, S.head, 'click');
+const b1 = B.read();
+fire(bw, S.head, 'click');
+out.blocked = [b0, b1, B.read()];
+B.stop();
+T.stop();
+out.listenersLeft = win.count() + bw.count();
+console.log(JSON.stringify(out));
+"""
+
+
+class CoworkerToggleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (_DESK / 'shell.js').read_text(encoding='utf-8')
+        cls.css = (_DESK / 'shell.css').read_text(encoding='utf-8')
+
+    def run_harness(self):
+        if not (_NODE and _os.path.isfile(_NODE)):
+            self.skipTest('node not installed')
+        with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as handle:
+            handle.write(_COWORKER_HARNESS)
+        try:
+            res = _subprocess.run([_NODE, handle.name, str(_DESK / 'shell.js')], capture_output=True, text=True,
+                                  timeout=30)
+        finally:
+            _os.unlink(handle.name)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return json.loads(res.stdout.strip().splitlines()[-1])
+
+    def test_click_toggles_once_before_notion_and_remembers(self):
+        out = self.run_harness()
+        self.assertEqual(out['click1'], dict(collapsed=True, aria='false', title='Show coworkers', stored='1',
+                                             prevented=True, ownClicks=0, swallowed=False))
+        self.assertEqual(out['click2'], dict(collapsed=False, aria='true', title='Hide coworkers', stored='0'))
+        self.assertTrue(out['down'])
+        self.assertTrue(out['single'])
+        self.assertTrue(out['remembered'])
+
+    def test_enter_and_space_toggle_exactly_once(self):
+        out = self.run_harness()
+        self.assertTrue(out['enter']['after']['collapsed'])
+        self.assertEqual(out['enter']['after'], out['enter']['settled'])  # no second toggle from click/keyup
+        self.assertFalse(out['space']['collapsed'])
+        self.assertTrue(out['space']['upPrevented'])
+        self.assertFalse(out['repeat']['collapsed'])  # held key: no flicker
+        self.assertFalse(out['otherKey'])
+
+    def test_survives_sidebar_rerender(self):
+        out = self.run_harness()
+        self.assertFalse(out['rebuilt']['collapsed'])  # fresh node from the re-render
+        self.assertEqual(out['synced']['collapsed'], True)
+        self.assertEqual(out['synced']['aria'], 'false')
+        self.assertEqual(out['afterRerender']['collapsed'], False)
+        self.assertEqual(out['afterRerender']['stored'], '0')
+
+    def test_notion_nodes_untouched_blocked_storage_and_stop(self):
+        out = self.run_harness()
+        self.assertEqual(out['notion'], dict(handled=False, rowKept=True, count=True))
+        self.assertEqual(out['blocked'][1], not out['blocked'][0])
+        self.assertEqual(out['blocked'][2], out['blocked'][0])
+        self.assertEqual(out['listenersLeft'], 0)
+
+    def test_wiring_css_and_line_endings(self):
+        for needle in ('coworkers.start();', 'coworkers.stop();', 'coworkers.syncAll();',
+                       'var coworkers = createCoworkerToggle(window, doc);', "'ntDesk.coworkersCollapsed'"):
+            self.assertIn(needle, self.js)
+        tog = self.js[self.js.index('function createCoworkerToggle'):self.js.index('window.__ntDesk.shellUtil = {')]
+        for bad in ('removeChild', '.remove()', 'innerHTML'):
+            self.assertNotIn(bad, tog)
+        for rule in ('.nt-desk-coworkers .nt-desk-coworkers-head {', '.nt-desk-coworkers .nt-desk-chevron {',
+                     'transform: rotate(-90deg)', '.nt-desk-coworkers.nt-desk-collapsed .nt-desk-coworker-list {'):
+            self.assertIn(rule, self.css)
+        for name in ('shell.js', 'shell.css'):
+            self.assertNotIn(b'\r\n', (_DESK / name).read_bytes())
+
+    def test_node_check(self):
+        if not (_NODE and _os.path.isfile(_NODE)):
+            self.skipTest('node not installed')
+        res = _subprocess.run([_NODE, '--check', str(_DESK / 'shell.js')], capture_output=True, text=True, timeout=30)
+        self.assertEqual(res.returncode, 0, res.stderr)

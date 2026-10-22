@@ -198,7 +198,7 @@ class SettingsTests(unittest.TestCase):
         handlers = ns.default_handlers(server, sleep=lambda s: None)
         got = handlers['settings_get']({})
         self.assertEqual((got['coworker_rotate_mode'], got['main_context_policy'], got['coworker_delete_old_chat']),
-                         ('new_welcome', 'auto', False))
+                         ('new_welcome', 'auto', True))  # delete retired coworker chats: default on (store.py)
 
     def test_save_uses_the_existing_settings_route(self):
         server = FakeServer(FakeStore())

@@ -189,6 +189,20 @@ def estimate(turn, completed):
     return dict(percent=PHASES[phase], source='phase', phase=phase, label=phase.capitalize())
 
 
+def guard_turn(store, task, worker, thread, transcript):
+    """I12: report agent/automation tool calls of this task's own turn. Never raises; never writes to Notion."""
+    try:
+        from . import agent_guard
+        hits = agent_guard.forbidden_calls(own_turn(transcript, task))
+        if hits:
+            latest = store.get('tasks', task.get('id'), None) if store is not None else None
+            agent_guard.report(store, latest or task, hits, thread_id=str(thread or ''),
+                               worker_id=(worker or {}).get('id', ''))
+        return hits
+    except Exception:
+        return []
+
+
 def summarize(transcript, task):
     """Small progress dict of one task's own turn (no clock, no state)."""
     turn = own_turn(transcript, task)
@@ -307,6 +321,7 @@ class ProgressFeed:
             with request_priority('background'):
                 transcript = self.adapter.client(worker['account_id']).transcript(thread, limit=WINDOW)
             info, error = summarize(transcript, task), ''
+            guard_turn(self.store, task, worker, thread, transcript)
         except Exception as exc:
             info, error = None, type(exc).__name__
         with self.lock:
