@@ -181,6 +181,14 @@ class TransientInference(Exception):
 
 CANCELLED_BEFORE_SUBMISSION = 'Assignment cancelled before submission'
 HEAL_BASE, HEAL_CAP = 60, 600  # seconds: 60, 120, 240, 480, 600, 600, ...
+# Owner rule: at the hard token limit (burst level 'pause' or the 6 h budget used up) every RUNNING
+# coworker turn stops at once, not only new ones. The stop is local (Notion has no verified stop
+# endpoint): the stream is closed, a sent turn is reconciled (I5, never resent), an unsent one waits.
+LIMIT_STOP_EVENT = 'limit_stop'
+LIMIT_RESUME_EVENT = 'limit_resume'
+LIMIT_PAUSED_BY = 'token_limit'
+LIMIT_CHECK_SECONDS = 2.0   # cheap ledger check at most every 2 s (engine clock)
+LIMIT_CLEAR_SECONDS = 5.0   # hysteresis: two clear checks at least 5 s apart before the latch clears
 
 
 def cancelled_before_submission(exc):
@@ -205,6 +213,10 @@ class Engine:
         self.thread = None
         self.clock = time.time  # injectable for the worker heal backoff
         self.team_grower = None  # team_grow.TeamGrower, set by the Application (automatic team growth)
+        # Token hard-limit latch (memory only; rebuilt from the ledger by the next check after a restart).
+        self.limit_latch = None
+        self._limit_checked = None
+        self._limit_clear_since = 0.0
         self._restore()
 
     def _restore(self):
@@ -1190,6 +1202,168 @@ class Engine:
                 raise ValueError('Another active task owns this PC path; request a dependency instead')
             self.store.put('tasks',trial)
 
+    # ---- Token hard limit: stop running coworker turns ------------------------------------------
+    def limit_state(self, now=None):
+        """Read-only: dict(hard, source '6h'|'burst'|'', wait, level, reason). The throttle level is never hard."""
+        from . import token_budget
+        now = self.clock() if now is None else now
+        try:
+            wait = float(token_budget.exhausted(self.store, now) or 0)
+        except Exception:
+            wait = 0.0
+        if wait > 0:
+            return dict(hard=True, source='6h', wait=wait, level='pause', reason='6 h token budget used up')
+        try:
+            burst = token_budget.burst_state(self.store, now) or {}
+        except Exception:
+            burst = {}
+        level = str(burst.get('level') or 'ok')
+        if level == 'pause':
+            return dict(hard=True, source='burst', wait=float(burst.get('wait') or 120), level=level,
+                        reason=str(burst.get('reason') or 'token burst hard limit'))
+        return dict(hard=False, source='', wait=0.0, level=level, reason='')
+
+    def _limit_check(self):
+        """Called by tick() under the lock; cheap (two ledger reads) and at most every LIMIT_CHECK_SECONDS."""
+        now = self.clock()
+        last = getattr(self, '_limit_checked', None)
+        if last is not None and 0 <= now - last < LIMIT_CHECK_SECONDS:
+            return getattr(self, 'limit_latch', None)
+        self._limit_checked = now
+        state = self.limit_state(now)
+        latch = getattr(self, 'limit_latch', None)
+        if state['hard']:
+            self._limit_clear_since = 0.0
+            stopped, kept = self._limit_stop(state)
+            task_ids = [info['task_id'] for info, _ in stopped]
+            worker_ids = [info['worker_id'] for info, _ in stopped]
+            if latch is None:
+                self.limit_latch = dict(since=now, source=state['source'], wait=state['wait'],
+                                        reason=state['reason'], task_ids=task_ids)
+                self.store.event(LIMIT_STOP_EVENT, '', source=state['source'], reason=state['reason'],
+                                 wait_s=round(state['wait'], 1), count=len(stopped), task_ids=task_ids,
+                                 worker_ids=worker_ids, main_kept=kept,
+                                 message='Token hard limit reached (%s): %d running coworker turn(s) stopped; '
+                                         'Main chats untouched' % (state['reason'], len(stopped)))
+            else:
+                latch.update(source=state['source'], wait=state['wait'], reason=state['reason'])
+                if stopped:
+                    latch['task_ids'] = list(latch.get('task_ids') or []) + task_ids
+                    self.store.event('limit_stop_more', '', source=state['source'], count=len(stopped),
+                                     task_ids=task_ids, worker_ids=worker_ids,
+                                     message='Token limit still reached: %d more coworker turn(s) stopped' % len(stopped))
+            if stopped:
+                self._limit_stop_turns(stopped)
+        elif latch is not None:
+            # Hysteresis: two clear checks in a row, at least LIMIT_CLEAR_SECONDS apart.
+            if not self._limit_clear_since:
+                self._limit_clear_since = now
+            elif now - self._limit_clear_since >= LIMIT_CLEAR_SECONDS:
+                self._limit_resume(latch, now)
+        return self.limit_latch
+
+    def _limit_stop(self, state):
+        """Set the cancel Event of every running coworker turn. Main/operator turns and recovery reads stay."""
+        stopped, kept = [], 0
+        for future, info in list(self.inflight.items()):
+            if info.get('recovery') or info.get('limit_stop') or future.done():
+                continue  # a turn that already finished counts as done
+            worker = self.store.get('workers', info.get('worker_id')) or {}
+            if worker.get('purpose') != 'worker':
+                kept += 1
+                continue
+            info.update(limit_stop=True, limit_wait=float(state.get('wait') or 0))
+            cancel = info.get('cancel')
+            if cancel is not None:
+                cancel.set()
+            stopped.append((info, worker))
+        return stopped, kept
+
+    def _limit_stop_turns(self, stopped):
+        """Ask the adapter to stop the remote turns, off the engine lock; every answer is logged."""
+        stop = getattr(self.adapter, 'stop_turn', None)
+        if not callable(stop):
+            return None
+        jobs = []
+        for info, worker in stopped:
+            task = self.store.get('tasks', info['task_id']) or {}
+            jobs.append((info['task_id'], info.get('run_id') or '', info['worker_id'],
+                         task.get('thread_id') or worker.get('thread_id') or '', dict(worker)))
+
+        def call():
+            for task_id, run_id, worker_id, thread_id, worker in jobs:
+                try:
+                    answer = stop(thread_id, worker)
+                except Exception as exc:
+                    answer = dict(ok=False, reason='error: %s' % str(exc)[:200])
+                if not isinstance(answer, dict):
+                    answer = dict(ok=bool(answer), reason='')
+                try:
+                    self.store.event('limit_stop_turn', run_id, task_id=task_id, worker_id=worker_id,
+                                     thread_id=thread_id, ok=bool(answer.get('ok')),
+                                     reason=str(answer.get('reason') or ''),
+                                     message='Remote stop for a limit-stopped turn: %s' %
+                                             ('ok' if answer.get('ok') else str(answer.get('reason') or 'not stopped')))
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=call, name='limit-stop-turn', daemon=True)
+        self._limit_stop_thread = thread
+        thread.start()
+        return thread
+
+    def _limit_hold(self, task, info, exc):
+        """Outcome of a limit-stopped turn that ended with an exception (never failed, never resent)."""
+        now = self.clock()
+        wait = float(info.get('limit_wait') or 0) or 120.0
+        started = float(task.get('started') or 0)
+        sent = (task.get('submission_phase') not in (None, '', 'preparing')
+                or float(task.get('sent_at') or 0) >= started > 0)
+        if str(exc).startswith('Assignment cancelled before') or not sent:
+            # Nothing reached Notion: the chat is fine, the attempt is not used, the task waits for the limit.
+            self._release(info['worker_id'], info['lease'])
+            task.pop('remote_unknown', None)
+            task.update(state='retry', attempts=max(0, task['attempts'] - 1), next_at=now + wait,
+                        paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
+                        error='Stopped by token limit before anything was sent; waits until the limit clears '
+                              '(about %d s)' % int(wait))
+        else:
+            # I5: the turn may have left; it is read back by reconcile, never resent.
+            task.update(state='uncertain', remote_unknown=False, reconcile_checks=task.get('reconcile_checks', 0) + 1,
+                        reconcile_at=time.time() + 5, paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
+                        error='Stopped locally by token limit; the Notion turn is read back, never resent')
+            worker = self.store.get('workers', info['worker_id'])
+            if worker:
+                worker['state'] = 'recovering'
+                self.store.put('workers', worker)
+
+    def _limit_resume(self, latch, now):
+        self.limit_latch = None
+        self._limit_clear_since = 0.0
+        resumed = 0
+        for task in self.store.all('tasks'):
+            if task.get('paused_by') != LIMIT_PAUSED_BY or task.get('state') != 'retry':
+                continue
+            task.pop('paused_by', None)
+            task.update(next_at=min(float(task.get('next_at') or 0), now), error='')
+            self.store.put('tasks', task)
+            resumed += 1
+        self.store.event(LIMIT_RESUME_EVENT, '', source=latch.get('source', ''), reason=latch.get('reason', ''),
+                         stopped_s=round(max(0.0, now - float(latch.get('since') or now)), 1), resumed=resumed,
+                         message='Token limit cleared: %d waiting coworker task(s) resume' % resumed)
+
+    def _limit_charge_reply(self, task, info, text):
+        """A limit-stopped turn read back as done: its reply was never charged (the stream was cancelled)."""
+        task.pop('paused_by', None)
+        if not info.get('recovery') or task.get('limit_reply_charged'):
+            return
+        from . import token_budget
+        try:
+            token_budget.charge_reply(self.store, self.store.get('workers', info['worker_id']) or {}, text)
+        except Exception:
+            pass
+        task['limit_reply_charged'] = True
+
     def tick(self):
         with self.lock:
             for future, info in list(self.inflight.items()):
@@ -1199,6 +1373,8 @@ class Engine:
                         # Seconds from the finished remote call to its completion here (lock wait + tick start).
                         info['complete_wait_s'] = round(max(0.0, time.time() - info['done_at']), 3)
                     self._complete(future, info)
+            # Owner rule: at the hard token limit every running coworker turn stops at once (Main untouched).
+            limit_latch = self._limit_check()
             self._start_merges()
             self._reconcile()
             self._heal_workers()
@@ -1254,6 +1430,10 @@ class Engine:
                             task['ready_at'] = time.time()
                             self.store.event('task_ready', run['id'], commit=False, task_id=task['id'], deps=len(task['deps']))
                         worker = self._choose_worker(task, run, settings)
+                        if worker and limit_latch is not None and worker.get('purpose') == 'worker':
+                            # Token hard limit: no new coworker turn until the latch clears; next_at is not
+                            # changed, so nothing piles up. Main tasks still dispatch (run() keeps its checks).
+                            worker = None
                         if worker:
                             self._dispatch(task, run, worker)
                             assigned = True
@@ -1351,6 +1531,8 @@ class Engine:
         task.update(state='running', worker_id=worker['id'], lease=secrets.token_urlsafe(32),
                     step_id=uid(), started=time.time(), attempts=task['attempts']+1, error='', partial='',
                     thread_id=worker['thread_id'], submission_phase='preparing')
+        if task.get('paused_by') == LIMIT_PAUSED_BY:
+            task.pop('paused_by', None)  # a fresh attempt after a token-limit wait (nothing was sent before)
         # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
         task.update(reconcile_checks=0, remote_done_at=0, reconcile_at=0, approval_seen=None, awaiting_approval='',
                     approval_evidence=False, pending_tool='', pending_tool_state='', turn_state='', turn_state_reason='', done_poll_since=0, done_poll_fast=False,
@@ -1519,6 +1701,8 @@ class Engine:
                 task['result'] = json.dumps(data, ensure_ascii=False)
                 task['requires_review']=bool(data.get('requires_review'))
                 task['error'] = data.get('summary', '') if task['state'] != 'done' else ''
+            if task.get('paused_by') == LIMIT_PAUSED_BY:
+                self._limit_charge_reply(task, info, text)
             task['finished'] = time.time()
             # Proof record: changed files in the write scope, reported tests, screenshot (proof.py, never raises).
             task['proof'] = task_proof.record(task, text, self._project_root(run)) if task.get('proof_base') else task_proof.record(dict(task, id=''), text, None)
@@ -1728,7 +1912,11 @@ class Engine:
                 task['prompt'] += '\nPlease correct this problem in the response: '+str(exc)
         except Exception as exc:
             failure=exc
-            if cancelled_before_submission(exc):
+            if info.get('limit_stop') and (run or {}).get('state') != 'cancelled':
+                # Token hard limit stopped this turn: never failed, never the presend failover, never resent.
+                failure=None
+                self._limit_hold(task, info, exc)
+            elif cancelled_before_submission(exc):
                 # Fix M: a cancel that won the race is not a chat failure; nothing was sent.
                 failure=None
                 self._release(info['worker_id'], info['lease'])
@@ -1749,6 +1937,10 @@ class Engine:
             else:
                 self._release(info['worker_id'], info['lease'], 'error')
                 task.update(state='blocked', error=str(exc)[:400])
+        if info.get('limit_stop') and task['state'] == 'uncertain':
+            # Sent before the stop (PendingRemote / inference path): read back by reconcile, never resent (I5).
+            task.update(paused_by=LIMIT_PAUSED_BY, limit_stopped_at=self.clock(),
+                        error='Stopped locally by token limit; the Notion turn is read back, never resent')
         from .telemetry import classify
         error_class = classify(failure) or ('TASK_FAILED' if task['state'] in ('failed', 'blocked') else '')
         if error_class == 'ACCOUNT_BLOCKED' and task['state'] == 'blocked' and not task.get('remote_unknown'):
