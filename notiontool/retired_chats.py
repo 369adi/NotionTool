@@ -49,15 +49,24 @@ def _lock(store):
     return lock if lock is not None else contextlib.nullcontext()
 
 
+RETIRED_PURPOSE = 'retired_worker'
+
+
 def _drop(store, worker_id, tid):
-    """Remove tid from the worker's retired_threads on a fresh read."""
+    """Remove tid from the worker's retired_threads on a fresh read; mark an age-retired worker's own chat deleted."""
     with _lock(store):
         worker = store.get('workers', worker_id)
         if not worker:
             return
+        changed = False
         retired = [t for t in (worker.get('retired_threads') or []) if t != tid]
         if retired != (worker.get('retired_threads') or []):
             worker['retired_threads'] = retired
+            changed = True
+        if worker.get('purpose') == RETIRED_PURPOSE and worker.get('thread_id') == tid and not worker.get('chat_deleted'):
+            worker.update(chat_deleted=True, enabled=False, state='missing')
+            changed = True
+        if changed:
             store.put('workers', worker)
 
 
@@ -73,7 +82,8 @@ def delete_retired(store, adapter, dry_run=False, limit=50):
     deleted, skipped, failed = [], [], []
     workers = store.all('workers')
     chats = store.all('chats')
-    current = {w.get('thread_id') for w in workers if w.get('thread_id')}
+    # Age-retired Coworkers (purpose 'retired_worker') keep their old chat as thread_id: that chat is retired too.
+    current = {w.get('thread_id') for w in workers if w.get('thread_id') and w.get('purpose') != RETIRED_PURPOSE}
     main_workers = {c.get('main_worker') for c in chats if c.get('main_worker')}
     main_workers |= {w['id'] for w in workers if w.get('purpose') in ('main', 'operator')}
     special_threads = {c.get('thread_id') for c in chats
@@ -83,7 +93,8 @@ def delete_retired(store, adapter, dry_run=False, limit=50):
 
     by_account, seen = {}, set()
     for worker in workers:
-        for tid in worker.get('retired_threads') or []:
+        own = [worker.get('thread_id')] if worker.get('purpose') == RETIRED_PURPOSE and not worker.get('chat_deleted') else []
+        for tid in (worker.get('retired_threads') or []) + own:
             if not tid or tid in seen:
                 continue
             seen.add(tid)

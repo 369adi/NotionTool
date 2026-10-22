@@ -1,6 +1,6 @@
 /* NotionTool desktop overlay part: extras. All selectors use the nt-desk- prefix.
  * Colors come from the design tokens (--nt-*) with fallbacks, so the part also works alone. */
-.nt-desk-bar,
+.nt-desk-brand-dot,
 .nt-desk-banners,
 .nt-desk-toasts,
 .nt-desk-pal-backdrop {
@@ -28,7 +28,6 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  .nt-desk-bar,
   .nt-desk-banners,
   .nt-desk-toasts,
   .nt-desk-pal-backdrop {
@@ -36,34 +35,6 @@
   }
 }
 
-/* ---- floating bar --------------------------------------------------------------------- */
-/* Fallback position (no sidebar found): high enough to clear the sidebar footer row.
- * extras.js docks the bar just above the sidebar footer ('New chat' row) via .nt-desk-bar-docked. */
-.nt-desk-bar {
-  position: fixed;
-  left: 12px;
-  bottom: var(--nt-desk-bar-bottom, 104px);
-  z-index: 2147482000;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
-  background: var(--nt-desk-glass);
-  -webkit-backdrop-filter: blur(16px) saturate(140%);
-  backdrop-filter: blur(16px) saturate(140%);
-  border: 1px solid var(--nt-desk-border);
-  border-radius: var(--nt-desk-radius);
-  box-shadow: var(--nt-desk-shadow);
-}
-
-/* Docked inside the sidebar, above its footer row; left/bottom/max-width come from extras.js. */
-.nt-desk-bar.nt-desk-bar-docked {
-  right: auto;
-  box-sizing: border-box;
-  overflow: hidden;
-}
-
-.nt-desk-bar-live,
 .nt-desk-banner .nt-desk-btn {
   font: inherit;
   color: var(--nt-desk-text);
@@ -75,7 +46,6 @@
   transition: border-color var(--nt-desk-ease), box-shadow var(--nt-desk-ease), background var(--nt-desk-ease);
 }
 
-.nt-desk-bar-live:hover,
 .nt-desk-banner .nt-desk-btn:hover {
   border-color: var(--nt-desk-accent);
   box-shadow: var(--nt-desk-glow);
@@ -93,35 +63,26 @@
   box-shadow: none;
 }
 
-.nt-desk-badge {
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  box-sizing: border-box;
-  border-radius: 9px;
-  background: var(--nt-desk-bad);
-  color: #ffffff;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 18px;
-  text-align: center;
-  cursor: pointer;
-  box-shadow: 0 0 12px rgba(239, 68, 68, .45);
-}
-
-.nt-desk-bar .nt-desk-dot {
-  width: 8px;
-  height: 8px;
+/* ---- harness status dot (right after the 'NotionTool' brand name) --------------------- */
+.nt-desk-brand-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
   border-radius: 50%;
   background: var(--nt-desk-muted);
+  vertical-align: middle;
 }
 
-.nt-desk-bar .nt-desk-dot.nt-desk-dot-ok {
+.nt-desk-brand-dot.nt-desk-brand-dot-ok {
   background: var(--nt-desk-ok);
-  box-shadow: 0 0 8px rgba(34, 197, 94, .6);
+  box-shadow: 0 0 6px rgba(34, 197, 94, .5);
 }
 
-.nt-desk-badge[hidden],
+/* The Live tab in the tab bar is the only Live entry point: the old header pill stays hidden. */
+[data-nt-desk="live-pill"] { display: none !important; }
+
 .nt-desk-banner[hidden],
 .nt-desk-banner-actions[hidden],
 .nt-desk-pal-backdrop[hidden],
@@ -440,4 +401,4 @@ html .nt-desk-toasts > .nt-desk-tcard.nt-desk-tcard-out {
 
 /* Kill switch (Ctrl+Alt+Shift+N): show everything Notion had and hide our layer. */
 html.nt-desk-off .nt-desk-hidden { display: revert !important; }
-html.nt-desk-off .nt-desk-bar, html.nt-desk-off .nt-desk-banner { display: none !important; }
+html.nt-desk-off .nt-desk-brand-dot, html.nt-desk-off .nt-desk-banner { display: none !important; }

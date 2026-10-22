@@ -43,7 +43,7 @@ _COOKIE_ALLOWED_ROOTS = frozenset([
 
 _API_PREFIX = "/api/v3/"
 # Maximum body size read from responses.
-_MAX_BODY = 10 * 1024 * 1024    # 10 MB
+_MAX_BODY = 64 * 1024 * 1024    # 64 MB (B46: long coworker transcripts exceed 10 MB; a cut body made recover fail forever)
 _MAX_ERR  =       4 * 1024      # 4 KB for error bodies (discarded after status extraction)
 
 

@@ -216,7 +216,8 @@ class DispatchTests(ShellCase):
             self.assertEqual(ident, 'x')
             self.assertEqual(payload, {'ok': False, 'error': 'Action not allowed'})
         self.assertEqual(ns.ACTIONS, ('state', 'runs', 'run_pause', 'run_cancel', 'run_retry', 'task_reconcile',
-                                      'settings_get', 'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm'))
+                                      'settings_get', 'settings_set', 'mcp_list', 'mcp_refresh', 'run_confirm',
+                                      'mcp_add', 'mcp_bridge', 'host_key', 'bridge_tunnel'))
 
     def test_handlers_outside_whitelist_are_dropped(self):
         shell = ns.NotionShell(self.browser, 'a', {'eval': lambda a: 1, 'state': lambda a: 2},
