@@ -23,7 +23,7 @@ KEEP = 3 * 3600  # items stay 3 h: the snapshot at a Notion rate limit shows win
 # go on. step_hard_60m 1500 stays as a safety net below the 1,760 steps / 60 min that tripped Notion.
 DEFAULTS = dict(step_soft_15m=800, step_hard_15m=1000, step_hard_60m=1500, step_pause_s=900,
                 wsteps_soft_15m=112_000_000, wsteps_hard_15m=140_000_000, wsteps_hard_60m=210_000_000,
-                step_context_cap=200_000, max_parallel_turns=5, start_spacing_s=45, starts_5m=8,
+                step_context_cap=200_000, max_parallel_turns=4, start_spacing_s=45, starts_5m=8,
                 provider_cooldown_s=900, step_soft_48h=25000, step_hard_48h=30000,
                 inf_hard_60m=450, cw_streak_h=12, cw_active_steps_h=100, cw_rest_s=3600,
                 err_hard_60m=30, err_wait_s=300)
@@ -469,6 +469,11 @@ def start_wait(store, worker, now=None, task=None):
         used = int(st.get('steps_15m') or 0)
         if used + need > lim['step_hard_15m']:
             return 60, 'step budget: %d used + ~%d expected > %d per 15 min' % (used, need, lim['step_hard_15m'])
+        # steady instead of waves: keep 10 % of the 60 min budget free so no all-chat stop is hit
+        used60 = int(st.get('steps_60m') or 0)
+        if used60 + need > lim['step_hard_60m'] * 0.9:
+            return 120, 'step budget: %d used + ~%d expected > 90 %% of %d per 60 min' % (
+                used60, need, lim['step_hard_60m'])
     spacing = lim['start_spacing_s'] * (2 if st['level'] == 'throttle' else 1)
     gap = now - float(st.get('last_start') or 0)
     if gap < spacing:

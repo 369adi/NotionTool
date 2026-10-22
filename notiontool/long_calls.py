@@ -28,10 +28,10 @@ MIN_LIMIT, MAX_LIMIT = 10.0, 55.0
 SETTING = 'mcp_sync_limit_s'
 KEEP_S = 30 * 60
 MAX_JOBS = 50
-DEFAULT_WAIT, MAX_WAIT = 30.0, 40.0
+DEFAULT_WAIT, MAX_WAIT = 50.0, 50.0  # one long wait instead of many short polls (each call = Notion steps)
 JOB_TOOL = 'nt_job_result'
 HINT = ('Still running on the PC. Do not start it again. Call nt_job_result with this job_id '
-        'to get the result (waits up to 40 s per call).')
+        'to get the result (waits up to 50 s per call; do not poll with shorter waits or sleep commands).')
 JOB_TOOL_SPEC = {
     'name': JOB_TOOL,
     'description': ('Get the result of a NotionTool tool call that answered still_running with a job_id '
