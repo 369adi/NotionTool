@@ -17,7 +17,8 @@ class FakeTransport:
 
     def stream(self, method, body, headers, timeout=0):
         self.adapter.streams.append((method, body['thread_id']))
-        self.adapter.threads[body['thread_id']] = 'Welcome to Notion'
+        if not self.adapter.drop_creation:  # a dropped creation never shows up in the chat list
+            self.adapter.threads[body['thread_id']] = 'Welcome to Notion'
         return iter(())
 
 
@@ -44,6 +45,7 @@ class FakeAdapter:
     def __init__(self, store):
         self.store = store
         self.threads, self.streams, self.renames = {}, [], []
+        self.drop_creation = False
 
     def client(self, account_id):
         return FakeClient(self)
@@ -153,6 +155,33 @@ class AppChatRouteTests(unittest.TestCase):
         self.assertEqual(again['chat_id'], up['chat_id'])  # same Main chat entry comes back
         self.assertEqual((len(self.adapter.streams), len(self.adapter.renames)), (streams, renames))
 
+    def test_unconfirmed_create_is_not_resent(self):
+        self.adapter.drop_creation = True
+        first = self.create('Lost', False, 'r-lost')
+        self.assertNotEqual(first['state'], 'done')
+        self.assertEqual(len(self.adapter.streams), 1)
+        self.adapter.drop_creation = False
+        again = self.create('Lost', False, 'r-lost')  # same request_id: resumed, never POSTed a second time
+        self.assertTrue(again['duplicate'])
+        self.assertEqual(len(self.adapter.streams), 1)
+
+    def test_request_id_and_name_are_validated(self):
+        with self.assertRaises(ValueError):
+            self.create('Name', False, '')
+        with self.assertRaises(ValueError):
+            self.create('   ', False, 'r-blank')
+        with self.assertRaises(ValueError):
+            self.create('x' * (own_chats.MAX_NAME_CHARS + 1), False, 'r-long')
+        self.assertEqual(self.adapter.streams, [])
+
+    def test_promote_refuses_operator_main_and_unknown_chat(self):
+        self.store.put('workers', dict(id='a:m', account_id='a', thread_id='m', purpose='main', enabled=True,
+                                       state='ready', label='Operator Main'))
+        with self.assertRaises(ValueError):
+            self.post(own_chats.PROMOTE_ROUTE, thread_id='m', main=False)
+        with self.assertRaises(ValueError):
+            self.post(own_chats.PROMOTE_ROUTE, thread_id='nope', main=True)
+
     def test_promote_refuses_coworkers(self):
         self.store.put('workers', dict(id='a:w', account_id='a', thread_id='w', purpose='worker', enabled=True,
                                        state='ready', label='Cowork 1'))
@@ -219,7 +248,7 @@ class PrivateChatSelectionTests(unittest.TestCase):
 SERVER_SOURCE = (Path(__file__).resolve().parents[1] / 'notiontool' / 'server.py').read_bytes()
 
 
-@unittest.skipUnless(b'/api/app/chat/create' in SERVER_SOURCE, 'server.py does not route /api/app/chat/* yet')
+@unittest.skipUnless(b'/api/app/chat/' in SERVER_SOURCE, 'server.py does not route /api/app/chat/* yet')
 class ServerRouteTests(AppChatRouteTests):
     """The three routes through the real POST dispatch (Handler.handle_request -> Application.action)."""
 

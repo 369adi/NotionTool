@@ -14,6 +14,15 @@ The watcher then sends one short continue message into that chat:
 - through the shared request budget (I11); checks run at background priority.
 The watch runs while the setting turn_watch is on (default True), independent of background_remote.
 
+All coworkers finished (setting auto_continue_on_done, default True, and main_auto_continue): when every
+delegated task in the runs of an operator Main chat has left the pending states, the watcher sends
+ALL_DONE_TEXT once into that Main chat - only while its turn is idle (not streaming, no open tool call,
+not awaiting a Notion confirmation), after DONE_QUIET_SECONDS of quiet since the last task finished, at
+most once per batch (the handled task ids are stored as worker['all_done']; only a new delegation adds
+new ids) and never while the 6-hour token budget is used up. It reuses the transcript of the regular
+check and continue_turn under the same request priority. A send that raised is never repeated, because
+Notion may have stored it; only an explicit "chat busy, nothing sent" allows a later attempt.
+
 Operator usage: for operator workers only, at most every main_context_check_seconds (default 300)
 the already fetched transcript is added to ChatContext and the usage (tokens, user turns) is stored
 as worker['context_usage']; main_switch.check() then decides whether to ask the user about a switch.
@@ -28,6 +37,8 @@ from .notion import FINISHED_STATUSES, session_state
 
 RESUME_TEXT = ('Continue: your previous turn was interrupted before it finished (automatic resume by NotionTool). '
                'Pick up exactly where you stopped and finish the task.')
+ALL_DONE_TEXT = ('All coworkers are finished (automatic message by NotionTool). '
+                 'Check their results, confirm or fix them, and continue with the next steps.')
 # Idle mode (setting idle_mode, default on, button in the status strip): a Main chat whose turn ended
 # shortly before NotionTool restarted (e.g. a build swap) gets one automatic 'continue' after the restart,
 # so the user never has to type 'weiter' after an update.
@@ -49,6 +60,7 @@ CHECK_SECONDS = 30
 GRACE_SECONDS = 150  # a Main often thinks or waits on a slow tool for more than a minute between steps
 PENDING_TOOL_SECONDS = 420  # newest step is a tool call without result; every NotionTool tool times out well before this
 STALL_SECONDS = 600  # chat still says 'running' but nothing new for 10 min: a hung turn (e.g. a broken tool call)
+DONE_QUIET_SECONDS = 20  # quiet after the last finished task; short gaps between dependent tasks never trigger
 MAX_CHAIN = 5
 MAX_CHAIN_OPERATOR = 20  # the operator Main may work in idle mode for hours
 CHAIN_WINDOW = 1800   # without a visible user message, a resume within 30 min continues the chain
@@ -60,6 +72,9 @@ USAGE_ERROR_SECONDS = 3600  # at most one operator_usage_failed event per thread
 IDLE = FINISHED_STATUSES  # same constant as notion.session_state: a missing status is 'unknown', never idle
 EXCLUDED_STATES = ('missing', 'disabled', 'retired')
 ACTIVE_TASK_STATES = ('running', 'uncertain')
+# A delegated task in one of these states keeps its batch open (retry and cancelling are queued/running too).
+PENDING_TASK_STATES = ('queued', 'retry', 'running', 'verifying', 'uncertain', 'preparing', 'cancelling', 'checkpoint')
+CONFIRM_MARKERS = ('confirm', 'approval', 'permission')
 OPERATOR = 'operator'
 STOP_WORDS = re.compile(r'\b(stop|halt|pause|warte|aufh(?:ö|oe)ren)\b', re.IGNORECASE)
 # No paused-turn marker is documented in notion.py transcript() (it returns getThreadTranscript as is).
@@ -142,7 +157,9 @@ def _role(entity):
 
 
 def _is_resume(entity):
-    return RESUME_TEXT[:40] in text_of(entity.get('content', entity.get('text', '')))
+    """True for our own automatic messages (resume and all-coworkers-finished)."""
+    text = text_of(entity.get('content', entity.get('text', '')))
+    return RESUME_TEXT[:40] in text or ALL_DONE_TEXT[:40] in text
 
 
 def user_turns(entities):
@@ -201,6 +218,45 @@ def interrupted_turn(transcript, now=None):
                 pending=False if stalled else _pending_tool(last, entities), stalled=stalled,
                 user_ids=[str(x) for x in (user.get('client_message_id'), user.get('id')) if x],
                 user_text=user_text)
+
+
+def _entities(transcript):
+    return sorted((p.get('entity') or {} for p in (transcript.get('patches') or []) if p.get('op') == 'put'),
+                  key=lambda e: e.get('sequence') or 0)
+
+
+def awaiting_confirmation(transcript):
+    """True when a step after the newest message waits for a Notion confirmation (approve/permission)."""
+    for entity in reversed(_entities(transcript)):
+        kind = str(entity.get('kind') or entity.get('type') or '').lower()
+        if kind in ('assistant_message', 'user_message'):
+            return False
+        marks = ' '.join(str(entity.get(field) or '') for field in ('state', 'status', 'stop_reason', 'stopReason'))
+        if any(marker in kind or marker in marks.lower() for marker in CONFIRM_MARKERS) \
+                or entity.get('awaiting_confirmation') or entity.get('needs_confirmation'):
+            return True
+    return False
+
+
+def turn_idle(transcript):
+    """True when the chat neither streams, runs a tool nor waits for a Notion confirmation."""
+    if transcript.get('session_pending') or session_state(transcript) != 'finished':
+        return False  # running and unknown are never idle (shared rule with notion.session_state)
+    if awaiting_confirmation(transcript):
+        return False
+    found = interrupted_turn(transcript)
+    return not (found and found.get('pending'))
+
+
+def _pending_task(task):
+    return task.get('state') in PENDING_TASK_STATES or bool(task.get('remote_unknown'))
+
+
+def _finished_at(task):
+    try:
+        return float(task.get('finished') or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def restart_continue(transcript, started):
@@ -324,6 +380,7 @@ class TurnWatch:
     def __init__(self, store, adapter, engine, clock=time.time):
         self.store, self.adapter, self.engine, self.clock = store, adapter, engine, clock
         self.first_seen, self.sending, self.blocked = {}, set(), False
+        self.done_seen = {}  # worker id -> (task ids, first time all were seen finished)
         self.usage_at, self.usage_failed, self.full_read = {}, {}, set()
         self.spawn = lambda fn, *args: threading.Thread(target=fn, args=args, daemon=True, name='turn-resume').start()
         self.started = clock()
@@ -552,6 +609,90 @@ class TurnWatch:
             pass
         return entities
 
+    def delegated_tasks(self, worker):
+        """All tasks of the runs that belong to this operator Main chat (not released)."""
+        chats = {c['id'] for c in self.store.all('chats')
+                 if c.get('operator') and c.get('state') != 'released' and c.get('main_worker') == worker['id']}
+        if not chats:
+            return []
+        runs = {r['id'] for r in self.store.all('runs') if r.get('chat_id') in chats}
+        return [t for t in self.store.all('tasks') if t.get('run_id') in runs]
+
+    def check_all_done(self, worker, client, transcript):
+        """Send ALL_DONE_TEXT once per finished batch of delegated tasks; returns the step id or None."""
+        settings = self.store.settings()
+        if (worker.get('purpose') != OPERATOR or not settings.get('auto_continue_on_done', True)
+                or not settings.get('main_auto_continue', True)):
+            return None
+        tasks = self.delegated_tasks(worker)
+        if not tasks:
+            return None
+        if any(_pending_task(t) for t in tasks):
+            self.done_seen.pop(worker['id'], None)
+            return None
+        ids = sorted(str(t['id']) for t in tasks)
+        handled = set((self.store.get('workers', worker['id'], {}).get('all_done') or {}).get('ids') or [])
+        if set(ids) <= handled:
+            return None  # this batch was already announced; only a new delegation adds new ids
+        now = self.clock()
+        seen = self.done_seen.get(worker['id'])
+        if not seen or seen[0] != ids:
+            seen = self.done_seen[worker['id']] = (ids, now)
+        finished = max(_finished_at(t) for t in tasks)
+        if now - (finished or seen[1]) < DONE_QUIET_SECONDS:
+            return None
+        if not turn_idle(transcript):
+            return None
+        if budget_used_up(self.store, now):
+            return None  # 6-hour token budget used up: no automatic message until the reset
+        with self.engine.lock:
+            fresh = self.store.get('workers', worker['id'])
+            if not fresh or fresh.get('thread_id') != worker['thread_id']:
+                return None
+            state = dict(fresh.get('all_done') or {})
+            previous = list(state.get('ids') or [])
+            if set(ids) <= set(previous):
+                return None
+            step = self.adapter.new_id(client.info['space_id'], '00aa')
+            fresh['all_done'] = dict(ids=ids, previous_ids=previous, at=now, step=step)
+            resume = dict(fresh.get('resume') or {})
+            resume['steps'] = (list(resume.get('steps') or []) + [step])[-10:]  # our message, not the user's
+            fresh['resume'] = resume
+            self.store.put('workers', fresh)
+            self.sending.add(worker['id'])
+        self.store.event('coworkers_done', worker_id=worker['id'], thread_id=worker['thread_id'], tasks=len(ids),
+                         message='All %d delegated task(s) finished; NotionTool tells the Main to continue' % len(ids))
+        self.spawn(self.send_all_done, worker, step, ids)
+        return step
+
+    def send_all_done(self, worker, step, ids):
+        from .network_budget import request_priority
+        try:
+            with request_priority('rest'):
+                sent = self.adapter.continue_turn(worker, ALL_DONE_TEXT, step)
+            if sent:
+                self.store.event('coworkers_done_sent', worker_id=worker['id'], thread_id=worker['thread_id'],
+                                 message='Sent the all-coworkers-finished message to the Main')
+            else:
+                self.revert_all_done(worker, ids, 'coworkers_done_skipped',
+                                     'The Main became busy again; nothing was sent')
+        except Exception as exc:
+            # Notion may have stored the message: never send it again for this batch.
+            self.store.event('coworkers_done_unconfirmed', worker_id=worker['id'], thread_id=worker['thread_id'],
+                             message='All-coworkers-finished message not confirmed; it is not sent again: '
+                                     + type(exc).__name__ + ': ' + str(exc)[:200])
+        finally:
+            self.sending.discard(worker['id'])
+
+    def revert_all_done(self, worker, ids, kind, reason):
+        with self.engine.lock:
+            fresh = self.store.get('workers', worker['id'])
+            state = (fresh or {}).get('all_done') or {}
+            if fresh and state.get('ids') == ids:
+                fresh['all_done'] = dict(state, ids=list(state.get('previous_ids') or []))
+                self.store.put('workers', fresh)
+        self.store.event(kind, worker_id=worker['id'], thread_id=worker['thread_id'], message=reason)
+
     def check(self, worker):
         if worker['id'] in self.sending:
             return None
@@ -559,6 +700,9 @@ class TurnWatch:
         transcript = client.transcript(worker['thread_id'], limit=WINDOW)
         self.measure_usage(worker, client, transcript)
         self.count_steps(worker, transcript, client=client)
+        done = self.check_all_done(worker, client, transcript)
+        if done:
+            return done
         found = interrupted_turn(transcript, now=self.clock())
         if not found:
             return self.check_restart(worker, transcript)

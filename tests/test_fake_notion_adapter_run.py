@@ -2,8 +2,10 @@
 
 Every test sets one fault with FakeState.set_fault, then calls the real FakeNotionAdapter.run (which in turn
 calls the real recover / reconcile_empty_stream) and checks the result and the events the real code wrote.
-Only two things are replaced, both for speed or because the fake cannot answer them:
+Only three things are replaced, all for speed or because the fake cannot answer them:
   - verify_response_model (the fake has no per-step model records, so the real check always ends 'pending')
+  - the pre-seeded chat config: setUp stores the confirmed thread_configs record itself, so run() skips the
+    config write that the fake cannot show
   - for the slow-timeout test, the stream timeout, which run() fixes at 60 s, is lowered to 0.3 s.
 unittest only; every test finishes in well under 2 s.
 """
@@ -190,12 +192,14 @@ class FakeAdapterRunTests(unittest.TestCase):
         self.assertTrue(str(reply).endswith(DONE))
         self.assertEqual(self.kinds(), ['user_message', 'assistant_message', 'turn_completed'])
         self.assertEqual(str(reply), fake_text(self.own_turn()))  # the committed reply, not stream text
+        # A real empty stream: no line at all, then the connection ends with an OSError; run() reconciles by itself.
         done = self.events('remote_done')
         # The stream died before the first patch-start line: an empty stream is unknown, and run() reconciles it.
         self.assertEqual([(e['outcome'], e['error_class']) for e in done], [('unknown', 'REMOTE_UNKNOWN')])
         self.assertIn('empty stream', done[0]['detail'])
         self.assertEqual(done[0]['lines'], 0)
         self.assertEqual(self.events('first_output'), [])  # the stream carried no answer text at all
+        self.assertEqual(len(self.events('empty_stream_reconciled')), 1)
         self.assertEqual(len(self.events('recover_timing')), 1)
         self.adapter.verify_response_model.assert_called_once()
         self.assertIsNotNone(self.task().get('remote_done_at'))

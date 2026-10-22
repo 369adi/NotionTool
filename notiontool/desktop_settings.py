@@ -64,6 +64,8 @@ HARNESS_SETTINGS = [
     # Main chat
     _bool('main_auto_continue', 'Continue the Main automatically', 'Main chat', True,
           'Send the next step to the Main chat when coworker results arrive.'),
+    _bool('auto_continue_on_done', 'Continue the Main when all coworkers finish', 'Main chat', True,
+          'Send one message to the Main chat when all its delegated coworker tasks are finished.'),
     _bool('turn_watch', 'Watch Main turns', 'Main chat', True,
           'Watch the Main chat for finished turns and stalls.'),
     _choice('main_context_policy', 'Main context policy', 'Main chat', ('hint', 'auto', 'ask'), 'hint',
