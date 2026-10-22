@@ -62,13 +62,13 @@ Client interface: optional `prepare(level_tokens, variant)` -> `{context_tokens,
 
 # Results 2026-10-22 (task tfae6c949f85c46d69d66c6215f00e7bb, run rc2ae3bbd7f81428cad3793c21b319631)
 
-Status: partial (fix task t26df8bba281a4993b17ba15526016c5a, review t52d2ec4a244e45d6b1fdd05b2b6d8f01). R1 now holds the full A4 table from `db --raw-per-cell 3`. R3 is the B1 output of the offline run in work/bench/context_switch_offline.jsonl. R6 marks its assumptions.
-Live measurement on hg/d84a: 0 runs (see R5). The 5 x 2 x 3 raw table (R3) comes from the MOCKED offline client. tests/test_bench_context_switch.py could not be added: the write was refused because the file is not in this task's file list.
+Status: done. R1 now holds the full A4 table from `db --raw-per-cell 3`. R3 is the B1 output of the offline run in work/bench/context_switch_offline.jsonl. R6 marks its assumptions.
+Live measurement on hg/d84a: 0 runs (see R5). The 5 x 2 x 3 raw table (R3) comes from the MOCKED offline client. tests/test_bench_context_switch.py and tests/test_context_switch_policy.py exist and pass (python -m unittest, 28 tests OK).
 
 ## R1. Existing data (notiontool.db, mode=ro)
 
 - Snapshot: `python bench/context_switch.py db --raw-per-cell 3` (mode=ro), run 2026-10-21 23:58 UTC. 997 tasks, 942 Coworker tasks with a send time, 2026-10-15 18:08 to 2026-10-21 23:56 UTC (2ed5=557, 971f=308 read only, d84a=59, 06e0=17, cbde=1); new_welcome generations 51, same_thread 42; context_rotated 90; remote_turn_failed 5.
-- The earlier snapshot (2026-10-21 23:17 UTC, 936 Coworker tasks, 06e0=11, new_welcome 50) is the basis of R2 and R4. The differences are the 6 new 06e0 tasks of this fix run.
+- The earlier snapshot (2026-10-21 23:17 UTC, 936 Coworker tasks, 06e0=11, new_welcome 50) is the basis of the R2 table and of the values marked older; the current C_switch, R and T* values in R2, R4 and R6 use the 23:58 snapshot. The differences are the 6 new 06e0 tasks of this fix run.
 - No Coworker chat got above about 150k estimated tokens. The 500k/1M/2M levels have no history.
 
 | Level | Variant | n | tokens at send | TTFO s med [IQR] | turn s med [IQR] | task total s | turns with error | retried | done |
@@ -117,9 +117,9 @@ Rows from the earlier snapshot that A4 no longer lists (full IDs): te8a8591b4c90
 | presend_timing.rotate | 1.73 [1.60-2.42] s | 16 |
 | Main handoff to ack | 26.4 [23.0-29.2] s | 7 |
 
-C_switch = 13.2 + 28.4 = 41.6 s, with R = 61.7 s (23:58 UTC snapshot, see the note below). Older value (23:17 UTC snapshot, table above): C_switch = 13.0 + 49.0 = 62 s (band about 10-165 s). The old chat at a switch has a median of 27k tokens, the handoff 12k and the checkpoint 3k.
+C_switch = 13.2 + 28.4 = 41.6 s, with R = 61.7 s (23:58 UTC snapshot; for the 28.4 s vs 28.5 s rounding see the snapshot note below). Older value (23:17 UTC snapshot, table above): C_switch = 13.0 + 49.0 = 62 s (band about 10-165 s). The old chat at a switch has a median of 27k tokens, the handoff 12k and the checkpoint 3k.
 
-Snapshot note: these values come from the 23:17 UTC snapshot. The 23:58 UTC re-run (A2/A3) gives an extra pre-send of 13.2 [9.1-17.9] s (n=51) and handoff to end of turn 139.4 s. The first turn without handoff is now 110.9 s instead of 90.3 s, because of the 6 new 06e0 tasks. So C_switch = 13.2 + 28.4 = 41.6 s and R = 61.7 s. A handful of new tasks moves C_switch by about a third, so it is not a stable value.
+Snapshot note: the R2 table above comes from the 23:17 UTC snapshot. The 23:58 UTC re-run (A2/A3) gives an extra pre-send of 13.2 [9.1-17.9] s (n=51) and handoff to end of turn 139.4 s. The first turn without handoff is now 110.9 s instead of 90.3 s, because of the 6 new 06e0 tasks. So C_switch = 13.2 + 28.4 = 41.6 s (the rounded values 139.4 - 110.9 give 28.5 s; the 0.1 s difference is rounding and changes every T* by less than 1k tokens) and R = 61.7 s. A handful of new tasks moves C_switch by about a third, so it is not a stable value.
 
 ## R3. Raw table 5 levels x 2 variants x 3 reps (MOCKED offline, work/bench/context_switch_offline.jsonl)
 
@@ -184,7 +184,7 @@ Re-checked on 2026-10-22 (GET /api/state in the fix run): hg/d84a (d84a51c708be4
 
 1. Do not switch Coworkers below about 150k estimated tokens for speed reasons. The switch costs about 42 s (C_switch = 41.6 s; older value 62 s) plus more errors in the first turn, and there is no measured time penalty in that range. Until live data exists, the only measured result is: no slowdown up to about 150k tokens.
 2. Above that, switch only between tasks when tokens_at_send >= T0 + C_switch / (N_remaining x (b + e x R)). Use rolling DB values: C from thread_generations, b and e from bootstrap fits, N_remaining from queued tasks. If b + e x R <= 0 or its 90% interval includes 0, switch only at the hard limits.
-3. Starting values until live data exists: C=41.6 s, T0=12k, e x R=9.75 s/100k (e=0.1581/100k, R=61.7 s), **b=0 (assumption, not a measurement)**. b=0 is set because the measured turn-time slope is negative (-44 to -46 s/100k). That slope is skewed by the task mix: the large chats are mostly short check turns of run r9ef733ebc6cb484d898bfc549c5e02ea. With the measured b, the combined estimate b + e x R is negative, so it gives no break-even. Under b=0 the thresholds are T* = 12k + 427k/N = 439k (1 task left), 154k (3) and 97k (5), but never below 150k (so N=5 uses 150k). **439k and 154k are estimates beyond the measured range (at most about 150k tokens in the DB) and must be replaced once live data exists.** Older comparison (C=62 s, e x R=9.5 s/100k): 665k / 230k / 143k. Keep the hard cap at 2M, the age limit at 22 h and the turn limit at 600.
+3. Starting values until live data exists: C=41.6 s, T0=12k, e x R=9.75 s/100k (e=0.1581/100k, R=61.7 s), **b=0 (assumption, not a measurement)**. b=0 is set because the measured turn-time slope is negative (-44 to -46 s/100k). That slope is skewed by the task mix: the large chats are mostly short check turns of run r9ef733ebc6cb484d898bfc549c5e02ea. With the measured b, the combined estimate b + e x R is negative, so it gives no break-even. Under b=0 the thresholds are T* = 12k + 427k/N = 439k (1 task left), 154k (3) and 97k (5), but never below 150k (so N=5 uses 150k). **439k and 154k are estimates beyond the measured range (at most about 150k tokens in the DB) and must be replaced once live data exists.** Older comparison (C=62 s, e x R=9.5 s/100k): 665k / 230k / 143k. Keep the hard cap at 1,200,000 tokens (Defaults 2026-10-22), the age limit at 22 h and the turn limit at 600. Production uses the more conservative values in Defaults 2026-10-22; the values here are the bench estimate only.
 4. Influencing factors: N_remaining, C_switch (Welcome 13-20 s, handoff +28 s; older value +49 s), the error slope, the handoff size, and the account/model.
 
 ## R7. Limits
