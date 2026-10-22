@@ -1209,7 +1209,11 @@ class Application:
                 old_team = team_size(settings)
                 for key,lo,hi in [('max_workers',1,40),('per_account',1,40),('max_attempts',1,5),
                                  ('task_timeout',60,3600),('max_fix_rounds',0,4),('context_token_limit',8000,10000000),
-                                 ('context_turn_limit',5,2000),('context_handoff_chars',8000,40000),('max_runs_per_chat',1,6),('coworker_max_age_hours',1,72)]:
+                                 ('context_turn_limit',5,2000),('context_handoff_chars',8000,40000),('max_runs_per_chat',1,6),('coworker_max_age_hours',1,72),
+                                 # Measured Coworker switch rule (chat_context.switch_decision, desktop_settings.SWITCH_SETTINGS)
+                                 ('switch_min_tokens',0,10000000),('switch_base_tokens',0,1000000),('switch_cost_s',0,3600),
+                                 ('switch_slope_ms_per_100k',0,600000),('switch_error_permille_per_100k',0,1000),
+                                 ('switch_retry_s',0,3600),('switch_remaining_tasks',1,50)]:
                     if key in body:
                         settings[key] = max(lo,min(hi,int(body[key])))
                 if 'host_api_port' in body:
@@ -1224,6 +1228,10 @@ class Application:
                     if body['coworker_fresh_context'] not in ('threshold','every_task'):
                         raise ValueError('Choose threshold or every_task')
                     settings['coworker_fresh_context'] = body['coworker_fresh_context']
+                if 'coworker_switch_policy' in body:
+                    if body['coworker_switch_policy'] not in ('threshold','measured'):
+                        raise ValueError("coworker_switch_policy must be 'threshold' or 'measured'")
+                    settings['coworker_switch_policy'] = body['coworker_switch_policy']
                 if 'context_replace_mode' in body:
                     if body['context_replace_mode'] not in ('soft','full'):
                         raise ValueError('Choose soft or full')

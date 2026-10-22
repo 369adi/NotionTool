@@ -23,6 +23,79 @@ def excerpt(text, cap):
     return text[:cap // 2] + '\n[Full source retained locally]\n' + text[-cap // 2:]
 
 
+# Measured Coworker switch rule (docs/CONTEXT_SWITCH_BENCH.md, 'Defaults 2026-10-22'). Integer settings:
+# T0 switch_base_tokens, C switch_cost_s, b switch_slope_ms_per_100k / 1000 (s per task per 100k),
+# e switch_error_permille_per_100k / 1000, R switch_retry_s, floor switch_min_tokens, N = tasks ahead from the
+# worker's real queue (switch_remaining_tasks only as fallback). Defaults rest on the step-gap measurement
+# (docs/context_sweet_spot.md): C 76 s, b 0.251 s/step/100k x 14 steps = 3514 ms, e 0 (error share is an
+# upper bound from <=150k data), flat up to 400k -> floor 400k. T* = 2174778 / 732926 / 444556 for N 1/3/5.
+SWITCH_DEFAULTS = dict(coworker_switch_policy='measured', switch_min_tokens=400000, switch_base_tokens=12000,
+                       switch_cost_s=76, switch_slope_ms_per_100k=3514, switch_error_permille_per_100k=0,
+                       switch_retry_s=60, switch_remaining_tasks=3)
+QUEUED_TASK_STATES = ('queued', 'ready', 'retry')
+
+
+def queued_ahead(tasks, worker, task):
+    """Queued tasks ahead of this worker, without the task about to be sent: tasks assigned to the worker, plus
+    unassigned queued tasks of the same run (they may land here). None when the queue cannot be read."""
+    if tasks is None:
+        return None
+    run, own = task.get('run_id'), set()
+    for t in tasks:
+        if t.get('id') == task.get('id') or t.get('state') not in QUEUED_TASK_STATES:
+            continue
+        if t.get('worker_id') == worker.get('id') or (run and t.get('run_id') == run and not t.get('worker_id')):
+            own.add(t.get('id'))
+    return len(own)
+
+
+def switch_decision(settings, usage, purpose='worker', queued=None):
+    """Decide whether a chat switches before its next task (pure, so tests and rotate() agree).
+
+    measured (Coworkers only): extra_s = N x (b + e x R) x (tokens - T0) / 100k is the estimated extra time of
+    continuing for the next N tasks. Switch when extra_s > C and tokens >= the floor, i.e. above
+    max(floor, T*) with T* = T0 + C x 100k / (N x (b + e x R)). N = 1 + queued (the task about to be sent plus
+    the queued ones); switch_remaining_tasks is used only when queued is None. context_token_limit and
+    context_turn_limit stay hard limits in both policies; threshold keeps the old behaviour exactly.
+    """
+    s = dict(SWITCH_DEFAULTS)
+    s.update({k: v for k, v in (settings or {}).items() if k in SWITCH_DEFAULTS and v is not None})
+    tokens, turns = int(usage.get('estimated_tokens') or 0), int(usage.get('turns') or 0)
+    limit, turn_limit = int(usage.get('token_limit') or 1200000), int(usage.get('turn_limit') or 600)
+    policy = 'measured' if s['coworker_switch_policy'] == 'measured' and purpose == 'worker' else 'threshold'
+    if queued is None:
+        n, n_source = max(1, int(s['switch_remaining_tasks'])), 'setting'
+    else:
+        n, n_source = min(50, 1 + max(0, int(queued))), 'queue'
+    per_100k = n * (max(0, int(s['switch_slope_ms_per_100k'])) / 1000 +
+                    max(0, int(s['switch_error_permille_per_100k'])) / 1000 * max(0, int(s['switch_retry_s'])))
+    t0, cost = max(0, int(s['switch_base_tokens'])), max(0, int(s['switch_cost_s']))
+    floor = max(0, int(s['switch_min_tokens']))
+    extra = per_100k * max(0, tokens - t0) / 100000
+    t_star = math.ceil(t0 + cost * 100000 / per_100k) if per_100k > 0 else None
+    at = min(limit, max(floor, t_star)) if (policy == 'measured' and t_star is not None) else limit
+    if tokens >= limit:
+        reason = 'token_limit'
+    elif turns >= turn_limit:
+        reason = 'turn_limit'
+    elif policy == 'measured' and t_star is not None and tokens >= floor and extra > cost:
+        reason = 'measured'
+    else:
+        reason = ''
+    return dict(switch=bool(reason), reason=reason, policy=policy, tokens=tokens, turns=turns,
+                extra_s=round(extra, 1), switch_cost_s=cost, switch_at_tokens=at, t_star_tokens=t_star,
+                min_tokens=floor, remaining_tasks=n, remaining_source=n_source, queued_tasks=queued,
+                token_limit=limit, turn_limit=turn_limit)
+
+
+def switch_message(reason, d):
+    return ('Context switch (%s, policy %s): %d tokens, %d turns, estimated extra %.1f s for the next %d tasks (%s) '
+            'vs switch cost %d s; switch point %d tokens (T* %s, floor %d, hard limit %d)'
+            % (reason, d['policy'], d['tokens'], d['turns'], d['extra_s'], d['remaining_tasks'],
+               d.get('remaining_source', 'setting'), d['switch_cost_s'], d['switch_at_tokens'], d['t_star_tokens'],
+               d['min_tokens'], d['token_limit']))
+
+
 class ChatContext:
     def __init__(self, store):
         self.store = store
@@ -223,7 +296,15 @@ class ChatContext:
         pending = self.store.get('rotations', worker['id'])
         fresh_due = (worker.get('purpose') == 'worker' and self.store.settings().get('coworker_fresh_context') == 'every_task'
                      and usage['turns'] > 0 and bool(worker.get('prev_task_id')))
-        if not pending and not fresh_due and not worker.get('compress_requested') and usage['estimated_tokens'] < usage['token_limit'] and usage['turns'] < usage['turn_limit']:
+        # Switch rule (threshold or measured); context_token_limit/context_turn_limit stay hard limits.
+        # N = tasks ahead from the worker's real queue (worker or run); the setting is only the fallback.
+        try:
+            queued = queued_ahead(self.store.all('tasks'), worker, task)
+        except Exception:
+            queued = None
+        decision = switch_decision(self.store.settings(), usage, worker.get('purpose'), queued)
+        usage = dict(usage, switch=decision)
+        if not pending and not fresh_due and not worker.get('compress_requested') and not decision['switch']:
             worker['context_usage'] = usage
             self.store.put('workers', worker)
             return worker
@@ -259,7 +340,13 @@ class ChatContext:
         if not pending:
             pending = dict(id=worker['id'], old_thread=worker['thread_id'],
                 handoff=self.handoff(worker, task), state='reserved', created=time.time(), task_id=task['id'])
+            reason = ('every_task' if fresh_due else 'compress_requested' if worker.get('compress_requested')
+                      else decision['reason'] or 'pending')
+            pending['reason'] = reason
             self.store.put('rotations', pending)
+            # One event per switch, written once when the switch is reserved (between tasks, before the send).
+            self.store.event('context_switch', task.get('run_id', ''), worker_id=worker['id'], task_id=task['id'],
+                             reason=reason, message=switch_message(reason, decision), decision=decision)
         # Fix R: coworkers get each task's context from the harness; a model-written JSON checkpoint
         # is not needed there and failed repeatedly ('not structured JSON'). Only non-coworkers use it.
         if getattr(adapter, 'semantic_context', False) and worker.get('purpose') != 'worker':

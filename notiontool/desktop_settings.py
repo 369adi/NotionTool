@@ -116,6 +116,28 @@ HARNESS_SETTINGS = [
     for item, label, default in APP_HIDE_ITEMS
 ]
 
+# Coworker switch rule (chat_context.switch_decision). Server keys: bounds are the /api/settings clamps in
+# server.py; defaults rest on the step-gap measurement (docs/CONTEXT_SWITCH_BENCH.md, 'Defaults 2026-10-22').
+SWITCH_SETTINGS = [
+    _choice('coworker_switch_policy', 'Coworker switch rule', 'Coworkers', ('threshold', 'measured'), 'measured',
+            'measured (default): switch between tasks when the estimated extra time beats the switch cost; '
+            'threshold: switch only at the context limit. The token and turn limits stay hard caps in both.'),
+    _int('switch_min_tokens', 'Measured: never switch below (tokens)', 'Coworkers', 0, 10000000, 400000,
+         'Measured rule floor: step times are flat up to about 400k, so no switch for speed below this.'),
+    _int('switch_base_tokens', 'Measured: base context T0 (tokens)', 'Coworkers', 0, 1000000, 12000,
+         'Context size of a fresh chat after the handoff.'),
+    _int('switch_cost_s', 'Measured: switch cost (s)', 'Coworkers', 0, 3600, 76,
+         'Time one switch costs: new Welcome chat plus the slower first turn after the handoff.'),
+    _int('switch_slope_ms_per_100k', 'Measured: extra time per task per 100k tokens (ms)', 'Coworkers', 0, 600000, 3514,
+         'Extra time per task per 100k tokens of context, in ms (3514 = 0.251 s per step x 14 steps).'),
+    _int('switch_error_permille_per_100k', 'Measured: extra errors per 100k (per mille)', 'Coworkers', 0, 1000, 0,
+         'Rise of the error share per 100k tokens, in per mille (off by default: only an upper bound so far).'),
+    _int('switch_retry_s', 'Measured: cost of one error (s)', 'Coworkers', 0, 3600, 60,
+         'Time one failed turn costs (retry).'),
+    _int('switch_remaining_tasks', 'Measured: tasks ahead (fallback)', 'Coworkers', 1, 50, 3,
+         'Used only when the queue cannot be read; normally the queued tasks of the worker or run are counted.'),
+]
+
 # Notion settings sections the overlay hides. Account, security, billing, Notion AI and
 # connections are never hidden. German labels are for the German Notion UI.
 HIDDEN_NOTION_SETTINGS = [
@@ -140,18 +162,27 @@ def is_secret_key(key):
 
 
 def settings_schema(current):
-    """{'harness': entries with 'value' (from current or the default), 'hidden_notion': sections}."""
+    """{'harness': entries with 'value' (from current or the default), 'switch': the Coworker switch
+    rule entries (same shape), 'hidden_notion': sections}.
+
+    The switch entries stay a separate list until web/desktop/settings.js maps them to a section
+    (SECTION_OF_KEY); they are set through /api/settings."""
     current = current if isinstance(current, dict) else {}
-    harness = []
-    for entry in HARNESS_SETTINGS:
-        if is_secret_key(entry['key']):
-            continue
-        item = dict(entry)
-        if item['options'] is not None:
-            item['options'] = list(item['options'])
-        item['value'] = current.get(entry['key'], entry['default'])
-        harness.append(item)
-    out = {'harness': harness, 'hidden_notion': [dict(section) for section in HIDDEN_NOTION_SETTINGS],
+
+    def items(entries):
+        out = []
+        for entry in entries:
+            if is_secret_key(entry['key']):
+                continue
+            item = dict(entry)
+            if item['options'] is not None:
+                item['options'] = list(item['options'])
+            item['value'] = current.get(entry['key'], entry['default'])
+            out.append(item)
+        return out
+
+    out = {'harness': items(HARNESS_SETTINGS), 'switch': items(SWITCH_SETTINGS),
+           'hidden_notion': [dict(section) for section in HIDDEN_NOTION_SETTINGS],
            'efforts': list(REASONING_ORDER)}
     # Optional: the supported efforts of the current model (cached model catalog, see
     # effort_policy.catalog_efforts). The Settings tab offers only these when present.

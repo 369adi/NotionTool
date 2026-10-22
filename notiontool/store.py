@@ -194,6 +194,10 @@ class Store:
                        context_token_limit=1200000, context_turn_limit=600, context_handoff_chars=24000,
                        host_api_port=8790, host_api_allow_network=False, host_api_bind='127.0.0.1',
                        coworker_fresh_context='threshold', context_replace_mode='soft',
+                       # Coworker switch rule (chat_context.switch_decision; docs/CONTEXT_SWITCH_BENCH.md 'Defaults').
+                       coworker_switch_policy='measured', switch_min_tokens=400000, switch_base_tokens=12000,
+                       switch_cost_s=76, switch_slope_ms_per_100k=3514, switch_error_permille_per_100k=0,
+                       switch_retry_s=60, switch_remaining_tasks=3,
                        ui_mode='classic', dynamic_roles=False, role_definitions=[],
                        coworker_rotate_mode='new_welcome', main_context_policy='hint',
                        coworker_delete_old_chat=True)
