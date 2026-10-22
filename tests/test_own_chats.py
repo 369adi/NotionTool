@@ -42,6 +42,9 @@ class ValidateNameTests(unittest.TestCase):
         for name in ('Main', 'Main 2', 'Main Chat', '  Mainframe'):
             self.reject(name, oc.MSG_MAIN)
         self.assertEqual(oc.validate_name('My Main ideas'), 'My Main ideas')
+        # With the Main tick a Main name is fine; the tick decides what the chat is.
+        self.assertEqual(oc.validate_name('Main', [], allow_main=True), 'Main')
+        self.assertEqual(oc.validate_name(' Main 3 ', [], allow_main=True), 'Main 3')
 
     def test_cowork_number_rejected(self):
         for name in ('Cowork 1', 'Cowork 12', ' Cowork 3 '):
@@ -118,18 +121,18 @@ WORKERS = [
 class NextCoworkTitleTests(unittest.TestCase):
     def test_with_cowork_names(self):
         self.assertIsNotNone(oc._cowork_module())
-        self.assertEqual(oc.next_cowork_title([], None), 'Cowork 1')
-        self.assertEqual(oc.next_cowork_title(WORKERS, {}), 'Cowork 4')
-        self.assertEqual(oc.next_cowork_title(WORKERS, {'w1': 1, 'w2': 5, 'w3': 2}), 'Cowork 3')
+        self.assertEqual(oc.next_cowork_title([], None), 'Coworker 1')
+        self.assertEqual(oc.next_cowork_title(WORKERS, {}), 'Coworker 4')
+        self.assertEqual(oc.next_cowork_title(WORKERS, {'w1': 1, 'w2': 5, 'w3': 2}), 'Coworker 3')
 
     def test_without_cowork_names(self):
         with mock.patch.dict(sys.modules, {'notiontool.cowork_names': None}):
             self.assertIsNone(oc._cowork_module())
-            self.assertEqual(oc.next_cowork_title([], None), 'Cowork 1')
-            self.assertEqual(oc.next_cowork_title(WORKERS, {}), 'Cowork 4')
-            self.assertEqual(oc.next_cowork_title(WORKERS, {'w1': 1, 'w2': 5, 'w3': 2}), 'Cowork 3')
+            self.assertEqual(oc.next_cowork_title([], None), 'Coworker 1')
+            self.assertEqual(oc.next_cowork_title(WORKERS, {}), 'Coworker 4')
+            self.assertEqual(oc.next_cowork_title(WORKERS, {'w1': 1, 'w2': 5, 'w3': 2}), 'Coworker 3')
             # w1 keeps 2, duplicate w3 gets 1, w2 gets 3; 'gone' is ignored -> next free is 4
-            self.assertEqual(oc.next_cowork_title(WORKERS, {'w1': 2, 'w3': 2, 'gone': 1}), 'Cowork 4')
+            self.assertEqual(oc.next_cowork_title(WORKERS, {'w1': 2, 'w3': 2, 'gone': 1}), 'Coworker 4')
 
     def test_both_paths_agree(self):
         cases = [([], None), (WORKERS, {}), (WORKERS, {'w1': 3}), (WORKERS, {'w1': True, 'w2': 0, 'w3': 'x'})]

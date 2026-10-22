@@ -67,7 +67,8 @@ class RetryGuardTests(unittest.TestCase):
 
     def test_live_case_file_claims_keep_empty_reply_attempt_uncertain(self):
         self.task(files=['notiontool/operator_main.py', 'notiontool/engine.py', 'tests/test_operator_main.py'])
-        task, _ = self.complete_with(PendingRemote())
+        # Only a proven empty turn may retry; the file claims must still hold it for reconcile.
+        task, _ = self.complete_with(PendingRemote(state='done_empty'))
         self.assertEqual(task['state'], 'uncertain')
         self.assertEqual(task['worker_id'], 'first')
         self.assertTrue(task['side_effect_hold'])
@@ -100,9 +101,22 @@ class RetryGuardTests(unittest.TestCase):
 
     def test_clean_empty_reply_may_still_retry(self):
         self.task()
-        task, _ = self.complete_with(PendingRemote())
+        task, _ = self.complete_with(PendingRemote(state='done_empty'))
         self.assertEqual(task['state'], 'retry')
         self.assertFalse(task.get('side_effect_hold'))
+
+    def test_unproven_empty_reply_never_retries(self):
+        # b59013e3 / build 23: without proof from the transcript an empty-looking turn is never resent.
+        self.task()
+        task, _ = self.complete_with(PendingRemote())
+        self.assertEqual(task['state'], 'uncertain')
+        kinds = [e['kind'] for e in self.store.events(limit=500)]
+        self.assertNotIn('empty_reply_retry', kinds)
+
+    def test_done_error_counts_as_proven_empty(self):
+        self.task()
+        task, _ = self.complete_with(PendingRemote(state='done_error'))
+        self.assertEqual(task['state'], 'retry')
 
     def test_confirmed_failed_turn_with_side_effects_is_not_retried(self):
         self.task(files=['notiontool/engine.py'])

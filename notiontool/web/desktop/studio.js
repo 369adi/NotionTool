@@ -2,7 +2,7 @@
  * NotionTool Studio part (studio.js): window.__ntDesk.studio = function (ctx) { ... return { stop } }.
  *
  * - Status strip above the composer: Main model + reasoning effort for the next turn (read-only,
- *   from state), coworkers busy x/N, current run progress.
+ *   from state), 'Coworkers 1 of 10 busy' and 'Run 2 of 3 steps' (both from window.__ntDesk.counts).
  * - Notification center: bell chip in the brand header (unread count), drawer with the last 50
  *   toasts, native desktop notifications (asked once) when a run finishes, a task needs the Main
  *   (unclear) or the harness goes offline.
@@ -36,6 +36,14 @@
     var key = String(code).toLowerCase();
     return MODEL_LABEL[key] || String(code);
   }
+  var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', auto: 'Auto' };
+  function nextTurnText(nt) {
+    var code = nt && nt.model ? String(nt.model) : '';
+    var model = code && code.toLowerCase() !== 'auto' ? modelLabel(code) : 'Auto model';
+    var e = nt && nt.effort ? String(nt.effort).toLowerCase() : 'auto';
+    var effort = EFFORT_LABEL[e] || (e.charAt(0).toUpperCase() + e.slice(1)).replace(/_/g, ' ');
+    return 'Next turn: ' + model + ' \u00b7 ' + effort + ' effort';
+  }
   function nextTurn(state) {
     // Read-only: the harness may publish next_turn {model, effort}; older states only have it on the Main row.
     var s = state || {};
@@ -44,9 +52,9 @@
     return { model: nt.model || main.model || '', effort: nt.effort || nt.reasoning_effort || main.effort || '' };
   }
   function coworkers(state) {
-    var list = (state && Array.isArray(state.chats) ? state.chats : []).filter(function (c) { return c && c.role === 'coworker'; });
-    var busy = list.filter(function (c) { return !!(c.task_title || Number(c.started) > 0); }).length;
-    return { busy: busy, total: list.length };
+    // The one shared helper (extras.js): enabled workers of the active account, never chat rows.
+    var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
+    return c ? { busy: c.busy, total: c.coworkers } : { busy: 0, total: 0 };
   }
   function currentRun(state) {
     var runs = state && Array.isArray(state.runs) ? state.runs : [];
@@ -60,7 +68,7 @@
       'Run id: ' + run.id].join('\n');
   }
   window.__ntDesk.studioUtil = { nextTurn: nextTurn, coworkers: coworkers, currentRun: currentRun,
-    runSummary: runSummary, modelLabel: modelLabel };
+    runSummary: runSummary, modelLabel: modelLabel, nextTurnText: nextTurnText };
 
   window.__ntDesk.studio = function (ctx) {
     ctx = ctx || {};
@@ -183,10 +191,43 @@
       ui.runFill = el('span', { cls: 'nt-desk-strip-fill' });
       ui.run = el('span', { cls: 'nt-desk-strip-item nt-desk-strip-run' }, [ui.runText,
         el('span', { cls: 'nt-desk-strip-bar' }, [ui.runFill])]);
+      ui.tokens = el('span', { cls: 'nt-desk-strip-item nt-desk-strip-tokens' });
+      // Idle mode button: on = after a NotionTool restart (build swap) the Main continues by itself.
+      ui.idle = el('button', { cls: 'nt-desk-strip-item nt-desk-strip-idle', type: 'button' });
+      ui.idle.style.pointerEvents = 'auto';
+      ui.idle.style.cursor = 'pointer';
+      ui.idle.addEventListener('click', toggleIdle);
       ui.strip = el('div', { cls: 'nt-desk-strip', id: 'nt-desk-strip', role: 'status', 'aria-live': 'polite' },
-        [ui.model, ui.crew, ui.run]);
+        [ui.model, ui.crew, ui.run, ui.tokens, ui.idle]);
       ui.strip.hidden = true;
       document.body.appendChild(ui.strip);
+    }
+    var idleWanted = null;  // value just clicked, until the next state shows it
+    function idleOn() {
+      if (idleWanted !== null) return idleWanted;
+      return !(state && state.idle_mode === false);
+    }
+    function toggleIdle(ev) {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      var next = !idleOn();
+      idleWanted = next;
+      renderIdle();
+      Promise.resolve(ctx.call('settings_set', { values: { idle_mode: next } })).then(function () {
+        toast(next ? 'Idle mode on: the Main continues by itself after a restart' : 'Idle mode off', 'info');
+      }, function (e) {
+        idleWanted = null; renderIdle();
+        toast('Idle mode could not be saved: ' + String((e && e.message) || e).slice(0, 120), 'warning');
+      });
+    }
+    function renderIdle() {
+      if (!ui.idle) return;
+      if (idleWanted !== null && state && state.idle_mode === idleWanted) idleWanted = null;
+      var on = idleOn();
+      ui.idle.textContent = on ? 'Idle mode: on' : 'Idle mode: off';
+      ui.idle.setAttribute('aria-pressed', on ? 'true' : 'false');
+      ui.idle.setAttribute('title', on ? 'On: after a NotionTool restart (e.g. an update) the Main continues automatically. Click to turn off.'
+        : 'Off: after a restart the Main waits for you. Click to turn on.');
+      ui.idle.classList.toggle('nt-desk-strip-hot', on);
     }
     function composer() {
       var best = null, area = 0;
@@ -197,31 +238,102 @@
       });
       return best;
     }
+    // ---- 6-hour token budget: shown in the strip; sending is blocked while it is used up ----
+    function budget() { var b = state && state.token_budget; return b && typeof b === 'object' && b.limit ? b : null; }
+    function millions(n) { n = Number(n) || 0; return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n); }
+    function budgetBlocked() { var b = budget(); return !!(b && b.blocked && !document.documentElement.classList.contains('nt-desk-off')); }
+    function inComposer(node) { return !!(node && node.closest && node.closest('.nt-desk-composer')); }
+    var SEND_RE = /^(send|submit|senden|absenden)\b/i;
+    function blockSend(ev) {
+      ev.preventDefault(); ev.stopPropagation(); if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+      var b = budget();
+      toast('Token limit of ' + millions(b && b.limit) + ' per 6 h is reached. Sending is blocked; resets in ' +
+        Math.ceil(((b && b.resets_in) || 0) / 60) + ' min.', 'warning');
+    }
+    function onSendKey(ev) {
+      if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing || !budgetBlocked() || !inComposer(ev.target)) return;
+      blockSend(ev);
+    }
+    function onSendClick(ev) {
+      if (!budgetBlocked() || !inComposer(ev.target)) return;
+      var btn = ev.target.closest('button,[role="button"]');
+      var label = btn ? (btn.getAttribute('aria-label') || btn.getAttribute('title') || '') : '';
+      if (btn && SEND_RE.test(label.trim())) blockSend(ev);
+    }
+    window.addEventListener('keydown', onSendKey, true);
+    window.addEventListener('click', onSendClick, true);
+    window.addEventListener('pointerdown', onSendClick, true);
+
+    // True only while a Notion AI chat is the visible view (Main or a coworker chat).
+    function overlayOpen() {
+      var nodes = document.querySelectorAll('[role="dialog"], [role="menu"], [role="listbox"], [aria-modal="true"]');
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (ui.strip && ui.strip.contains(n)) continue;
+        if (ui.drawer && ui.drawer.contains(n)) continue;
+        var rect = n.getBoundingClientRect();
+        if (rect.width > 40 && rect.height > 40) return true;
+      }
+      return false;
+    }
+    function inChatView() {
+      var sh = window.__ntShell;
+      if (sh && sh.current && sh.current !== 'chat') return false;  // Live, Settings, ... tabs
+      var href = String(location.href || '');
+      return /\/(ai|chat)(?=[\/?#]|$)/i.test(href) || /[?&]t=[0-9a-f-]{32,36}/i.test(href);
+    }
+    var MODEL_RE = /^(Auto|Opus|Sonnet|Haiku|GPT|Gemini|o\d)[\w .\-]{0,24}$/i;
+    function domModel(root) {
+      var scope = root && root.querySelectorAll ? root : document;
+      var btns = scope.querySelectorAll('[role="button"]');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.closest && b.closest('[data-nt-desk]')) continue;
+        var t = String(b.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t || !MODEL_RE.test(t)) continue;
+        var rc = b.getBoundingClientRect();
+        if (rc.width > 0 && rc.height > 0) return t;
+      }
+      return '';
+    }
     function renderStrip() {
       if (!ui.strip) buildStrip();
       if (!ui.strip.isConnected) document.body.appendChild(ui.strip);
       var root = document.documentElement;
       var r = composer();
       var off = root.classList.contains('nt-desk-off');
-      if (!r || off) { ui.strip.hidden = true; root.classList.remove(STRIP_ON); return; }
+      // The strip belongs to the AI chat only: hidden on pages, databases, Live and every other view.
+      // Bug 2026-10-21: the strip stayed over Notion's Settings dialog and over the model menu, so the
+      // model could not be changed. Any open Notion dialog/menu/listbox hides the strip.
+      if (!r || off || !inChatView() || overlayOpen()) { ui.strip.hidden = true; root.classList.remove(STRIP_ON); return; }
       var nt = nextTurn(state);
-      ui.model.textContent = 'Next turn: ' + (modelLabel(nt.model) || 'auto') + ' \u00b7 effort ' + (nt.effort || 'auto');
-      ui.model.setAttribute('title', nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
+      // Bug 2026-10-21: the harness never publishes next_turn, so the strip always said 'Auto model'.
+      // Without harness data, show the model Notion's own composer chip really uses.
+      var dm = nt.model ? '' : domModel(r);
+      if (dm) { ui.model.textContent = 'Model: ' + dm; nt = { model: dm, effort: '', fromNotion: true }; }
+      else ui.model.textContent = nextTurnText(nt);
+      ui.model.setAttribute('title', nt.fromNotion ? 'Model shown by Notion for this chat' : nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
         : 'The harness has not published the next-turn model yet');
-      var crew = coworkers(state);
-      ui.crew.textContent = 'Coworkers busy ' + crew.busy + '/' + crew.total;
-      ui.crew.classList.toggle('nt-desk-strip-hot', crew.busy > 0);
-      var run = currentRun(state);
-      if (run) {
-        var total = Number(run.tasks_total) || 0, done = Number(run.tasks_done) || 0;
-        ui.runText.textContent = 'Run ' + (run.state || '') + (run.stage ? ' \u00b7 ' + run.stage : '') + ' \u00b7 ' + done + '/' + total;
-        ui.run.setAttribute('title', String(run.title || run.id));
-        ui.runFill.style.width = (total ? Math.round(100 * done / total) : 0) + '%';
-      } else {
-        ui.runText.textContent = 'No run';
-        ui.run.removeAttribute('title');
-        ui.runFill.style.width = '0%';
+      // Every number comes from window.__ntDesk.counts, the same helper the Live tab and grid use.
+      var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
+      ui.crew.textContent = c ? c.coworkersText : 'No coworkers';
+      ui.crew.classList.toggle('nt-desk-strip-hot', !!(c && c.busy > 0));
+      var run = c ? c.run : null;
+      ui.runText.textContent = c ? c.runText : 'No run yet';
+      if (run) ui.run.setAttribute('title', run.title || 'Current run');
+      else ui.run.removeAttribute('title');
+      ui.runFill.style.width = (run ? run.percent : 0) + '%';
+      ui.run.classList.toggle('nt-desk-strip-idle', !(run && run.active));
+      var tb = budget();
+      ui.tokens.hidden = !tb;
+      if (tb) {
+        ui.tokens.textContent = (tb.blocked ? 'Token limit reached \u00b7 ' : 'Tokens ') + millions(tb.used) + ' of ' +
+          millions(tb.limit) + ' (6 h)';
+        ui.tokens.setAttribute('title', 'Estimated tokens of Main and coworkers in this 6-hour window; resets in ' +
+          Math.ceil((tb.resets_in || 0) / 60) + ' min. Sending is blocked when the limit is reached.');
+        ui.tokens.classList.toggle('nt-desk-strip-hot', !!tb.blocked || tb.percent >= 80);
       }
+      renderIdle();
       ui.strip.hidden = false;
       var h = ui.strip.offsetHeight || 26;
       ui.strip.style.left = Math.round(r.left) + 'px';
@@ -255,7 +367,10 @@
       seeded = true;
     }
     function checkOffline() {
-      var down = (lastPush && Date.now() - lastPush > OFFLINE_MS) || !!(state && state.connected === false);
+      // Any harness message counts as alive: state pushes and the 3 s heartbeat (__ntDeskLastMessage).
+      var beat = typeof window.__ntDeskLastMessage === 'number' ? window.__ntDeskLastMessage : 0;
+      var seen = Math.max(lastPush || 0, beat);
+      var down = (seen && Date.now() - seen > OFFLINE_MS) || !!(state && state.connected === false);
       if (down && !offline) notify('NotionTool harness is offline', 'No state update for 20 seconds', 'nt-offline', 'error');
       else if (!down && offline) record('NotionTool harness is back online', 'success');
       offline = !!down;

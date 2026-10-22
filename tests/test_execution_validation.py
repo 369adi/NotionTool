@@ -27,7 +27,7 @@ class ExecutionValidationTests(unittest.TestCase):
             return {'recordMap':{'thread_message':{
                 'cfg':{'value':{'step':{'type':'config','value':{'model':'opus-id','modelFromUser':True}}}},
                 'own':{'value':{'step':{'type':'user','id':'own'}}},'reply':{'value':{'step':step}}}}}
-        self.client=SimpleNamespace(info={'space_id':'space'},call=call,transcript=lambda _: {
+        self.client=SimpleNamespace(info={'space_id':'space'},call=call,transcript=lambda _, limit=100: {
             'session':{'status':'idle'},'patches':[
                 {'op':'put','entity':{'kind':'user_message','sequence':1,'client_message_id':'own'}},
                 {'op':'put','entity':{'kind':'assistant_message','sequence':2,'content':[{'type':'text','text':'The answer is 837.'}]}}]})
