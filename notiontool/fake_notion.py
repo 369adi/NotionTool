@@ -991,10 +991,14 @@ def seed_scenario(store, state=None, name='default'):
             wid = key + ':' + thread['id']
             purpose = KIND_PURPOSE.get(thread['kind'], 'private')
             if store.get('workers', wid) is None:
-                store.put('workers', dict(id=wid, account_id=key, thread_id=thread['id'], purpose=purpose,
-                                          enabled=purpose in ('main', 'worker'), state='ready', lease='',
-                                          last_used=0, label=thread['title'], welcome=purpose in ('main', 'worker'),
-                                          simulated=True))
+                record = dict(id=wid, account_id=key, thread_id=thread['id'], purpose=purpose,
+                              enabled=purpose in ('main', 'worker'), state='ready', lease='',
+                              last_used=0, label=thread['title'], welcome=purpose in ('main', 'worker'),
+                              simulated=True)
+                if purpose == 'worker':
+                    # Same fields the real team setup leaves on a joined Welcome Coworker (notion.py ensure_team).
+                    record.update(join_state='joined', pool_admitted=True)
+                store.put('workers', record)
                 added['workers'] += 1
             chat_id = 'c_fake_' + key
             if purpose == 'main' and store.get('chats', chat_id) is None:
@@ -1002,10 +1006,26 @@ def seed_scenario(store, state=None, name='default'):
                                         folder_id='', project_path='', created=now, main_number=1,
                                         state='active', predecessor=''))
                 added['chats'] += 1
+        # Team ledger in the shape the real team setup writes (notion.py ensure_team / apply_chat_pool):
+        # main and worker1..workerN -> {'id': thread id, 'pending': False}. Private chats are never listed.
+        account = store.get('accounts', key)
+        current = account.get('team_threads') or {}
+        ledger = dict(current)
+        mains = state.threads_of(key, 'main')
+        if mains and not (ledger.get('main') or {}).get('id'):
+            ledger['main'] = {'id': mains[0]['id'], 'pending': False}
+        for number, thread in enumerate(state.threads_of(key, 'coworker'), 1):
+            role = 'worker%d' % number
+            if not (ledger.get(role) or {}).get('id'):
+                ledger[role] = {'id': thread['id'], 'pending': False}
+        if ledger != current:
+            account['team_threads'] = ledger
+            store.put('accounts', account)
     store.raise_counter('main', 1)
     settings = store.get('settings', 'app', {}) or {}
     if 'harness_account_id' not in settings:
-        store.put('settings', dict(settings, id='app', harness_account_id='ready', coworker_target=3))
+        store.put('settings', dict(settings, id='app', harness_account_id='ready', coworker_target=3,
+                                   per_account=3))  # team size 3: team setup finds all roles filled
     return dict(added, scenario=name, state=str(state.path))
 
 
