@@ -35,7 +35,8 @@ clear_fault(target, name=None) removes one or all:
   hang           {'seconds': S}      the send commits the user step, then only keep-alive lines until
                                      cancel is set or min(timeout, S) passes (then TimeoutError)
   interrupted    {'cut': True}       the reply stops mid-answer without the final line; the stream is
-                                     cut (OSError) unless cut is False
+                                     cut (OSError) unless cut is False. The chat stays 'running' with no
+                                     completion time (no turn_completed, no completed_time)
   missing        {}                  HTTP 404 on transcript/send, not listed, record alive=False
   deleted_delay  {'seconds': K}      already deleted (404, alive=False) but still listed for K seconds
                                      after deleted_at
@@ -46,8 +47,9 @@ clear_fault(target, name=None) removes one or all:
   busy           {}                  another turn is running: transcript session 'running' + session_pending,
                                      record latest_user_or_trigger_time > completed_time; a send is refused
                                      with NotionHttpError(409) and commits nothing
-  empty_stream   {}                  empty_stream_committed: the stream ends after patch-start with no text,
-                                     but Notion commits the user step, the full reply and turn_completed
+  empty_stream   {}                  empty_stream_committed: Notion saves the user step, the full reply and
+                                     turn_completed, then the stream fails with OSError before the first
+                                     patch-start line (empty stream: outcome unknown, the adapter reconciles)
   lost_stream    {}                  cut_stream_lost: the stream is cut (OSError) before Notion committed
                                      anything; the transcript does not contain the step
   error_step     {'message': T}      the stream yields an 'error' step; the transcript gets an agent_error
