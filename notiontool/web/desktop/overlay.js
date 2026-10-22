@@ -407,6 +407,7 @@
     var busy = false;
     var stopped = false;
     var observer = null;
+    var watchdog = 0;
     var unsub = null;
     var chatGroups = [];
     var applied = false;
@@ -1740,12 +1741,26 @@
       attributeFilter: ['aria-selected', 'aria-current', 'href'] });
     unsub = ctx.onState(function () { schedule(); });
     run();
+    // Permanent sidebar check (bug 2026-10-22, after a PC restart the Mains list stayed empty):
+    // Notion can load its chat list late without a mutation we react to. Every 5 s, if the harness
+    // is online but no chat row is marked yet, re-apply the sidebar. Cheap: one querySelector.
+    watchdog = setInterval(function () {
+      if (stopped) return;
+      try {
+        var st = typeof ctx.getState === 'function' ? ctx.getState() : null;
+        if (!online(st)) return;
+        var root = sidebarRoot();
+        if (!root || !root.querySelector('[data-nt-desk="chat-row"]')) schedule();
+      } catch (e) { /* never break the page */ }
+    }, 5000);
 
     return {
       stop: function () {
         stopped = true;
         if (timer) clearTimeout(timer);
         timer = 0;
+        if (watchdog) clearInterval(watchdog);
+        watchdog = 0;
         if (observer) observer.disconnect();
         if (typeof unsub === 'function') unsub();
         document.removeEventListener('pointerdown', onPress, true);

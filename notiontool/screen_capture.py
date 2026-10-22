@@ -28,6 +28,10 @@ ALIASES = {
     'roblox': ('robloxstudiobeta', 'robloxstudio', 'robloxplayerbeta'),
     'roblox studio': ('robloxstudiobeta', 'robloxstudio'),
     'blender': ('blender', 'blender-launcher'),
+    # The NotionTool desktop window is Notion.exe (title = current chat, e.g. "Main"), not NotionTool.exe.
+    'notiontool': ('notion',),
+    'notion tool': ('notion',),
+    'notion': ('notion',),
 }
 DEFAULT_SIDE = 1600
 MAX_SIDE = 3840
