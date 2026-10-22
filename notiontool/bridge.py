@@ -742,6 +742,8 @@ class Bridge:
     def guard_scope(self, task, run, path):
         """Refuse a coworker write outside the task's non-empty files list (no list: no limit).
 
+        Any write inside the task's own git worktree is allowed (merged and tested at the end).
+
         Absolute and project-relative entries are compared through file_registry.path_key, so
         both forms of the same file match; an entry that is a folder covers the files below it.
         engine.claim_file appends every claimed file to task['files'], so the assigned list is
@@ -761,6 +763,10 @@ class Bridge:
         base = project or self.root(run)
         copy = self.worktree(task)
         key = file_registry.path_key(path)
+        if copy is not None and _key_inside(key, file_registry.path_key(copy)):
+            # Owner rule 2026-10-22: a task with its own git worktree may write any file in that copy;
+            # the copy is merged and tested at the end, so the files list is a plan hint, not a wall.
+            return
         for entry in files:
             raw = Path(os.path.expanduser(entry))
             targets = [raw if raw.is_absolute() else base / raw]
