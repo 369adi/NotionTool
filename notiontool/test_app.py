@@ -224,42 +224,6 @@ def check(root=None, port=DEFAULT_PORT, settle_seconds=8, keep=False):
 
 # --- simulated Notion inside the test app (called by server.launch in fake mode) ---------------------
 
-def seed_fake_store(store, adapter, state):
-    """Accounts, chat workers and the Main chat record for the simulated Notion; idempotent across restarts."""
-    from .fake_notion import ACCOUNTS
-    now = time.time()
-    added = 0
-    for slot, (key, email, _name, _space, _ai) in enumerate(ACCOUNTS, 1):
-        if store.get('accounts', key) is None:
-            client = adapter.client(key)
-            info = client.identity()
-            access = adapter.workspace_ai_access(info)
-            ready = access.get('state') == 'enabled'
-            store.put('accounts', dict(id=key, slot=slot, email=email, label='Slot %d' % slot,
-                                       state='ready' if ready else 'ai_disabled', identity=info, ai_access=access,
-                                       model=client.model() if ready else '', bridge_connected=False,
-                                       cooldown_until=0, simulated=True))
-            added += 1
-        for thread in state.threads_of(key):
-            wid = key + ':' + thread['id']
-            purpose = KIND_PURPOSE.get(thread['kind'], 'private')
-            if store.get('workers', wid) is None:
-                store.put('workers', dict(id=wid, account_id=key, thread_id=thread['id'], purpose=purpose,
-                                          enabled=purpose in ('main', 'worker'), state='ready', lease='',
-                                          last_used=0, label=thread['title'], welcome=purpose in ('main', 'worker'),
-                                          simulated=True))
-            chat_id = 'c_fake_' + key
-            if purpose == 'main' and store.get('chats', chat_id) is None:
-                store.put('chats', dict(id=chat_id, title=thread['title'], main_worker=wid, account_id=key,
-                                        folder_id='', project_path='', created=now, main_number=1,
-                                        state='active', predecessor=''))
-    store.raise_counter('main', 1)
-    settings = store.get('settings', 'app', {}) or {}
-    if 'harness_account_id' not in settings:
-        store.put('settings', dict(settings, id='app', harness_account_id='ready', coworker_target=3))
-    return added
-
-
 def boot_fake_notion(app):
     """Fake mode of the test app: simulated Notion, seeded store and the real Notion-data loops."""
     from . import fake_notion
@@ -267,14 +231,14 @@ def boot_fake_notion(app):
     from .main_wake import MainWake
     state = fake_notion.install(app.adapter)
     app.fake_notion = state
-    added = seed_fake_store(app.store, app.adapter, state)
+    added = fake_notion.seed_scenario(app.store, state)  # the one shared seed (same records as the unit tests)
     threading.Thread(target=app.turn_watch.loop, daemon=True, name='turn-watch').start()
     app.coworker_upkeep = CoworkerUpkeep(app.store, app.adapter, app.engine)
     threading.Thread(target=app.coworker_upkeep.loop, daemon=True, name='coworker-upkeep').start()
     app.main_wake = MainWake(app.store, app.adapter, app.engine)
     threading.Thread(target=app.main_wake.loop, daemon=True, name='main-wake').start()
-    app.store.event(FAKE_READY_EVENT, message='Simulated Notion installed (%d accounts seeded now, %d workers)'
-                    % (added, len(app.store.all('workers'))), source=str(state.path))
+    app.store.event(FAKE_READY_EVENT, message='Simulated Notion installed (%d accounts, %d workers seeded now)'
+                    % (added['accounts'], added['workers']), source=str(state.path))
     return state
 
 
