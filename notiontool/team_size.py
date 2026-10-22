@@ -9,7 +9,7 @@ run capacity counts at most N coworkers per account.
 import re
 
 LOW, HIGH = 1, 40
-DEFAULT_PER_ACCOUNT = 10
+DEFAULT_PER_ACCOUNT = 5
 ROLE_RE = re.compile(r'^worker([0-9]+)$')
 
 

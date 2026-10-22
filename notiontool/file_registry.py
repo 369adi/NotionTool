@@ -156,22 +156,55 @@ def in_use(store, exclude_task='', now=None):
     return items
 
 
-def summary(store, project_path='', exclude_task='', now=None):
-    """Prompt text listing the files other chats are editing, relative to the project folder when possible."""
-    items = in_use(store, exclude_task, now)
+SCRATCH_DIRS = ('work', 'data', '.git')
+
+
+def _relative(root, path):
+    if root is None:
+        return None
+    try:
+        return Path(path).resolve().relative_to(root)
+    except (ValueError, OSError):
+        return None
+
+
+def _is_scratch(root, path):
+    """Operator helper files (work/, data/) are never something a coworker would edit."""
+    rel = _relative(root, path)
+    return rel is not None and bool(rel.parts) and rel.parts[0].casefold() in SCRATCH_DIRS
+
+
+def relevant(store, project_path='', exclude_task='', now=None, task=None):
+    """Claims that matter for this task: no operator scratch, and with a task only files overlapping its own files."""
+    root = Path(project_path).resolve() if project_path else None
+    items = [item for item in in_use(store, exclude_task, now) if not _is_scratch(root, item['path'])]
+    if task is None:
+        return items
+    if root is None or not task.get('files'):
+        return []
+    mine = [path_key(root / relative) for relative in normalize_files(root, task['files'], strict=False)]
+    return [item for item in items if any(overlap(path_key(item['path']), key) for key in mine)]
+
+
+def summary(store, project_path='', exclude_task='', now=None, task=None):
+    """Prompt text about files of this task that another chat is also changing.
+
+    Lists only what is relevant: never operator helper files, and with a task only its own files.
+    A task with its own worktree is not forbidden anything: it writes into its copy and the
+    overlap is solved at merge, so the note only asks to keep that edit small.
+    """
+    items = relevant(store, project_path, exclude_task, now, task)
     if not items:
         return ''
     root = Path(project_path).resolve() if project_path else None
     names = []
     for item in items[:SUMMARY_LIMIT]:
-        path = Path(item['path'])
-        if root is not None:
-            try:
-                path = path.relative_to(root)
-            except ValueError:
-                pass
-        names.append(str(path) + ' (' + item['owner'] + ')')
+        rel = _relative(root, item['path'])
+        names.append((str(rel) if rel is not None else str(item['path'])) + ' (' + item['owner'] + ')')
     more = len(items) - SUMMARY_LIMIT
     text = '; '.join(names) + ('; and ' + str(more) + ' more' if more > 0 else '')
+    if task is not None and task.get('patch_worktree'):
+        return ('\nHeads-up: another chat is also changing some of your files: ' + text + '. You work in your own'
+                ' copy, so go ahead, but keep your edits there focused; overlaps are merged after review.\n')
     return ('\nOther chats are editing these files right now; do not write to them, and describe a needed change'
             ' in your result instead: ' + text + '.\n')

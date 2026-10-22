@@ -5,9 +5,11 @@ system agent. Machine contracts are normalized outside the model.
 """
 from html import unescape
 from html.parser import HTMLParser
+import json
 import re
 
 from .protocol import ContractError,validate_plan
+from .agent_guard import with_rule
 
 class ProviderReplyError(ContractError):
     pass
@@ -95,6 +97,20 @@ def table_plan(text):
     return plan
 
 
+def _reported_object(text):
+    """The coworker's own JSON report ({status, summary}) inside the answer, or None."""
+    decoder=json.JSONDecoder()
+    for match in re.finditer(r'\{', str(text or '')):
+        try:
+            value,_=decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if (isinstance(value,dict) and isinstance(value.get('summary'),str)
+                and str(value.get('status')).lower() in ('done','partial','blocked','failed')):
+            return value
+    return None
+
+
 def normalize(task,text):
     if provider_error(text):raise ProviderReplyError('Notion returned a provider error instead of an answer')
     failure_line=inference_error(text)
@@ -114,11 +130,22 @@ def normalize(task,text):
             ('automated system','external workflow','if you\'re a real person','get started in notion')))
     if task['role']=='planner':return table_plan(text)
     if task['role']=='reviewer':
-        match=re.search(r'(?im)^\s*(?:#+\s*)?(PASS|REPAIR|All checks passed|Changes needed)\b',readable)
+        match=re.search(r'(?im)^\s*(?:#+\s*)?(APPROVED|PASS|REPAIR|All checks passed|Changes needed)\b',readable)
         if not match:raise ContractError('Review needs an explicit checked verdict')
-        passed=match.group(1).lower() in ('pass','all checks passed')
+        passed=match.group(1).lower() in ('approved','pass','all checks passed')
         return dict(passed=passed,summary=readable,fixes=[] if passed else table_plan(text)['tasks'])
     if task['role']=='executor':
+        inner=_reported_object(text)
+        if inner:
+            # The coworker answered with its own (often fenced) JSON report: keep its status and summary
+            # instead of nesting the whole block inside a summary string. 'partial' is a finished turn
+            # with incomplete coverage: done, but marked for the Main's review.
+            state=str(inner.get('status')).lower()
+            summary=inner['summary'].strip() or readable
+            extra={k:inner[k] for k in ('files','tests','evidence','artifacts','result_file') if k in inner}
+            return dict(extra,status='done' if state=='partial' else state,summary=summary,
+                        evidence=inner.get('evidence') or [],artifacts=inner.get('artifacts') or [],
+                        context=readable[:6000],requires_review=candidate or state=='partial',partial=state=='partial')
         match=re.search(r'(?im)^\s*(?:#+\s*)?(DONE|BLOCKED|FAILED)\b',readable)
         if not readable:raise ContractError('Empty execution response')
         # A contribution is reported here, not globally verified. The separate
@@ -223,7 +250,36 @@ def guarded_capture(capture, args, task=None, project_settings=None, already_tak
     return capture(args)
 
 
+RESULT_FILE_HINT=('\nWrite your full detailed result with nt_write_file to {path}. In the chat, reply only with the short JSON result: '
+                  '{{"status", "summary" (at most 5 sentences), "files", "tests", "result_file": "{path}"}}, then your final status line.')
+READ_FULL_HINT='\nRead a Full result file only when the review fails, tests fail or more detail is explicitly needed.'
+
+
+def _result_file_hint(task,run,tools_available):
+    """Result-file instruction for a coworker part ('' without tools or ids, or if the path is unsafe)."""
+    if not tools_available or not run.get('id') or not task.get('id'):
+        return ''
+    # Read-only parts answer in the chat: writing a result file contradicts "change and save no files"
+    # and costs an extra tool round trip per coworker.
+    if task.get('read_only') or re.search(r'\bread[- ]only\b', str(task.get('prompt') or ''), re.I):
+        return ''
+    try:
+        from . import result_files
+        path=result_files.path_for(run['id'],task['id'])
+    except (ImportError,OSError,ValueError):
+        return ''
+    return RESULT_FILE_HINT.format(path=path)
+
+
 def prompt(task,run,context,token,tools_available):
+    """I12: every chat prompt carries the agent guard; Coworker prompts (all roles but planner/direct) also the coworker rule."""
+    text=_prompt_text(task,run,context,token,tools_available)
+    if run.get('allocation',{}).get('mode')=='direct':
+        return with_rule(text)
+    return with_rule(text,coworker=task.get('role')!='planner')
+
+
+def _prompt_text(task,run,context,token,tools_available):
     goal=run['goal']
     reference=('\nFor reference, the work already completed:\n'+context+'\n') if context.strip() else ''
     memory=('\nFor reference, our completed earlier work:\n'+run['context']+'\n') if run.get('context','').strip() else ''
@@ -234,6 +290,8 @@ def prompt(task,run,context,token,tools_available):
     adviser_tools=(SCREEN_TOOLS_LINE+ADVISER_TOOLS_NOTE+'\n') if tools_available else ''
     if run.get('allocation',{}).get('mode')=='direct':
         return goal+memory+'\nReply naturally in my language.'
+    if task.get('stage_role')=='design':
+        return 'I would like a design for this request before it is built:\n'+goal+'\n'+task['prompt']+memory+project+adviser_tools
     if task['role'] in ('architect','researcher','quality_planner'):
         angle={'architect':'a clear method and useful independent parts','researcher':'facts, calculations and practical constraints',
                'quality_planner':'specific checks and possible mistakes'}[task['role']]
@@ -244,7 +302,8 @@ def prompt(task,run,context,token,tools_available):
         independence=f'\nI requested exactly {explicit} independent execution contributions. Give exactly {explicit} rows with no dependencies; each part must compute and check its own result without relying on another row. Do not add a review or combine row.' if explicit else ''
         return 'You are the Architect of my request. Decide whether to work alone or delegate, and assign the explicit model of every task. Please make an execution task list:\n'+goal+memory+reference+project+run.get('file_claims','')+adviser_tools+f'\nUp to {run.get("worker_budget",run["capacity"])} people can contribute independent parts. Choose the smallest useful task list that preserves answer quality and speed. Do not invent work to fill available people. Separate independent work only when it saves time or improves quality; avoid duplicate research and merging overhead. Respect any explicit contribution count in my request. Use dependencies where needed. Delegated work will be reviewed and combined separately.'+independence+correction+'\nPlease present the task list as this readable table:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='reviewer':
-        return 'Please check these completed results against my request:\n'+goal+reference+project+tools+screen_tools+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
+        focus=('\n'+task['prompt']+'\n') if task.get('review_of') else ''
+        return 'Please check these completed results against my request:\n'+goal+focus+reference+project+tools+screen_tools+READ_FULL_HINT+'\nExplain what you checked. Give the verdict on a separate line: All checks passed, or Changes needed. If changes are needed, include a table of concrete remaining tasks in this format:\n'+(MODEL_TABLE if run.get('model_routing') else TABLE)
     if task['role']=='integrator':
         return 'Please combine these checked results into a complete answer to my request:\n'+goal+reference+memory+screen_tools+'\nUse my language. State what was actually checked and any remaining limitations.'
-    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'
+    return 'My overall request (for context; other parts are handled separately):\n'+goal+memory+'\nYour assigned part (do only this part):\n'+task['prompt']+project+run.get('file_claims','')+tools+screen_tools+reference+_result_file_hint(task,run,tools_available and bool(tools))+'\nPlease reply with the result of your assigned part only, with this check: '+task['acceptance']+'. Do not answer or repeat the other parts of my request. If anything needed is unavailable, explain that clearly.'

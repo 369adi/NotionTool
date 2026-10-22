@@ -172,5 +172,26 @@ class FileRegistryTests(unittest.TestCase):
             file_registry.normalize_files(self.project, ['docs/A.md', '../other.md'])
 
 
+    def test_summary_skips_scratch_and_unrelated_files(self):
+        scratch = self.project / 'work' / '_helper.py'
+        scratch.parent.mkdir(parents=True, exist_ok=True)
+        scratch.write_text('x', encoding='utf-8')
+        other = self.project / 'notiontool' / 'engine.py'
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text('x', encoding='utf-8')
+        file_registry.claim_operator(self.store, scratch)
+        file_registry.claim_operator(self.store, other)
+        plain = file_registry.summary(self.store, str(self.project))
+        self.assertNotIn('_helper.py', plain)
+        self.assertIn('engine.py', plain)
+        unrelated = dict(id='x1', files=['docs/Z.md'])
+        self.assertEqual(file_registry.summary(self.store, str(self.project), task=unrelated), '')
+        mine = dict(id='x2', files=['notiontool/engine.py'])
+        self.assertIn('engine.py', file_registry.summary(self.store, str(self.project), task=mine))
+        copy = dict(mine, patch_worktree=str(self.project / 'wt'))
+        note = file_registry.summary(self.store, str(self.project), task=copy)
+        self.assertIn('own copy', note)
+        self.assertNotIn('do not write', note)
+
 if __name__ == '__main__':
     unittest.main()

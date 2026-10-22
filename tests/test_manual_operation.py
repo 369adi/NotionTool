@@ -32,13 +32,13 @@ class ManualOperationTests(unittest.TestCase):
         app = Application.__new__(Application)
         app.store = self.store
         app.ensure_mcp_listener = Mock()
-        app.ensure_gateway = Mock()
+        app.ensure_gateway = Mock(return_value=0)  # local MCP gateway (gateway.py) is not an account connection
         app.mcp_http = SimpleNamespace(server_port=9888)
         app.tailscale = Mock()
         app.tailscale.start.return_value = {'url': 'https://device.ts.net/mcp'}
         app.adapter = Mock()
         result = app.start_tunnel()
-        app.ensure_gateway.assert_not_called()
+        app.ensure_gateway.assert_called_once_with()
         app.adapter.connect_bridge.assert_not_called()
         app.tailscale.start.assert_called_once_with(9888)
         self.assertEqual(result['connected_accounts'], 0)
