@@ -119,7 +119,8 @@ def report_text(report):
     """One short English line for a report-only stall."""
     report = report or {}
     task = str(report.get('task_id') or '')[:10]
-    return '%s stalled for %s on task %s; report only, nothing was stopped or resent' % (
+    return ('%s stalled for %s on task %s; report only, nothing was stopped or resent. '
+            'If that chat shows Notion\'s Continue prompt, it waits for your click there.') % (
         _who(report), _minutes(report.get('idle_s')), task)
 
 

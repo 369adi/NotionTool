@@ -93,6 +93,12 @@ def make(**settings):
     return store, adapter, watch, clock
 
 
+def bump(adapter):
+    current = adapter.transcripts[OPERATOR['thread_id']]
+    seq = len(current['patches']) + 1
+    adapter.transcripts[OPERATOR['thread_id']] = transcript(*current['patches'], entity(seq, 'assistant_message', 'a%d' % seq, content=[['more']]))
+
+
 def observations(store, worker):
     return (store.get('thread_context', worker['account_id'] + ':' + worker['thread_id']) or {}).get('observations', 0)
 
@@ -111,9 +117,11 @@ class UsageTests(unittest.TestCase):
         store, adapter, watch, clock = make()
         watch.check(OPERATOR)
         clock.now += 299
+        bump(adapter)  # a new turn; an identical transcript is skipped by ChatContext
         watch.check(OPERATOR)
         self.assertEqual(observations(store, OPERATOR), 1)
         clock.now += 1
+        bump(adapter)  # a new turn; an identical transcript is skipped by ChatContext
         watch.check(OPERATOR)
         self.assertEqual(observations(store, OPERATOR), 2)
 
@@ -121,6 +129,7 @@ class UsageTests(unittest.TestCase):
         store, adapter, watch, clock = make(main_context_check_seconds=60)
         watch.check(OPERATOR)
         clock.now += 60
+        bump(adapter)  # a new turn; an identical transcript is skipped by ChatContext
         watch.check(OPERATOR)
         self.assertEqual(observations(store, OPERATOR), 2)
 

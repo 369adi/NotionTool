@@ -187,10 +187,11 @@ class PausedTurnTests(unittest.TestCase):
                        entity(4, 'turn_completed'))
         self.assertEqual(interrupted_turn(t)['key'], 'last')
 
-    def test_limit_marker_after_a_reply_counts_as_interrupted(self):
+    def test_limit_marker_waits_for_the_users_continue_click(self):
+        # User rule: Notion's step-limit 'Fortfahren' is pressed by the user, never resumed automatically.
         t = transcript(entity(1, 'user_message', 'u1'), entity(2, 'assistant_message'),
                        entity(3, 'turn_completed', 'done', stop_reason='step_limit'))
-        self.assertEqual(interrupted_turn(t)['key'], 'done')
+        self.assertIsNone(interrupted_turn(t))
 
     def test_running_session_is_not_interrupted(self):
         t = transcript(entity(1, 'user_message'), entity(2, 'tool_call'), status='running')

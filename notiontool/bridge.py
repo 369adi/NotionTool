@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import itertools
 
 
@@ -54,11 +55,41 @@ REA_TOOLS = {
 }
 from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled
 READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewer')
+from . import long_calls
+from . import token_budget
+# Hard usage limit (owner rule: ALL chats stop at once, the Main too): while the 6 h token budget
+# is used up, Bridge.limit_gate refuses every tool with a LIMIT_STOP: error, for the Main (no
+# assignment token) and for coworkers (with token). During a burst pause only coworker tools are
+# refused (B42). Only this read-only allow list still works. Every name was checked against the
+# tool specs: OPERATOR_TOOLS entries with readOnlyHint True (devtools RO, SCREEN_OPERATOR_TOOLS),
+# the bridge's own discovery tools, nt_job_result, the screen tools and the coworkers' read-only
+# tools (engine.READ_ONLY_TOOLS: read_file, list_files, context). Not allowed although marked
+# read-only: nt_local_mcp (refresh=true restarts servers) and nt_inference_body (Notion client).
+# Local MCP '*_tools' discovery (readOnlyHint True in tools/list) is allowed by name suffix.
+# The gate sits in _call(), operator_call() and local_call(), before any tool runs. A long job
+# started before the limit keeps running (it is not killed); nt_job_result still reads its result.
+LIMIT_ALLOWED_TOOLS = frozenset((
+    'mcp_servers', 'mcp_list_tools', long_calls.JOB_TOOL,
+    'nt_read_file', 'nt_list_dir', 'nt_search_code', 'nt_file_outline', 'nt_memory_read',
+    'nt_screen_windows', 'nt_screen_capture', 'screen_windows', 'screen_capture',
+    'read_file', 'list_files', 'context',
+))
+# nt_api: every GET is read-only; of the POST routes only stopping work (docs/HOST_API.md:
+# /api/run/cancel {id}, /api/run/pause {id, paused}), which lowers usage.
+LIMIT_ALLOWED_API_POSTS = ('/api/run/cancel', '/api/run/pause')
+LIMIT_EVENT = 'limit_stop_tool_refused'
+LIMIT_EVENT_SECONDS = 60.0  # at most one event per (caller, tool) per minute
+# nt_job_result (long_calls.JOB_TOOL) only reads a finished or running job of the same caller:
+# read-only and allowed for every role. Bridge.rpc answers it before any role check or lock.
+ANY_ROLE_TOOLS = (long_calls.JOB_TOOL,)
+# Writes stay synchronous, never background jobs (a late write could collide with the next owner).
+INLINE_TOOLS = ('write_file', 'nt_write_file', 'nt_edit_file')
 # Custom roles (settings role_definitions, read like server.role_state()) are read-only when their
 # tools value is role_policy.READ_ONLY ('read_only'); see Bridge.role_is_read_only.
 CUSTOM_READ_ONLY = 'read_only'
 READ_ONLY_REFUSAL = 'This planning/review role has read-only PC access'
 from .screen_capture import SCREEN_TOOLS, SCREEN_OPERATOR_TOOLS, SCREEN_OPERATOR_NAMES, ScreenCapture
+from .agent_guard import GUARD_RULE, PLAN_RULE
 
 
 def shell_command(command):
@@ -99,7 +130,7 @@ def unittest_python():
 
 # Operator scope: only with the owner Host API key (never the worker bridge token).
 OPERATOR_TOOLS = [
-    {'name':'nt_api','description':'Operator: call a NotionTool Host API route on the owner PC. GET or POST /api/... (e.g. /api/health, /api/state, /api/chats, /api/send, /api/main/create, /api/operations).',
+    {'name':'nt_api','description':'Operator: call a NotionTool Host API route on the owner PC. GET or POST /api/... (e.g. /api/health, /api/state, /api/chats, /api/send, /api/main/create, /api/operations). ' + GUARD_RULE + ' ' + PLAN_RULE,
      'annotations':{'readOnlyHint':False,'destructiveHint':True},
      'inputSchema':{'type':'object','properties':{'method':{'type':'string','enum':['GET','POST']},'path':{'type':'string'},'body':{'type':'object'},'timeout':{'type':'number'}},'required':['path']}},
     {'name':'nt_notion_call','description':'Operator: raw internal Notion API call (POST /api/v3/<method>) as the selected harness account. For verified reverse-engineering tests.',
@@ -263,8 +294,40 @@ class Bridge:
             raise ValueError('No PC project folder configured for this chat')
         raise ValueError('The configured project folder does not exist')
 
-    def path(self, run, relative='.'):
+    def worktree(self, task):
+        """The git worktree a task works in: its own copy, or for a review the reviewed task's copy.
+
+        None when the task has no existing worktree; tools then use the project folder.
+        """
+        if not task:
+            return None
+        candidates = [task]
+        if task.get('review_of'):
+            candidates.append(self.store.get('tasks', task['review_of'], None) or {})
+        for item in candidates:
+            folder = item.get('patch_worktree')
+            if item is not task and item.get('patch_state') == 'merged':
+                continue  # A merged change is reviewed in the main project folder.
+            if folder and Path(folder).is_dir():
+                return Path(folder).resolve()
+        return None
+
+    def path(self, run, relative='.', task=None):
         root = self.root(run)
+        copy = self.worktree(task)
+        if copy is not None:
+            # The task works in its own copy: relative paths and absolute paths into the main
+            # project folder both mean the same file inside the copy.
+            raw = Path(os.path.expanduser(str(relative)))
+            project = self.project(run)
+            if raw.is_absolute() and project:
+                resolved = raw.resolve()
+                if resolved.is_relative_to(project) and not resolved.is_relative_to(project / 'work'):
+                    raw = resolved.relative_to(project)
+            path = (raw if raw.is_absolute() else copy / raw).resolve()
+            if self.full_access() or path.is_relative_to(copy) or path.is_relative_to(root):
+                return path
+            raise ValueError("File is outside this task's copy of the project (%s)" % copy)
         path = (root/os.path.expanduser(str(relative))).resolve()
         if self.full_access():
             # Full PC access (explicit opt-in in Settings): absolute paths anywhere.
@@ -273,8 +336,103 @@ class Bridge:
             raise ValueError('File is outside the configured project folder (enable full PC access in Settings)')
         return path
 
+    # ---- hard usage limit -------------------------------------------------
+    @staticmethod
+    def limit_allowed(name, args):
+        """Read-only allow list at the hard limit (see LIMIT_ALLOWED_TOOLS / LIMIT_ALLOWED_API_POSTS)."""
+        name = str(name or '')
+        if name in LIMIT_ALLOWED_TOOLS:
+            return True
+        if name in TOOL_SERVER and name.endswith('_tools'):
+            return True  # local MCP tool discovery (readOnlyHint True in tools/list)
+        if name == 'nt_api':
+            args = args if isinstance(args, dict) else {}
+            # Same method rule as operator_call: a body without a method means POST.
+            method = str(args.get('method') or ('POST' if args.get('body') is not None else 'GET')).upper()
+            path = str(args.get('path') or '').split('?', 1)[0].split('#', 1)[0]
+            return method == 'GET' or (method == 'POST' and path in LIMIT_ALLOWED_API_POSTS)
+        return False
+
+    def _limit_purpose(self, token):
+        """'worker' for a live assignment token, else 'main' (also when the lookup fails)."""
+        try:
+            return 'worker' if token and self.has_assignment(token) else 'main'
+        except Exception:
+            return 'main'
+
+    def limit_gate(self, name, args, token='', caller=''):
+        """Refuse a tool (LimitStop, text 'LIMIT_STOP: ...') at the hard usage limit.
+
+        The 6 h token budget stops every caller: the Main (no assignment token) and coworkers (with
+        token). A burst pause stops only coworkers (purpose 'worker'). Read-only allow-listed tools
+        always pass. Fail-open: hard_stop_state never raises and returns stop=False (and logs
+        token_budget_failed) when the ledger cannot be read.
+        """
+        if self.store is None or self.limit_allowed(name, args):
+            return
+        purpose = self._limit_purpose(token)
+        now_fn = getattr(self, '_limit_now', None)  # tests only: a fake clock for the window
+        state = token_budget.hard_stop_state(self.store, purpose, now_fn() if now_fn else None)
+        if not state.get('stop'):
+            return
+        wait = int(state.get('wait') or 0)
+        source = str(state.get('source') or '6h')
+        who = caller or ('worker' if purpose == 'worker' else 'main')
+        self._limit_event(name, who, purpose, source, wait, str(state.get('reason') or ''))
+        raise token_budget.LimitStop(token_budget.limit_stop_text(wait, source))
+
+    def _limit_event(self, name, caller, purpose, source, wait, reason):
+        """At most one limit_stop_tool_refused event per (caller, tool) per LIMIT_EVENT_SECONDS."""
+        try:
+            clock = getattr(self, '_limit_clock', None) or time.monotonic
+            key = (str(caller), str(name)[:80])
+            with self.__dict__.setdefault('_limit_lock', threading.Lock()):
+                now = clock()
+                seen = self.__dict__.setdefault('_limit_event_at', {})
+                last = seen.get(key)
+                if last is not None and 0 <= now - last < LIMIT_EVENT_SECONDS:
+                    return
+                if len(seen) > 500:
+                    for old in [k for k, v in seen.items() if not 0 <= now - v < LIMIT_EVENT_SECONDS]:
+                        seen.pop(old, None)
+                seen[key] = now
+            self.store.event(LIMIT_EVENT, tool=key[1], caller=key[0], purpose=purpose, source=source, wait_s=wait,
+                             message=('Tool refused at the hard usage limit: ' + reason)[:300])
+        except Exception:
+            pass
+
     # ---- tools ------------------------------------------------------------
+    def _tool_started(self, run_id, task_id='', tool='', message=''):
+        """Record a tool start; call() records the matching tool_finished (also on errors and timeouts)."""
+        self.store.event('tool_started', run_id, task_id=task_id, tool=tool, message=message)
+        self._tool_ctx().started = (run_id, task_id, tool, time.monotonic())
+
+    def _tool_ctx(self):
+        return self.__dict__.setdefault('_tool_local', threading.local())
+
     def call(self, name, args, token):
+        ctx = self._tool_ctx()
+        ctx.started = None
+        try:
+            result = self._call(name, args, token)
+        except BaseException as exc:
+            started, ctx.started = ctx.started, None
+            if started:
+                run_id, task_id, tool, begun = started
+                self.store.event('tool_finished', run_id, task_id=task_id, tool=tool, ok=False,
+                                 seconds=round(time.monotonic() - begun, 3),
+                                 error=(type(exc).__name__ + ': ' + str(exc))[:200])
+            raise
+        started, ctx.started = ctx.started, None
+        if started:
+            run_id, task_id, tool, begun = started
+            extra = {'exit_code': result.get('exit_code')} if isinstance(result, dict) and 'exit_code' in result else {}
+            self.store.event('tool_finished', run_id, task_id=task_id, tool=tool, ok=True,
+                             seconds=round(time.monotonic() - begun, 3), **extra)
+        return result
+
+    def _call(self, name, args, token):
+        self.limit_gate(name, args, token)  # hard usage limit: before any tool runs (Main and coworkers)
         if name in SCREEN_TOOLS and self.screen_access() and not self.has_assignment(token):
             # Read-only screen tools also work in the user's own chats (Main), which have no assignment token.
             return self.screen().call(name, args, role='chat')
@@ -294,7 +452,7 @@ class Bridge:
                 raise ValueError('Unknown or disabled tool' + (' (enable browser access in Settings)' if name in BROWSER_TOOLS else ' (enable '+LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+' in Settings)' if name in TOOL_SERVER else ''))
             if name in TOOL_SERVER:
                 rea = self.local_client(TOOL_SERVER[name])
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message=LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+': '+str(args.get('name','discover'))[:100])
+                self._tool_started(run['id'],task_id=task['id'],tool=name,message=LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+': '+str(args.get('name','discover'))[:100])
             if self.role_is_read_only(task['role']) and (name=='write_file' or name in BROWSER_ACTIONS
                     or (name=='run_shell' and read_only_test_modules(args.get('command')) is None)):
                 raise ValueError('This planning/review role has read-only PC access')
@@ -305,7 +463,7 @@ class Bridge:
             elif name in BROWSER_TOOLS:
                 if name in BROWSER_ACTIONS:
                     detail = args.get('url') or args.get('selector') or args.get('text') or args.get('expression') or ''
-                    self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message='Browser: '+name+' '+str(detail)[:200])
+                    self._tool_started(run['id'],task_id=task['id'],tool=name,message='Browser: '+name+' '+str(detail)[:200])
             elif name=='context':
                 wanted = args.get('task_id')
                 if args.get('thread_id'):
@@ -342,14 +500,14 @@ class Bridge:
             elif name=='run_shell' and self.role_is_read_only(task['role']):
                 # Read-only test run: fixed project root (a cwd argument is ignored),
                 # no folder claim, only the lease check.
-                cwd = self.project(run)
+                cwd = self.worktree(task) or self.project(run)
                 if cwd is None:
                     raise ValueError('Read-only test runs need a project folder')
                 self.engine.check_lease(task['id'],token)
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,
+                self._tool_started(run['id'],task_id=task['id'],tool=name,
                                  message='Tests in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             elif name=='run_shell':
-                cwd = self.path(run,str(args.get('cwd') or '.'))
+                cwd = self.path(run,str(args.get('cwd') or '.'),task=task)
                 if not cwd.is_dir():
                     raise ValueError('Shell folder does not exist')
                 # Shell is a powerful tool, not a filesystem sandbox. With full PC access it is still
@@ -360,10 +518,10 @@ class Bridge:
                     self.engine.claim_absolute(task['id'],token,Path(cwd).anchor)
                 else:
                     self.engine.check_lease(task['id'],token)
-                self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,
+                self._tool_started(run['id'],task_id=task['id'],tool=name,
                                  message='Shell in '+str(cwd)[:200]+': '+str(args.get('command',''))[:300])
             else:
-                path = self.path(run,str(args.get('path','.')))
+                path = self.path(run,str(args.get('path','.')),task=task)
                 if name=='list_files':
                     area = self.hidden_area(self.project(run))
                     self.guard_area(path, area, 'Listing')
@@ -389,7 +547,7 @@ class Bridge:
                     text = str(args.get('text',''))
                     if len(text)>2*1024*1024:
                         raise ValueError('Write is too large')
-                    self.store.event('tool_started',run['id'],task_id=task['id'],tool=name,message='Write: '+str(path)[:300])
+                    self._tool_started(run['id'],task_id=task['id'],tool=name,message='Write: '+str(path)[:300])
                     self.snapshot_before_write(task, run, path)
                     path.parent.mkdir(parents=True,exist_ok=True)
                     path.write_text(text,encoding='utf-8',newline='')
@@ -449,6 +607,7 @@ class Bridge:
 
     def local_call(self, name, args):
         """Local MCP tool (Roblox, Blender, REA) for the owner connection, without a worker assignment."""
+        self.limit_gate(name, args)  # hard usage limit: refused for the Main as well
         server = LOCAL_BY_KEY[TOOL_SERVER[name]]
         if not local_enabled(self.store.settings(), server):
             raise ValueError('Switch on '+server['label']+' in MCP servers first')
@@ -487,7 +646,6 @@ class Bridge:
                     process.kill()
                 process.communicate()
                 raise ValueError('Command timed out; its process tree was stopped') from None
-            self.store.event('tool_finished',run['id'],task_id=task['id'],tool=name,exit_code=process.returncode)
             return dict(exit_code=process.returncode,output=output.decode('utf-8',errors='replace')[-30000:])
         finally:
             self.shell_gate.release()
@@ -584,6 +742,8 @@ class Bridge:
     def guard_scope(self, task, run, path):
         """Refuse a coworker write outside the task's non-empty files list (no list: no limit).
 
+        Any write inside the task's own git worktree is allowed (merged and tested at the end).
+
         Absolute and project-relative entries are compared through file_registry.path_key, so
         both forms of the same file match; an entry that is a folder covers the files below it.
         engine.claim_file appends every claimed file to task['files'], so the assigned list is
@@ -600,16 +760,40 @@ class Bridge:
         if not files:
             return
         project = self.project(run)
+        base = project or self.root(run)
+        copy = self.worktree(task)
         key = file_registry.path_key(path)
+        if copy is not None and _key_inside(key, file_registry.path_key(copy)):
+            # Owner rule 2026-10-22: a task with its own git worktree may write any file in that copy;
+            # the copy is merged and tested at the end, so the files list is a plan hint, not a wall.
+            return
         for entry in files:
-            target = Path(os.path.expanduser(entry))
-            if not target.is_absolute():
-                target = (project or self.root(run)) / target
-            if _key_inside(key, file_registry.path_key(target)):
-                return
+            raw = Path(os.path.expanduser(entry))
+            targets = [raw if raw.is_absolute() else base / raw]
+            if copy is not None:
+                # The same entry inside the task's own copy (git worktree).
+                rel = raw
+                if raw.is_absolute():
+                    try:
+                        rel = raw.resolve().relative_to(project) if project else None
+                    except ValueError:
+                        rel = None
+                if rel is not None:
+                    targets.append(copy / rel)
+            for target in targets:
+                if _key_inside(key, file_registry.path_key(target)):
+                    return
         raise ValueError("Write refused: %s is not in this task's files list (%s); no file was changed. "
                          "Only the assigned files may be written; report other needed changes in your result."
                          % (path, ', '.join(files)[:300]))
+
+    def _task_dev_path(self, token, path):
+        """Resolve a coworker write path: inside the task's worktree when it has one, else as before."""
+        with self.engine.lock:
+            task, run = self.assignment(token)
+            if self.worktree(task) is not None:
+                return self.path(run, str(path or ''), task=task)
+        return dev_path(path)
 
     def _claim_for_task(self, token, path):
         """Claim path for the task behind token (same rules as the write_file tool)."""
@@ -657,6 +841,9 @@ class Bridge:
     def operator_call(self, app, name, args):
         import re, urllib.request, urllib.error
         from .harness_account import selected_account
+        # Hard usage limit: every operator tool of the Main is refused except the read-only allow list.
+        self.limit_gate(name, args, (args.get('assignment_token') or '') if isinstance(args, dict) else '',
+                        caller='operator')
         if name in SCREEN_OPERATOR_NAMES: return self.screen().call(name[3:], args, role='operator')
         if name in DEV_NAMES:
             area = self.hidden_area(dev_path('.'))
@@ -668,13 +855,27 @@ class Bridge:
                 if token:
                     # A coworker task writes under its own lock: its own files pass,
                     # files of other tasks or of the operator are still refused.
-                    task, run = self._claim_for_task(token, dev_path(args.get('path')))
+                    # A task with its own git worktree writes into that copy, never into main.
+                    target = self._task_dev_path(token, args.get('path'))
+                    args['path'] = str(target)
+                    task, run = self._claim_for_task(token, target)
                     # O5: only after the owner-token lock passed; never blocks the write.
-                    self.snapshot_before_write(task, run, dev_path(args.get('path')))
+                    self.snapshot_before_write(task, run, target)
                 else:
                     # Register the operator edit so coworker chats see it and leave the file alone.
-                    with self.engine.lock:
-                        file_registry.claim_operator(self.store, dev_path(args.get('path')))
+                    # Bounded wait (live 2026-10-22 04:13: an edit call never answered and the Main hung until
+                    # the user stopped it): a busy engine lock must never stall a file edit indefinitely.
+                    if self.engine.lock.acquire(timeout=10):
+                        try:
+                            file_registry.claim_operator(self.store, dev_path(args.get('path')))
+                        finally:
+                            self.engine.lock.release()
+                    else:
+                        try:
+                            self.store.event('operator_claim_skipped', message='Engine busy for 10 s; edit runs without registry claim',
+                                             path=str(args.get('path'))[:300])
+                        except Exception:
+                            pass
             return self.filter_dev_result(name, args, dev_call(name, args), area)
         if name=='nt_local_mcp':
             return self.local_refresh(str(args.get('server') or '') or None, bool(args.get('refresh')), schemas=bool(args.get('server')))
@@ -727,6 +928,70 @@ class Bridge:
             return {'lines':lines}
         raise ValueError('Unknown operator tool')
 
+    # ---- long calls (MCP -32001) ------------------------------------------
+    def long_jobs(self):
+        jobs = getattr(self, '_long_jobs', None)
+        if jobs is None:
+            jobs = self._long_jobs = long_calls.Jobs()
+        return jobs
+
+    @staticmethod
+    def caller_key(args, operator):
+        """Who may read a job: the coworker assignment (token) or the owner connection."""
+        token = str((args or {}).get('assignment_token') or '') if isinstance(args, dict) else ''
+        if token:
+            return 'task:' + token
+        return 'operator' if operator is not None else 'chat'
+
+    @staticmethod
+    def is_job_call(name, args):
+        return name in ANY_ROLE_TOOLS or (name == 'mcp_call' and isinstance(args, dict)
+                                          and args.get('tool_name') in ANY_ROLE_TOOLS)
+
+    @staticmethod
+    def runs_inline(name, args):
+        inner = (args or {}).get('tool_name') if name == 'mcp_call' and isinstance(args, dict) else None
+        return name in INLINE_TOOLS or inner in INLINE_TOOLS
+
+    def job_result(self, name, args, operator):
+        """nt_job_result {job_id, wait_s}: read-only, every role, only the caller that started the job."""
+        inner = (args.get('arguments') or {}) if name == 'mcp_call' else args
+        return self.long_jobs().result(self.caller_key(args, operator), inner.get('job_id'), inner.get('wait_s'))
+
+    def tool_value(self, name, args, operator):
+        """The tools/call dispatch (runs on a long_calls job thread unless it is a write)."""
+        tools = self.tools()
+        if operator is not None and name in OPERATOR_NAMES:
+            return self.operator_call(operator, name, args)
+        if name in TOOL_SERVER:
+            if operator is not None or name.endswith('_tools'):
+                return self.local_call(name, args)
+            raise ValueError('Calling local MCP tools from your own chat requires the Bearer token shown in Settings > Remote MCP access, or a valid worker assignment through mcp_call.')
+        if name=='mcp_servers':
+            value = [{'id':'NotionTool','tools':list(TOOLS),'full_pc_access':self.full_access()}]
+            if self.browser_access():
+                value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
+            if self.screen_access():
+                value.append({'id':'Screen','tools':list(SCREEN_TOOLS),'assignment_token':'not needed'})
+            settings = self.store.settings()
+            for server in LOCAL_SERVERS:
+                if local_enabled(settings, server):
+                    value.append({'id':server['label'],'tools':list(tool_specs(server))})
+            return value
+        if name=='mcp_list_tools':
+            value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
+                     if not args.get('tool_name') or n==args['tool_name']]
+            if not args.get('tool_name') or args['tool_name']==long_calls.JOB_TOOL:
+                spec = long_calls.JOB_TOOL_SPEC
+                value.append(dict(name=spec['name'],description=spec['description'],inputSchema=json.loads(json.dumps(spec['inputSchema']))))
+            return value
+        if name=='mcp_call':
+            inner,inner_args,token = args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token','')
+            # Owner connection (operator scope already has shell access): local MCP tools need no assignment token.
+            discover = inner in TOOL_SERVER and inner.endswith('_tools') and not token
+            return self.local_call(inner,inner_args) if inner in TOOL_SERVER and (discover or (operator is not None and not self.has_assignment(token))) else self.call(inner,inner_args,token)
+        raise ValueError('Unknown MCP tool')
+
     def rpc(self, message, operator=None):
         ident = message.get('id')
         method,params = message.get('method'),message.get('params') or {}
@@ -747,10 +1012,11 @@ class Bridge:
                     {'name':'mcp_list_tools','description':'Get schemas for a NotionTool tool by name',
                      'annotations':{'readOnlyHint':True,'destructiveHint':False},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'}}}},
-                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty); in the owner connection the local MCP tools (roblox_*, blender_*, rea_*) need no token either',
+                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty); in the owner connection the local MCP tools (roblox_*, blender_*, rea_*) need no token either. Calls longer than about 45 s return still_running with a job_id: do not start them again, fetch the result with nt_job_result',
                      'annotations':{'readOnlyHint':False,'destructiveHint':True},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'},'assignment_token':{'type':'string'},
-                                   'arguments':{'type':'object'}},'required':['tool_name']}}]}
+                                   'arguments':{'type':'object'}},'required':['tool_name']}},
+                    json.loads(json.dumps(long_calls.JOB_TOOL_SPEC))]}
                 if operator is not None:
                     result['tools'] += OPERATOR_TOOLS
                 # Publish only the two lazy entrypoints for enabled providers.
@@ -768,34 +1034,18 @@ class Bridge:
                                 'destructiveHint': name.endswith('_call')}})
             elif method=='tools/call':
                 name,args = params.get('name'),params.get('arguments') or {}
-                tools = self.tools()
-                if operator is not None and name in OPERATOR_NAMES:
-                    value = self.operator_call(operator, name, args)
-                elif name in TOOL_SERVER:
-                    if operator is not None or name.endswith('_tools'):
-                        value = self.local_call(name, args)
-                    else:
-                        raise ValueError('Calling local MCP tools from your own chat requires the Bearer token shown in Settings > Remote MCP access, or a valid worker assignment through mcp_call.')
-                elif name=='mcp_servers':
-                    value = [{'id':'NotionTool','tools':list(TOOLS),'full_pc_access':self.full_access()}]
-                    if self.browser_access():
-                        value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
-                    if self.screen_access():
-                        value.append({'id':'Screen','tools':list(SCREEN_TOOLS),'assignment_token':'not needed'})
-                    settings = self.store.settings()
-                    for server in LOCAL_SERVERS:
-                        if local_enabled(settings, server):
-                            value.append({'id':server['label'],'tools':list(tool_specs(server))})
-                elif name=='mcp_list_tools':
-                    value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
-                             if not args.get('tool_name') or n==args['tool_name']]
-                elif name=='mcp_call':
-                    inner,inner_args,token = args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token','')
-                    # Owner connection (operator scope already has shell access): local MCP tools need no assignment token.
-                    discover = inner in TOOL_SERVER and inner.endswith('_tools') and not token
-                    value = self.local_call(inner,inner_args) if inner in TOOL_SERVER and (discover or (operator is not None and not self.has_assignment(token))) else self.call(inner,inner_args,token)
+                if self.is_job_call(name, args):
+                    # nt_job_result itself is never wrapped; it waits at most 40 s.
+                    value = self.job_result(name, args, operator)
+                elif self.runs_inline(name, args):
+                    value = self.tool_value(name, args, operator)
                 else:
-                    raise ValueError('Unknown MCP tool')
+                    # Answer before Notion's MCP request timeout (-32001): a slower call goes on as a
+                    # job on one thread (call() logs tool_finished there when it really ends).
+                    value = self.long_jobs().run(self.caller_key(args, operator), name, args,
+                        lambda: self.tool_value(name, args, operator), long_calls.sync_limit(self.store.settings()))
+                if isinstance(value, dict):
+                    value = dict(value)  # a stored job result keeps its image for the next nt_job_result
                 image = value.pop('_image', None) if isinstance(value, dict) else None
                 result = {'content':[{'type':'text','text':json.dumps(value,ensure_ascii=False)}]}
                 if image:
