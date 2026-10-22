@@ -16,15 +16,20 @@ import json, os, shutil, socket, sqlite3, subprocess, sys, threading, time, urll
 from pathlib import Path
 
 DEFAULT_PORT = 8791
+REAL_PORT = 8790  # the real NotionTool; the test app never binds, probes or stops it
 BOOT_SECONDS = 60
 CREATE_NO_WINDOW = 0x08000000
 FAKE_ENV = 'NOTIONTOOL_FAKE_NOTION'
 FAKE_READY_EVENT = 'fake_notion_ready'
-_PROCS = {}  # pid -> Popen handle opened by start(); stop() waits for and releases it
+_PROCS = {}  # pid -> Popen handle opened by start(); stop() waits for, kills and releases every one
+# Every wait in this module is bounded (a hung tasklist/taskkill or child must never block a test run).
+CMD_SECONDS = 15        # tasklist / taskkill
+STOP_WAIT_SECONDS = 10  # graceful end of a process tree before kill()
+KILL_WAIT_SECONDS = 5   # after kill()
+PORT_FREE_SECONDS = 15  # until the stopped app's port no longer accepts connections
 SCENARIOS = ('restart_cut', 'too_large', 'deleted_chat', 'wake')
 # Upper bounds per scenario after the restart (turn watch checks every 30 s, grace 150 s for the cut).
 SCENARIO_SECONDS = dict(restart_cut=150, too_large=110, deleted_chat=90, wake=90)
-KIND_PURPOSE = {'main': 'main', 'coworker': 'worker', 'private': 'private'}
 EVENT_FIELDS = ('message', 'thread_id', 'worker_id', 'account_id', 'run_id', 'run_ids', 'state', 'chat_id',
                 'operation_id', 'reason', 'error', 'task_id', 'name', 'source')
 WATCH_KINDS = ('circuit_open', 'turn_watch_waiting', 'chat_pool_error', 'crash', 'exception')
@@ -77,19 +82,99 @@ def _serving(port, timeout=2.0):
         return False
 
 
+def _run(cmd, timeout=CMD_SECONDS):
+    """subprocess.run with a hard timeout and no inherited stdin; stdout bytes, or None if it failed or hung.
+
+    The old stop()/_alive() ran tasklist and taskkill without a timeout: one hung tasklist (WMI busy, the
+    console of the dying app) blocked the whole unittest run forever although no test-app python was left.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout,
+                              creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0).stdout or b''
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def _alive(pid):
+    """Is pid a running test-app python? Own processes are asked through their Popen handle (no subprocess)."""
     if not pid:
         return False
+    proc = _PROCS.get(pid)
+    if proc is not None:
+        return proc.poll() is None
     if os.name == 'nt':
-        out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % pid, '/NH'], capture_output=True,
-                             creationflags=CREATE_NO_WINDOW).stdout or b''
-        # tasklist prints in the OEM code page (umlauts broke the text decoding): compare bytes.
-        return str(pid).encode('ascii') in out
+        out = _run(['tasklist', '/FI', 'PID eq %d' % pid, '/NH', '/FO', 'CSV'])
+        if out is None:
+            return True  # unknown (tasklist hung): treat as running so stop() still ends it
+        # tasklist prints in the OEM code page (umlauts broke the text decoding): compare bytes. CSV gives the
+        # exact pid field; a pid reused by a non-python process is not ours and is never killed.
+        return ('"%d"' % pid).encode('ascii') in out and b'python' in out.lower()
     try:
         os.kill(pid, 0)
         return True
     except OSError:
         return False
+
+
+def _kill_tree(pid):
+    if os.name == 'nt':
+        _run(['taskkill', '/PID', str(pid), '/T', '/F'])
+    else:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+
+
+def _close_pipes(proc):
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _end(pid, proc=None):
+    """End one test-app process tree: terminate, wait (bounded), kill if still there, close its pipes."""
+    if proc is not None:
+        if proc.poll() is None:
+            _kill_tree(pid)
+            try:
+                proc.wait(timeout=STOP_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=KILL_WAIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+        _close_pipes(proc)
+        return proc.poll() is not None
+    if not _alive(pid):
+        return True
+    _kill_tree(pid)
+    deadline = time.time() + STOP_WAIT_SECONDS
+    while _alive(pid) and time.time() < deadline:  # release the database before it is reused
+        time.sleep(0.3)
+    return not _alive(pid)
+
+
+def _port_free(port, seconds=PORT_FREE_SECONDS):
+    """Wait (bounded) until nothing accepts connections on port. TIME_WAIT leftovers accept nothing and the
+    app binds with SO_REUSEADDR, so they do not block the next start. Port 8790 is never probed."""
+    port = int(port)
+    if port == REAL_PORT:
+        return True
+    deadline = time.time() + seconds
+    while True:
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=0.5):
+                pass
+        except OSError:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
 
 
 def _tail(log, lines=25):
@@ -129,30 +214,35 @@ def startup_errors(data):
 
 
 def stop(root=None):
+    """Stop every test-app process start() opened plus the one recorded in work/test-app.json.
+
+    Each process tree is terminated (taskkill /T /F on Windows) and waited for with a timeout, killed if it is
+    still there, its pipes are closed and its port must stop accepting connections, so the next test can start.
+    Every wait is bounded. Never touches this process, the real app or port 8790.
+    """
     _, _, info, _ = _paths(root)
-    pid = _state(info).get('pid')
-    if pid and _alive(pid):
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True,
-                           creationflags=CREATE_NO_WINDOW)
+    st = _state(info)
+    pid = st.get('pid')
+    targets = {p: (proc, getattr(proc, 'test_app_port', None)) for p, proc in list(_PROCS.items())}
+    if pid and pid not in targets:
+        targets[pid] = (None, st.get('port'))
+    left, ports = [], set()
+    for p, (proc, port) in targets.items():
+        if p == os.getpid():
+            continue
+        if _end(p, proc):
+            _PROCS.pop(p, None)  # reaped: no 'subprocess is still running' ResourceWarning left behind
         else:
-            os.kill(pid, 15)
-        began = time.time()
-        while _alive(pid) and time.time() - began < 10:  # release the database before it is reused
-            time.sleep(0.3)
-    proc = _PROCS.pop(pid, None) if pid else None
-    if proc is not None:
-        # Reap the handle start() opened, so no 'subprocess is still running' ResourceWarning is left behind.
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+            left.append(p)  # stays in _PROCS so the next stop() tries again
+        if port and int(port) != REAL_PORT:
+            ports.add(int(port))
+    busy = [port for port in sorted(ports) if not _port_free(port)]
     try:
         Path(info).unlink()
     except OSError:
         pass
-    return {'stopped': True, 'pid': pid}
+    return {'stopped': not left, 'pid': pid, 'pids': sorted(targets), 'left_running': left,
+            'port_free': not busy, 'busy_ports': busy}
 
 
 def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, fake=True):
@@ -162,7 +252,10 @@ def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, f
     if fresh:
         shutil.rmtree(data, ignore_errors=True)
     data.mkdir(parents=True, exist_ok=True)
-    port = _free(int(port or DEFAULT_PORT))
+    port = int(port or DEFAULT_PORT)
+    if port == REAL_PORT:
+        raise ValueError('port %d belongs to the real NotionTool; the test app never uses it' % REAL_PORT)
+    port = _free(port)
     env = dict(os.environ, NOTIONTOOL_TEST_INSTANCE='1', PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1')
     env.pop('NOTIONTOOL_FAKE_STATE', None)  # the simulated state always lives in the test data folder
     if fake:
@@ -174,7 +267,9 @@ def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, f
         proc = subprocess.Popen([python_exe(), str(root / 'main.py'), '--serve', '--data-dir', str(data),
                                  '--port', str(port)], cwd=str(root), env=env, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
-    _PROCS[proc.pid] = proc  # stop() reaps it
+    # The log handle is closed here (end of the with block); the child keeps its own copy. stop() reaps proc.
+    proc.test_app_port = port
+    _PROCS[proc.pid] = proc
     Path(info).write_text(json.dumps({'pid': proc.pid, 'port': port, 'started': began, 'fake': bool(fake)}),
                           encoding='utf-8')
     while time.time() - began < boot_seconds:
@@ -287,9 +382,14 @@ def _object(data, kind, ident):
 
 
 def _wait(probe, seconds, interval=2.0):
+    """Poll probe until it returns something truthy or seconds pass (always bounded). A probe that fails for a
+    moment (the app is replacing fake_notion.json, the database is busy) counts as 'not yet'."""
     deadline = time.time() + seconds
     while True:
-        value = probe()
+        try:
+            value = probe()
+        except (OSError, ValueError, sqlite3.Error):
+            value = None
         if value or time.time() >= deadline:
             return value
         time.sleep(interval)
