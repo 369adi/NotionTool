@@ -159,6 +159,8 @@ html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
 .nt-desk-chip { flex: none; padding: 1px 6px; border-radius: 999px; font-size: 10px; line-height: 14px; font-weight: 700;
   background: rgba(124, 92, 255, .22); color: #d9d0ff; }
 .nt-desk-model { background: rgba(34, 211, 238, .18); color: #a5f3fc; }
+.nt-desk-ailimit { white-space: nowrap; overflow: visible; margin-left: auto; background: rgba(34, 197, 94, .18); color: #bbf7d0; }
+.nt-desk-ailimit-low { background: rgba(239, 68, 68, .25); color: #fecaca; }
 .nt-desk-age-ok { background: rgba(255, 255, 255, .1); color: #d6dbea; }
 .nt-desk-age-amber { background: #f59e0b; color: #0b0d12; }
 .nt-desk-age-red { background: #ef4444; color: #ffffff; }

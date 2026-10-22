@@ -37,7 +37,9 @@ class OverlayTest(unittest.TestCase):
 
     def test_steps_chip_in_coworker_head(self):
         self.assertIn('function stepsChip(state)', OVERLAY)
-        self.assertIn("'AI steps left: '", OVERLAY)
+        self.assertIn("' AI left'", OVERLAY)
+        self.assertIn('nt-desk-ailimit', OVERLAY)  # not .nt-desk-steps: theme.css styles that as Notion's step pill
+        self.assertNotIn("'nt-desk-chip nt-desk-steps'", OVERLAY)
         self.assertIn('stepsChip(state)', OVERLAY)
 
 

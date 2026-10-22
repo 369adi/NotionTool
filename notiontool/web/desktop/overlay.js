@@ -917,10 +917,13 @@
       var s = state && state.steps_hour;
       if (!s || typeof s.limit !== 'number' || !s.limit) return null;
       var left = Math.max(0, Number(s.left) || 0);
-      var cls = 'nt-desk-chip nt-desk-steps' + (left <= s.limit * 0.1 ? ' nt-desk-steps-low' : '');
+      // own class: theme.js/theme.css use .nt-desk-steps for Notion's 'N Schritte' pill (it cut this chip off)
+      var cls = 'nt-desk-chip nt-desk-ailimit' + (left <= s.limit * 0.1 ? ' nt-desk-ailimit-low' : '');
+      var at = new Date();
+      var hhmm = ('0' + at.getHours()).slice(-2) + ':' + ('0' + at.getMinutes()).slice(-2) + ':' + ('0' + at.getSeconds()).slice(-2);
       return el('span', { cls: cls, 'data-nt-desk': 'steps-chip',
-        text: 'AI steps left: ' + left + '/' + s.limit,
-        title: 'AI steps used in the last 60 min: ' + (s.used || 0) + ' of ' + s.limit
+        text: left + '/' + s.limit + ' AI left',
+        title: 'Live (updated ' + hhmm + '). AI steps used in the last 60 min: ' + (s.used || 0) + ' of ' + s.limit
           + '. Last 15 min: ' + (s.steps_15m || 0) + ' of ' + (s.limit_15m || 1000) + ' steps.'
           + (s.level === 'pause' ? ' All chats are paused now.' : '') });
     }
