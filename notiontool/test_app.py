@@ -1,16 +1,32 @@
 """Test app for Coworkers (B40): a second, isolated NotionTool started from the current source code.
 
-It runs hidden with its own empty data folder (work/test-app-data, wiped on every start) and its own
+It runs hidden with its own data folder (work/test-app-data, wiped on every fresh start) and its own
 port (default 8791), with NOTIONTOOL_TEST_INSTANCE=1 so server.launch starts only the local API: no Notion
-window, no accounts, no gateway, no updater, no watches. A fix is proven when the test app boots from the
-changed code and serves HTTP without startup errors. The real app is never touched.
+window, no gateway, no updater, no backups. The real app is never touched.
+
+start() also sets NOTIONTOOL_FAKE_NOTION=1: server.launch then installs the simulated Notion
+(fake_notion.py, state file <test-app-data>/fake_notion.json), seeds the simulated accounts and chats into
+the store (boot_fake_notion) and runs the real loops that need Notion data (turn watch, main wake,
+coworker upkeep). start(fake=False) gives the plain test instance exactly as before.
+
+scenario(name) proves one behaviour end to end in the test app and returns verdict passed/failed with
+the events it saw: restart_cut, too_large, deleted_chat, wake.
 """
-import json, os, shutil, socket, sqlite3, subprocess, sys, time, urllib.error, urllib.request
+import json, os, shutil, socket, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request
 from pathlib import Path
 
 DEFAULT_PORT = 8791
 BOOT_SECONDS = 60
 CREATE_NO_WINDOW = 0x08000000
+FAKE_ENV = 'NOTIONTOOL_FAKE_NOTION'
+FAKE_READY_EVENT = 'fake_notion_ready'
+SCENARIOS = ('restart_cut', 'too_large', 'deleted_chat', 'wake')
+# Upper bounds per scenario after the restart (turn watch checks every 30 s, grace 150 s for the cut).
+SCENARIO_SECONDS = dict(restart_cut=150, too_large=110, deleted_chat=90, wake=90)
+KIND_PURPOSE = {'main': 'main', 'coworker': 'worker', 'private': 'private'}
+EVENT_FIELDS = ('message', 'thread_id', 'worker_id', 'account_id', 'run_id', 'run_ids', 'state', 'chat_id',
+                'operation_id', 'reason', 'error', 'task_id', 'name', 'source')
+WATCH_KINDS = ('circuit_open', 'turn_watch_waiting', 'chat_pool_error', 'crash', 'exception')
 
 
 def _root():
@@ -64,9 +80,10 @@ def _alive(pid):
     if not pid:
         return False
     if os.name == 'nt':
-        out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % pid, '/NH'], capture_output=True, text=True,
-                             creationflags=CREATE_NO_WINDOW).stdout
-        return str(pid) in out
+        out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % pid, '/NH'], capture_output=True,
+                             creationflags=CREATE_NO_WINDOW).stdout or b''
+        # tasklist prints in the OEM code page (umlauts broke the text decoding): compare bytes.
+        return str(pid).encode('ascii') in out
     try:
         os.kill(pid, 0)
         return True
@@ -119,6 +136,9 @@ def stop(root=None):
                            creationflags=CREATE_NO_WINDOW)
         else:
             os.kill(pid, 15)
+        began = time.time()
+        while _alive(pid) and time.time() - began < 10:  # release the database before it is reused
+            time.sleep(0.3)
     try:
         Path(info).unlink()
     except OSError:
@@ -126,26 +146,34 @@ def stop(root=None):
     return {'stopped': True, 'pid': pid}
 
 
-def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS):
+def start(root=None, port=DEFAULT_PORT, boot_seconds=BOOT_SECONDS, fresh=True, fake=True):
+    """Start the test app. fresh=False keeps the data folder (a restart); fake=False is the plain test app."""
     root, data, info, log = _paths(root)
     stop(root)
-    shutil.rmtree(data, ignore_errors=True)
+    if fresh:
+        shutil.rmtree(data, ignore_errors=True)
     data.mkdir(parents=True, exist_ok=True)
     port = _free(int(port or DEFAULT_PORT))
     env = dict(os.environ, NOTIONTOOL_TEST_INSTANCE='1', PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1')
-    with open(log, 'w', encoding='utf-8') as out:
+    env.pop('NOTIONTOOL_FAKE_STATE', None)  # the simulated state always lives in the test data folder
+    if fake:
+        env[FAKE_ENV] = '1'
+    else:
+        env.pop(FAKE_ENV, None)
+    began = time.time()
+    with open(log, 'w' if fresh else 'a', encoding='utf-8') as out:
         proc = subprocess.Popen([python_exe(), str(root / 'main.py'), '--serve', '--data-dir', str(data),
                                  '--port', str(port)], cwd=str(root), env=env, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW if os.name == 'nt' else 0)
-    Path(info).write_text(json.dumps({'pid': proc.pid, 'port': port, 'started': time.time()}), encoding='utf-8')
-    began = time.time()
+    Path(info).write_text(json.dumps({'pid': proc.pid, 'port': port, 'started': began, 'fake': bool(fake)}),
+                          encoding='utf-8')
     while time.time() - began < boot_seconds:
         if proc.poll() is not None:
             return {'ok': False, 'reason': 'The test app exited while starting (code %s)' % proc.returncode,
                     'port': port, 'log_tail': _tail(log)}
-        if _serving(port):
+        if _serving(port) and (not fake or _events(data, began - 1, (FAKE_READY_EVENT,))):
             return {'ok': True, 'pid': proc.pid, 'port': port, 'boot_seconds': round(time.time() - began, 1),
-                    'url': 'http://127.0.0.1:%d/' % port}
+                    'url': 'http://127.0.0.1:%d/' % port, 'fake_notion': bool(fake)}
         time.sleep(0.5)
     return {'ok': False, 'reason': 'The test app did not answer within %d s' % boot_seconds, 'pid': proc.pid,
             'port': port, 'log_tail': _tail(log)}
@@ -157,7 +185,7 @@ def status(root=None):
     pid, port = st.get('pid'), st.get('port')
     running = bool(pid and _alive(pid))
     return {'running': running, 'serving': bool(running and port and _serving(port)), 'pid': pid, 'port': port,
-            'startup_errors': startup_errors(data), 'log_tail': _tail(log, 10)}
+            'fake_notion': bool(st.get('fake')), 'startup_errors': startup_errors(data), 'log_tail': _tail(log, 10)}
 
 
 def check(root=None, port=DEFAULT_PORT, settle_seconds=8, keep=False):
@@ -184,6 +212,336 @@ def check(root=None, port=DEFAULT_PORT, settle_seconds=8, keep=False):
             'log_tail': '' if passed else tail, 'kept_running': bool(keep)}
 
 
+# --- simulated Notion inside the test app (called by server.launch in fake mode) ---------------------
+
+def seed_fake_store(store, adapter, state):
+    """Accounts, chat workers and the Main chat record for the simulated Notion; idempotent across restarts."""
+    from .fake_notion import ACCOUNTS
+    now = time.time()
+    added = 0
+    for slot, (key, email, _name, _space, _ai) in enumerate(ACCOUNTS, 1):
+        if store.get('accounts', key) is None:
+            client = adapter.client(key)
+            info = client.identity()
+            access = adapter.workspace_ai_access(info)
+            ready = access.get('state') == 'enabled'
+            store.put('accounts', dict(id=key, slot=slot, email=email, label='Slot %d' % slot,
+                                       state='ready' if ready else 'ai_disabled', identity=info, ai_access=access,
+                                       model=client.model() if ready else '', bridge_connected=False,
+                                       cooldown_until=0, simulated=True))
+            added += 1
+        for thread in state.threads_of(key):
+            wid = key + ':' + thread['id']
+            purpose = KIND_PURPOSE.get(thread['kind'], 'private')
+            if store.get('workers', wid) is None:
+                store.put('workers', dict(id=wid, account_id=key, thread_id=thread['id'], purpose=purpose,
+                                          enabled=purpose in ('main', 'worker'), state='ready', lease='',
+                                          last_used=0, label=thread['title'], welcome=purpose in ('main', 'worker'),
+                                          simulated=True))
+            chat_id = 'c_fake_' + key
+            if purpose == 'main' and store.get('chats', chat_id) is None:
+                store.put('chats', dict(id=chat_id, title=thread['title'], main_worker=wid, account_id=key,
+                                        folder_id='', project_path='', created=now, main_number=1,
+                                        state='active', predecessor=''))
+    store.raise_counter('main', 1)
+    settings = store.get('settings', 'app', {}) or {}
+    if 'harness_account_id' not in settings:
+        store.put('settings', dict(settings, id='app', harness_account_id='ready', coworker_target=3))
+    return added
+
+
+def boot_fake_notion(app):
+    """Fake mode of the test app: simulated Notion, seeded store and the real Notion-data loops."""
+    from . import fake_notion
+    from .coworker_upkeep import CoworkerUpkeep
+    from .main_wake import MainWake
+    state = fake_notion.install(app.adapter)
+    app.fake_notion = state
+    added = seed_fake_store(app.store, app.adapter, state)
+    threading.Thread(target=app.turn_watch.loop, daemon=True, name='turn-watch').start()
+    app.coworker_upkeep = CoworkerUpkeep(app.store, app.adapter, app.engine)
+    threading.Thread(target=app.coworker_upkeep.loop, daemon=True, name='coworker-upkeep').start()
+    app.main_wake = MainWake(app.store, app.adapter, app.engine)
+    threading.Thread(target=app.main_wake.loop, daemon=True, name='main-wake').start()
+    app.store.event(FAKE_READY_EVENT, message='Simulated Notion installed (%d accounts seeded now, %d workers)'
+                    % (added, len(app.store.all('workers'))), source=str(state.path))
+    return state
+
+
+# --- scenarios ---------------------------------------------------------------------------------------
+
+def _events(data, since=0.0, kinds=None):
+    db = Path(data) / 'notiontool.db'
+    if not db.is_file():
+        return []
+    try:
+        con = sqlite3.connect(str(db), timeout=5)
+        try:
+            rows = con.execute('SELECT seq, ts, kind, doc FROM events WHERE ts>=? ORDER BY seq',
+                               (float(since),)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+    out = []
+    for seq, ts, kind, doc in rows:
+        if kinds and kind not in kinds:
+            continue
+        try:
+            fields = json.loads(doc)
+        except ValueError:
+            fields = {}
+        item = dict(seq=seq, at=round(ts, 1), kind=kind)
+        for name in EVENT_FIELDS:
+            value = fields.get(name)
+            if value not in (None, '', [], {}):
+                item[name] = value[:200] if isinstance(value, str) else value
+        out.append(item)
+    return out
+
+
+def _object(data, kind, ident):
+    try:
+        con = sqlite3.connect(str(Path(data) / 'notiontool.db'), timeout=5)
+        try:
+            row = con.execute('SELECT doc FROM objects WHERE kind=? AND id=?', (kind, str(ident))).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return json.loads(row[0]) if row else None
+
+
+def _wait(probe, seconds, interval=2.0):
+    deadline = time.time() + seconds
+    while True:
+        value = probe()
+        if value or time.time() >= deadline:
+            return value
+        time.sleep(interval)
+
+
+def _text(entry):
+    content = entry.get('content')
+    if isinstance(content, list):
+        return ''.join(str(c.get('content', '')) for c in content if isinstance(c, dict))
+    return str(content or entry.get('text') or '')
+
+
+def _entries_since(fs, thread_id, since):
+    thread = fs.thread(thread_id) or {}
+    return [e for e in thread.get('entries', []) if int(e.get('created_at') or 0) >= int(since * 1000)]
+
+
+def _answered(fs, thread_id, since, needle):
+    """The user message containing needle that the app sent after since, if a reply followed it."""
+    entries = _entries_since(fs, thread_id, since)
+    for index, entry in enumerate(entries):
+        if entry.get('kind') == 'user_message' and needle in _text(entry):
+            if any(e.get('kind') == 'assistant_message' for e in entries[index + 1:]):
+                return _text(entry)[:160]
+    return None
+
+
+def _api_key(data):
+    from .vendor.sessions import SessionStore
+    return (SessionStore(data_dir=str(Path(data) / 'sessions')).load_identity('host_api') or {}).get('key', '')
+
+
+def _post(port, key, path, body, timeout=60):
+    request = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path), data=json.dumps(body).encode('utf-8'),
+                                     method='POST', headers={'Authorization': 'Bearer ' + key,
+                                                             'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read() or b'{}')
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read() or b'{}')
+        except ValueError:
+            return exc.code, {}
+
+
+def _restart(root, port):
+    return start(root, port, fresh=False)
+
+
+def _result(passed, reasons, events, **details):
+    return dict(passed=bool(passed), reasons=[] if passed else reasons, events=events, details=details)
+
+
+def _sc_restart_cut(root, port, data, fs):
+    """Main stopped after a tool result (no reply); after a restart the turn watch sends the continue."""
+    from .fake_notion import _entity, fake_uuid
+    main = fs.threads_of('ready', 'main')[0]['id']
+    stop(root)
+    now = time.time()
+    step = fake_uuid('scenario', 'restart_cut', now)
+    with fs.edit() as d:
+        thread = d['threads'][main]
+        thread['sequence'] += 1
+        thread['entries'].append(_entity('user_message', step, thread['sequence'], now - 170,
+                                         'Scenario restart_cut: run the build and report', client_message_id=step))
+        thread['sequence'] += 1
+        thread['entries'].append(dict(kind='tool_result', id=fake_uuid('scenario', 'tool', now),
+                                      sequence=thread['sequence'], created_at=int((now - 165) * 1000),
+                                      tool_use_id='toolu_scenario_restart_cut', result={'ok': True}))
+        thread['session_status'] = 'idle'
+        thread['latest_user_or_trigger_time'] = int((now - 170) * 1000)
+    restarted = _restart(root, port)
+    if not restarted.get('ok'):
+        return _result(False, ['restart failed: ' + restarted.get('reason', '')], [])
+    kinds = ('turn_interrupted', 'turn_stalled', 'turn_restart_continue', 'turn_restart_cut')
+    wid = 'ready:' + main
+
+    def probe():
+        seen = [e for e in _events(data, now, kinds) if e.get('thread_id') == main or e.get('worker_id') == wid]
+        sent = _answered(fs, main, now, 'Continue') or _answered(fs, main, now, 'Weiter')
+        return (seen, sent) if seen and sent else None
+    found = _wait(probe, SCENARIO_SECONDS['restart_cut'])
+    events = _events(data, now, kinds + WATCH_KINDS)
+    if not found:
+        return _result(False, ['no automatic continue reached the interrupted Main within %d s'
+                               % SCENARIO_SECONDS['restart_cut']], events)
+    return _result(True, [], events, continue_message=found[1], main_thread=main)
+
+
+def _sc_too_large(root, port, data, fs):
+    """A Coworker transcript over the size limit is read with the smaller limit; no skip, no circuit_open."""
+    cowork = fs.threads_of('ready', 'coworker')[0]['id']
+    stop(root)
+    fs.set_fault(cowork, 'too_large', max_limit=10)
+    now = time.time()
+    restarted = _restart(root, port)
+    if not restarted.get('ok'):
+        return _result(False, ['restart failed: ' + restarted.get('reason', '')], [])
+
+    def probe():
+        reads = [c for c in fs.calls('getThreadTranscript') if c.get('thread_id') == cowork and c.get('at', 0) >= now]
+        return reads if len(reads) >= 2 else None
+    reads = _wait(probe, SCENARIO_SECONDS['too_large'])
+    time.sleep(3)  # let the scan finish and write its events
+    # All app events since the restart plus the simulated transcript reads (the evidence for the fallback).
+    events = _events(data, now) + [dict(kind='fake_getThreadTranscript', at=round(c.get('at', 0), 1),
+                                        thread_id=c.get('thread_id')) for c in (reads or [])]
+    skipped = [e for e in events if e['kind'] == 'turn_restart_cut_skipped' and cowork in json.dumps(e)]
+    circuit = [e for e in events if e['kind'] == 'circuit_open']
+    reasons = []
+    if not reads:
+        reasons.append('the test app never retried the too-large Coworker transcript')
+    if skipped:
+        reasons.append('the transcript read failed (turn_restart_cut_skipped)')
+    if circuit:
+        reasons.append('circuit_open event seen')
+    return _result(not reasons, reasons, events, transcript_reads=len(reads or []), coworker_thread=cowork,
+                   note='FakeTransport does not pass through NetworkBudget, so circuit_open cannot fire in fake mode')
+
+
+def _sc_deleted_chat(root, port, data, fs):
+    """A private chat deleted in Notion: a new chat with the same name is accepted right away."""
+    old = next(t for t in fs.threads_of('ready', 'private') if t['title'] == 'Project notes')
+    stop(root)
+    now = time.time()
+    with fs.edit() as d:
+        d['threads'][old['id']].update(alive=False, deleted_at=now)
+    restarted = _restart(root, port)
+    if not restarted.get('ok'):
+        return _result(False, ['restart failed: ' + restarted.get('reason', '')], [])
+    request_id = 'scenario-deleted-chat-%d' % int(now * 1000)
+    code, answer = _post(restarted['port'], _api_key(data), '/api/app/chat/create',
+                         dict(name='Project notes', main=False, request_id=request_id, account_id='ready'))
+    ledger_id = str(answer.get('id') or 'appchat:' + request_id)
+
+    def probe():
+        ledger = _object(data, 'app_chats', ledger_id) or {}
+        return ledger if ledger.get('state') in ('done', 'failed') else None
+    ledger = (_wait(probe, SCENARIO_SECONDS['deleted_chat']) if code == 200 else None) or \
+        _object(data, 'app_chats', ledger_id) or {}
+    events = _events(data, now, ('app_chat_created', 'app_chat_name_refresh_skipped', 'operation') + WATCH_KINDS)
+    old_worker = _object(data, 'workers', 'ready:' + old['id']) or {}
+    created = [t for t in fs.threads_of('ready') if t['id'] != old['id'] and t['title'] == 'Project notes'
+               and t.get('alive', True)]
+    reasons = []
+    if code != 200 or answer.get('error'):
+        reasons.append('create refused (HTTP %s): %s' % (code, str(answer.get('error', ''))[:200]))
+    if ledger.get('state') != 'done':
+        reasons.append('chat creation ended in state %r: %s' % (ledger.get('state'), str(ledger.get('error', ''))[:200]))
+    if not created:
+        reasons.append('no new alive chat named Project notes in the simulated Notion')
+    return _result(not reasons, reasons, events, http_status=code, ledger_state=ledger.get('state'),
+                   old_worker_state=old_worker.get('state'), new_thread=(created[0]['id'] if created else ''))
+
+
+def _sc_wake(root, port, data, fs):
+    """A finished operator run: Main gets the cowork-finished message once."""
+    from .store import Store
+    try:
+        from .main_wake import WAKE_HEAD
+    except ImportError:
+        WAKE_HEAD = 'Cowork run finished'
+    main = fs.threads_of('ready', 'main')[0]['id']
+    cowork = fs.threads_of('ready', 'coworker')[0]['id']
+    stop(root)
+    now = time.time()
+    run_id = 'run_scenario_wake'
+    store = Store(data)
+    try:
+        store.batch([('runs', dict(id=run_id, operator=True, state='done', created=now - 120, updated=now,
+                                   title='Scenario wake', summary='Simulated cowork run finished', error='',
+                                   account_id='ready', main_worker='ready:' + main)),
+                     ('tasks', dict(id='task_scenario_wake', run_id=run_id, state='done', title='Simulated part',
+                                    worker_id='ready:' + cowork, updated=now))])
+    finally:
+        store.close()
+    restarted = _restart(root, port)
+    if not restarted.get('ok'):
+        return _result(False, ['restart failed: ' + restarted.get('reason', '')], [])
+    needle = str(WAKE_HEAD).split(':')[-1].strip()[:40] or 'Cowork run finished'
+
+    def probe():
+        sent = [e for e in _events(data, now, ('main_wake_sent',))]
+        reply = _answered(fs, main, now, needle)
+        return (sent, reply) if sent and reply else None
+    found = _wait(probe, SCENARIO_SECONDS['wake'])
+    events = _events(data, now, ('main_wake_sent', 'main_wake_wait_busy', 'main_wake_failed') + WATCH_KINDS)
+    if not found:
+        return _result(False, ['Main did not get the cowork-finished message within %d s'
+                               % SCENARIO_SECONDS['wake']], events)
+    return _result(True, [], events, wake_message=found[1], main_thread=main)
+
+
+SCENARIO_FUNCS = dict(restart_cut=_sc_restart_cut, too_large=_sc_too_large, deleted_chat=_sc_deleted_chat,
+                      wake=_sc_wake)
+
+
+def scenario(name, root=None, port=DEFAULT_PORT, keep=False):
+    """Run one scenario in a fresh fake-mode test app; returns {'scenario', 'verdict', 'events', 'reasons', ...}."""
+    name = str(name or '')
+    if name not in SCENARIOS:
+        raise ValueError('scenario name must be one of: ' + ', '.join(SCENARIOS))
+    from .fake_notion import FakeState
+    root, data, _, log = _paths(root)
+    began = time.time()
+    first = start(root, port, fresh=True)
+    if not first.get('ok'):
+        stop(root)
+        return dict(scenario=name, verdict='failed', events=[], reasons=['the test app did not start: '
+                    + str(first.get('reason', ''))], log_tail=first.get('log_tail', ''))
+    fs = FakeState(path=data / 'fake_notion.json')
+    try:
+        outcome = SCENARIO_FUNCS[name](root, first['port'], data, fs)
+    except Exception as exc:
+        outcome = _result(False, ['%s: %s' % (type(exc).__name__, exc)], _events(data, began, WATCH_KINDS))
+    tail = _tail(log)
+    if 'Traceback (most recent call last)' in tail and outcome['passed']:
+        outcome = dict(outcome, passed=False, reasons=['traceback in the test app log'])
+    if not keep:
+        stop(root)
+    return dict(scenario=name, verdict='passed' if outcome['passed'] else 'failed', events=outcome['events'],
+                reasons=outcome['reasons'], details=outcome['details'], seconds=round(time.time() - began, 1),
+                log_tail='' if outcome['passed'] else tail, kept_running=bool(keep))
+
+
 def run(action='check', **kw):
     action = str(action or 'check')
     if action == 'start':
@@ -194,4 +552,6 @@ def run(action='check', **kw):
         return status()
     if action == 'check':
         return check(port=kw.get('port') or DEFAULT_PORT, keep=bool(kw.get('keep')))
-    raise ValueError('action must be start, status, stop or check')
+    if action == 'scenario':
+        return scenario(kw.get('name'), port=kw.get('port') or DEFAULT_PORT, keep=bool(kw.get('keep')))
+    raise ValueError('action must be start, status, stop, check or scenario')
