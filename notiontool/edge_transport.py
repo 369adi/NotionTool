@@ -27,6 +27,12 @@ class EdgeTransport:
         self.woken_at = 0.0
         self.wake_logged_at = 0.0
         self.stall_wake_after = 8.0
+        # Responsiveness checks of the tab (see tab_frozen): limit per evaluation, short retry between the
+        # two checks, one shared time budget for both, and an own 60 s log timer for edge_tab_probe.
+        self.probe_timeout = 2.5
+        self.probe_retry_s = 0.5
+        self.probe_budget_s = 5.8
+        self.probe_logged_at = float('-inf')
         # Shared stream poller: one DevTools call per tick for all active streams instead of one per stream.
         self._watch_cv = threading.Condition()
         self._watched = {}
@@ -93,7 +99,84 @@ class EdgeTransport:
     def retry_after(self):
         return getattr(self.local, 'retry_after', 30)
 
-    def wake(self, target, force=False, reason='periodic'):
+    # One page task that answers through the tab's task queue. A MessageChannel message is not delayed by
+    # background timer throttling (a lone setTimeout is), but it does not run while the page is frozen.
+    # Whichever fires first resolves the promise.
+    PROBE_SCRIPT = ('new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(1); '
+                    'c.port2.postMessage(0); setTimeout(() => r(1), 0); })')
+
+    # Plain evaluation: answered by DevTools without a page task, so it separates a slow or broken
+    # DevTools link from a page whose task queue does not run.
+    PLAIN_SCRIPT = '1'
+
+    @staticmethod
+    def _timed_out(exc):
+        if isinstance(exc, TimeoutError):
+            return True
+        return 'timeout' in type(exc).__name__.lower() or 'timed out' in str(exc).lower()
+
+    def tab_check(self, target, deadline):
+        """One responsiveness check: 'active', 'miss', 'busy' or 'unreachable'.
+
+        Plain evaluation times out -> busy; fails with a connection or DevTools error -> unreachable;
+        answers but the message-channel task does not -> miss; both answer -> active.
+        """
+        def limit():
+            return max(0.1, min(self.probe_timeout, deadline - time.monotonic()))
+        try:
+            self.browser.evaluate(target, self.PLAIN_SCRIPT, limit())
+        except Exception as exc:
+            return 'busy' if self._timed_out(exc) else 'unreachable'
+        if deadline - time.monotonic() <= 0:
+            return 'busy'
+        try:
+            self.browser.evaluate(target, self.PROBE_SCRIPT, limit())
+        except Exception:
+            return 'miss'
+        return 'active'
+
+    def tab_frozen(self, target, cancel=None):
+        """Verdict of up to two checks a short retry apart; 'frozen' only after two misses in a row.
+
+        Returns 'active', 'busy', 'unreachable', 'miss' (one unconfirmed miss) or 'frozen'. Both checks
+        share one time budget (probe_budget_s); a set cancel flag skips the retry and the second check.
+        The old single 2 s setTimeout check failed on healthy tabs that were only busy draining a long
+        stream or throttled in the background.
+        """
+        deadline = time.monotonic() + self.probe_budget_s
+        first = self.tab_check(target, deadline)
+        if first == 'active' or (cancel is not None and cancel.is_set()):
+            return first
+        pause = min(self.probe_retry_s, max(0.0, deadline - time.monotonic()))
+        waiter = getattr(cancel, 'wait', None)
+        if waiter is not None:
+            if waiter(pause):
+                return first
+        else:
+            time.sleep(pause)
+        if deadline - time.monotonic() <= 0.1:
+            return first
+        second = self.tab_check(target, deadline)
+        if second == 'miss':
+            return 'frozen' if first == 'miss' else first
+        return second
+
+    def _log_probe(self, verdict, reason, started):
+        # Busy or unreachable after a forced wake: visible in the log, but never reported as frozen.
+        now = time.monotonic()
+        if now - self.probe_logged_at < 60:
+            return
+        self.probe_logged_at = now
+        event = getattr(self.store, 'event', None)
+        if event is None:
+            return
+        try:
+            event('edge_tab_probe', account_id=self.account_id, verdict=verdict, reason=str(reason)[:80],
+                  elapsed_ms=int((now - started) * 1000))
+        except Exception:
+            pass
+
+    def wake(self, target, force=False, reason='periodic', cancel=None):
         # Phase 4 Fix K: keep the hidden transport tab out of Edge's frozen lifecycle state.
         # A frozen tab still answers DevTools evaluations, but its fetch readers and timers stop:
         # a Notion stream that already ended is never read to its end and the task waits until
@@ -105,11 +188,13 @@ class EdgeTransport:
         self.woken_at = now
         frozen = None
         if force:
-            try:
-                self.browser.evaluate(target, 'new Promise(r => setTimeout(() => r(1), 0))', 2)
-                frozen = False
-            except Exception:
-                frozen = True
+            # A stalled stream is often only a long model think or a busy/background tab: 'frozen' only
+            # after two checks a short retry apart both missed while the plain evaluation answered.
+            started = time.monotonic()
+            verdict = self.tab_frozen(target, cancel)
+            frozen = verdict == 'frozen'
+            if verdict in ('busy', 'unreachable'):
+                self._log_probe(verdict, reason, started)
         try:
             wake = getattr(self.browser, 'wake', None)
             if wake is not None:
@@ -304,7 +389,7 @@ class EdgeTransport:
                     result = inbox.get(timeout=1.0)
                 except queue.Empty:
                     if time.monotonic() - progress_at > self.stall_wake_after:
-                        self.wake(target, force=True, reason='stalled ' + path)
+                        self.wake(target, force=True, reason='stalled ' + path, cancel=cancel)
                         progress_at = time.monotonic()
                     continue
                 if isinstance(result, dict) and result.get('_poll_error'):
@@ -335,7 +420,7 @@ class EdgeTransport:
                     progress_at, last_seen = time.monotonic(), seen_now
                 elif time.monotonic() - progress_at > self.stall_wake_after:
                     # Phase 4 Fix K: no new bytes for a while; a frozen tab would hold them back.
-                    self.wake(target, force=True, reason='stalled ' + path)
+                    self.wake(target, force=True, reason='stalled ' + path, cancel=cancel)
                     progress_at = time.monotonic()
                 if result.get('text'):
                     yield result['text']

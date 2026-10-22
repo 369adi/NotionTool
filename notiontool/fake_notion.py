@@ -35,7 +35,8 @@ clear_fault(target, name=None) removes one or all:
   hang           {'seconds': S}      the send commits the user step, then only keep-alive lines until
                                      cancel is set or min(timeout, S) passes (then TimeoutError)
   interrupted    {'cut': True}       the reply stops mid-answer without the final line; the stream is
-                                     cut (OSError) unless cut is False
+                                     cut (OSError) unless cut is False. The chat stays 'running' with no
+                                     completion time (no turn_completed, no completed_time)
   missing        {}                  HTTP 404 on transcript/send, not listed, record alive=False
   deleted_delay  {'seconds': K}      already deleted (404, alive=False) but still listed for K seconds
                                      after deleted_at
@@ -46,8 +47,9 @@ clear_fault(target, name=None) removes one or all:
   busy           {}                  another turn is running: transcript session 'running' + session_pending,
                                      record latest_user_or_trigger_time > completed_time; a send is refused
                                      with NotionHttpError(409) and commits nothing
-  empty_stream   {}                  empty_stream_committed: the stream ends after patch-start with no text,
-                                     but Notion commits the user step, the full reply and turn_completed
+  empty_stream   {}                  empty_stream_committed: Notion saves the user step, the full reply and
+                                     turn_completed, then the stream fails with OSError before the first
+                                     patch-start line (empty stream: outcome unknown, the adapter reconciles)
   lost_stream    {}                  cut_stream_lost: the stream is cut (OSError) before Notion committed
                                      anything; the transcript does not contain the step
   error_step     {'message': T}      the stream yields an 'error' step; the transcript gets an agent_error
@@ -703,6 +705,8 @@ class FakeTransport:
                 thread['sequence'] += 1
                 thread['entries'].append(_entity('turn_completed', fake_uuid('done', tid, thread['sequence']),
                                                  thread['sequence'], now))
+            if not completed:
+                return  # an interrupted turn: Notion keeps the session 'running' and sets no completed_time
             thread['session_status'] = 'idle'
             thread['completed_time'] = max(_ms(now), int(thread.get('latest_user_or_trigger_time') or 0))
 
@@ -730,6 +734,11 @@ class FakeTransport:
         tid = thread['id']
         answer = answer_for(thread['title'], prompt, turn)
         inference = fake_uuid('inference', tid, thread['sequence'])
+        if 'empty_stream' in faults:
+            # Notion commits the user step, the full reply and turn_completed, but the stream dies before the
+            # first patch-start line: the adapter sees an empty stream (unknown / REMOTE_UNKNOWN) and reconciles.
+            self._commit_reply(tid, answer, completed=True)
+            raise OSError('fake empty stream')
         yield json.dumps({'type': 'patch-start', 'data': {'s': [{'id': inference, 'type': 'agent-inference', 'value': []}]}})
 
         def chunk(text):
@@ -754,9 +763,6 @@ class FakeTransport:
             self._commit_reply(tid, ''.join(partial).rstrip('\n'), completed=False)
             if params.get('cut', True):
                 raise OSError('fake: stream interrupted mid-answer')
-            return
-        if 'empty_stream' in faults:
-            self._commit_reply(tid, answer, completed=True)  # committed, but nothing came over the stream
             return
         if 'error_step' in faults:
             text = str(_param(faults, 'error_step').get('message') or ERROR_STEP_TEXT)

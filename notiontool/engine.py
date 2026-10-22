@@ -770,22 +770,61 @@ class Engine:
             self.store.event('stage_changed', run_id, message='done')
             return dict(id=run_id, state='done', confirmed_at=now)
 
+    def _unsent_proof(self, task_id):
+        """Notion's own thread record proves that our prompt never arrived. Live 22 Oct 2026 (task te4de127): the
+        thread's latest user/trigger turn was hours older than our send and that turn had completed, so nothing
+        of ours ran, but remote_done_at stayed 0 and the task blocked every restart.
+
+        Proof = latest_user_ms < (sent_at - 60) * 1000 and completed_ms >= latest_user_ms (and latest_user_ms > 0).
+        Thread: the task's thread_id, else the worker's; account: the worker's. This is a network read, so the
+        caller runs it before taking self.lock. A missing task/worker/thread/send time, a missing adapter method or
+        any read error returns None, which keeps the old refusal."""
+        task = self.store.get('tasks', task_id)
+        if not task or task.get('remote_done_at'):
+            return None
+        sent = float(task.get('sent_at') or 0)
+        worker = (self.store.get('workers', task['worker_id']) if task.get('worker_id') else None) or {}
+        thread_id = task.get('thread_id') or worker.get('thread_id') or ''
+        account_id = worker.get('account_id') or ''
+        outcome = getattr(self.adapter, 'turn_outcome', None)
+        client = getattr(self.adapter, 'client', None)
+        if sent <= 0 or not thread_id or not account_id or not callable(outcome) or not callable(client):
+            return None
+        try:
+            latest, completed, status = outcome(client(account_id), thread_id)
+            latest, completed = float(latest or 0), float(completed or 0)
+        except Exception as exc:
+            self.store.event('unsent_proof_failed', task.get('run_id', ''), task_id=task_id,
+                             message=(type(exc).__name__ + ': ' + str(exc))[:200])
+            return None
+        if not (0 < latest < (sent - 60) * 1000 and completed >= latest):
+            return None
+        return dict(thread_id=thread_id, sent_at=sent, latest_user_ms=latest, completed_ms=completed,
+                    status=str(status or ''))
+
     def resolve_uncertain(self, task_id, resolution, note=''):
         """The Main decides a task whose Notion turn finished but whose answer never reached the harness.
 
         Nothing is sent again (I5). 'accept': the Main checked the work directly and takes it as the result
         (RESULT: DONE). 'abandon': the task ends as failed, so its run stops for the Main. Either way the
-        reserved thread is released and the task no longer holds its files."""
+        reserved thread is released and the task no longer holds its files. 'accept' always needs Notion's
+        confirmation (remote_done_at); 'abandon' also works without it when Notion's thread record proves the
+        prompt never arrived (_unsent_proof, read before the lock)."""
         if resolution not in ('accept', 'abandon'):
             raise ValueError("resolution must be 'accept' or 'abandon'")
+        proof = self._unsent_proof(task_id) if resolution == 'abandon' else None
         with self.lock:
             task = self.store.get('tasks', task_id)
             if not task:
                 raise ValueError('Task not found')
             if task.get('state') != 'uncertain' and not task.get('remote_unknown'):
                 raise ValueError('Only an unconfirmed task can be resolved by the Main (state: %s)' % task.get('state', ''))
+            unsent = None
             if not task.get('remote_done_at'):
-                raise ValueError('Notion has not confirmed that the turn finished; wait for it or stop the turn first')
+                # Only 'abandon' may skip the confirmation, and only with Notion's proof for this very send.
+                if not proof or float(task.get('sent_at') or 0) != proof['sent_at']:
+                    raise ValueError('Notion has not confirmed that the turn finished; wait for it or stop the turn first')
+                unsent = proof
             if any(info.get('task_id') == task_id for info in self.inflight.values()):
                 raise ValueError('A reconciliation check is running for this task; try again in a few seconds')
             note = ' '.join(str(note or '').split())[:2000]
@@ -801,15 +840,25 @@ class Engine:
                     summary += ' ' + note
                 task.update(state='done', requires_review=False, error='',
                             result=json.dumps(dict(status='done', summary=summary + '\nRESULT: DONE'), ensure_ascii=False))
+            elif unsent:
+                why = ('Notion proves the prompt never arrived: thread %s has its latest user turn at %d ms, more than '
+                       '60 s before the send at %d s, and that turn completed at %d ms (status %s)'
+                       % (unsent['thread_id'], unsent['latest_user_ms'], unsent['sent_at'], unsent['completed_ms'],
+                          unsent['status'] or '-'))
+                task.update(state='failed', unsent_proof=unsent,
+                            error=('Abandoned by the Main; %s; nothing was resent. %s' % (why, note)).strip()[:600])
             else:
                 task.update(state='failed',
                             error=('Abandoned by the Main after reconciliation; nothing was resent. ' + note).strip()[:400])
             task.update(main_resolution=resolution, resolved_at=now, finished=now)
             self.store.put('tasks', task)
+            extra = dict(proof=unsent) if unsent else {}
             self.store.event('task_resolved_by_main', task['run_id'], task_id=task_id, worker_id=task.get('worker_id', ''),
                              resolution=resolution,
-                             message='The Main %s the unconfirmed task without resending it'
-                                     % ('accepted' if resolution == 'accept' else 'abandoned'))
+                             message='The Main %s the unconfirmed task without resending it%s'
+                                     % ('accepted' if resolution == 'accept' else 'abandoned',
+                                        ' (Notion proves the prompt never arrived)' if unsent else ''),
+                             **extra)
             return dict(id=task_id, state=task['state'], resolution=resolution)
 
     def coordination(self):

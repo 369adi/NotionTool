@@ -201,6 +201,9 @@ class FaultTests(FakeNotionTestCase):
         self.assertTrue(result['text'])
         self.assertNotIn('RESULT: DONE', result['text'])
         self.assertFalse(any(e['kind'] == 'turn_completed' for e in result['own_turn']))
+        # The turn was never completed: the session stays running, as in the real Notion.
+        self.assertEqual(client.transcript(worker)['session']['status'], 'running')
+        self.assertEqual(session_state(client.transcript(worker)), 'running')
         self.state.set_fault(worker, 'interrupted', cut=False)
         text, _ = client.send(worker, 'stop halfway again')
         self.assertTrue(text)
@@ -381,11 +384,14 @@ class AddedFaultTests(FakeNotionTestCase):
         client = signed_in(self.state)
         worker = tid(self.state, 'coworker')
         self.state.set_fault(worker, 'empty_stream')
-        text, step = client.send(worker, 'answer silently')
-        self.assertEqual(text, '')
-        result = client.wait(worker, step)
+        with self.assertRaises(OSError) as err:  # the stream dies before the first patch-start line
+            client.send(worker, 'answer silently', step_id='step-empty')
+        self.assertNotIsInstance(err.exception, NotionHttpError)
+        self.assertIn('empty stream', str(err.exception))
+        result = client.wait(worker, 'step-empty')
         self.assertEqual(result['state'], 'done_reply')  # committed although the stream was empty
         self.assertTrue(result['text'].endswith('RESULT: DONE'))
+        self.assertEqual(session_state(client.transcript(worker)), 'finished')
 
     def test_fault_lost_stream(self):
         client = signed_in(self.state)

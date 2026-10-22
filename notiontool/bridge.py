@@ -56,6 +56,29 @@ REA_TOOLS = {
 from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled
 READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewer')
 from . import long_calls
+from . import token_budget
+# Hard usage limit (owner rule: ALL chats stop at once, the Main too): while the 6 h token budget
+# is used up, Bridge.limit_gate refuses every tool with a LIMIT_STOP: error, for the Main (no
+# assignment token) and for coworkers (with token). During a burst pause only coworker tools are
+# refused (B42). Only this read-only allow list still works. Every name was checked against the
+# tool specs: OPERATOR_TOOLS entries with readOnlyHint True (devtools RO, SCREEN_OPERATOR_TOOLS),
+# the bridge's own discovery tools, nt_job_result, the screen tools and the coworkers' read-only
+# tools (engine.READ_ONLY_TOOLS: read_file, list_files, context). Not allowed although marked
+# read-only: nt_local_mcp (refresh=true restarts servers) and nt_inference_body (Notion client).
+# Local MCP '*_tools' discovery (readOnlyHint True in tools/list) is allowed by name suffix.
+# The gate sits in _call(), operator_call() and local_call(), before any tool runs. A long job
+# started before the limit keeps running (it is not killed); nt_job_result still reads its result.
+LIMIT_ALLOWED_TOOLS = frozenset((
+    'mcp_servers', 'mcp_list_tools', long_calls.JOB_TOOL,
+    'nt_read_file', 'nt_list_dir', 'nt_search_code', 'nt_file_outline', 'nt_memory_read',
+    'nt_screen_windows', 'nt_screen_capture', 'screen_windows', 'screen_capture',
+    'read_file', 'list_files', 'context',
+))
+# nt_api: every GET is read-only; of the POST routes only stopping work (docs/HOST_API.md:
+# /api/run/cancel {id}, /api/run/pause {id, paused}), which lowers usage.
+LIMIT_ALLOWED_API_POSTS = ('/api/run/cancel', '/api/run/pause')
+LIMIT_EVENT = 'limit_stop_tool_refused'
+LIMIT_EVENT_SECONDS = 60.0  # at most one event per (caller, tool) per minute
 # nt_job_result (long_calls.JOB_TOOL) only reads a finished or running job of the same caller:
 # read-only and allowed for every role. Bridge.rpc answers it before any role check or lock.
 ANY_ROLE_TOOLS = (long_calls.JOB_TOOL,)
@@ -313,6 +336,71 @@ class Bridge:
             raise ValueError('File is outside the configured project folder (enable full PC access in Settings)')
         return path
 
+    # ---- hard usage limit -------------------------------------------------
+    @staticmethod
+    def limit_allowed(name, args):
+        """Read-only allow list at the hard limit (see LIMIT_ALLOWED_TOOLS / LIMIT_ALLOWED_API_POSTS)."""
+        name = str(name or '')
+        if name in LIMIT_ALLOWED_TOOLS:
+            return True
+        if name in TOOL_SERVER and name.endswith('_tools'):
+            return True  # local MCP tool discovery (readOnlyHint True in tools/list)
+        if name == 'nt_api':
+            args = args if isinstance(args, dict) else {}
+            # Same method rule as operator_call: a body without a method means POST.
+            method = str(args.get('method') or ('POST' if args.get('body') is not None else 'GET')).upper()
+            path = str(args.get('path') or '').split('?', 1)[0].split('#', 1)[0]
+            return method == 'GET' or (method == 'POST' and path in LIMIT_ALLOWED_API_POSTS)
+        return False
+
+    def _limit_purpose(self, token):
+        """'worker' for a live assignment token, else 'main' (also when the lookup fails)."""
+        try:
+            return 'worker' if token and self.has_assignment(token) else 'main'
+        except Exception:
+            return 'main'
+
+    def limit_gate(self, name, args, token='', caller=''):
+        """Refuse a tool (LimitStop, text 'LIMIT_STOP: ...') at the hard usage limit.
+
+        The 6 h token budget stops every caller: the Main (no assignment token) and coworkers (with
+        token). A burst pause stops only coworkers (purpose 'worker'). Read-only allow-listed tools
+        always pass. Fail-open: hard_stop_state never raises and returns stop=False (and logs
+        token_budget_failed) when the ledger cannot be read.
+        """
+        if self.store is None or self.limit_allowed(name, args):
+            return
+        purpose = self._limit_purpose(token)
+        now_fn = getattr(self, '_limit_now', None)  # tests only: a fake clock for the window
+        state = token_budget.hard_stop_state(self.store, purpose, now_fn() if now_fn else None)
+        if not state.get('stop'):
+            return
+        wait = int(state.get('wait') or 0)
+        source = str(state.get('source') or '6h')
+        who = caller or ('worker' if purpose == 'worker' else 'main')
+        self._limit_event(name, who, purpose, source, wait, str(state.get('reason') or ''))
+        raise token_budget.LimitStop(token_budget.limit_stop_text(wait, source))
+
+    def _limit_event(self, name, caller, purpose, source, wait, reason):
+        """At most one limit_stop_tool_refused event per (caller, tool) per LIMIT_EVENT_SECONDS."""
+        try:
+            clock = getattr(self, '_limit_clock', None) or time.monotonic
+            key = (str(caller), str(name)[:80])
+            with self.__dict__.setdefault('_limit_lock', threading.Lock()):
+                now = clock()
+                seen = self.__dict__.setdefault('_limit_event_at', {})
+                last = seen.get(key)
+                if last is not None and 0 <= now - last < LIMIT_EVENT_SECONDS:
+                    return
+                if len(seen) > 500:
+                    for old in [k for k, v in seen.items() if not 0 <= now - v < LIMIT_EVENT_SECONDS]:
+                        seen.pop(old, None)
+                seen[key] = now
+            self.store.event(LIMIT_EVENT, tool=key[1], caller=key[0], purpose=purpose, source=source, wait_s=wait,
+                             message=('Tool refused at the hard usage limit: ' + reason)[:300])
+        except Exception:
+            pass
+
     # ---- tools ------------------------------------------------------------
     def _tool_started(self, run_id, task_id='', tool='', message=''):
         """Record a tool start; call() records the matching tool_finished (also on errors and timeouts)."""
@@ -344,6 +432,7 @@ class Bridge:
         return result
 
     def _call(self, name, args, token):
+        self.limit_gate(name, args, token)  # hard usage limit: before any tool runs (Main and coworkers)
         if name in SCREEN_TOOLS and self.screen_access() and not self.has_assignment(token):
             # Read-only screen tools also work in the user's own chats (Main), which have no assignment token.
             return self.screen().call(name, args, role='chat')
@@ -518,6 +607,7 @@ class Bridge:
 
     def local_call(self, name, args):
         """Local MCP tool (Roblox, Blender, REA) for the owner connection, without a worker assignment."""
+        self.limit_gate(name, args)  # hard usage limit: refused for the Main as well
         server = LOCAL_BY_KEY[TOOL_SERVER[name]]
         if not local_enabled(self.store.settings(), server):
             raise ValueError('Switch on '+server['label']+' in MCP servers first')
@@ -745,6 +835,9 @@ class Bridge:
     def operator_call(self, app, name, args):
         import re, urllib.request, urllib.error
         from .harness_account import selected_account
+        # Hard usage limit: every operator tool of the Main is refused except the read-only allow list.
+        self.limit_gate(name, args, (args.get('assignment_token') or '') if isinstance(args, dict) else '',
+                        caller='operator')
         if name in SCREEN_OPERATOR_NAMES: return self.screen().call(name[3:], args, role='operator')
         if name in DEV_NAMES:
             area = self.hidden_area(dev_path('.'))

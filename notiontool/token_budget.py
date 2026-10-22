@@ -8,6 +8,7 @@ or rotating chats never lowers the used amount. Counts are estimates (bytes / 3)
 numbers. When the window is used up, no new turn is sent until the next window starts.
 """
 import math
+import threading
 import time
 
 WINDOW_SECONDS = 6 * 3600
@@ -119,6 +120,97 @@ def refuse_if_exhausted(store, now=None):
         pass
     raise RateLimited(min(wait, 600), 'Token budget of %d tokens per 6 h is used up; resets in %d min'
                       % (limit(store), wait // 60 + 1), free=True, scope='account')
+
+
+# ---- Hard stop for every chat (Main and coworkers) -------------------------------------------
+# Owner rule: when the 6 h budget is used up, ALL chats stop at once. The engine refuses and
+# cancels coworker turns; the Main only works through the MCP bridge, so bridge.Bridge refuses its
+# tools (error text starts with LIMIT_STOP_PREFIX) using hard_stop_state below.
+LIMIT_STOP_CODE = 'LIMIT_STOP'
+LIMIT_STOP_PREFIX = LIMIT_STOP_CODE + ':'
+
+
+class LimitStop(ValueError):
+    """A tool refused at the hard limit. ValueError, so bridge.rpc returns its text as isError."""
+
+
+HARD_STOP_CACHE_SECONDS = 1.0  # same as engine.LIMIT_CHECK_SECONDS
+_hard_stop_cache = {}
+_hard_stop_lock = threading.Lock()
+_clock = time.monotonic  # cache clock (tests replace it)
+
+
+def clear_hard_stop_cache():
+    with _hard_stop_lock:
+        _hard_stop_cache.clear()
+
+
+def _hard_stop_compute(store, purpose, now):
+    wait = int(exhausted(store, now) or 0)
+    if wait > 0:
+        # The 6 h budget stops everyone: the Main and the coworkers.
+        return dict(stop=True, source='6h', wait=wait,
+                    reason='6 h token budget of %d tokens used up; resets in about %d min'
+                           % (limit(store), wait // 60 + 1))
+    if purpose == 'worker':
+        # The burst guard only slows coworkers (B42): level pause stops coworker tools, never the Main.
+        burst = burst_state(store, now)
+        if burst.get('level') == 'pause':
+            wait = max(1, int(burst.get('wait') or 0))
+            return dict(stop=True, source='burst', wait=wait,
+                        reason='coworkers paused: ' + str(burst.get('reason') or 'very high usage'))
+    return dict(stop=False, source='', reason='', wait=0)
+
+
+def hard_stop_state(store, purpose='main', now=None):
+    """dict(stop, source, reason, wait) for a tool call of purpose 'main' or 'worker'.
+
+    stop is True while exhausted(store, now) > 0 (source '6h', every purpose) and, for purpose
+    'worker' only, while burst_state is at level 'pause' (source 'burst'). wait is the number of
+    seconds until the stop ends. The result is cached for HARD_STOP_CACHE_SECONDS per (store,
+    purpose, now). Never raises: on any error the state is fail-open (stop=False) and a
+    'token_budget_failed' event is logged when possible.
+    """
+    purpose = 'worker' if purpose == 'worker' else 'main'
+    key = (id(store), purpose, now)
+    try:
+        stamp = _clock()
+        with _hard_stop_lock:
+            hit = _hard_stop_cache.get(key)
+            if hit is not None and hit[1] is store and 0 <= stamp - hit[0] < HARD_STOP_CACHE_SECONDS:
+                return dict(hit[2])
+    except Exception:
+        stamp = None
+    try:
+        state = _hard_stop_compute(store, purpose, now)
+    except Exception as exc:
+        state = dict(stop=False, source='', reason='', wait=0)
+        try:
+            store.event('token_budget_failed', message='Hard limit check failed; tools stay allowed (fail-open)',
+                        error=type(exc).__name__, purpose=purpose)
+        except Exception:
+            pass
+    if stamp is not None:
+        try:
+            with _hard_stop_lock:
+                if len(_hard_stop_cache) > 64:
+                    _hard_stop_cache.clear()
+                _hard_stop_cache[key] = (stamp, store, dict(state))
+        except Exception:
+            pass
+    return state
+
+
+def limit_stop_text(wait, source='6h'):
+    """The LIMIT_STOP: refusal text for a tool call at the hard limit (short: rpc keeps 400 chars)."""
+    try:
+        minutes = max(0, int(wait or 0)) // 60 + 1
+    except (TypeError, ValueError):
+        minutes = 1
+    why = 'coworker burst pause, very high usage' if source == 'burst' else '6 h token budget used up'
+    return (LIMIT_STOP_PREFIX + ' hard usage limit reached (%s). Stop now, do no further work and tell '
+            'the user that the usage limit is reached. It resets in about %d min. Read-only tools still work.'
+            % (why, minutes))
 
 
 # ---- Burst guard (short-term usage) ----------------------------------------------------------
