@@ -75,7 +75,9 @@ def prompt_for(task, run, context, token, tools_available=False):
     # Present actual user work, not a pseudo-system message. IDs and tokens are
     # coordinator metadata, and belong in the prompt only when a connected tool
     # requires them. This also prevents unused credentials confusing the model.
-    header = 'Please help me with this request:\n' + run['goal'] + '\n\n'
+    from .plain_protocol import TOOLS_FIRST, tools_first  # tool load first (Notion AI skips it otherwise)
+    header = (TOOLS_FIRST if tools_first(task, run, tools_available) else '')
+    header += 'Please help me with this request:\n' + run['goal'] + '\n\n'
     if run.get('project_path'):
         header += 'The project folder is '+run['project_path']+'.\n'
     if run.get('context','').strip():

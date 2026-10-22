@@ -279,7 +279,26 @@ def prompt(task,run,context,token,tools_available):
     return with_rule(text,coworker=task.get('role')!='planner')
 
 
+# Notion AI bug (owner, 22 Oct 2026): when the request comes first, the chat often never loads its MCP tools
+# and answers 'no MCP / I cannot see the project' without trying. Asking for the tools FIRST fixes it.
+TOOLS_FIRST = ('Before anything else: load your NotionTool tools now (connect to the NotionTool MCP and list '
+               'its tools), even if you think none are connected. Only if loading really fails, say exactly '
+               'what failed.\n\n')
+
+
+def tools_first(task, run, tools_available):
+    """True when the turn needs project tools, so the tool load must be the first thing in the message."""
+    if not tools_available or run.get('allocation', {}).get('mode') == 'direct':
+        return False
+    return bool(run.get('project_path') or task.get('files'))
+
+
 def _prompt_text(task,run,context,token,tools_available):
+    body=_prompt_body(task,run,context,token,tools_available)
+    return (TOOLS_FIRST+body) if tools_first(task,run,tools_available) else body
+
+
+def _prompt_body(task,run,context,token,tools_available):
     goal=run['goal']
     reference=('\nFor reference, the work already completed:\n'+context+'\n') if context.strip() else ''
     memory=('\nFor reference, our completed earlier work:\n'+run['context']+'\n') if run.get('context','').strip() else ''
