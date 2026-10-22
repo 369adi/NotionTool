@@ -16,6 +16,13 @@ from notiontool.engine import RateLimited
 
 NOW = 1_800_000_000.0  # fixed clock, start of an hour bucket
 
+_SOURCE = Path(__file__).resolve().parent.parent / 'notiontool'
+# The strict charge-point tests run once the callers pass task / role / model (review fix in notion.py, engine.py).
+NOTION_PASSES_TASK = "charge_send(self.store, worker, prompt, task_id=task['id']" in \
+    (_SOURCE / 'notion.py').read_text(encoding='utf-8')
+ENGINE_PASSES_TASK = "role=task.get('role'), model=task.get('model')" in \
+    (_SOURCE / 'engine.py').read_text(encoding='utf-8')
+
 
 class FakeStore:
     def __init__(self, **settings):
@@ -277,6 +284,50 @@ class TokenLedgerTests(unittest.TestCase):
 
     # ---- real send and reply path ----------------------------------------------------------------
     def test_fake_task_through_send_and_reply_path(self):
+        usage, window, model = self.run_fake_task()
+        # Every token of the sent turn and its reply is in the ledger, exactly as in the window total.
+        self.assertGreater(usage['total']['output'], 0)
+        self.assertGreater(usage['total']['input'], 0)
+        self.assertEqual(usage['total']['tokens'], window['used'])
+        self.assertEqual(usage['total']['turns'], 1)
+        self.assertEqual(sum(row['tokens'] for row in usage['by_task'].values()), window['used'])
+
+    @unittest.skipUnless(NOTION_PASSES_TASK, 'notion.py charge_send/charge_reply do not pass task_id/role/model yet')
+    def test_fake_task_ledger_row_is_attributed_strictly(self):
+        usage, window, model = self.run_fake_task()
+        self.assertIn('t1', usage['by_task'])
+        row = usage['by_task']['t1']
+        self.assertEqual(set(row['by_role']), {'executor'})
+        self.assertEqual(set(row['by_model']), {model})
+        self.assertEqual(row['by_model'][model]['tokens'], window['used'])
+        self.assertEqual(row['tokens'], window['used'])
+        self.assertEqual(row['turns'], 1)
+
+    @unittest.skipUnless(ENGINE_PASSES_TASK, 'engine._limit_charge_reply does not pass task_id/role/model yet')
+    def test_engine_recovery_reply_charge_records_task_role_model(self):
+        import types
+        from notiontool import engine
+        owner = next(v for v in vars(engine).values()
+                     if isinstance(v, type) and '_limit_charge_reply' in vars(v))
+        store = FakeStore()
+        store.put('workers', dict(COWORKER))
+        stub = types.SimpleNamespace(store=store)
+        task = {'id': 't9', 'role': 'reviewer', 'model': 'sonnet', 'paused_by': 'limit'}
+        owner._limit_charge_reply(stub, task, {'recovery': True, 'worker_id': 'w1'}, 'y' * 300)
+        self.assertTrue(task['limit_reply_charged'])
+        usage = token_budget.usage_by_task(store)
+        self.assertEqual(set(usage['by_task']), {'t9'})
+        row = usage['by_task']['t9']
+        self.assertEqual(set(row['by_role']), {'reviewer'})
+        self.assertEqual(set(row['by_model']), {'sonnet'})
+        self.assertGreater(row['output'], 0)
+        self.assertEqual(row['tokens'], token_budget.public(store)['used'])
+        # Charged once: a second call for the same task records nothing more.
+        owner._limit_charge_reply(stub, task, {'recovery': True, 'worker_id': 'w1'}, 'y' * 300)
+        self.assertEqual(token_budget.usage_by_task(store)['by_task']['t9']['tokens'], row['tokens'])
+
+    def run_fake_task(self):
+        """One task (t1, executor, opus) through the real FakeNotionAdapter.run send and reply path."""
         from unittest import mock
         from notiontool import fake_notion
         from notiontool.fake_notion import FakeState
@@ -303,18 +354,7 @@ class TokenLedgerTests(unittest.TestCase):
                                     'state': 'running', 'model': 'opus'})
                 reply = adapter.run(worker, store.get('tasks', 't1'), 'Say hello', threading.Event(), lambda text: None)
                 self.assertTrue(str(reply).strip())
-                usage = token_budget.usage_by_task(store)
-                window = token_budget.public(store)
-                # Every token of the sent turn and its reply is in the ledger, exactly as in the window total.
-                self.assertGreater(usage['total']['output'], 0)
-                self.assertGreater(usage['total']['input'], 0)
-                self.assertEqual(usage['total']['tokens'], window['used'])
-                self.assertEqual(usage['total']['turns'], 1)
-                rows = [row for task in usage['by_task'].values() for row in [task]]
-                self.assertEqual(sum(r['tokens'] for r in rows), window['used'])
-                if 't1' in usage['by_task']:  # the charge points pass task / role / model (notion.py fix)
-                    self.assertEqual(set(usage['by_task']['t1']['by_role']), {'executor'})
-                    self.assertEqual(usage['by_task']['t1']['tokens'], window['used'])
+                return token_budget.usage_by_task(store), token_budget.public(store), client.model('opus')
             finally:
                 store.close()
 
