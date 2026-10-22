@@ -757,11 +757,16 @@ class Bridge:
             task['assigned_files'] = assigned
             self.store.put('tasks', dict(task))
         files = [str(f).strip() for f in assigned if str(f).strip()]
+        copy = self.worktree(task)
+        if copy is None and self._needs_own_copy(task, run):
+            # Owner rule 2026-10-22: every coworker writes only in its own copy; main is changed by the merge.
+            raise ValueError("Write refused: this task has no own copy of the project (git worktree), so writing "
+                             "%s would change main directly; no file was changed. Stop and report this in your "
+                             "result; NotionTool will give the task its own copy." % (path,))
         if not files:
             return
         project = self.project(run)
         base = project or self.root(run)
-        copy = self.worktree(task)
         key = file_registry.path_key(path)
         if copy is not None and _key_inside(key, file_registry.path_key(copy)):
             # Owner rule 2026-10-22: a task with its own git worktree may write any file in that copy;
@@ -786,6 +791,21 @@ class Bridge:
         raise ValueError("Write refused: %s is not in this task's files list (%s); no file was changed. "
                          "Only the assigned files may be written; report other needed changes in your result."
                          % (path, ', '.join(files)[:300]))
+
+    def _needs_own_copy(self, task, run):
+        """True for a writing executor of a patch-mode run: it must work in its own git worktree."""
+        if not task or task.get('role') != 'executor' or not run:
+            return False
+        patch_on = getattr(self.engine, '_patch_on', None)
+        if not callable(patch_on):
+            return False
+        try:
+            from .engine import task_is_read_only
+            if task_is_read_only(task):
+                return False
+            return bool(patch_on(run))
+        except Exception:
+            return False
 
     def _task_dev_path(self, token, path):
         """Resolve a coworker write path: inside the task's worktree when it has one, else as before."""

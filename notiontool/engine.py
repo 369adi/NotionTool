@@ -60,6 +60,19 @@ def reconcile_delay(checks, now, done_poll_since=0, approval=False, slot_free=Tr
 
 # Patch mode (patch_mode.py): on by default for git projects with a main branch; the setting turns it off.
 PATCH_MODE_DEFAULT = True
+_READ_ONLY_RE = re.compile(r'\bread[- ]only\b', re.I)
+
+
+def task_is_read_only(task):
+    """True only for an explicit read-only task: the read_only flag, a 'read-only' title, or a prompt that
+    starts with 'read-only'. Quoted context further down the prompt (e.g. an old audit line) never counts;
+    that loose match once sent a merge task without its own copy straight into main."""
+    if task.get('read_only'):
+        return True
+    if _READ_ONLY_RE.search(task.get('title') or ''):
+        return True
+    head = (task.get('prompt') or '').lstrip()[:40]
+    return bool(re.match(r'read[- ]only\b', head, re.I))
 # Merge results that are worth one more try later; anything else stays 'failed' for the operator.
 # 'main_red': the same tests also fail on clean main, so the task is not to blame. It waits until main
 # moves (a fix landed) and is then merged again; these waits never use up PATCH_RETRY_LIMIT.
@@ -1639,7 +1652,7 @@ class Engine:
         if task.get('files') and not task.get('proof_base'):
             # Proof: base snapshot of the write scope, taken once when the task starts (proof.py).
             task['proof_base'] = task_proof.start(task['id'], task['files'], self._project_root(run))
-        read_only = bool(task.get('read_only')) or bool(re.search(r'\bread[- ]only\b', task.get('prompt') or '', re.I))
+        read_only = task_is_read_only(task)
         if task['role'] == 'executor' and self._patch_on(run) and not read_only:
             # own git worktree before dispatch (patch_mode.py); read-only audits skip it (dispatch spread)
             self._patch_prepare(task, run)
