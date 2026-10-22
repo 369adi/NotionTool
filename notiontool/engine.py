@@ -21,6 +21,7 @@ from .model_verification import ModelVerificationError
 from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, run_with_priority
 from . import proof as task_proof
 from . import patch_mode as patch_mod
+from . import stale_tasks as stale_mod
 import subprocess
 from .timeouts import task_limit
 
@@ -295,6 +296,42 @@ class Engine:
                 except Exception as exc:
                     # Name and text: 'ImportError' alone hid the missing chat_pool.name_coworkers for hours.
                     self.store.event('team_grow_check_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+            try:
+                self._auto_cleanup_maybe()
+            except Exception as exc:
+                self.store.event('auto_cleanup_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+
+    def _auto_cleanup_maybe(self):
+        """Owner rule 2026-10-22: stale or broken runs and tasks end without asking the owner.
+
+        Starts stale_tasks.sweep every auto_cleanup_seconds (default 120 s; the first sweep runs 60 s after
+        start, so restart recovery settles first). It runs on the I/O pool because rule (d) may read Notion's
+        thread record; it never sends anything (I5). Setting auto_cleanup=False turns it off.
+        Returns the submitted future, or None."""
+        now = self.clock()
+        due = self.__dict__.get('_auto_cleanup_at')
+        if due is None:
+            self._auto_cleanup_at = now + stale_mod.CLEANUP_FIRST_DELAY
+            return None
+        if now < due:
+            return None
+        running = self.__dict__.get('_auto_cleanup_future')
+        if running is not None and not running.done():
+            return None
+        settings = self.store.settings()
+        self._auto_cleanup_at = now + _setting_number(settings, 'auto_cleanup_seconds', stale_mod.CLEANUP_INTERVAL,
+                                                      30, 86400)
+        if settings.get('auto_cleanup', True) is False:
+            return None
+        self._auto_cleanup_future = self.pool.submit(self._auto_cleanup_run)
+        return self._auto_cleanup_future
+
+    def _auto_cleanup_run(self):
+        try:
+            return stale_mod.sweep(self)
+        except Exception as exc:
+            self.store.event('auto_cleanup_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+            return []
 
     def tasks(self, run_id):
         return [t for t in self.store.all('tasks') if t['run_id'] == run_id]
