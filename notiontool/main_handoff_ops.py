@@ -169,7 +169,7 @@ class MainHandoffOps:
     supports_operator = False  # main_switch.advance creates chats only when this is True
 
     def __init__(self, store, adapter, account_id, old_chat_id='', main_chat_id='', mains=None, clock=None,
-                 operator=False, switch_id=''):
+                 operator=False, switch_id='', pool=False):
         self.store, self.adapter, self.account_id = store, adapter, account_id
         self.old_chat_id = old_chat_id      # Notion thread of the current Main
         self.main_chat_id = main_chat_id    # local chat record of that Main (messages, repoint target)
@@ -178,6 +178,10 @@ class MainHandoffOps:
         # Operator mode: the Main moved is the operator Main of a main_switches record, not a pool Main.
         self.operator = bool(operator)
         self.switch_id = str(switch_id or '')
+        # Pool-Main switch (main_switch mode 'pool'): the same safe switch flow as the operator (candidate
+        # Welcome chat, wait for its welcome turn, ack after the turn ended), but after the ack the new chat
+        # becomes a pool Main and the old one 'archived_main' (rule: every Main has every Main feature).
+        self.pool = bool(pool)
         if self.operator:
             self.supports_operator = True
 
@@ -444,7 +448,8 @@ class MainHandoffOps:
 
     def _repoint_after_ack(self, handoff, prompt):
         if self.operator:
-            return self._repoint_operator(handoff, prompt)
+            if not self.pool:
+                return self._repoint_operator(handoff, prompt)
         new_worker = self._worker(handoff['new_chat_id'])
         old_worker = self._worker(handoff['old_chat_id'])
         if not new_worker:
@@ -613,7 +618,7 @@ def switch_ops(store, adapter, record, clock=None, mains=None):
     record = record or {}
     return MainHandoffOps(store, adapter, record.get('account_id', ''), old_chat_id=record.get('operator_thread', ''),
                           main_chat_id=record.get('operator_chat_id', ''), mains=mains, clock=clock,
-                          operator=True, switch_id=record.get('id', ''))
+                          operator=True, switch_id=record.get('id', ''), pool=record.get('mode') == 'pool')
 
 
 def run_rotation(store, adapter, account_id, emit, clock=None, mains=None):

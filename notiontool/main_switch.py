@@ -515,7 +515,11 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
         return dict(ok=False, state='skipped', reason="main_context_policy is '%s'; needs ask or auto" % policy)
     chat = store.get('chats', str(operator_chat_id or '')) or {}
     worker = store.get('workers', chat.get('main_worker') or '') if chat.get('main_worker') else None
-    if not chat.get('operator') or chat.get('state') == 'released' or not worker or worker.get('purpose') != OPERATOR:
+    # Every Main has every Main feature (user rule): a pool Main ('main') switches like the operator Main
+    # (bug 2026-10-22: the switch refused the pool Main with 'Not an active operator Main chat').
+    mode = 'operator' if chat.get('operator') and (worker or {}).get('purpose') == OPERATOR else (
+        'pool' if worker and worker.get('purpose') == 'main' else '')
+    if chat.get('state') == 'released' or not mode:
         return dict(ok=False, state='skipped', reason='Not an active operator Main chat')
     if str(trigger or '') in NO_SWITCH_TRIGGERS:
         return dict(ok=False, state='skipped', reason='A Main switch never starts from team setup')
@@ -540,7 +544,7 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
         record = dict(id=rid, request_id=rid, state='brief_ready', run_id='',
                       operator_chat_id=chat['id'], operator_worker_id=worker['id'],
                       operator_thread=worker.get('thread_id', ''), account_id=worker.get('account_id', ''),
-                      brief_path=path, handoff_id='switch_' + rid, new_chat_id='', reason='brief from the Main',
+                      mode=mode, brief_path=path, handoff_id='switch_' + rid, new_chat_id='', reason='brief from the Main',
                       error='', created=stamp, updated=stamp,
                       brief_finalized=bool((finalized or {}).get('ok')), brief_rules=finalized or {})
         store.put(KIND, record)
@@ -559,7 +563,7 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
     record = dict(id=rid, request_id=rid, state='brief_requested', run_id=result['run_id'],
                   operator_chat_id=chat['id'], operator_worker_id=worker['id'],
                   operator_thread=worker.get('thread_id', ''), account_id=worker.get('account_id', ''),
-                  brief_path=path, handoff_id='switch_' + rid, new_chat_id='', reason='', error='',
+                  mode=mode, brief_path=path, handoff_id='switch_' + rid, new_chat_id='', reason='', error='',
                   created=stamp, updated=stamp)
     store.put(KIND, record)
     store.event('main_switch_brief_requested', record['run_id'], message='Main switch brief requested',

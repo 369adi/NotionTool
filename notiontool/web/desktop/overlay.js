@@ -1798,6 +1798,11 @@
           p = p.parentElement;
         }
         if ((box.innerText || '').length > 800) continue;
+        // A modal notice (aria-modal dialog in Notion's overlay layer) makes Notion set `inert` on the
+        // whole app until it is answered. Hiding it would leave the app unclickable (bug 2026-10-22),
+        // so a modal notice stays visible; only non-modal banners are hidden.
+        if (el.closest && el.closest('[aria-modal="true"], [role="dialog"], [role="alertdialog"], .' + OVERLAY)) continue;
+        if (box.closest && box.closest('[aria-modal="true"], .' + OVERLAY)) continue;
         box.style.setProperty('display', 'none', 'important');
         box.__ntCookieHidden = true;
         el.__ntCookieHidden = true;
