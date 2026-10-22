@@ -7,6 +7,7 @@ a file lock and never block another Coworker.
 import json
 import re
 import time
+from pathlib import Path
 
 QUALITIES = ('fast', 'standard', 'high')
 MAX_FIX_ROUNDS = 2
@@ -22,6 +23,16 @@ DESIGN_ROLES = ('design', 'design_critique')
 GATE_ROLES = ('integrate', 'synthesis')  # wait until every build they depend on is finally reviewed
 REVIEW_FINAL = ('approved', 'skipped', 'open')
 GATE_HOLD_S = 30.0
+# Review economy (token saving). Each saving has its own setting; missing or unknown values = the
+# first entry (the default). 'opus' / 'full' restore the old behavior exactly.
+REVIEW_MODEL_POLICIES = ('auto', 'opus')
+REVIEW_FOLLOWUP_SCOPES = ('fix_only', 'full')
+REVIEW_CORE_FILES = ('notiontool/engine.py', 'notiontool/notion.py', 'notiontool/token_budget.py',
+                     'notiontool/bridge.py', 'notiontool/edge_transport.py', 'notiontool/server.py',
+                     'notiontool/network_budget.py')
+REVIEW_SONNET_MAX_FILES = 2
+REVIEW_SMALL_FILE_LINES = 400  # size limit when the acceptance names none (setting review_small_file_lines)
+SIZE_HINT = re.compile(r'(?i)\b(\d{1,6})\s*(?:lines?|loc)\b')
 
 
 def _files(tasks):
@@ -110,6 +121,163 @@ def review_prompt(goal, chain):
             '(one row per fix, with the file and the exact change).'
             % (last.get('title', ''), ', '.join(files) or 'none listed (use the report)', last.get('acceptance', ''),
                goal, ', '.join(tests) or 'the checks named in the acceptance criteria'))
+
+
+def _settings(engine):
+    """store.settings() read defensively: any error or a non-dict means 'all defaults'."""
+    try:
+        got = engine.store.settings()
+    except Exception:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _choice(settings, key, allowed):
+    value = str((settings or {}).get(key) or '').strip().lower()
+    return value if value in allowed else allowed[0]
+
+
+def _norm(path):
+    text = str(path or '').strip().replace('\\', '/')
+    while text.startswith('./'):
+        text = text[2:]
+    return text.lower()
+
+
+def _core_files(settings):
+    raw = (settings or {}).get('review_core_files')
+    if raw is None:
+        raw = REVIEW_CORE_FILES
+    if isinstance(raw, str):
+        raw = re.split(r'[,;\n]', raw)
+    try:
+        return {_norm(f) for f in raw if _norm(f)}
+    except TypeError:
+        return {_norm(f) for f in REVIEW_CORE_FILES}
+
+
+def _changed_files(tasks):
+    """Planned files plus the changed files of the proof record, in order, without duplicates."""
+    out = []
+    for t in tasks:
+        proof = t.get('proof') if isinstance(t.get('proof'), dict) else {}
+        listed = list(t.get('assigned_files') or t.get('files') or []) + list(proof.get('files') or [])
+        for f in listed:
+            f = f.get('path') if isinstance(f, dict) else f
+            f = str(f or '').strip().replace('\\', '/')
+            if f and f not in out:
+                out.append(f)
+    return out
+
+
+def _tests(chain):
+    return sorted(set(TESTS.findall(' '.join(str(t.get('prompt', '')) + ' ' + str(t.get('acceptance', '')) for t in chain))))
+
+
+def _root(engine, run):
+    try:
+        return Path(engine._project_root(run))
+    except Exception:
+        return Path(run['project_path']) if run.get('project_path') else None
+
+
+def _rel(root, name):
+    path = Path(name)
+    if root is not None and path.is_absolute():
+        try:
+            return path.resolve().relative_to(Path(root).resolve()).as_posix()
+        except (ValueError, OSError):
+            return name
+    return name
+
+
+def _line_count(root, name):
+    """Lines of the file now, or None when it cannot be read (unknown size counts as large)."""
+    path = Path(name)
+    if not path.is_absolute():
+        if root is None:
+            return None
+        path = Path(root) / name
+    try:
+        with open(path, 'rb') as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return None
+
+
+def _line_limit(chain, settings):
+    """Largest 'N lines' the acceptance names; otherwise setting review_small_file_lines."""
+    hints = [int(n) for t in chain for n in SIZE_HINT.findall(str(t.get('acceptance') or ''))]
+    if hints:
+        return max(1, max(hints))
+    try:
+        return max(1, int((settings or {}).get('review_small_file_lines', REVIEW_SMALL_FILE_LINES)))
+    except (TypeError, ValueError):
+        return REVIEW_SMALL_FILE_LINES
+
+
+def review_model(engine, run, chain, settings=None):
+    """(model, model_reason) for the review of chain; (None, '') = old behavior (engine default model).
+
+    Setting review_model_policy: 'auto' (default) picks 'sonnet' for a chain that changed at most
+    REVIEW_SONNET_MAX_FILES files, none of them a core file (setting review_core_files) and none larger
+    than its acceptance suggests; everything else gets an explicit 'opus'. 'opus' = old behavior."""
+    settings = _settings(engine) if settings is None else settings
+    if _choice(settings, 'review_model_policy', REVIEW_MODEL_POLICIES) == 'opus':
+        return None, ''
+    why = 'review_model_policy auto: '
+    files = _changed_files(chain)
+    if not files:
+        return 'opus', why + 'no changed file is listed, so the risk is unknown: opus review'
+    if len(files) > REVIEW_SONNET_MAX_FILES:
+        return 'opus', why + '%d changed files (more than %d): opus review' % (len(files), REVIEW_SONNET_MAX_FILES)
+    root = _root(engine, run)
+    core_set = _core_files(settings)
+    core = [f for f in files if _norm(_rel(root, f)) in core_set]
+    if core:
+        return 'opus', why + 'core file changed (%s): opus review' % ', '.join(core)
+    limit = _line_limit(chain, settings)
+    for f in files:
+        lines = _line_count(root, f)
+        if lines is None:
+            return 'opus', why + 'size of %s unknown: opus review' % f
+        if lines > limit:
+            return 'opus', why + '%s has %d lines (more than %d): opus review' % (f, lines, limit)
+    return 'sonnet', why + 'small non-core change (%s; at most %d lines each): sonnet review' % (', '.join(files), limit)
+
+
+def _previous_fix_list(chain, by_id):
+    """Fix list of the review that sent the last fixer, from that review's result (or the fixer prompt)."""
+    if len(chain) < 2:
+        return ''
+    prev = by_id.get(chain[-2].get('review_task') or '') or {}
+    try:
+        data = json.loads(prev.get('result') or '{}')
+    except ValueError:
+        data = {}
+    text = _fix_list(data) if isinstance(data, dict) else ''
+    if text:
+        return text
+    prompt = _strip_result_line(chain[-1].get('prompt'))
+    marker = 're-run the listed tests:\n'
+    return prompt.split(marker, 1)[1].strip() if marker in prompt else ''
+
+
+def followup_review_prompt(goal, chain, fix_list):
+    """Review round >= 2 with review_followup_scope 'fix_only': check the fix, not the whole part again."""
+    last = chain[-1]
+    changed = _changed_files([last])
+    return ('Follow-up review (round %d) of the delegated part "%s". You are read-only: do not edit any file.\n'
+            'Do not re-review the whole part. The previous independent review asked for this fix list:\n%s\n'
+            'The last fixer (%s) changed these files: %s.\n'
+            'Check only two things: that every fix of this list was applied correctly, and that the fixer\'s '
+            'change broke nothing (read those changed files; acceptance criteria: %s; user goal: %s).\n'
+            'Run these tests: %s.\n'
+            'Then give the verdict on a separate line: APPROVED, or Changes needed followed by a concrete fix list '
+            '(one row per fix, with the file and the exact change).'
+            % (len(chain), chain[0].get('title', ''), fix_list or '(fix list not available: use the fixer report)',
+               last.get('title', '') or last.get('id', ''), ', '.join(changed) or 'none listed (use the report)',
+               last.get('acceptance', ''), goal, ', '.join(_tests(chain)) or 'the checks named in the acceptance criteria'))
 
 
 def _strip_result_line(prompt):
@@ -232,13 +400,23 @@ def step(engine, run, tasks):
                 changed = True
                 continue
             designs = _design_ids(tasks)
-            prompt = review_prompt(run.get('goal', ''), chain)
+            settings = _settings(engine)
+            followup = (len(chain) >= 2
+                        and _choice(settings, 'review_followup_scope', REVIEW_FOLLOWUP_SCOPES) == 'fix_only')
+            if followup:
+                prompt = followup_review_prompt(run.get('goal', ''), chain, _previous_fix_list(chain, by_id))
+            else:
+                prompt = review_prompt(run.get('goal', ''), chain)
             if designs:
                 prompt += ('\nThe design and its critique (%s) are in your context: also check that the build '
                            'follows them.' % ', '.join(designs))
+            model, model_reason = review_model(engine, run, chain, settings)
+            model_kw = dict(model=model, model_reason=model_reason) if model else {}  # none = old default
             review = engine.add_task(run, 'reviewer', prompt,
                                      'Review: ' + chain[0].get('title', ''), deps=[task['id']] + designs,
-                                     acceptance=task.get('acceptance', ''))
+                                     acceptance=task.get('acceptance', ''), **model_kw)
+            if followup:
+                review['review_followup'] = 'fix_only'
             # engine._dispatch builds a review_of task's context only from review_scope: TEAM designs go in too.
             # The legacy quality-high design (role architect) stays out of the scope; tests/test_operator_roles.py:144
             # pins that scope and is not in this task's write list (follow-up).
