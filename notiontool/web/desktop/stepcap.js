@@ -456,3 +456,138 @@
   }
   attempt();
 })();
+
+/* nt-steps-bar:start
+ * AI steps bar (owner 2026-10-22): replaces the 'x/450 AI left' chip of overlay.js with a progress bar of the AI
+ * steps LEFT in the rolling 60 min window plus its reset times. Data: state.steps_hour from desktop_shell._steps_hour
+ * (used, left, limit, resets_at, next_free_at, under_limit_at, steps_15m, limit_15m; times in epoch seconds).
+ * overlay.js re-creates the chip on every change, so the chip is hidden and the bar is kept next to it.
+ */
+(function () {
+  'use strict';
+  var root = typeof window !== 'undefined' ? window : this;
+  if (!root || root.__ntStepsBarModel) return;
+  var YELLOW_AT = 0.7, RED_AT = 0.9;
+  var COLORS = { ok: 'var(--nt-desk-accent, #2383e2)', warn: '#d9a400', high: '#c4372b' };
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hm(sec) {
+    if (!sec) return '';
+    var d = new Date(sec * 1000);
+    return pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  // Pure view model (unit-tested in tests/test_steps_bar.py).
+  function model(s) {
+    if (!s || typeof s !== 'object') return null;
+    var limit = Math.max(1, Number(s.limit) || 450);
+    var used = Math.max(0, Number(s.used) || 0);
+    var left = Math.max(0, s.left == null ? limit - used : Number(s.left) || 0);
+    var ratio = Math.min(1, used / limit);
+    var level = ratio >= RED_AT ? 'high' : ratio >= YELLOW_AT ? 'warn' : 'ok';
+    var text = left + ' AI steps left';
+    if (used > 0 && s.resets_at) text += ' \u00b7 full at ' + hm(s.resets_at);
+    var lines = ['AI steps in the rolling 60 min window: ' + used + ' used of ' + limit + ', ' + left + ' left.'];
+    if (s.next_free_at) lines.push('Next step frees up at ' + hm(s.next_free_at) + '.');
+    if (s.under_limit_at) lines.push('Under the limit again at ' + hm(s.under_limit_at) + '.');
+    if (s.resets_at) lines.push('Fully free again at ' + hm(s.resets_at) + '.');
+    else lines.push('No AI steps in the last 60 min.');
+    lines.push('Last 15 min: ' + (Number(s.steps_15m) || 0) + ' of ' + (Number(s.limit_15m) || 0) + ' steps.');
+    if (s.level && s.level !== 'ok') lines.push('Step guard: ' + s.level + (s.wait ? ' (' + s.wait + ' s)' : '') + '.');
+    return { used: used, left: left, limit: limit, ratio: ratio, fill: Math.round(left / limit * 1000) / 10,
+             level: level, color: COLORS[level], text: text, title: lines.join('\n') };
+  }
+  root.__ntStepsBarModel = model;
+  if (typeof document === 'undefined') return;
+
+  function state() {
+    var c = root.__ntDeskCtx;
+    try { return c && c.getState ? (c.getState() || {}).steps_hour : null; } catch (e) { return null; }
+  }
+
+  function build() {
+    var bar = document.createElement('span');
+    bar.className = 'nt-desk-ailimit-bar';
+    bar.setAttribute('data-nt-desk', 'steps-bar');
+    bar.setAttribute('role', 'meter');
+    bar.style.cssText = 'display:inline-flex;align-items:center;gap:6px;min-width:0;font-size:11px;white-space:nowrap;';
+    var track = document.createElement('span');
+    track.className = 'nt-desk-ailimit-bar-track';
+    track.style.cssText = 'display:inline-block;width:64px;height:6px;border-radius:3px;overflow:hidden;' +
+      'background:rgba(127,127,127,0.2);flex:none;';
+    var fill = document.createElement('span');
+    fill.className = 'nt-desk-ailimit-bar-fill';
+    fill.style.cssText = 'display:block;height:100%;width:0;border-radius:3px;';
+    var label = document.createElement('span');
+    label.className = 'nt-desk-ailimit-bar-text';
+    track.appendChild(fill);
+    bar.appendChild(track);
+    bar.appendChild(label);
+    return bar;
+  }
+
+  function paint(bar, m) {
+    var fill = bar.querySelector('.nt-desk-ailimit-bar-fill');
+    var label = bar.querySelector('.nt-desk-ailimit-bar-text');
+    bar.className = 'nt-desk-ailimit-bar nt-desk-ailimit-bar-' + m.level;
+    bar.title = m.title;
+    bar.setAttribute('aria-label', m.text);
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', String(m.limit));
+    bar.setAttribute('aria-valuenow', String(m.left));
+    if (fill) { fill.style.width = m.fill + '%'; fill.style.background = m.color; }
+    if (label) label.textContent = m.text;
+  }
+
+  var queued = false;
+  function render() {
+    queued = false;
+    var m = model(state());
+    var chips = document.querySelectorAll('[data-nt-desk="steps-chip"]');
+    for (var i = 0; i < chips.length; i++) {
+      var chip = chips[i];
+      if (!m) { chip.style.display = ''; continue; }
+      chip.style.display = 'none';
+      var bar = chip.nextElementSibling;
+      if (!bar || bar.getAttribute('data-nt-desk') !== 'steps-bar') {
+        bar = build();
+        chip.parentNode.insertBefore(bar, chip.nextSibling);
+      }
+      paint(bar, m);
+    }
+    var bars = document.querySelectorAll('[data-nt-desk="steps-bar"]');
+    for (var j = 0; j < bars.length; j++) {
+      var prev = bars[j].previousElementSibling;
+      if (!prev || prev.getAttribute('data-nt-desk') !== 'steps-chip') bars[j].parentNode.removeChild(bars[j]);
+    }
+  }
+  function queue() {
+    if (queued) return;
+    queued = true;
+    setTimeout(render, 50);
+  }
+
+  var bound = false;
+  function bind() {
+    var c = root.__ntDeskCtx;
+    if (!bound && c && c.onState) { bound = true; try { c.onState(queue); } catch (e) { bound = false; } }
+    if (typeof MutationObserver !== 'undefined' && document.body && !root.__ntStepsBarObserver) {
+      root.__ntStepsBarObserver = new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i++) {
+          var added = records[i].addedNodes || [];
+          for (var k = 0; k < added.length; k++) {
+            var n = added[k];
+            if (n.nodeType === 1 && n.getAttribute('data-nt-desk') !== 'steps-bar') { queue(); return; }
+          }
+        }
+      });
+      root.__ntStepsBarObserver.observe(document.body, { childList: true, subtree: true });
+    }
+    queue();
+    if (!bound) setTimeout(bind, 1000);
+  }
+  bind();
+  // the reset times move with the clock; repaint the labels once a minute (no network)
+  setInterval(queue, 60000);
+})();
+/* nt-steps-bar:end */

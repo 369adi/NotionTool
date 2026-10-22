@@ -53,6 +53,7 @@ MAX_CHAIN = 5
 MAX_CHAIN_OPERATOR = 20  # the operator Main may work in idle mode for hours
 CHAIN_WINDOW = 1800   # without a visible user message, a resume within 30 min continues the chain
 WINDOW = 40           # newest transcript entries read per check
+PAGE_MAX = 1000       # count_steps pages back up to this many entries to reach the last seen entry
 USAGE_SECONDS = 300   # default of main_context_check_seconds
 USAGE_FIRST_WINDOW = 1000  # one larger read per thread, so the old history counts
 USAGE_ERROR_SECONDS = 3600  # at most one operator_usage_failed event per thread per hour
@@ -455,13 +456,16 @@ class TurnWatch:
                     pass
             return None
 
-    def count_steps(self, worker, transcript):
+    def count_steps(self, worker, transcript, client=None):
         """Step guard (step_guard.py) for chats NotionTool does not stream itself. Never raises.
 
         - every watched chat: a Notion rate-limit / AI-disabled error entry pauses all chats of the account
           (each entry once; entries older than the cooldown are ignored),
-        - Main chats only (coworker steps are counted live from the stream in notion.py): new step entries
-          since the last check count as steps. The first look at a chat only sets the baseline.
+        - Main chats only (coworker steps are counted live from the stream in notion.py, and only there):
+          new step entries since the last check count as steps; answers and tool calls count as AI steps.
+          The very first look at a chat only sets the baseline; the baseline is persisted in the store, so a
+          restart continues from it. With a client, a longer transcript is read when more than WINDOW
+          entries are new.
         """
         try:
             from . import step_guard
@@ -479,30 +483,74 @@ class TurnWatch:
                 if step_guard.is_provider_limit(detail):
                     step_guard.note_provider_limit(self.store, worker, detail[:300], now=now,
                                                    key='%s:%s' % (worker.get('thread_id', ''), entity.get('id') or when))
-            if worker.get('purpose') not in (OPERATOR, 'main'):
-                return 0
-            ids, roles = set(), {}
-            for entity in entities:
-                kind = str(entity.get('kind') or entity.get('type') or '').lower()
-                if entity.get('id') and _role(entity) in ('assistant_message', 'tool', 'error') and 'result' not in kind:
-                    ids.add(str(entity['id']))
-                    roles[str(entity['id'])] = 'e' if 'error' in kind else _role(entity)
-            seen_map = self.__dict__.setdefault('step_seen', {})
+            if worker.get('purpose') not in step_guard.TRANSCRIPT_PURPOSES:
+                return 0  # streamed purposes are counted by step_guard.count_new (notion.py), only there
+            # The seen baseline is persisted per worker:thread (step_guard.SEEN_KIND), so a restart keeps it.
+            # It holds the ids of all transcript entries (oldest first), not only step entries, so paging back
+            # can tell whether the read reaches back to the last check.
             key = worker['id'] + ':' + str(worker.get('thread_id', ''))
-            seen = seen_map.get(key)
-            seen_map[key] = set(list((seen or set()) | ids)[-2000:])
+            seen_map = self.__dict__.setdefault('step_seen', {})
+            seen_list = seen_map.get(key)
+            if seen_list is None:
+                seen_list = step_guard.load_seen(self.store, key)
+            seen = set(seen_list) if seen_list is not None else None
+            if seen is not None and client is not None:
+                entities = self._page_back(worker, client, entities, seen)
+            order, steps, inference_keys, errors = [], [], {}, 0
+            for entity in entities:
+                if not entity.get('id'):
+                    continue
+                eid = str(entity['id'])
+                order.append(eid)
+                if seen is None or eid in seen:
+                    continue
+                kind = str(entity.get('kind') or entity.get('type') or '').lower()
+                role = _role(entity)
+                if 'result' in kind or role not in ('assistant_message', 'tool', 'error') and 'inference' not in kind:
+                    continue
+                steps.append(eid)
+                if 'error' in kind or role == 'error':
+                    errors += 1
+                    continue
+                # AI (inference) steps: every answer and every tool call of the agent is issued by an inference.
+                # Entries of one inference (parallel tool calls) count once. Real Main transcript (thread_context,
+                # python -m notiontool.step_guard shape data/notiontool.db, 2026-10-22): tool entries carry no
+                # inference_id / step_id; parallel MCP calls of one inference share the exact 'started_at' stamp.
+                started = entity.get('started_at')
+                group = entity.get('inference_id') or entity.get('step_id') or \
+                    ('started:' + str(started) if started else eid)
+                inference_keys[str(group)] = 1
+            merged = list(seen_list or [])
+            known = set(merged)
+            merged += [i for i in order if i not in known and not known.add(i)]
+            merged = merged[-step_guard.SEEN_MAX:]
+            seen_map[key] = merged
+            if merged != seen_list:
+                step_guard.save_seen(self.store, key, merged, now=now)
             if seen is None:
                 return 0
-            fresh = ids - seen
-            new = len(fresh)
+            new = len(steps)
             if new:
-                # assistant messages = AI (inference) steps; error entries count for the error brake
-                inference = sum(1 for i in fresh if roles.get(i) == 'assistant_message')
-                errors = sum(1 for i in fresh if roles.get(i) in ('e', 'error'))
-                step_guard.add_steps(self.store, worker, new, now=now, inference=inference, errors=errors)
+                step_guard.add_steps(self.store, worker, new, now=now, inference=len(inference_keys), errors=errors)
             return new
         except Exception:
             return 0
+
+    def _page_back(self, worker, client, entities, seen):
+        """Re-read a longer transcript until it overlaps the seen baseline (or holds the whole chat).
+
+        Without this, more than WINDOW new entries between two checks would be lost.
+        """
+        limit = WINDOW
+        try:
+            while limit < PAGE_MAX and len(entities) >= limit \
+                    and not any(str(e.get('id')) in seen for e in entities if e.get('id')):
+                limit = min(PAGE_MAX, limit * 4)
+                longer = client.transcript(worker['thread_id'], limit=limit)
+                entities = [p.get('entity') or {} for p in (longer.get('patches') or []) if p.get('op') == 'put']
+        except Exception:
+            pass
+        return entities
 
     def check(self, worker):
         if worker['id'] in self.sending:
@@ -510,7 +558,7 @@ class TurnWatch:
         client = self.adapter.client(worker['account_id'])
         transcript = client.transcript(worker['thread_id'], limit=WINDOW)
         self.measure_usage(worker, client, transcript)
-        self.count_steps(worker, transcript)
+        self.count_steps(worker, transcript, client=client)
         found = interrupted_turn(transcript, now=self.clock())
         if not found:
             return self.check_restart(worker, transcript)

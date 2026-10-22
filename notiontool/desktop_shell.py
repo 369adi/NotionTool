@@ -696,8 +696,15 @@ def _steps_hour(store, account, now):
         used = int(st.get('ai_steps_60m') or 0)
         s15 = int(st.get('steps_15m') or 0)
         limit15 = int(lim.get('step_hard_15m') or 1000)
+        # rolling window (step_guard._ai_window): next_free_at = the oldest counted AI step drops out,
+        # resets_at = the newest one drops out (bar fully free), under_limit_at = used < limit again
+        def when(key):
+            value = st.get(key)
+            return round(float(value), 1) if isinstance(value, (int, float)) and value > 0 else None
         return dict(used=used, limit=limit, left=max(0, limit - used), steps_15m=s15, limit_15m=limit15,
-                    level=str(st.get('level') or 'ok'), wait=int(st.get('wait') or 0))
+                    level=str(st.get('level') or 'ok'), wait=int(st.get('wait') or 0),
+                    resets_at=when('ai_resets_at'), next_free_at=when('ai_next_free_at'),
+                    under_limit_at=when('ai_under_limit_at'), window_s=3600, window_15m_s=900)
     except Exception:
         return None
 

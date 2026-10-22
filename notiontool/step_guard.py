@@ -18,6 +18,9 @@ Everything here is bookkeeping: no function raises except refuse_start (RateLimi
 import time
 
 KIND = 'step_guard'
+# Purposes whose steps are counted once from their transcript (turn_watch.count_steps). Every other
+# purpose that NotionTool streams (worker, spare_main, external, ...) is counted from the stream (count_new).
+TRANSCRIPT_PURPOSES = ('operator', 'main')
 KEEP = 3 * 3600  # items stay 3 h: the snapshot at a Notion rate limit shows windows up to 3 h
 # Owner rule 2026-10-22: hard stop at 1000 steps / 15 min, then ALL chats pause 15 min (step_pause_s) and
 # go on. step_hard_60m 1500 stays as a safety net below the 1,760 steps / 60 min that tripped Notion.
@@ -234,12 +237,18 @@ def _latch_step_pause(record, lim, account, now):
 
 
 def count_new(store, worker, steps, counted, now=None):
-    """Stream helper: counts len(steps) - counted new steps; returns the new counted value."""
+    """Stream helper: counts len(steps) - counted new steps; returns the new counted value.
+
+    Every streamed purpose adds steps here except TRANSCRIPT_PURPOSES (operator / main): those are counted
+    once from their transcript by turn_watch.count_steps; counting them here too would count them twice.
+    """
     try:
         n = len(steps or [])
     except TypeError:
         return counted
     if n > counted:
+        if (worker or {}).get('purpose') in TRANSCRIPT_PURPOSES:
+            return n
         new = [s for s in list(steps)[counted:n] if isinstance(s, dict)]
         types = [str(s.get('type') or '').lower() for s in new]
         inference = sum(1 for t in types if 'inference' in t) if any(types) else None
@@ -304,19 +313,53 @@ def note_provider_limit(store, worker, text, now=None, key=''):
         return False
 
 
+def _ai_window(record, account, now, limit=None):
+    """AI steps of the rolling 60 min window of one account and when they drop out (epoch seconds).
+
+    ai_next_free_at: the oldest counted AI step leaves the window (the next step becomes free again),
+    ai_resets_at: the newest counted AI step leaves the window (the bar is fully free again),
+    ai_under_limit_at: at or over the limit, the time enough of the oldest AI steps left that used < limit.
+    None when there is nothing to wait for.
+    """
+    items = sorted((float(i[0]), _item_val(i, 5)) for i in record['items']
+                   if (i[4] if len(i) > 4 else '') == account and 0 <= now - float(i[0]) <= 3600
+                   and _item_val(i, 5) > 0)
+    used = sum(v for _, v in items)
+    out = dict(ai_steps_60m=used, ai_next_free_at=round(items[0][0] + 3600, 1) if items else None,
+               ai_resets_at=round(items[-1][0] + 3600, 1) if items else None, ai_under_limit_at=None)
+    if limit and used >= limit:
+        total = used
+        for ts, value in items:
+            total -= value
+            if total < limit:
+                out['ai_under_limit_at'] = round(ts + 3600, 1)
+                break
+    return out
+
+
+def ai_window(store, now=None, account=''):
+    """Public read of _ai_window for one account. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        return _ai_window(_record(store), account, now, limits(store)['inf_hard_60m'])
+    except Exception:
+        return dict(ai_steps_60m=0, ai_next_free_at=None, ai_resets_at=None, ai_under_limit_at=None)
+
+
 def _account_state(record, lim, account, now):
     base = dict(lim)
+    win = _ai_window(record, account, now, lim['inf_hard_60m'])
     provider = record['provider'].get(account) or {}
     until = float(provider.get('until') or 0)
     if until > now:
         return dict(level='pause', reason='Notion rate limit: cooldown after a provider error', wait=int(until - now) + 1,
-                    account=account, provider_until=until, limits=base)
+                    account=account, provider_until=until, limits=base, **win)
     s48 = _h48_sum(record, account, now)
     paused = float((record.get('step_pause') or {}).get(account) or 0)
     if paused > now:
         return dict(level='pause', reason='step limit: all chats stop for %d min' % (lim['step_pause_s'] // 60),
                     wait=int(paused - now) + 1, account=account, provider_until=until, step_pause_until=paused,
-                    limits=base)
+                    limits=base, **win)
     if until and now < until + lim['provider_cooldown_s']:
         for key in SCALED:
             lim[key] = max(1, lim[key] // 2)  # after the cooldown: half speed for the same time
@@ -335,6 +378,7 @@ def _account_state(record, lim, account, now):
                cw_rest_until=float(rest.get('until') or 0),
                starts_5m=starts5, last_start=max(starts or [0]), provider_until=until, limits=lim,
                steps_48h=s48, soft_48h=s48 >= lim['step_soft_48h'], hard_48h=s48 >= lim['step_hard_48h'])
+    out.update((k, v) for k, v in win.items() if k != 'ai_steps_60m')  # same items, same sum as i60
     if s15 >= lim['step_hard_15m'] or s60 >= lim['step_hard_60m'] or i60 >= lim['inf_hard_60m'] \
             or w15 >= lim['wsteps_hard_15m'] or w60 >= lim['wsteps_hard_60m']:
         # wait until the oldest counted item of the 15 min window drops out, at least 60 s
@@ -519,3 +563,141 @@ def public(store, now=None):
     now = time.time() if now is None else now
     st = state(store, now)
     return {k: v for k, v in st.items() if k != 'last_start'}
+
+
+# ---- seen baseline of watched (Main) chats ------------------------------------
+# turn_watch.count_steps counts the transcript entries of a Main chat that it has not seen before.
+# The seen ids live in the store (kind step_seen, one doc per worker:thread), so a restart neither loses
+# the steps written while NotionTool was down nor starts a new baseline.
+SEEN_KIND = 'step_seen'
+SEEN_MAX = 2000
+
+
+def load_seen(store, key):
+    """Seen entry ids (oldest first) of one worker:thread, or None when the chat was never looked at."""
+    try:
+        doc = store.get(SEEN_KIND, key)
+    except Exception:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get('ids'), list):
+        return None
+    return [str(i) for i in doc['ids']]
+
+
+def save_seen(store, key, ids, now=None):
+    """Store the last SEEN_MAX ids in order. Never raises."""
+    try:
+        store.put(SEEN_KIND, dict(id=key, ids=list(ids)[-SEEN_MAX:],
+                                  at=round(time.time() if now is None else now, 1)))
+        return True
+    except Exception:
+        return False
+
+
+# ---- read-only audit (python -m notiontool.step_guard audit data/notiontool.db) ----
+def audit(db_path, now=None, out=print):
+    """Report the rolling record of a NotionTool database. Opens it read-only (mode=ro), writes nothing."""
+    import json
+    import sqlite3
+    from pathlib import Path
+    now = time.time() if now is None else now
+    uri = 'file:' + Path(db_path).resolve().as_posix() + '?mode=ro'
+    db = sqlite3.connect(uri, uri=True)
+    try:
+        row = db.execute('SELECT doc FROM objects WHERE kind=? AND id=?', (KIND, 'rolling')).fetchone()
+        record = json.loads(row[0]) if row else {}
+        workers = [json.loads(r[0]) for r in db.execute("SELECT doc FROM objects WHERE kind='workers'").fetchall()]
+        seen_rows = db.execute('SELECT count(*) FROM objects WHERE kind=?', (SEEN_KIND,)).fetchone()[0]
+        stops = db.execute("SELECT ts, kind, doc FROM events WHERE kind IN ('step_limit_stop', "
+                           "'provider_rate_limited') ORDER BY seq DESC LIMIT 5").fetchall()
+    finally:
+        db.close()
+
+    def hm(t):
+        return time.strftime('%m-%d %H:%M:%S', time.localtime(float(t)))
+
+    items = record.get('items') or []
+    out('now %s  items %d%s' % (hm(now), len(items),
+                                ('  oldest %s newest %s' % (hm(items[0][0]), hm(items[-1][0]))) if items else ''))
+    for acc in sorted({(i[4] if len(i) > 4 else '') for i in items}):
+        mine = [i for i in items if (i[4] if len(i) > 4 else '') == acc]
+        out('account %s: %d items' % (acc[:8], len(mine)))
+        for purpose in ('m', 'w'):
+            sel = [i for i in mine if i[3] == purpose]
+            st = sum(int(i[1]) for i in sel)
+            ai = sum(_item_val(i, 5) for i in sel)
+            out('  purpose %s: items %d steps %d ai %d (ai/steps %.2f), items with ai=0: %d, ai>steps: %d'
+                % (purpose, len(sel), st, ai, ai / st if st else 0, sum(1 for i in sel if not _item_val(i, 5)),
+                   sum(1 for i in sel if _item_val(i, 5) > int(i[1]))))
+        out('  60 min windows every 10 min: end s60 i60 | main steps/ai | coworker steps/ai')
+        end = now
+        while end > now - KEEP + 3600:
+            win = [i for i in mine if 0 <= end - float(i[0]) <= 3600]
+            m = [i for i in win if i[3] == 'm']
+            w = [i for i in win if i[3] == 'w']
+            out('   %s %4d %4d | %4d/%4d | %4d/%4d' % (
+                hm(end), sum(int(i[1]) for i in win), sum(_item_val(i, 5) for i in win),
+                sum(int(i[1]) for i in m), sum(_item_val(i, 5) for i in m),
+                sum(int(i[1]) for i in w), sum(_item_val(i, 5) for i in w)))
+            end -= 600
+        out('  last 12 items: time steps purpose ai errors')
+        for i in mine[-12:]:
+            out('   %s %d %s %d %d' % (hm(i[0]), int(i[1]), i[3], _item_val(i, 5), _item_val(i, 6)))
+    for hit in (record.get('hits') or [])[-3:]:
+        w = (hit.get('windows') or {}).get('3600') or {}
+        out('rate-limit hit %s account %s: 60 min steps %s ai %s' % (hm(hit.get('ts') or 0),
+                                                                     str(hit.get('account'))[:8], w.get('steps'), w.get('ai_steps')))
+    for ts, kind, doc in stops:
+        out('event %s %s %s' % (hm(ts), kind, str((json.loads(doc) or {}).get('detail') or '')[:120]))
+    purposes = {}
+    for w in workers:
+        purposes[str(w.get('purpose') or '')] = purposes.get(str(w.get('purpose') or ''), 0) + 1
+    out('workers by purpose %s; step_seen docs %d' % (json.dumps(purposes, sort_keys=True), seen_rows))
+    return record
+
+
+# ---- read-only transcript shape (python -m notiontool.step_guard shape data/notiontool.db) ----
+def shape(db_path, out=print, samples=6):
+    """Field statistics of the stored Main transcript entries (thread_context). Read-only (mode=ro).
+
+    Shows which field ties the entries of one AI step (parallel tool calls) together.
+    """
+    import collections
+    import json
+    import sqlite3
+    from pathlib import Path
+    uri = 'file:' + Path(db_path).resolve().as_posix() + '?mode=ro'
+    db = sqlite3.connect(uri, uri=True)
+    try:
+        workers = [json.loads(r[0]) for r in db.execute("SELECT doc FROM objects WHERE kind='workers'").fetchall()]
+        mains = {str(w.get('thread_id')): w for w in workers if w.get('purpose') in TRANSCRIPT_PURPOSES}
+        rows = db.execute("SELECT id, doc FROM objects WHERE kind='thread_context'").fetchall()
+    finally:
+        db.close()
+    for ident, doc in rows:
+        thread = str(ident).split(':', 1)[-1]
+        if thread not in mains:
+            continue
+        entities = sorted((json.loads(doc).get('entities') or {}).values(), key=lambda e: e.get('sequence', 0))
+        kinds = collections.Counter(str(e.get('kind') or e.get('type') or '') for e in entities)
+        out('main thread %s purpose %s: %d entries; kinds %s' % (thread[:8], mains[thread].get('purpose'),
+                                                               len(entities), json.dumps(dict(kinds), sort_keys=True)))
+        tools = [e for e in entities if 'tool' in str(e.get('kind') or e.get('type') or '').lower()
+                 and 'result' not in str(e.get('kind') or e.get('type') or '').lower()]
+        fields = sorted({k for e in tools for k in e})
+        out('  tool-call entries %d; fields: value count / distinct values / values shared by >1 entry' % len(tools))
+        for field in fields:
+            vals = collections.Counter(json.dumps(e.get(field), sort_keys=True)[:120] for e in tools if field in e)
+            out('   %-28s %5d %5d %5d' % (field, sum(vals.values()), len(vals), sum(1 for n in vals.values() if n > 1)))
+        for e in tools[-samples:]:
+            out('  sample ' + json.dumps({k: json.dumps(v)[:60] for k, v in e.items()}, sort_keys=True)[:900])
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == 'audit':
+        audit(sys.argv[2])
+    elif len(sys.argv) >= 3 and sys.argv[1] == 'shape':
+        shape(sys.argv[2])
+    else:
+        print('usage: python -m notiontool.step_guard audit|shape <path to notiontool.db>')
