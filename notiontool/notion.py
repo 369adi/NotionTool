@@ -483,7 +483,32 @@ class NotionClient:
             raise ThreadMissing(body['threadId'], path)
         if status != 200:
             raise ValueError(f'Notion {path}: {text}')
-        return json.loads(text)
+        data = json.loads(text)
+        return self._follow_fanout(path, data, timeout)
+
+    def _follow_fanout(self, path, data, timeout):
+        """Live 2026-10-22: syncRecordValues* answers with an empty recordMap plus fanoutData that names the
+        server cell holding the records (x-notion-cell). Without following it every thread record read was
+        empty, so thread_busy never saw a finished turn. Merge the records of every named cell."""
+        fanout = data.get('fanoutData') if isinstance(data, dict) else None
+        if not fanout or not isinstance(fanout, list):
+            return data
+        records = dict(data.get('recordMap') or {})
+        for item in fanout:
+            if not isinstance(item, dict) or not isinstance(item.get('request'), dict):
+                continue
+            headers = {**self.headers(), **{k: str(v) for k, v in (item.get('headers') or {}).items()}}
+            status, text = self.transport.request(path, item['request'], headers=headers, timeout=timeout)
+            if status == 429:
+                raise RateLimited(getattr(self.transport, 'retry_after', 30))
+            if status != 200:
+                raise ValueError(f'Notion {path} (cell {item.get("headers")}): {text}')
+            for table, rows in (json.loads(text).get('recordMap') or {}).items():
+                if isinstance(rows, dict):
+                    records.setdefault(table, {}).update(rows)
+        result = {k: v for k, v in data.items() if k != 'fanoutData'}
+        result['recordMap'] = records
+        return result
 
     def identity(self):
         data = self.call('loadUserContent',{})
@@ -1514,38 +1539,54 @@ class NotionAdapter:
         finally:
             stream_alive[0] = False
 
+    def turn_outcome(self, client, thread_id):
+        """Notion's own record of the latest turn: (latest user/trigger ms, completed ms, outcome status)."""
+        result = client.call('syncRecordValuesSpaceInitial', {'requests': [
+            {'pointer': {'table': 'thread', 'id': thread_id, 'spaceId': client.info['space_id']}, 'version': -1}]})
+        found = result.get('recordMap', {}).get('thread', {})
+        thread = unwrap(found[thread_id]) if thread_id in found else {}
+        if isinstance(thread.get('value'), dict) and 'id' in thread['value']:
+            thread = thread['value']  # live 2026-10-22: {spaceId, value: {value: record}}
+        if not thread:
+            raise LookupError('thread record not returned')
+        outcome = (thread.get('data') or {}).get('last_turn_outcome') or {}
+        return (float(thread.get('latest_user_or_trigger_time') or 0), float(outcome.get('completed_time') or 0),
+                outcome.get('status') or '')
+
     def _stall_watch(self, client, worker, cancel, stream_cancel, alive, last_chunk, run_id='', trace=None):
-        """A frozen Edge stream never yields again (live 22 Oct 05:42, Coworker 4): the turn was finished in Notion,
-        but the task waited forever and the Main was never woken. After a long silence this reads the chat itself;
-        only when its turn is over does it end the stream, so the normal reconcile reads our committed reply.
-        It never resends and never ends a running turn."""
+        """Live 22 Oct 2026: Notion keeps the runInferenceTranscript response open after the turn is finished
+        (Coworker 4: turn completed 05:46:42, stream still open at 06:11; 6 of 7 streams since 04:54 ended only
+        by our own 900 s abort). The stream end is therefore no longer the signal: Notion writes the end of a turn
+        to the thread record (last_turn_outcome). While the stream is silent, that record is read; once it shows
+        our turn as completed the stream is closed and the normal reconcile reads our committed reply.
+        Never resends, never ends a running turn."""
         trace = trace or {}
-        check_after = float(getattr(self, 'stream_stall_check_s', 120))
-        recheck = float(getattr(self, 'stream_stall_recheck_s', 60))
-        poll = float(getattr(self, 'stream_stall_poll_s', 1.0))
-        checked = 0.0
+        poll = float(getattr(self, 'stream_turn_poll_s', 5.0))
+        quiet = float(getattr(self, 'stream_turn_quiet_s', 3.0))  # only read the record while no bytes arrive
+        sent_ms = time.time() * 1000 - 5000
+        failures = 0
         while alive[0] and not stream_cancel.is_set():
             if cancel is not None and cancel.wait(poll):
                 stream_cancel.set()  # the task itself was cancelled: pass it on to the stream
                 return
             if cancel is None:
                 time.sleep(poll)
-            now = time.monotonic()
-            if not alive[0] or now - last_chunk[0] < check_after or now - checked < recheck:
+            if not alive[0] or time.monotonic() - last_chunk[0] < quiet:
                 continue
-            checked = now
             try:
-                transcript = client.transcript(worker['thread_id'], limit=30)
-                session = transcript.get('session') or {}
-                over = (not transcript.get('session_pending') and session.get('status') in (None, 'idle', 'completed')
-                        and not self.thread_busy(client, worker['thread_id']))
+                latest, completed, status = self.turn_outcome(client, worker['thread_id'])
+                failures = 0
             except Exception as exc:
-                self.store.event('stream_stall_check_failed', run_id,
-                                 message=(type(exc).__name__ + ': ' + str(exc))[:200], **trace)
+                failures += 1
+                if failures in (1, 10, 100):
+                    self.store.event('stream_turn_check_failed', run_id, failures=failures,
+                                     message=(type(exc).__name__ + ': ' + str(exc))[:200], **trace)
                 continue
-            if over and alive[0]:
-                self.store.event('stream_stall_turn_done', run_id, idle_s=round(now - last_chunk[0], 1),
-                                 message='Stream frozen but the chat turn is over; reading the reply from the chat', **trace)
+            if completed >= sent_ms and completed >= latest and alive[0]:
+                self.store.event('stream_turn_done', run_id, outcome=status,
+                                 idle_s=round(time.monotonic() - last_chunk[0], 1),
+                                 message='Notion finished the turn but kept the stream open; reading the reply from the chat',
+                                 **trace)
                 stream_cancel.set()
                 return
 
@@ -1847,12 +1888,7 @@ class NotionAdapter:
     def thread_busy(self, client, thread_id, window=None):
         """True while Notion has not written the outcome of the latest turn in this chat."""
         try:
-            result = client.call('syncRecordValuesSpaceInitial', {'requests': [
-                {'pointer': {'table': 'thread', 'id': thread_id, 'spaceId': client.info['space_id']}, 'version': -1}]})
-            found = result.get('recordMap', {}).get('thread', {})
-            thread = unwrap(found[thread_id]) if thread_id in found else {}
-            latest = float(thread.get('latest_user_or_trigger_time') or 0)
-            done = float(((thread.get('data') or {}).get('last_turn_outcome') or {}).get('completed_time') or 0)
+            latest, done, _status = self.turn_outcome(client, thread_id)
         except Exception:
             return False  # The session checks still apply when the record cannot be read.
         # A turn without an outcome for longer than the task timeout counts as abandoned.
