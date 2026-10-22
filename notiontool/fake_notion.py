@@ -8,18 +8,29 @@ run()/recover() stream parsing, rename_thread, delete_thread) runs unchanged:
                 re-read on every call and written atomically, so it survives an app restart.
 - FakeTransport request(path, body, headers=None, timeout=45) -> (status, text) and
                 stream(path, body, headers=None, timeout=60, cancel=None) -> NDJSON lines,
-                with _base, retry_after, model_catalog and close() like the real transports.
+                with _base, retry_after, model_catalog, close() and a .browser stub.
 - FakeClient    a NotionClient on a FakeTransport: headers, call, identity, model, threads,
                 transcript (inherited, same return shapes) plus helpers rename_thread,
                 delete_thread, thread_records, send and wait.
 - install(adapter) makes adapter.client(account_id, anonymous=False) return FakeClient
                 objects. Nothing else is patched.
+- FakeNotionAdapter(NotionAdapter) the real adapter with only client(), edge_transport(),
+                browser_login() and adopt_session_cookies() replaced (refuses to start unless
+                NOTIONTOOL_TEST_INSTANCE=1 or force=True).
+- seed_scenario(store) writes the simulated accounts, chat workers and Main chats as store records.
+- main(argv)    command line: python -m notiontool.fake_notion [--state F | --data-dir D]
+                reset | seed | set-fault TARGET NAME [key=value ...] | clear-fault TARGET [NAME] | show [TARGET]
+                TARGET is a thread id, an account key ('ready', 'noai') or 'account/title' ('ready/Coworker 1').
 
 Seed: two accounts, 'ready' (Notion AI on) and 'noai' (Notion AI disabled), each with a
 Main chat, three Coworker chats and two private chats. Answers are deterministic and end
 with 'RESULT: DONE'.
 
-Faults per thread, in state['faults'][thread_id] = {name: params} (set_fault() or by hand):
+Unknown endpoints answer HTTP 400 'fake: unhandled endpoint X' (never a silent success) and log a
+fake_unhandled_endpoint event (state['events'] and, via FakeNotionAdapter/install, the store events).
+
+Faults per thread, in state['faults'][thread_id] = {name: params} (set_fault() or by hand);
+clear_fault(target, name=None) removes one or all:
   too_large      {'max_limit': N}    getThreadTranscript with limit > N fails with 'Response too large'
   hang           {'seconds': S}      the send commits the user step, then only keep-alive lines until
                                      cancel is set or min(timeout, S) passes (then TimeoutError)
@@ -28,29 +39,60 @@ Faults per thread, in state['faults'][thread_id] = {name: params} (set_fault() o
   missing        {}                  HTTP 404 on transcript/send, not listed, record alive=False
   deleted_delay  {'seconds': K}      already deleted (404, alive=False) but still listed for K seconds
                                      after deleted_at
+  rate_limit     {'retry_after': S,  HTTP 429 on every request/send that touches the thread; the transport's
+                  'times': N}        retry_after is S, so call() raises RateLimited(S) and the stream raises
+                                     NotionHttpError(429, retry_after=S). Nothing is committed. With times the
+                                     fault clears itself after N refusals.
+  busy           {}                  another turn is running: transcript session 'running' + session_pending,
+                                     record latest_user_or_trigger_time > completed_time; a send is refused
+                                     with NotionHttpError(409) and commits nothing
+  empty_stream   {}                  empty_stream_committed: the stream ends after patch-start with no text,
+                                     but Notion commits the user step, the full reply and turn_completed
+  lost_stream    {}                  cut_stream_lost: the stream is cut (OSError) before Notion committed
+                                     anything; the transcript does not contain the step
+  error_step     {'message': T}      the stream yields an 'error' step; the transcript gets an agent_error
+                                     entry and turn_completed without reply text (turn_state done_error)
+  slow           {'seconds': S}      the reply arrives spread over S seconds (keep-alive lines between the
+                                     pieces); past the call timeout TimeoutError, the reply is committed anyway
+  chat_list_unavailable {}           account fault (on the account key or any of its threads): the space
+                                     record is missing, so notion.threads() raises ChatListUnavailable
+  welcome_not_listed {'seconds': K}  the chat is alive and readable but not in the space thread_ids (for K
+                                     seconds from 'since', forever without seconds). On an account key every
+                                     chat created later (createThread) inherits the fault.
 """
 import contextlib
 import copy
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 
-from .notion import MODEL_NAMES, NotionClient, text_content
+from .notion import MODEL_NAMES, NotionAdapter, NotionClient, text_content
 from .vendor.transport import NotionHttpError
 
 FAKE_BASE = 'https://fake.notion.invalid'
 STATE_ENV = 'NOTIONTOOL_FAKE_STATE'
+TEST_INSTANCE_ENV = 'NOTIONTOOL_TEST_INSTANCE'
 STATE_FILE = 'fake_notion.json'
 STATE_VERSION = 1
 RESULT_LINE = 'RESULT: DONE'
-FAULTS = ('too_large', 'hang', 'interrupted', 'missing', 'deleted_delay')
+FAULTS = ('too_large', 'hang', 'interrupted', 'missing', 'deleted_delay',
+          'rate_limit', 'busy', 'empty_stream', 'lost_stream', 'error_step', 'slow',
+          'chat_list_unavailable', 'welcome_not_listed')
+ACCOUNT_FAULTS = ('chat_list_unavailable', 'welcome_not_listed')  # may target an account key
 DEFAULT_DELETED_DELAY = 30
+DEFAULT_RETRY_AFTER = 30
+DEFAULT_SLOW_SECONDS = 2.0
+ERROR_STEP_TEXT = 'fake: simulated error step (Notion reported an error for this turn)'
 CALL_LOG_KEEP = 500
+EVENT_LOG_KEEP = 200
+UNHANDLED_EVENT = 'fake_unhandled_endpoint'
 WELCOME_TITLE = 'Welcome to Notion'
+KIND_PURPOSE = {'main': 'main', 'coworker': 'worker', 'private': 'private'}
 
 # (key, email, user name, workspace name, Notion AI enabled)
 ACCOUNTS = (
@@ -69,6 +111,10 @@ CHATS = (
 
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
+
+
+class SimulationRefused(RuntimeError):
+    """FakeNotionAdapter was asked to start outside the test app."""
 
 
 def _lock_for(path):
@@ -118,7 +164,8 @@ def _entity(kind, ident, sequence, at, text=None, **extra):
 def seed_state(now=None):
     """Fresh simulated world: 2 accounts x (Main, 3 Coworkers, 2 private chats), one finished turn each."""
     now = time.time() if now is None else now
-    state = dict(version=STATE_VERSION, created_at=now, accounts={}, threads={}, messages={}, faults={}, calls=[])
+    state = dict(version=STATE_VERSION, created_at=now, accounts={}, threads={}, messages={}, faults={}, calls=[],
+                 events=[])
     for key, email, name, space_name, ai in ACCOUNTS:
         space_id = fake_uuid('space', key)
         account = dict(key=key, email=email, name=name, user_id=fake_uuid('user', key), space_id=space_id,
@@ -164,6 +211,7 @@ class FakeState:
                     for table in ('accounts', 'threads', 'messages', 'faults'):
                         data.setdefault(table, {})
                     data.setdefault('calls', [])
+                    data.setdefault('events', [])
                     return data
                 with contextlib.suppress(OSError):  # keep an unreadable file for inspection
                     os.replace(str(self.path), str(self.path) + '.corrupt')
@@ -220,12 +268,55 @@ class FakeState:
     def calls(self, path=None):
         return [c for c in self.load()['calls'] if path is None or c.get('path') == path]
 
+    def events(self, kind=None):
+        return [e for e in self.load()['events'] if kind is None or e.get('kind') == kind]
+
+    def faults(self, target):
+        return copy.deepcopy(_faults(self.load(), target))
+
+    def resolve_target(self, target):
+        """Thread id, account key or 'account/title' (e.g. 'ready/Coworker 1') -> thread id or account key."""
+        data = self.load()
+        target = str(target or '').strip()
+        if target in data['threads'] or target in data['accounts']:
+            return target
+        if '/' in target:
+            key, title = target.split('/', 1)
+            for tid in data['accounts'].get(key, {}).get('thread_order', []):
+                thread = data['threads'].get(tid)
+                if thread and thread['title'] == title:
+                    return tid
+        raise KeyError('fake: no simulated thread or account %r' % target)
+
+    def summary(self, target=None):
+        """What `show` prints: accounts, their chats (alive, listed, session, faults) and the last events."""
+        data = self.load()
+        now = self.clock()
+        accounts = {}
+        for key, account in data['accounts'].items():
+            threads = []
+            for tid in account['thread_order']:
+                thread = data['threads'].get(tid)
+                if thread is None or (target and target not in (key, tid)):
+                    continue
+                threads.append(dict(id=tid, title=thread['title'], kind=thread['kind'],
+                                    alive=not _gone(data, thread, now), listed=_listed(data, thread, now),
+                                    session=thread['session_status'], turns=thread.get('turns', 0),
+                                    faults=copy.deepcopy(_faults(data, tid))))
+            if target and not threads and target != key:
+                continue
+            accounts[key] = dict(email=account['email'], ai_enabled=account['ai_enabled'],
+                                 faults=copy.deepcopy(_faults(data, key)), threads=threads)
+        return dict(path=str(self.path), accounts=accounts, calls=len(data['calls']), events=data['events'][-20:])
+
     # --- faults ---------------------------------------------------------------------------
     def set_fault(self, thread_id, name, **params):
+        """Set a fault on a thread id (account faults also on an account key); see the module header."""
         if name not in FAULTS:
             raise ValueError('unknown fault %r; known: %s' % (name, ', '.join(FAULTS)))
         with self.edit() as data:
-            if thread_id not in data['threads']:
+            on_account = name in ACCOUNT_FAULTS and thread_id in data['accounts']
+            if thread_id not in data['threads'] and not on_account:
                 raise KeyError(thread_id)
             if name == 'deleted_delay':
                 params.setdefault('seconds', DEFAULT_DELETED_DELAY)
@@ -233,6 +324,12 @@ class FakeState:
                 if thread.get('deleted_at') is None:
                     thread['deleted_at'] = self.clock()
                 thread['alive'] = False
+            elif name == 'rate_limit':
+                params.setdefault('retry_after', DEFAULT_RETRY_AFTER)
+            elif name == 'slow':
+                params.setdefault('seconds', DEFAULT_SLOW_SECONDS)
+            elif name == 'welcome_not_listed' and not on_account:
+                params.setdefault('since', self.clock())
             data['faults'].setdefault(thread_id, {})[name] = params
 
     def clear_fault(self, thread_id, name=None):
@@ -249,6 +346,38 @@ class FakeState:
 def _faults(data, thread_id):
     faults = data['faults'].get(thread_id)
     return faults if isinstance(faults, dict) else {}
+
+
+def _param(faults, name):
+    value = faults.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _account_fault(data, key, name):
+    """Account-level fault: set on the account key or on any chat of that account."""
+    if name in _faults(data, key):
+        return True
+    return any(name in _faults(data, t) for t in data['accounts'].get(key, {}).get('thread_order', []))
+
+
+def _take_rate_limit(data, thread_ids):
+    """retry_after of the first rate-limited thread (counting down 'times'), else None."""
+    for tid in thread_ids:
+        faults = _faults(data, tid)
+        if 'rate_limit' not in faults:
+            continue
+        params = _param(faults, 'rate_limit')
+        retry = params.get('retry_after', DEFAULT_RETRY_AFTER)
+        if params.get('times') is not None:
+            left = int(params['times']) - 1
+            if left <= 0:
+                faults.pop('rate_limit', None)
+                if not faults:
+                    data['faults'].pop(tid, None)
+            else:
+                faults['rate_limit'] = dict(params, times=left)
+        return retry
+    return None
 
 
 def _gone(data, thread, now):
@@ -269,6 +398,15 @@ def _listed(data, thread, now):
         if deleted_at is None:
             deleted_at = thread['deleted_at'] = now  # hand-written fault: the delay starts at first read
         return now - deleted_at < float(params.get('seconds', DEFAULT_DELETED_DELAY))
+    if 'welcome_not_listed' in faults and thread.get('alive', True):
+        if not isinstance(faults['welcome_not_listed'], dict):
+            faults['welcome_not_listed'] = {}
+        params = faults['welcome_not_listed']
+        if params.get('since') is None:
+            params['since'] = now  # hand-written fault: the delay starts at first read
+        seconds = params.get('seconds')
+        if seconds is None or now - float(params['since']) < float(seconds):
+            return False
     return bool(thread.get('alive', True))
 
 
@@ -276,14 +414,26 @@ def _thread_record(data, thread):
     """syncRecordValues 'thread' value: the fields notion.py reads (alive, title, messages, busy times)."""
     outcome = {'completed_time': thread.get('completed_time') or 0}
     alive = not _gone(data, thread, 0)
+    latest = thread.get('latest_user_or_trigger_time') or 0
+    if 'busy' in _faults(data, thread['id']):
+        latest = max(int(latest), int(outcome['completed_time']) + 1)  # a turn is running
     return dict(id=thread['id'], space_id=thread['space_id'], alive=alive, messages=list(thread.get('messages', [])),
-                created_time=_ms(thread['created_at']), latest_user_or_trigger_time=thread.get('latest_user_or_trigger_time') or 0,
+                created_time=_ms(thread['created_at']), latest_user_or_trigger_time=latest,
                 last_turn_outcome=outcome,
                 data=dict(thread.get('data') or {}, title=thread['title'], last_turn_outcome=outcome))
 
 
 def _wrap(value):
     return {'value': {'value': value, 'role': 'editor'}}
+
+
+def _request_thread_ids(body):
+    ids = [str(body.get('threadId'))] if body.get('threadId') else []
+    for request in body.get('requests') or []:
+        pointer = (request or {}).get('pointer') or {}
+        if pointer.get('table') == 'thread' and pointer.get('id'):
+            ids.append(str(pointer['id']))
+    return ids
 
 
 class FakeTransport:
@@ -298,9 +448,15 @@ class FakeTransport:
         self.model_catalog = {}
         self.keepalive = keepalive
         self.closed = False
+        self.ready_process = None
+        self.event_sink = None  # optional callable(kind, **fields), e.g. Store.event
 
     def close(self):
         self.closed = True
+
+    @property
+    def browser(self):
+        raise RuntimeError('fake: the Edge browser is not available in simulation')
 
     # --- helpers --------------------------------------------------------------------------
     def _log(self, data, path, body):
@@ -308,6 +464,18 @@ class FakeTransport:
         data['calls'].append(dict(path=path, account=self.account_key, thread_id=body.get('threadId', ''),
                                   step_id=body.get('submittedUserStepId', ''), at=self.state.clock()))
         del data['calls'][:-CALL_LOG_KEEP]
+
+    def _note_unhandled(self, data, path):
+        data.setdefault('events', []).append(dict(kind=UNHANDLED_EVENT, path=str(path), account=self.account_key,
+                                                  at=self.state.clock()))
+        del data['events'][:-EVENT_LOG_KEEP]
+
+    def _emit_unhandled(self, path):
+        sink = self.event_sink
+        if callable(sink):
+            with contextlib.suppress(Exception):
+                sink(UNHANDLED_EVENT, message='fake: unhandled endpoint %s' % path, path=str(path),
+                     account_id=self.account_key, source='fake_notion')
 
     def _account(self, data):
         account = data['accounts'].get(self.account_key)
@@ -326,13 +494,24 @@ class FakeTransport:
     # --- request ----------------------------------------------------------------------------
     def request(self, path, body, headers=None, timeout=45, ndjson=False):
         body = body if isinstance(body, dict) else {}
+        unhandled = False
         with self.state.edit() as data:
             self._log(data, path, body)
             account = self._account(data)
+            retry = _take_rate_limit(data, _request_thread_ids(body))
             handler = getattr(self, '_ep_' + str(path), None)
-            if handler is None:
-                return self._error(400, 'fake: unhandled endpoint %s' % path)
-            return handler(data, account, body)
+            if retry is not None:
+                self.retry_after = retry
+                result = self._error(429, 'fake: rate limited, retry after %s s' % retry, 'RateLimited')
+            elif handler is None:
+                unhandled = True
+                self._note_unhandled(data, path)
+                result = self._error(400, 'fake: unhandled endpoint %s' % path)
+            else:
+                result = handler(data, account, body)
+        if unhandled:
+            self._emit_unhandled(path)
+        return result
 
     def _ep_loadUserContent(self, data, account, body):
         ai = bool(account['ai_enabled'])
@@ -366,6 +545,8 @@ class FakeTransport:
             pointer = (request or {}).get('pointer') or {}
             table, ident = pointer.get('table'), pointer.get('id')
             if table == 'space' and ident == account['space_id']:
+                if _account_fault(data, self.account_key, 'chat_list_unavailable'):
+                    continue  # no space record: notion.threads() raises ChatListUnavailable
                 listed = [t for t in account['thread_order'] if t in data['threads']
                           and _listed(data, data['threads'][t], now)]
                 record_map.setdefault('space', {})[ident] = _wrap(dict(
@@ -392,9 +573,10 @@ class FakeTransport:
             return self._error(500, 'NotionStreamError: Edge request interrupted (Error: Response too large)',
                                'ResponseTooLarge')
         window = thread['entries'][-limit:]
+        status = 'running' if 'busy' in _faults(data, tid) else thread['session_status']
         result = {'patches': [{'op': 'put', 'entity': copy.deepcopy(e)} for e in window],
-                  'session': {'status': thread['session_status'], 'sequence': thread['sequence']}}
-        if thread['session_status'] not in ('idle', 'completed'):
+                  'session': {'status': status, 'sequence': thread['sequence']}}
+        if status not in ('idle', 'completed'):
             result['session_pending'] = True
         return self._ok(result)
 
@@ -436,8 +618,31 @@ class FakeTransport:
         if path != 'runInferenceTranscript':
             with self.state.edit() as data:
                 self._log(data, path, body)
-            raise NotionHttpError(400)
+                self._note_unhandled(data, path)
+            self._emit_unhandled(path)
+            raise NotionHttpError(400, 'fake: unhandled endpoint %s' % path)
         return self._run(body, float(timeout or 60), cancel)
+
+    def _stream_fault(self, body):
+        """rate_limit / busy / lost_stream refuse the turn before Notion commits anything (the call is logged)."""
+        tid = str(body.get('threadId') or '')
+        with self.state.edit() as data:
+            thread = data['threads'].get(tid)
+            if thread is None or thread['account'] != self.account_key:
+                return None
+            faults = _faults(data, tid)
+            retry = _take_rate_limit(data, [tid])
+            if retry is not None:
+                self.retry_after = retry
+                failure = NotionHttpError(429, 'fake: rate limited, retry after %s s' % retry, retry_after=retry)
+            elif 'busy' in faults:
+                failure = NotionHttpError(409, 'fake: another turn is still running in this chat')
+            elif 'lost_stream' in faults:
+                failure = OSError('fake: stream lost before Notion committed the turn')
+            else:
+                return None
+            self._log(data, 'runInferenceTranscript', body)
+            return failure
 
     def _commit_user(self, body):
         """Commit the user step (or raise NotionHttpError); returns (thread snapshot, prompt, faults, turn)."""
@@ -456,6 +661,10 @@ class FakeTransport:
                               latest_user_or_trigger_time=0, completed_time=0, data={})
                 data['threads'][tid] = thread
                 account['thread_order'].append(tid)
+                inherited = _faults(data, self.account_key).get('welcome_not_listed')
+                if inherited is not None:
+                    params = dict(inherited if isinstance(inherited, dict) else {}, since=now)
+                    data['faults'].setdefault(tid, {})['welcome_not_listed'] = params
             if thread is None or thread['account'] != self.account_key or _gone(data, thread, now):
                 raise NotionHttpError(404)
             steps = [s for s in body.get('transcript') or [] if isinstance(s, dict)]
@@ -497,7 +706,26 @@ class FakeTransport:
             thread['session_status'] = 'idle'
             thread['completed_time'] = max(_ms(now), int(thread.get('latest_user_or_trigger_time') or 0))
 
+    def _commit_error(self, tid, text):
+        """error_step: Notion ends the turn with an error entry and no reply text."""
+        now = self.state.clock()
+        with self.state.edit() as data:
+            thread = data['threads'].get(tid)
+            if thread is None:
+                return
+            thread['sequence'] += 1
+            thread['entries'].append(_entity('agent_error', fake_uuid('error', tid, thread['sequence']),
+                                             thread['sequence'], now, error={'message': text}))
+            thread['sequence'] += 1
+            thread['entries'].append(_entity('turn_completed', fake_uuid('done', tid, thread['sequence']),
+                                             thread['sequence'], now))
+            thread['session_status'] = 'idle'
+            thread['completed_time'] = max(_ms(now), int(thread.get('latest_user_or_trigger_time') or 0))
+
     def _run(self, body, timeout, cancel):
+        failure = self._stream_fault(body)
+        if failure is not None:
+            raise failure
         thread, prompt, faults, turn = self._commit_user(body)
         tid = thread['id']
         answer = answer_for(thread['title'], prompt, turn)
@@ -526,6 +754,32 @@ class FakeTransport:
             self._commit_reply(tid, ''.join(partial).rstrip('\n'), completed=False)
             if params.get('cut', True):
                 raise OSError('fake: stream interrupted mid-answer')
+            return
+        if 'empty_stream' in faults:
+            self._commit_reply(tid, answer, completed=True)  # committed, but nothing came over the stream
+            return
+        if 'error_step' in faults:
+            text = str(_param(faults, 'error_step').get('message') or ERROR_STEP_TEXT)
+            yield json.dumps({'type': 'patch', 'v': [{'o': 'a', 'p': '/s/-', 'v': {
+                'id': fake_uuid('error-step', tid, thread['sequence']), 'type': 'error', 'message': text}}]})
+            self._commit_error(tid, text)
+            return
+        if 'slow' in faults:
+            seconds = float(_param(faults, 'slow').get('seconds', DEFAULT_SLOW_SECONDS))
+            started = time.monotonic()
+            for index, piece in enumerate(lines):
+                due = started + seconds * (index + 1) / max(1, len(lines))
+                while time.monotonic() < due:
+                    if cancel is not None and cancel.is_set():
+                        self._commit_reply(tid, answer, completed=True)  # Notion finishes on its side
+                        return
+                    if time.monotonic() - started >= timeout:
+                        self._commit_reply(tid, answer, completed=True)
+                        raise TimeoutError('fake: the slow reply did not finish within the call timeout')
+                    yield ''  # keep-alive between the pieces
+                    time.sleep(max(0.0, min(self.keepalive, due - time.monotonic())))
+                yield chunk(piece)
+            self._commit_reply(tid, answer, completed=True)
             return
         for piece in lines:
             yield chunk(piece)
@@ -604,10 +858,11 @@ def install(adapter, state=None):
 
     The store account is matched to a simulated account by its id ('ready'/'noai') or its email. One
     FakeTransport per account is kept, like the adapter's own transport cache (model catalog cache).
-    Returns the FakeState in use.
+    Unhandled endpoints are also reported to store.event when the store has one. Returns the FakeState.
     """
     store = getattr(adapter, 'store', None)
     state = state or FakeState(data_dir=getattr(store, 'directory', None))
+    sink = getattr(store, 'event', None)
     transports = {}
     lock = threading.Lock()
 
@@ -623,7 +878,201 @@ def install(adapter, state=None):
             transport = transports.get(key)
             if transport is None:
                 transport = transports[key] = FakeTransport(state, key)
+                if callable(sink):
+                    transport.event_sink = sink
         return FakeClient(key, account.get('identity'), state=state, transport=transport)
 
     adapter.client = client
     return state
+
+
+class FakeNotionAdapter(NotionAdapter):
+    """The real NotionAdapter; only the way it reaches Notion is simulated.
+
+    Overrides exactly client(), edge_transport(), browser_login() and adopt_session_cookies(); the
+    real NetworkBudget, run/recover, chat pool and refresh code stay in use. Refuses to start unless
+    NOTIONTOOL_TEST_INSTANCE=1 (the test app) or force=True (unit tests).
+    """
+    simulated = True
+    refresh_on_login = True
+
+    def __init__(self, store, state=None, force=False):
+        if not force and os.environ.get(TEST_INSTANCE_ENV) != '1':
+            raise SimulationRefused('FakeNotionAdapter only runs in the test app (%s=1)' % TEST_INSTANCE_ENV)
+        self.fake_state = state or FakeState(data_dir=getattr(store, 'directory', None))
+        self.fake_transports = {}
+        self.fake_lock = threading.Lock()
+        super().__init__(store)
+
+    def _fake_key(self, account_id):
+        try:
+            account = self.store.get('accounts', account_id, {}) or {}
+        except Exception:
+            account = {}
+        return self.fake_state.account_key_for(account_id, account.get('email', '')), account
+
+    def _fake_transport(self, key):
+        with self.fake_lock:
+            transport = self.fake_transports.get(key)
+            if transport is None:
+                transport = self.fake_transports[key] = FakeTransport(self.fake_state, key)
+                transport.event_sink = self.store.event
+            return transport
+
+    def client(self, account_id, anonymous=False):
+        key, account = self._fake_key(account_id)
+        return FakeClient(key, account.get('identity'), state=self.fake_state, transport=self._fake_transport(key))
+
+    def edge_transport(self, account_id):
+        key, _ = self._fake_key(account_id)
+        transport = self._fake_transport(key)
+        self.edge_transports[account_id] = transport
+        return transport
+
+    def browser_login(self, timeout=1200):
+        """No Edge window: signs in the simulated 'ready' account."""
+        return self.adopt_session_cookies([{'name': 'token_v2', 'value': 'fake:ready', 'domain': '.fake.notion.invalid'}],
+                                          source='browser_login')
+
+    def adopt_session_cookies(self, cookies, source='browser_login', select=False):
+        """token_v2 'fake:<account key>' (default 'ready') marks that simulated account as signed in."""
+        token = next((str(c.get('value')) for c in cookies or []
+                      if isinstance(c, dict) and c.get('name') == 'token_v2' and c.get('value')), '')
+        if not token:
+            raise ValueError('No Notion sign-in was detected (token_v2 cookie missing)')
+        key = token.split(':', 1)[1] if token.startswith('fake:') else 'ready'
+        if self.fake_state.account(key) is None:
+            raise ValueError('fake: unknown simulated account %s' % key)
+        info = FakeClient(key, state=self.fake_state, transport=self._fake_transport(key)).identity()
+        email = info['email'].lower()
+        accounts = self.store.all('accounts')
+        existing = next((a for a in accounts if str(a.get('email', '')).lower() == email), None)
+        account = existing or self.create_account(email)
+        account = dict(self.store.get('accounts', account['id'], account) or account, identity=info,
+                       state='signed_in', simulated=True, login_source=source)
+        self.store.put('accounts', account)
+        self.clear_account_pause(account['id'], verified=True)
+        if self.refresh_on_login:
+            try:
+                self.refresh(account['id'])
+            except Exception as exc:
+                self.store.event('fake_login_refresh_failed', message=str(exc)[:300], account_id=account['id'])
+        if select or not accounts:
+            from .harness_account import select_account
+            with contextlib.suppress(Exception):
+                select_account(self.store, account['id'])
+        account = self.store.get('accounts', account['id'], account) or account
+        return {'account_id': account['id'], 'email': account['email'], 'state': account.get('state', '')}
+
+
+def seed_scenario(store, state=None, name='default'):
+    """Write the simulated accounts, chat workers and Main chats as store records (idempotent).
+
+    Same record shapes as the real refresh()/create_account() (accounts id = account key, workers
+    '<key>:<thread id>', chats 'c_fake_<key>'). Returns the counts of records added now.
+    """
+    if name != 'default':
+        raise ValueError('unknown scenario %r; known: default' % name)
+    state = state or FakeState(data_dir=getattr(store, 'directory', None))
+    now = time.time()
+    added = dict(accounts=0, workers=0, chats=0)
+    for slot, (key, email, _name, _space, _ai) in enumerate(ACCOUNTS, 1):
+        if store.get('accounts', key) is None:
+            client = FakeClient(key, state=state)
+            info = client.identity()
+            access = NotionAdapter.workspace_ai_access(info)
+            ready = access.get('state') == 'enabled'
+            store.put('accounts', dict(id=key, slot=slot, email=email, label='Slot %d' % slot,
+                                       state='ready' if ready else 'ai_disabled', identity=info, ai_access=access,
+                                       model=client.model() if ready else '', bridge_connected=False,
+                                       cooldown_until=0, simulated=True))
+            added['accounts'] += 1
+        for thread in state.threads_of(key):
+            wid = key + ':' + thread['id']
+            purpose = KIND_PURPOSE.get(thread['kind'], 'private')
+            if store.get('workers', wid) is None:
+                store.put('workers', dict(id=wid, account_id=key, thread_id=thread['id'], purpose=purpose,
+                                          enabled=purpose in ('main', 'worker'), state='ready', lease='',
+                                          last_used=0, label=thread['title'], welcome=purpose in ('main', 'worker'),
+                                          simulated=True))
+                added['workers'] += 1
+            chat_id = 'c_fake_' + key
+            if purpose == 'main' and store.get('chats', chat_id) is None:
+                store.put('chats', dict(id=chat_id, title=thread['title'], main_worker=wid, account_id=key,
+                                        folder_id='', project_path='', created=now, main_number=1,
+                                        state='active', predecessor=''))
+                added['chats'] += 1
+    store.raise_counter('main', 1)
+    settings = store.get('settings', 'app', {}) or {}
+    if 'harness_account_id' not in settings:
+        store.put('settings', dict(settings, id='app', harness_account_id='ready', coworker_target=3))
+    return dict(added, scenario=name, state=str(state.path))
+
+
+def _parse_params(items):
+    params = {}
+    for item in items or []:
+        if '=' not in item:
+            raise ValueError('fault parameter %r must look like key=value' % item)
+        key, value = item.split('=', 1)
+        try:
+            params[key] = json.loads(value)
+        except ValueError:
+            params[key] = value
+    return params
+
+
+def main(argv=None):
+    """Command line for the simulated Notion state; prints JSON, returns 0 (or 2 on a bad target/fault)."""
+    import argparse
+    parser = argparse.ArgumentParser(prog='python -m notiontool.fake_notion',
+                                     description='Inspect and change the simulated Notion of the test app.')
+    parser.add_argument('--state', help='state file (default: env %s, else <data-dir>/%s)' % (STATE_ENV, STATE_FILE))
+    parser.add_argument('--data-dir', help='test app data folder (holds notiontool.db and %s)' % STATE_FILE)
+    sub = parser.add_subparsers(dest='command')
+    sub.required = True
+    sub.add_parser('reset', help='re-seed the simulated world (drops faults and new chats)')
+    sub.add_parser('seed', help='write the simulated accounts and chats into the store of --data-dir')
+    p = sub.add_parser('set-fault', help='set a fault: TARGET NAME [key=value ...]')
+    p.add_argument('target')
+    p.add_argument('name')
+    p.add_argument('params', nargs='*')
+    p = sub.add_parser('clear-fault', help='clear one fault or all faults of TARGET')
+    p.add_argument('target')
+    p.add_argument('name', nargs='?')
+    p = sub.add_parser('show', help='accounts, chats, faults and the last events')
+    p.add_argument('target', nargs='?')
+    args = parser.parse_args(argv)
+    state = FakeState(args.state, args.data_dir)
+    try:
+        if args.command == 'reset':
+            state.reset()
+            out = dict(reset=True, path=str(state.path))
+        elif args.command == 'seed':
+            if not args.data_dir:
+                raise ValueError('seed needs --data-dir (the folder with notiontool.db)')
+            from .store import Store
+            store = Store(Path(args.data_dir))
+            try:
+                out = seed_scenario(store, state)
+            finally:
+                store.close()
+        elif args.command == 'set-fault':
+            target = state.resolve_target(args.target)
+            state.set_fault(target, args.name, **_parse_params(args.params))
+            out = dict(target=target, faults=state.faults(target))
+        elif args.command == 'clear-fault':
+            target = state.resolve_target(args.target)
+            state.clear_fault(target, args.name)
+            out = dict(target=target, faults=state.faults(target))
+        else:
+            out = state.summary(state.resolve_target(args.target) if args.target else None)
+    except (KeyError, ValueError) as exc:
+        print(json.dumps({'error': str(exc).strip('"\'')}), file=sys.stderr)
+        return 2
+    print(json.dumps(out, indent=1, sort_keys=True))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

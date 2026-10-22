@@ -315,5 +315,303 @@ class PersistenceAndInstallTests(FakeNotionTestCase):
             adapter.client('unknown')
 
 
+# --- review fixes: added faults -------------------------------------------------------------
+
+class AddedFaultTests(FakeNotionTestCase):
+
+    def transcript_call(self, client, thread):
+        return client.call('getThreadTranscript', {'spaceId': client.info['space_id'], 'threadId': thread,
+                                                   'direction': 'backward', 'limit': 30})
+
+    def test_every_added_fault_can_be_set_and_cleared(self):
+        worker = tid(self.state, 'coworker')
+        added = ('rate_limit', 'busy', 'empty_stream', 'lost_stream', 'error_step', 'slow',
+                 'chat_list_unavailable', 'welcome_not_listed')
+        self.assertEqual(fake_notion.FAULTS[:5], ('too_large', 'hang', 'interrupted', 'missing', 'deleted_delay'))
+        for name in added:
+            self.assertIn(name, fake_notion.FAULTS)
+            self.assertIn(name, fake_notion.__doc__)  # described in the file header
+            self.state.set_fault(worker, name)
+            self.assertIn(name, self.state.faults(worker))
+            self.state.clear_fault(worker, name)
+            self.assertEqual(self.state.faults(worker), {})
+        self.state.set_fault('ready', 'chat_list_unavailable')  # account faults may target the account key
+        self.state.clear_fault('ready')
+        self.assertEqual(self.state.faults('ready'), {})
+        with self.assertRaises(KeyError):
+            self.state.set_fault('ready', 'busy')  # thread faults need a thread id
+
+    def test_fault_rate_limit(self):
+        from notiontool.engine import RateLimited
+        client = signed_in(self.state)
+        worker = tid(self.state, 'coworker')
+        turns = self.state.thread(worker)['turns']
+        self.state.set_fault(worker, 'rate_limit', retry_after=7, times=2)
+        with self.assertRaises(RateLimited):
+            self.transcript_call(client, worker)
+        self.assertEqual(client.transport.retry_after, 7)
+        with self.assertRaises(NotionHttpError) as err:
+            client.send(worker, 'too fast')
+        self.assertEqual(err.exception.status, 429)
+        self.assertEqual(err.exception.retry_after, 7)
+        self.assertEqual(self.state.thread(worker)['turns'], turns)  # nothing committed
+        self.assertEqual(self.state.faults(worker), {})  # times=2 used up: cleared itself
+        text, _ = client.send(worker, 'now it works')
+        self.assertTrue(text.endswith('RESULT: DONE'))
+
+    def test_fault_busy(self):
+        client = signed_in(self.state)
+        worker = tid(self.state, 'coworker')
+        self.state.set_fault(worker, 'busy')
+        transcript = client.transcript(worker)
+        self.assertEqual(transcript['session']['status'], 'running')
+        self.assertIs(transcript['session_pending'], True)
+        self.assertEqual(session_state(transcript), 'running')
+        record = Adapter().thread_records(client, [worker])[worker]
+        self.assertGreater(record['latest_user_or_trigger_time'], record['data']['last_turn_outcome']['completed_time'])
+        turns = self.state.thread(worker)['turns']
+        with self.assertRaises(NotionHttpError) as err:
+            client.send(worker, 'while busy')
+        self.assertEqual(err.exception.status, 409)
+        self.assertEqual(self.state.thread(worker)['turns'], turns)
+        self.state.clear_fault(worker, 'busy')
+        self.assertEqual(session_state(client.transcript(worker)), 'finished')
+
+    def test_fault_empty_stream(self):
+        client = signed_in(self.state)
+        worker = tid(self.state, 'coworker')
+        self.state.set_fault(worker, 'empty_stream')
+        text, step = client.send(worker, 'answer silently')
+        self.assertEqual(text, '')
+        result = client.wait(worker, step)
+        self.assertEqual(result['state'], 'done_reply')  # committed although the stream was empty
+        self.assertTrue(result['text'].endswith('RESULT: DONE'))
+
+    def test_fault_lost_stream(self):
+        client = signed_in(self.state)
+        worker = tid(self.state, 'coworker')
+        self.state.set_fault(worker, 'lost_stream')
+        with self.assertRaises(OSError) as err:
+            client.send(worker, 'lost', step_id='step-lost')
+        self.assertNotIsInstance(err.exception, NotionHttpError)
+        entities = [p['entity'] for p in client.transcript(worker)['patches']]
+        self.assertFalse(any(e.get('client_message_id') == 'step-lost' for e in entities))
+        self.assertEqual([c['step_id'] for c in self.state.calls('runInferenceTranscript')], ['step-lost'])
+
+    def test_fault_error_step(self):
+        client = signed_in(self.state)
+        worker = tid(self.state, 'coworker')
+        self.state.set_fault(worker, 'error_step', message='model overloaded')
+        text, step = client.send(worker, 'fail please')
+        self.assertEqual(text, '')
+        result = client.wait(worker, step)
+        self.assertEqual(result['state'], 'done_error')
+        self.assertTrue(any('error' in e['kind'] for e in result['own_turn']))
+
+    def test_fault_slow(self):
+        client = signed_in(self.state)
+        worker = tid(self.state, 'coworker')
+        self.state.set_fault(worker, 'slow', seconds=0.4)
+        started = time.monotonic()
+        text, _ = client.send(worker, 'take your time')
+        self.assertGreaterEqual(time.monotonic() - started, 0.4)
+        self.assertTrue(text.endswith('RESULT: DONE'))
+        self.state.set_fault(worker, 'slow', seconds=5)
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            client.send(worker, 'too slow', step_id='step-slow', timeout=0.3)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(client.wait(worker, 'step-slow')['state'], 'done_reply')  # arrives late anyway
+
+    def test_fault_chat_list_unavailable(self):
+        from notiontool.notion import ChatListUnavailable
+        client = signed_in(self.state)
+        self.state.set_fault('ready', 'chat_list_unavailable')
+        with self.assertRaises(ChatListUnavailable):
+            client.threads()
+        self.assertEqual(len(signed_in(self.state, 'noai').threads()), 6)  # other account unaffected
+        self.state.clear_fault('ready', 'chat_list_unavailable')
+        self.assertEqual(len(client.threads()), 6)
+        self.state.set_fault(tid(self.state, 'private'), 'chat_list_unavailable')  # set on one of its chats
+        with self.assertRaises(ChatListUnavailable):
+            client.threads()
+
+    def test_fault_welcome_not_listed(self):
+        now = [100.0]
+        state = FakeState(self.tmp / 'welcome.json', clock=lambda: now[0])
+        client = signed_in(state)
+        state.set_fault('ready', 'welcome_not_listed', seconds=5)
+        new = str(uuid.uuid4())
+        text, _ = client.send(new, 'hello', create=True)
+        self.assertTrue(text.endswith('RESULT: DONE'))
+        self.assertNotIn(new, [t['id'] for t in client.threads()])
+        self.assertEqual(session_state(client.transcript(new)), 'finished')  # alive and readable
+        now[0] += 6
+        self.assertIn(new, [t['id'] for t in client.threads()])
+        private = tid(state, 'private')
+        state.set_fault(private, 'welcome_not_listed')  # no seconds: never listed
+        now[0] += 1000
+        self.assertNotIn(private, [t['id'] for t in client.threads()])
+        state.clear_fault(private)
+        self.assertIn(private, [t['id'] for t in client.threads()])
+
+
+# --- review fixes: adapter fake, scenario seed, command line ---------------------------------
+
+class AdapterSeedCliTests(FakeNotionTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.stores = []
+
+    def tearDown(self):
+        for store in self.stores:  # close the SQLite files before the temporary folder is removed (Windows)
+            store.close()
+        super().tearDown()
+
+    def store(self, name='app'):
+        from notiontool.store import Store
+        directory = self.tmp / name
+        directory.mkdir(parents=True, exist_ok=True)
+        store = Store(directory)
+        self.stores.append(store)
+        return store
+
+    def adapter(self, store=None):
+        adapter = fake_notion.FakeNotionAdapter(store or self.store(), state=self.state, force=True)
+        adapter.refresh_on_login = False
+        return adapter
+
+    def test_adapter_guard_and_overrides(self):
+        store = self.store()
+        with mock.patch.dict(os.environ, {'NOTIONTOOL_TEST_INSTANCE': ''}):
+            with self.assertRaises(fake_notion.SimulationRefused):
+                fake_notion.FakeNotionAdapter(store, state=self.state)
+        with mock.patch.dict(os.environ, {'NOTIONTOOL_TEST_INSTANCE': '1'}):
+            adapter = fake_notion.FakeNotionAdapter(store, state=self.state)
+        self.assertIsInstance(adapter, NotionAdapter)
+        self.assertIs(adapter.simulated, True)
+        overridden = {n for n in vars(fake_notion.FakeNotionAdapter)
+                      if n in vars(NotionAdapter) and not n.startswith('__') and callable(vars(NotionAdapter)[n])}
+        self.assertEqual(overridden, {'client', 'edge_transport', 'browser_login', 'adopt_session_cookies'})
+
+    def test_adapter_login_client_and_edge_stub(self):
+        adapter = self.adapter()
+        signed = adapter.browser_login()
+        self.assertEqual(signed['email'], 'main1@fake-notion.test')
+        self.assertEqual(signed['state'], 'signed_in')
+        client = adapter.client(signed['account_id'])
+        self.assertIsInstance(client, FakeClient)
+        self.assertEqual(client.account_key, 'ready')
+        self.assertEqual(client.info['email'], 'main1@fake-notion.test')  # identity from the store record
+        edge = adapter.edge_transport(signed['account_id'])
+        self.assertIs(edge, client.transport)
+        self.assertIs(adapter.edge_transports[signed['account_id']], edge)
+        with self.assertRaisesRegex(RuntimeError, 'not available in simulation'):
+            edge.browser
+        edge.close()
+        self.assertTrue(edge.closed)
+        noai = adapter.adopt_session_cookies([{'name': 'token_v2', 'value': 'fake:noai'}])
+        self.assertEqual(noai['email'], 'noai1@fake-notion.test')
+        self.assertEqual(adapter.browser_login()['account_id'], signed['account_id'])  # same account again
+        with self.assertRaises(ValueError):
+            adapter.adopt_session_cookies([{'name': 'other', 'value': 'x'}])
+
+    def test_unhandled_endpoint_logs_event_and_keeps_400(self):
+        store = self.store()
+        adapter = self.adapter(store)
+        signed = adapter.browser_login()
+        client = adapter.client(signed['account_id'])
+        with self.assertRaisesRegex(ValueError, 'fake: unhandled endpoint getSomethingNew'):
+            client.call('getSomethingNew', {})
+        with self.assertRaises(NotionHttpError) as err:
+            list(client.transport.stream('streamSomethingNew', {}))
+        self.assertEqual(err.exception.status, 400)
+        self.assertEqual([e['path'] for e in self.state.events('fake_unhandled_endpoint')],
+                         ['getSomethingNew', 'streamSomethingNew'])
+        logged = [e for e in store.events() if e['kind'] == 'fake_unhandled_endpoint']
+        self.assertEqual([e['path'] for e in logged], ['getSomethingNew', 'streamSomethingNew'])
+
+    def test_seed_scenario_writes_store_records(self):
+        store = self.store()
+        added = fake_notion.seed_scenario(store, self.state)
+        self.assertEqual((added['accounts'], added['workers'], added['chats']), (2, 12, 2))
+        self.assertEqual(store.get('accounts', 'ready')['state'], 'ready')
+        self.assertTrue(store.get('accounts', 'ready')['model'])
+        self.assertTrue(store.get('accounts', 'ready')['simulated'])
+        self.assertEqual(store.get('accounts', 'noai')['state'], 'ai_disabled')
+        workers = [w for w in store.all('workers') if w['account_id'] == 'ready']
+        self.assertEqual(sorted(w['purpose'] for w in workers), ['main', 'private', 'private', 'worker', 'worker', 'worker'])
+        coworker = store.get('workers', 'ready:' + tid(self.state, 'coworker'))
+        self.assertEqual(coworker['label'], 'Coworker 1')
+        self.assertEqual(store.get('chats', 'c_fake_ready')['main_worker'], 'ready:' + tid(self.state))
+        again = fake_notion.seed_scenario(store, self.state)
+        self.assertEqual((again['accounts'], again['workers'], again['chats']), (0, 0, 0))
+        client = self.adapter(store).client('ready')  # seeded record works with the adapter
+        self.assertEqual(len(client.threads()), 6)
+        with self.assertRaises(ValueError):
+            fake_notion.seed_scenario(store, self.state, name='unknown')
+
+    def run_main(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fake_notion.main(['--state', str(self.state.path)] + list(argv))
+        return code, (json.loads(out.getvalue()) if out.getvalue() else None), err.getvalue()
+
+    def test_main_set_clear_show_reset(self):
+        worker = tid(self.state, 'coworker')
+        code, out, _ = self.run_main('set-fault', 'ready/Coworker 1', 'hang', 'seconds=5')
+        self.assertEqual(code, 0)
+        self.assertEqual(out, {'target': worker, 'faults': {'hang': {'seconds': 5}}})
+        code, out, _ = self.run_main('show', 'ready/Coworker 1')
+        self.assertEqual(code, 0)
+        self.assertEqual(out['accounts']['ready']['threads'][0]['faults'], {'hang': {'seconds': 5}})
+        code, out, _ = self.run_main('set-fault', worker, 'deleted_delay', 'seconds=60')
+        self.assertEqual(sorted(out['faults']), ['deleted_delay', 'hang'])
+        code, out, _ = self.run_main('clear-fault', worker, 'hang')
+        self.assertEqual(sorted(out['faults']), ['deleted_delay'])
+        code, out, _ = self.run_main('clear-fault', worker)
+        self.assertEqual(out['faults'], {})
+        code, _, err = self.run_main('set-fault', 'ready/No such chat', 'hang')
+        self.assertEqual(code, 2)
+        self.assertIn('no simulated thread', err)
+        code, _, err = self.run_main('set-fault', worker, 'explode')
+        self.assertEqual(code, 2)
+        self.assertIn('unknown fault', err)
+        self.state.set_fault(worker, 'missing')
+        code, out, _ = self.run_main('reset')
+        self.assertEqual((code, out['reset']), (0, True))
+        self.assertEqual(self.state.faults(worker), {})
+        code, out, _ = self.run_main('show')
+        self.assertEqual(sorted(out['accounts']), ['noai', 'ready'])
+        self.assertEqual(len(out['accounts']['ready']['threads']), 6)
+
+    def test_main_seed(self):
+        import contextlib
+        import io
+        data_dir = self.tmp / 'seeded'
+        data_dir.mkdir()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fake_notion.main(['--state', str(self.state.path), '--data-dir', str(data_dir), 'seed'])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())['workers'], 12)
+        self.assertEqual(self.store('seeded').get('accounts', 'noai')['state'], 'ai_disabled')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(fake_notion.main(['--state', str(self.state.path), 'seed']), 2)  # needs --data-dir
+
+    def test_module_entry_point(self):
+        import subprocess
+        import sys
+        root = Path(__file__).resolve().parents[1]
+        done = subprocess.run([sys.executable, '-m', 'notiontool.fake_notion', '--state', str(self.state.path), 'show'],
+                              cwd=str(root), capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('ready', json.loads(done.stdout)['accounts'])
+
+
 if __name__ == '__main__':
     unittest.main()
