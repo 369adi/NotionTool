@@ -11,6 +11,7 @@ Plain unittest: python -m unittest tests.test_test_app_scenarios
 """
 import faulthandler
 import json
+import os
 import sys
 import threading
 import time
@@ -73,6 +74,8 @@ def tearDownModule():
         _stop()
     finally:
         faulthandler.cancel_dump_traceback_later()
+    if not os.environ.get('NT_SCENARIO_SUMMARY'):  # opt-in: a plain test run writes nothing into work/ or data/
+        return
     root, _, _, _ = test_app._paths()
     summary = {name: dict(verdict=r['verdict'], reasons=r['reasons'], seconds=r.get('seconds'),
                           events=[e['kind'] for e in r['events']], details=r.get('details'))
@@ -99,6 +102,7 @@ class TestAppScenarios(unittest.TestCase):
             log_tail=result.get('log_tail', '')[-1500:]), indent=1))
         self.assertTrue(result['events'], 'a passed scenario must report the events it saw')
         self.assertEqual(test_app._PROCS, {}, 'scenario() must leave no test-app process behind')
+        return result
 
     def test_scenario_list(self):
         self.assertEqual(tuple(test_app.SCENARIOS), ('restart_cut', 'too_large', 'deleted_chat', 'wake'))
@@ -107,7 +111,9 @@ class TestAppScenarios(unittest.TestCase):
         self._scenario_passes('restart_cut')
 
     def test_too_large(self):
-        self._scenario_passes('too_large')
+        result = self._scenario_passes('too_large')
+        self.assertEqual(result['details'].get('circuit_open_check'), 'checked',
+                         'the simulated connection must pass the real NetworkBudget')
 
     def test_deleted_chat(self):
         self._scenario_passes('deleted_chat')
@@ -152,6 +158,19 @@ class TestPlainTestInstance(unittest.TestCase):
     def test_unknown_scenario_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'scenario name'):
             test_app.scenario('explode')
+
+
+class BootGuard(unittest.TestCase):
+    def test_simulated_mode_is_refused_outside_the_test_instance(self):
+        class RealApp:
+            test_instance = False
+        with self.assertRaisesRegex(RuntimeError, 'only the test app'):
+            test_app.boot_fake_notion(RealApp())
+
+    def test_run_flags(self):
+        self.assertIs(test_app._flag('false', True), False)
+        self.assertIs(test_app._flag(None, True), True)
+        self.assertIs(test_app._flag(1, False), True)
 
 
 if __name__ == '__main__':
