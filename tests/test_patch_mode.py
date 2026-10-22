@@ -146,6 +146,23 @@ class PatchModeTest(unittest.TestCase):
         self.assertEqual(self.main_sha(), before)
         self.assertFalse((self.root / 'work' / 'bench' / 'roman.py').exists())
 
+    def test_collect_adds_listed_files_even_when_gitignored(self):
+        t = self.task('t1', 's1', 'Bench', files=['work/bench/roman.py', './work/bench/test_roman.py',
+                                                   'work/bench/missing.py', 'data/x.db', '../evil.py'])
+        wt = Path(self.pm.prepare(t))
+        write(wt / 'work' / 'bench' / 'roman.py', 'X = 1\n')
+        write(wt / 'work' / 'bench' / 'test_roman.py', 'Y = 2\n')
+        write(wt / 'work' / 'bench' / 'unlisted.py', 'Z = 3\n')
+        write(wt / 'data' / 'x.db', 'db')
+        stats = self.pm.collect(t)
+        self.assertEqual(sorted(stats['forced']), ['work/bench/roman.py', 'work/bench/test_roman.py'])
+        self.assertEqual(sorted(f['path'] for f in stats['files']),
+                         ['work/bench/roman.py', 'work/bench/test_roman.py'])
+        result = self.pm.merge(t)
+        self.assertEqual(result['status'], 'merged')
+        self.assertEqual((self.root / 'work' / 'bench' / 'roman.py').read_text(encoding='utf-8'), 'X = 1\n')
+        self.assertFalse((self.root / 'work' / 'bench' / 'unlisted.py').exists())
+
     def test_verify_green_then_red(self):
         t = self.task('t1', 's1', 'Swap add')
         self.pm.prepare(t)
@@ -202,7 +219,9 @@ class PatchModeTest(unittest.TestCase):
         self.assertEqual(git(self.root, 'branch', '--list', 'task/*'), '')
         self.assertEqual(git(self.root, 'status', '--porcelain'), '')
         self.assertFalse(second['pushed'])
-        self.assertIn('No origin', second['push']['reason'])
+        self.assertIn('Auto-push is off', second['push']['reason'])
+        self.pm.auto_push = True
+        self.assertIn('No origin', self.pm.push(first['main_after'], second['main_after'], green=True)['reason'])
         self.assertEqual(self.created, [])
 
     def test_real_conflict_goes_to_one_follow_up_task_and_keeps_the_branch(self):
@@ -293,8 +312,21 @@ class PatchModeTest(unittest.TestCase):
             self.assertTrue((self.root / 'demoapp' / ('part%d.py' % i)).exists())
 
     # ---- push ----------------------------------------------------------------
+    def test_no_push_by_default_after_a_green_merge(self):
+        origin = self.add_origin()
+        before_remote = git(origin, 'rev-parse', 'main')
+        t0 = self.task('t0', 's0', 'Friendlier greeting')
+        self.pm.prepare(t0)
+        self.edit(t0, 'demoapp/text.py', '"hello"', '"hello there"')
+        result = self.pm.merge(t0)
+        self.assertEqual(result['status'], 'merged', result)
+        self.assertFalse(result['pushed'], result['push'])
+        self.assertIn('Auto-push is off', result['push']['reason'])
+        self.assertEqual(git(origin, 'rev-parse', 'main'), before_remote)
+
     def test_push_after_a_clean_green_merge_and_never_with_secrets(self):
         origin = self.add_origin()
+        self.pm.auto_push = True
         t1 = self.task('t1', 's1', 'Friendlier greeting')
         self.pm.prepare(t1)
         self.edit(t1, 'demoapp/text.py', '"hello"', '"hello there"')
@@ -316,6 +348,7 @@ class PatchModeTest(unittest.TestCase):
 
     def test_never_force_pushes_over_a_newer_origin(self):
         origin = self.add_origin()
+        self.pm.auto_push = True
         other = self.tmp / 'other'
         git(self.tmp, 'clone', '-q', str(origin), str(other))
         git(other, 'config', 'user.name', 'Other')

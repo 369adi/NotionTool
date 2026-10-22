@@ -29,8 +29,18 @@
       'new features', 'neue funktionen', 'neuigkeiten', 'was ist neu'],
     help: ['help', 'hilfe', 'help & support', 'hilfe & support', 'help and support', 'hilfe und support',
       'help, feedback, and more', 'hilfe, feedback und mehr'],
-    meetings: ['meetings', 'besprechungen', 'ai meeting notes', 'ki-besprechungsnotizen']
+    meetings: ['meetings', 'besprechungen', 'ai meeting notes', 'ki-besprechungsnotizen'],
+    // Icon buttons next to Notion's 'New chat' pill at the bottom of the sidebar (only there).
+    footer: ['new page', 'neue seite', 'hot and fresh features', 'heiße neue funktionen', 'neue funktionen']
   };
+  var NEW_CHAT_SEL = '[aria-label="New chat"],[aria-label="Neuer Chat"]';
+  function nearNewChat(node) {
+    var cur = node && node.parentElement;
+    for (var i = 0; cur && i < 3; i++, cur = cur.parentElement) {
+      try { if (cur.querySelector(NEW_CHAT_SEL)) return true; } catch (err) { return false; }
+    }
+    return false;
+  }
   // Exact visible texts of short buttons; their small card is hidden with them.
   var BUTTONS = {
     trial: ['probe-abo starten', 'start trial', 'start free trial', 'start a free trial', 'kostenlos testen',
@@ -183,6 +193,7 @@
         var label = node.getAttribute('aria-label') || '';
         var role = node.getAttribute('role') || (node.tagName === 'BUTTON' ? 'button' : '');
         var reason = labelReason(label, role);
+        if (reason === 'footer' && !nearNewChat(node)) reason = '';
         if (reason) { hide(node, reason, keep); return; }
         if (label && keepLabel(label)) return;
         var isClick = false;
@@ -200,6 +211,27 @@
         if (inside(node, OURS_SEL) || String(node.className || '').indexOf('nt-desk-') >= 0) return;
         var reason = dialogReason(node.getAttribute('aria-label') || '', visibleText(node));
         if (reason) hide(node, reason, keep);
+      });
+      // Sidebar footer: our sidebar carries data-nt-desk, so the label pass above skips it. Hide the icon
+      // buttons that sit next to Notion's 'New chat' pill (New page, Hot and fresh features); the pill stays.
+      all(document, NEW_CHAT_SEL).forEach(function (pill) {
+        var box = pill.parentElement;
+        var pr = pill.getBoundingClientRect();
+        for (var depth = 0; box && depth < 7; depth++, box = box.parentElement) {
+          var hits = all(box, '[aria-label]').filter(function (n) {
+            if (n === pill || inside(n, '[data-nt-desk-own]')) return false;
+            if (labelReason(n.getAttribute('aria-label'), 'button') !== 'footer') return false;
+            // Same row as the pill only (the footer), never a 'New page' button elsewhere in the sidebar.
+            var r = n.getBoundingClientRect();
+            return Math.abs((r.top + r.height / 2) - (pr.top + pr.height / 2)) < 30;
+          });
+          if (hits.length) {
+            // Own class: chrome.js manages nt-desk-hidden in the sidebar and would put these back.
+            hits.forEach(function (n) { if (!n.classList.contains('nt-desk-footer-hidden')) n.classList.add('nt-desk-footer-hidden'); });
+            reasons.footer = hits.length;
+            break;
+          }
+        }
       });
       // Nodes that no longer match (or left the page) get their class back off.
       var gone = marked.filter(function (node) { return keep.indexOf(node) < 0; });

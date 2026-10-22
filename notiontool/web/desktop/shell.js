@@ -436,12 +436,7 @@
       placeholder: function (tab, box) {
         box.appendChild(mk('div', { cls: 'nt-shell-empty-title' }, TAB_LABEL[tab] || ''));
         box.appendChild(mk('div', { cls: 'nt-shell-empty-text' }, PLACEHOLDER[tab] || ''));
-        var part = window.__ntDeskMounted && window.__ntDeskMounted[tab];
-        if (part && typeof part.open === 'function') {
-          var btn = mk('button', { type: 'button', cls: 'nt-shell-btn' }, 'Open ' + (TAB_LABEL[tab] || tab));
-          btn.addEventListener('click', function () { try { part.open(); } catch (e) { warn('open failed', e); } });
-          box.appendChild(btn);
-        }
+        // No 'Open' button: views register themselves and render directly in the tab.
       },
       chatBadge: function () {
         var tab = nativeTab(findTopRow(sidebar()), 'chat');
@@ -567,6 +562,25 @@
       var brand = sb.querySelector('[data-nt-desk="brand"]');
       if (!brand) return;
       if (!brand.classList.contains(CLS_BRAND)) brand.classList.add(CLS_BRAND);
+      // Notion collapses its own workspace/profile switcher (height 0, opacity 0, pointer-events none)
+      // and our brand header sits where it used to be. Forward clicks so the profile menu opens again
+      // (bug 2026-10-21: profile could no longer be clicked).
+      if (!brand.__ntSwitchBound) {
+        brand.__ntSwitchBound = true;
+        brand.style.cursor = 'pointer';
+        brand.setAttribute('role', 'button');
+        brand.setAttribute('aria-label', 'Workspace and profile');
+        brand.addEventListener('click', function (ev) {
+          var t0 = ev.target;
+          if (t0 && t0.closest && t0.closest('[data-nt-desk="conn"]')) return;
+          var sw = document.querySelector('.notion-sidebar-switcher');
+          if (!sw) return;
+          var t = sw.querySelector('[role=button]') || sw;
+          ev.preventDefault();
+          ev.stopPropagation();
+          t.click();
+        });
+      }
       var dot = null;
       var kids = brand.children || [];
       for (var i = 0; i < kids.length; i++) if (kids[i].getAttribute('data-nt-desk') === 'conn') { dot = kids[i]; break; }

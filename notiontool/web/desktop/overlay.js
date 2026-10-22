@@ -284,10 +284,11 @@
         try { var info = shared(w.created_at, now); if (info && info.label) age = { label: String(info.label), level: String(info.level || '') }; } catch (e) { /* keep ours */ }
       }
       var task = String(w.task_title || '');
+      var busy = !!task || !!w.task_id || workerBusy(w);
       var badge = ageBadge(w, now);
       var rotating = !!(badge && badge.rotating);
       return { id: String(w.id || ''), label: String(w.label || 'Coworker'), thread: threadKey(w.thread_id),
-        url: String(w.url || ''), model: String(w.model || ''), task: task || 'Idle', busy: !!task,
+        url: String(w.url || ''), model: String(w.model || ''), task: task || (busy ? 'Working' : 'Idle'), busy: busy,
         age: age.label + (rotating ? ' - rotating soon' : ''), ageCls: age.level, rotating: rotating,
         created: badge ? badge.created : '', ageTitle: badge ? badge.title : '' };
     });
@@ -645,6 +646,11 @@
       if (!state || !key) return false;
       // I33: every Main is always shown (also user-renamed ones like 'Roblox', several at once).
       if (mainOf(state, key)) return false;
+      // The user's own chats (e.g. 'Sonstiges') stay in Notion's list, so a normal click opens them
+      // (desktop JS never clicks or navigates). applyChats then leaves them out of our Chats section,
+      // so each chat is shown exactly once.
+      var own = list(state.private_chats).map(function (c) { return threadKey(c && c.thread_id); });
+      if (own.indexOf(key) >= 0) return false;
       var hidden = list(state.hidden_threads).map(threadKey);
       if (hidden.indexOf(key) >= 0) return true;
       var mains = list(state.mains).map(function (m) { return threadKey(m && m.thread_id); });
@@ -1246,7 +1252,10 @@
       }
       var collapsed = chatsCollapsed();
       section.classList.toggle('nt-desk-collapsed', collapsed);
-      var rows = privateChatRows(state);
+      // Chats that Notion already lists itself (own chats stay visible there) are not shown twice.
+      var rows = privateChatRows(state).filter(function (r) {
+        return !document.querySelector('[data-nt-desk="chat-row"][data-nt-desk-thread="' + r.thread + '"]');
+      });
       var sig = JSON.stringify(rows);
       if (section.getAttribute('data-nt-desk-sig') === sig) return;
       if (menu && section.contains(menu.button)) closeMenu(false);
@@ -1752,4 +1761,52 @@
       }
     };
   };
+})();
+
+// Hide Notion's cookie notice ('Notion uses cookies ...') in the NotionTool window (user wish 2026-10-21).
+// Only hides it (display:none); never clicks anything in it.
+(function () {
+  'use strict';
+  if (window.__ntCookieHide) return;
+  window.__ntCookieHide = true;
+  var RX = /^(notion uses cookies|notion verwendet cookies|we use cookies)/i;
+  // Notion's overlay layer (.notion-overlay-container) also holds every menu and popup, e.g. the
+  // workspace/profile switcher. It must never be hidden, or those menus open invisibly (bug 2026-10-21).
+  var OVERLAY = 'notion-overlay-container';
+  function isOverlay(node) { return !!(node && node.classList && node.classList.contains(OVERLAY)); }
+  function hide() {
+    try {
+      var layers = document.querySelectorAll('.' + OVERLAY);
+      for (var j = 0; j < layers.length; j++) {
+        if (layers[j].__ntCookieHidden || layers[j].style.getPropertyValue('display') === 'none') {
+          layers[j].style.removeProperty('display');
+          layers[j].__ntCookieHidden = false;
+        }
+      }
+      var nodes = document.querySelectorAll('div,section,aside,[role=dialog],[role=region]');
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (el.__ntCookieHidden) continue;
+        var t = (el.innerText || '').trim();
+        if (!t || t.length > 600 || !RX.test(t)) continue;
+        // Walk up to the fixed/sticky box that holds the notice, and hide that box.
+        var box = el, p = el;
+        for (var k = 0; k < 8 && p && p !== document.body; k++) {
+          if (isOverlay(p)) break;
+          var pos = getComputedStyle(p).position;
+          if (pos === 'fixed' || pos === 'sticky') { box = p; break; }
+          p = p.parentElement;
+        }
+        if ((box.innerText || '').length > 800) continue;
+        box.style.setProperty('display', 'none', 'important');
+        box.__ntCookieHidden = true;
+        el.__ntCookieHidden = true;
+      }
+    } catch (e) { /* never break the page */ }
+  }
+  var n = 0;
+  // Re-check for 10 minutes (the notice can appear late). Only in the real app window, not in test runners.
+  var realApp = typeof navigator !== 'undefined' && /Chrome|Electron/.test(String(navigator.userAgent || ''));
+  (function tick() { hide(); if (realApp && ++n < 600) setTimeout(tick, 1000); })();
+  if (document.readyState !== 'loading') hide(); else document.addEventListener('DOMContentLoaded', hide);
 })();

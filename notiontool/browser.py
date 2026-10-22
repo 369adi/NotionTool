@@ -211,7 +211,8 @@ class Browser:
                 f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check',
                 *NO_THROTTLE_FLAGS, self.start_url]
         flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        options = self._launch_options(args)
+        self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, **options)
         deadline = time.time() + 20
         while time.time() < deadline:
             try:
@@ -223,6 +224,48 @@ class Browser:
             except OSError:
                 time.sleep(0.3)
         raise RuntimeError('Browser did not start its DevTools endpoint')
+
+    def _launch_options(self, args):
+        """Owned Notion transport Edge: off screen and never activated (games, full screen)."""
+        options = {}
+        if self.hidden():
+            args.insert(-1, '--window-position=-32000,-32000')
+            if os.name == 'nt':
+                startup = subprocess.STARTUPINFO()
+                startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startup.wShowWindow = 4  # SW_SHOWNOACTIVATE
+                options['startupinfo'] = startup
+        return options
+
+    def hidden(self):
+        """True for the owned Notion transport browser (setting edge_transport_hidden, default on)."""
+        try:
+            on = self.store.settings().get('edge_transport_hidden', True)
+        except Exception:
+            on = True
+        return bool(on and self.edge_only and str(self.profile_name or '').startswith('notion-'))
+
+    def _window_bounds(self, tab, bounds):
+        win = self.send(tab, 'Browser.getWindowForTarget', {'targetId': tab.get('id')}, 5).get('windowId')
+        if win is None:
+            return False
+        self.send(tab, 'Browser.setWindowBounds', {'windowId': win, 'bounds': {'windowState': 'normal'}}, 5)
+        self.send(tab, 'Browser.setWindowBounds', {'windowId': win, 'bounds': bounds}, 5)
+        return True
+
+    def hide_window(self, tab):
+        """Move the window of tab off screen (not minimized: the tab keeps running). Never raises."""
+        try:
+            return self._window_bounds(tab, {'left': -32000, 'top': -32000, 'width': 1200, 'height': 800})
+        except Exception:
+            return False
+
+    def show_window(self, tab):
+        """Bring the window of tab back on screen (the user opened Notion in Edge). Never raises."""
+        try:
+            return self._window_bounds(tab, {'left': 80, 'top': 80, 'width': 1280, 'height': 860})
+        except Exception:
+            return False
 
     def close(self):
         if self.process is not None and self.process.poll() is None:

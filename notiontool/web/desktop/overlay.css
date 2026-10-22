@@ -2,6 +2,8 @@
  * Colours come from the theme part (--nt-* variables); every var() has a fallback so the
  * sidebar still looks right when the theme part is not loaded. */
 .nt-desk-hidden { display: none !important; }
+/* Sidebar footer icons next to 'New chat' (New page, Hot and fresh features). */
+html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
 
 /* Branded header at the top of the sidebar. */
 .nt-desk-brand {

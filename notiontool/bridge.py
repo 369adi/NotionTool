@@ -55,12 +55,18 @@ REA_TOOLS = {
 }
 from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled
 READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewer')
+from . import long_calls
+# nt_job_result (long_calls.JOB_TOOL) only reads a finished or running job of the same caller:
+# read-only and allowed for every role. Bridge.rpc answers it before any role check or lock.
+ANY_ROLE_TOOLS = (long_calls.JOB_TOOL,)
+# Writes stay synchronous, never background jobs (a late write could collide with the next owner).
+INLINE_TOOLS = ('write_file', 'nt_write_file', 'nt_edit_file')
 # Custom roles (settings role_definitions, read like server.role_state()) are read-only when their
 # tools value is role_policy.READ_ONLY ('read_only'); see Bridge.role_is_read_only.
 CUSTOM_READ_ONLY = 'read_only'
 READ_ONLY_REFUSAL = 'This planning/review role has read-only PC access'
 from .screen_capture import SCREEN_TOOLS, SCREEN_OPERATOR_TOOLS, SCREEN_OPERATOR_NAMES, ScreenCapture
-from .agent_guard import GUARD_RULE
+from .agent_guard import GUARD_RULE, PLAN_RULE
 
 
 def shell_command(command):
@@ -101,7 +107,7 @@ def unittest_python():
 
 # Operator scope: only with the owner Host API key (never the worker bridge token).
 OPERATOR_TOOLS = [
-    {'name':'nt_api','description':'Operator: call a NotionTool Host API route on the owner PC. GET or POST /api/... (e.g. /api/health, /api/state, /api/chats, /api/send, /api/main/create, /api/operations). ' + GUARD_RULE,
+    {'name':'nt_api','description':'Operator: call a NotionTool Host API route on the owner PC. GET or POST /api/... (e.g. /api/health, /api/state, /api/chats, /api/send, /api/main/create, /api/operations). ' + GUARD_RULE + ' ' + PLAN_RULE,
      'annotations':{'readOnlyHint':False,'destructiveHint':True},
      'inputSchema':{'type':'object','properties':{'method':{'type':'string','enum':['GET','POST']},'path':{'type':'string'},'body':{'type':'object'},'timeout':{'type':'number'}},'required':['path']}},
     {'name':'nt_notion_call','description':'Operator: raw internal Notion API call (POST /api/v3/<method>) as the selected harness account. For verified reverse-engineering tests.',
@@ -812,6 +818,70 @@ class Bridge:
             return {'lines':lines}
         raise ValueError('Unknown operator tool')
 
+    # ---- long calls (MCP -32001) ------------------------------------------
+    def long_jobs(self):
+        jobs = getattr(self, '_long_jobs', None)
+        if jobs is None:
+            jobs = self._long_jobs = long_calls.Jobs()
+        return jobs
+
+    @staticmethod
+    def caller_key(args, operator):
+        """Who may read a job: the coworker assignment (token) or the owner connection."""
+        token = str((args or {}).get('assignment_token') or '') if isinstance(args, dict) else ''
+        if token:
+            return 'task:' + token
+        return 'operator' if operator is not None else 'chat'
+
+    @staticmethod
+    def is_job_call(name, args):
+        return name in ANY_ROLE_TOOLS or (name == 'mcp_call' and isinstance(args, dict)
+                                          and args.get('tool_name') in ANY_ROLE_TOOLS)
+
+    @staticmethod
+    def runs_inline(name, args):
+        inner = (args or {}).get('tool_name') if name == 'mcp_call' and isinstance(args, dict) else None
+        return name in INLINE_TOOLS or inner in INLINE_TOOLS
+
+    def job_result(self, name, args, operator):
+        """nt_job_result {job_id, wait_s}: read-only, every role, only the caller that started the job."""
+        inner = (args.get('arguments') or {}) if name == 'mcp_call' else args
+        return self.long_jobs().result(self.caller_key(args, operator), inner.get('job_id'), inner.get('wait_s'))
+
+    def tool_value(self, name, args, operator):
+        """The tools/call dispatch (runs on a long_calls job thread unless it is a write)."""
+        tools = self.tools()
+        if operator is not None and name in OPERATOR_NAMES:
+            return self.operator_call(operator, name, args)
+        if name in TOOL_SERVER:
+            if operator is not None or name.endswith('_tools'):
+                return self.local_call(name, args)
+            raise ValueError('Calling local MCP tools from your own chat requires the Bearer token shown in Settings > Remote MCP access, or a valid worker assignment through mcp_call.')
+        if name=='mcp_servers':
+            value = [{'id':'NotionTool','tools':list(TOOLS),'full_pc_access':self.full_access()}]
+            if self.browser_access():
+                value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
+            if self.screen_access():
+                value.append({'id':'Screen','tools':list(SCREEN_TOOLS),'assignment_token':'not needed'})
+            settings = self.store.settings()
+            for server in LOCAL_SERVERS:
+                if local_enabled(settings, server):
+                    value.append({'id':server['label'],'tools':list(tool_specs(server))})
+            return value
+        if name=='mcp_list_tools':
+            value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
+                     if not args.get('tool_name') or n==args['tool_name']]
+            if not args.get('tool_name') or args['tool_name']==long_calls.JOB_TOOL:
+                spec = long_calls.JOB_TOOL_SPEC
+                value.append(dict(name=spec['name'],description=spec['description'],inputSchema=json.loads(json.dumps(spec['inputSchema']))))
+            return value
+        if name=='mcp_call':
+            inner,inner_args,token = args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token','')
+            # Owner connection (operator scope already has shell access): local MCP tools need no assignment token.
+            discover = inner in TOOL_SERVER and inner.endswith('_tools') and not token
+            return self.local_call(inner,inner_args) if inner in TOOL_SERVER and (discover or (operator is not None and not self.has_assignment(token))) else self.call(inner,inner_args,token)
+        raise ValueError('Unknown MCP tool')
+
     def rpc(self, message, operator=None):
         ident = message.get('id')
         method,params = message.get('method'),message.get('params') or {}
@@ -832,10 +902,11 @@ class Bridge:
                     {'name':'mcp_list_tools','description':'Get schemas for a NotionTool tool by name',
                      'annotations':{'readOnlyHint':True,'destructiveHint':False},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'}}}},
-                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty); in the owner connection the local MCP tools (roblox_*, blender_*, rea_*) need no token either',
+                    {'name':'mcp_call','description':'Execute a NotionTool tool. Coworker tools need the assignment token from your current prompt; screen_windows and screen_capture need no token or code (leave assignment_token empty); in the owner connection the local MCP tools (roblox_*, blender_*, rea_*) need no token either. Calls longer than about 45 s return still_running with a job_id: do not start them again, fetch the result with nt_job_result',
                      'annotations':{'readOnlyHint':False,'destructiveHint':True},
                      'inputSchema':{'type':'object','properties':{'tool_name':{'type':'string'},'assignment_token':{'type':'string'},
-                                   'arguments':{'type':'object'}},'required':['tool_name']}}]}
+                                   'arguments':{'type':'object'}},'required':['tool_name']}},
+                    json.loads(json.dumps(long_calls.JOB_TOOL_SPEC))]}
                 if operator is not None:
                     result['tools'] += OPERATOR_TOOLS
                 # Publish only the two lazy entrypoints for enabled providers.
@@ -853,34 +924,18 @@ class Bridge:
                                 'destructiveHint': name.endswith('_call')}})
             elif method=='tools/call':
                 name,args = params.get('name'),params.get('arguments') or {}
-                tools = self.tools()
-                if operator is not None and name in OPERATOR_NAMES:
-                    value = self.operator_call(operator, name, args)
-                elif name in TOOL_SERVER:
-                    if operator is not None or name.endswith('_tools'):
-                        value = self.local_call(name, args)
-                    else:
-                        raise ValueError('Calling local MCP tools from your own chat requires the Bearer token shown in Settings > Remote MCP access, or a valid worker assignment through mcp_call.')
-                elif name=='mcp_servers':
-                    value = [{'id':'NotionTool','tools':list(TOOLS),'full_pc_access':self.full_access()}]
-                    if self.browser_access():
-                        value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
-                    if self.screen_access():
-                        value.append({'id':'Screen','tools':list(SCREEN_TOOLS),'assignment_token':'not needed'})
-                    settings = self.store.settings()
-                    for server in LOCAL_SERVERS:
-                        if local_enabled(settings, server):
-                            value.append({'id':server['label'],'tools':list(tool_specs(server))})
-                elif name=='mcp_list_tools':
-                    value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
-                             if not args.get('tool_name') or n==args['tool_name']]
-                elif name=='mcp_call':
-                    inner,inner_args,token = args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token','')
-                    # Owner connection (operator scope already has shell access): local MCP tools need no assignment token.
-                    discover = inner in TOOL_SERVER and inner.endswith('_tools') and not token
-                    value = self.local_call(inner,inner_args) if inner in TOOL_SERVER and (discover or (operator is not None and not self.has_assignment(token))) else self.call(inner,inner_args,token)
+                if self.is_job_call(name, args):
+                    # nt_job_result itself is never wrapped; it waits at most 40 s.
+                    value = self.job_result(name, args, operator)
+                elif self.runs_inline(name, args):
+                    value = self.tool_value(name, args, operator)
                 else:
-                    raise ValueError('Unknown MCP tool')
+                    # Answer before Notion's MCP request timeout (-32001): a slower call goes on as a
+                    # job on one thread (call() logs tool_finished there when it really ends).
+                    value = self.long_jobs().run(self.caller_key(args, operator), name, args,
+                        lambda: self.tool_value(name, args, operator), long_calls.sync_limit(self.store.settings()))
+                if isinstance(value, dict):
+                    value = dict(value)  # a stored job result keeps its image for the next nt_job_result
                 image = value.pop('_image', None) if isinstance(value, dict) else None
                 result = {'content':[{'type':'text','text':json.dumps(value,ensure_ascii=False)}]}
                 if image:

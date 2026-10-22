@@ -50,7 +50,7 @@ MSG_TYPE = 'Chat name must be text.'
 MSG_EMPTY = 'Chat name must not be empty.'
 MSG_LONG = 'Chat name must be 80 characters or fewer.'
 MSG_CONTROL = 'Chat name must not contain control characters (such as tabs or line breaks).'
-MSG_MAIN = "Chat name must not start with 'Main'; Main chats are reserved for NotionTool."
+MSG_MAIN = "Names starting with 'Main' are for Main chats. Tick 'Main' to create a Main chat."
 MSG_COWORK = "Chat name must not look like 'Cowork N'; those names are reserved for coworker chats."
 MSG_RESERVED = "'%s' is reserved for NotionTool worker chats; choose another name."
 MSG_DUPLICATE = "A chat named '%s' already exists; choose another name."
@@ -71,7 +71,7 @@ __all__ = [
 ]
 
 
-def validate_name(name, existing_titles=()):
+def validate_name(name, existing_titles=(), allow_main=False):
     """Return the trimmed name or raise ValueError with a message the UI can show as is."""
     if not isinstance(name, str):
         raise ValueError(MSG_TYPE)
@@ -82,7 +82,7 @@ def validate_name(name, existing_titles=()):
         raise ValueError(MSG_LONG)
     if CONTROL_RE.search(cleaned):
         raise ValueError(MSG_CONTROL)
-    if cleaned.startswith(MAIN_PREFIX):
+    if cleaned.startswith(MAIN_PREFIX) and not allow_main:  # the Main tick decides, not the name
         raise ValueError(MSG_MAIN)
     if NUMBERED_RE.match(cleaned):
         raise ValueError(MSG_COWORK)
@@ -177,7 +177,7 @@ def _fallback_numbers(workers, saved):
 
 
 def next_cowork_title(workers, saved):
-    """'Cowork N' with the lowest number not used by any existing coworker slot in workers."""
+    """'Coworker N' with the lowest number not used by any existing coworker slot in workers."""
     module = _cowork_module()
     if module is not None:
         numbers = module.assign_numbers(workers, saved)
@@ -187,7 +187,7 @@ def next_cowork_title(workers, saved):
     number = 1
     while number in used:
         number += 1
-    return module.title_for(number) if module is not None else 'Cowork %d' % number
+    return module.title_for(number) if module is not None else 'Coworker %d' % number
 
 
 # ---- App routes: New chat (create / promote / rename) -------------------------------------
@@ -276,7 +276,7 @@ def create_chat(server, body):
             account_id = _selected_account(store, body)
             if not account_id:
                 raise ValueError(MSG_ACCOUNT)
-            name = validate_name(body.get('name'), _titles(store, account_id))
+            name = validate_name(body.get('name'), _titles(store, account_id), allow_main=_flag(body.get('main')))
             ledger = dict(id=ident, request_id=request_id, account_id=account_id, name=name,
                           main=_flag(body.get('main')), state='pending', op_id='', thread_id='', worker_id='',
                           chat_id='', renamed=False, error='', created=time.time(), updated=time.time())
@@ -415,7 +415,8 @@ def rename_chat(server, body):
     current = str(worker.get('label') or '').strip()
     if current.casefold() in {t.casefold() for t in PROTECTED_TITLES}:
         raise ValueError(MSG_PROTECTED % current)
-    name = validate_name(body.get('name'), _titles(store, worker.get('account_id'), skip=worker['id']))
+    name = validate_name(body.get('name'), _titles(store, worker.get('account_id'), skip=worker['id']),
+                         allow_main=worker.get('purpose') == MAIN_PURPOSE)
     adapter.rename_thread(adapter.client(worker['account_id']), thread_id, name)
     with store.lock:
         worker = store.get('workers', worker['id']) or worker

@@ -69,7 +69,7 @@ class EdgeTransport:
                       const take = c => { let n = 0, s = 0; while (n < c.length && n < 2048 && s < 2097152) s += c[n++].length; return c.splice(0, n).join(''); };
                       for (const key of keys) {
                         const q = all[key];
-                        out[key] = q ? {status:q.status, retry:q.retry, done:q.done, error:q.error,
+                        out[key] = q ? {status:q.status, retry:q.retry, done:q.done, error:q.error, reason:q.reason || '',
                           text:take(q.chunks), remaining:q.chunks.length} : null;
                       }
                       return out;
@@ -131,7 +131,9 @@ class EdgeTransport:
     def prepare(self):
         with self.lock:
             self.browser.ensure()
-            if self.ready_process is not self.browser.process:
+            # A reused Edge (started by an earlier NotionTool) has process None like ready_process:
+            # without the target check the transport target stayed None (send(None) TypeError).
+            if self.target is None or self.ready_process is not self.browser.process:
                 tabs = self.browser.tabs()
                 self.target = next((t for t in tabs if t.get('url') == self._base + '/robots.txt'), None)
                 if not self.target:
@@ -162,8 +164,20 @@ class EdgeTransport:
             # Navigation of the transport tab must never forward a request to another origin.
             if self.browser.evaluate(self.target, 'location.origin') != self._base:
                 raise OSError('Restore the Notion robots.txt transport tab before continuing')
+            self._hide_once()
             self.wake(self.target)
             return self.target
+
+    def _hide_once(self):
+        """The robots.txt transport window is never visible: moved off screen once per browser process."""
+        marker = (id(getattr(self.browser, 'process', None)), getattr(self.browser, 'port', 0))
+        if getattr(self, 'hidden_marker', None) == marker or getattr(self, 'shown_by_user', False):
+            return
+        self.hidden_marker = marker
+        hidden = getattr(self.browser, 'hidden', None)
+        hide = getattr(self.browser, 'hide_window', None)
+        if hidden is not None and hide is not None and hidden():
+            hide(self.target)
 
     def open(self):
         self.prepare()
@@ -200,6 +214,10 @@ class EdgeTransport:
         if not found:
             raise OSError('Edge did not open the Notion tab; the robots.txt transport tab is unchanged')
         try:
+            show = getattr(self.browser, 'show_window', None)
+            if show is not None:
+                self.shown_by_user = True  # the user asked for Notion in Edge: keep this window visible
+                show(found)
             self.browser.send(found, 'Page.bringToFront', {}, 10)
         except Exception:
             pass
@@ -249,7 +267,7 @@ class EdgeTransport:
                 q.chunks.push(decoder.decode(value, {stream:true}));
               }
               q.chunks.push(decoder.decode());
-            } catch (_) { q.error = true; }
+            } catch (e) { q.error = true; q.reason = String((e && (e.name + ': ' + e.message)) || e).slice(0, 200); }
             finally { clearTimeout(timer); q.done = true; }
           })();
           return true;
@@ -307,7 +325,11 @@ class EdgeTransport:
                     raise NotionHttpError(code)
                 if result.get('error'):
                     outcome = 'failed'
-                    raise NotionStreamError('Edge request interrupted; reconcile before reuse')
+                    # The browser's own reason (TypeError: Failed to fetch, AbortError, ...) used to be swallowed,
+                    # so a broken coworker could never be diagnosed from the log.
+                    why = str(result.get('reason') or '')[:200]
+                    raise NotionStreamError('Edge request interrupted; reconcile before reuse'
+                                            + (' (' + why + ')' if why else ''))
                 seen_now = (result.get('status'), result.get('remaining'), result.get('done'))
                 if result.get('text') or seen_now != last_seen:
                     progress_at, last_seen = time.monotonic(), seen_now
