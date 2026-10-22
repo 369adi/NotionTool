@@ -102,6 +102,29 @@ def operator_chat(store, account_id=''):
     return None
 
 
+def delegating_worker(store, chat):
+    """The Notion chat of a Main or operator chat that may delegate, else None (rule: every Main may delegate)."""
+    worker = store.get('workers', chat.get('main_worker') or '', {}) if chat.get('main_worker') else {}
+    worker = worker or {}
+    if worker.get('purpose') == OPERATOR and chat.get('operator'):
+        return worker
+    if worker.get('purpose') == 'main':
+        return worker
+    return None
+
+
+def delegating_chat(store):
+    """Chat used without chat_id: an operator chat of a ready account, else any Main of a ready account."""
+    ready = {a.get('id') for a in store.all('accounts') if a.get('state') == 'ready'}
+    live = [c for c in store.all('chats') if c.get('state') != 'released']
+    for want in (OPERATOR, 'main'):
+        for chat in live:
+            worker = delegating_worker(store, chat)
+            if worker and worker.get('purpose') == want and worker.get('account_id') in ready:
+                return chat
+    return operator_chat(store)
+
+
 def register_operator(store, worker_id, project_path='', now=None):
     """Make worker_id the operator Main of its account and return its chat (idempotent)."""
     stamp = time.time() if now is None else now
@@ -283,9 +306,9 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
                       for t in tasks]}
     validate_plan(plan, max_tasks=MAX_DELEGATED_TASKS)
     with engine.lock:
-        chat = store.get('chats', chat_id) if chat_id else operator_chat(store)
-        if not chat or not chat.get('operator') or chat.get('state') == 'released':
-            raise ValueError('Register this chat as operator Main first')
+        chat = store.get('chats', chat_id) if chat_id else delegating_chat(store)
+        if not chat or chat.get('state') == 'released' or not delegating_worker(store, chat):
+            raise ValueError('Only a Main chat can delegate; register this chat as operator Main first')
         if not goal:
             raise ValueError('Describe the goal of the delegated work')
         request_id = str(request_id or '')[:100]
@@ -296,8 +319,12 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
                     raise ValueError('request_id already belongs to another chat')
                 return _summary(engine, known, duplicate=True, warnings=_warnings(store, chat, tasks) + notes)
         operator = store.get('workers', chat.get('main_worker') or '') if chat.get('main_worker') else None
-        if not operator or operator.get('purpose') != OPERATOR:
+        if not operator or operator.get('purpose') not in (OPERATOR, 'main'):
             raise ValueError('The operator chat lost its Notion thread; register it again')
+        account = store.get('accounts', operator.get('account_id') or '', {}) or {}
+        if account.get('state') == 'ai_disabled':
+            raise ValueError('Notion AI is disabled for the account of this Main (%s); delegate from a Main '
+                             'of a ready account' % (account.get('email') or operator.get('account_id')))
         coworkers = [w for w in store.all('workers') if w.get('purpose') == 'worker' and w.get('enabled')
                      and w.get('account_id') == operator.get('account_id')]
         if not coworkers:

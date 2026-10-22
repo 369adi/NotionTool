@@ -127,7 +127,9 @@ def cap_coworker(effort, purpose=""):
     return effort
 
 # task_class groups for the reasoning effort rule (task_router class names).
-TOP_EFFORT_CLASSES = ("review",)
+# User 2026-10-21: xhigh only for the hardest work (risk high); reviews run on high, never lower.
+TOP_EFFORT_CLASSES = ()
+STEADY_EFFORT_CLASSES = ("review",)
 LIGHT_EFFORT_CLASSES = ("routine", "docs", "test")
 
 
@@ -168,7 +170,9 @@ def clamp_effort(target, supported):
 def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), default=None):
     """Pick the reasoning effort for one request. Returns (effort or None, reason).
 
-    - Main chat, task_class review or risk high -> the highest supported level.
+    - Main chat                                 -> the highest supported level.
+    - risk high (only the hardest work)         -> COWORKER_TOP_EFFORT (xhigh), never max.
+    - task_class review                         -> high (never lower, never xhigh unless risk high).
     - routine/docs/test, or risk low            -> the model's default, else low.
     - everything else (code/research/design/unclassified, medium risk) -> high.
     The result is always clamped to the supported levels of the model.
@@ -184,7 +188,9 @@ def choose_reasoning_effort(purpose="", task_class="", risk="", supported=(), de
     elif cls in TOP_EFFORT_CLASSES:
         rule, target = "task_class %s: highest supported effort" % cls, supported[-1]
     elif rk == "high":
-        rule, target = "risk high: highest supported effort", supported[-1]
+        rule, target = "risk high (hardest work): top Coworker effort", COWORKER_TOP_EFFORT
+    elif cls in STEADY_EFFORT_CLASSES:
+        rule, target = "task_class %s: high effort" % cls, "high"
     elif cls in LIGHT_EFFORT_CLASSES or rk == "low":
         what = ("task_class " + cls) if cls in LIGHT_EFFORT_CLASSES else "risk low"
         if default:

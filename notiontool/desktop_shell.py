@@ -38,7 +38,8 @@ DEFAULT_PORT = 9333
 PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'settings', 'extras', 'studio', 'stepcap', 'donesound')
 MOUNT_ORDER = ('theme', 'chrome', 'declutter', 'sidebar', 'shell', 'live', 'settings', 'extras', 'studio')
 DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_schema', 'app_settings_get',
-                                              'app_settings_set', 'main_switch_start')
+                                              'app_settings_set', 'main_switch_start', 'app_chat_create',
+                                              'app_chat_rename', 'app_chat_promote', 'main_refresh')
 CREATE_WAIT = 150.0
 SWITCH_ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
 
@@ -491,6 +492,25 @@ def collect_mains(chats, all_workers, account=''):
     return mains
 
 
+BUSY_TASK_STATES = ('running', 'sending', 'sent', 'uncertain', 'reviewing', 'cancelling', 'claimed',
+                    'tool_pending', 'executing', 'fixing')
+
+
+def _task_label(task):
+    """Short label of a coworker's current task: title, else summary, else the first prompt line; '' without task."""
+    if not task:
+        return ''
+    for key in ('title', 'summary'):
+        value = str(task.get(key) or '').strip()
+        if value:
+            return value.splitlines()[0].strip()
+    for line in str(task.get('prompt') or '').splitlines():
+        line = line.strip()
+        if line and not line.startswith('End your answer with a final line RESULT'):
+            return line
+    return 'Working'
+
+
 def desktop_state(server, app_settings=None, now=None):
     """The pushed state for the desktop parts (see docs/DESKTOP_APP.md, part contract)."""
     store = server.store
@@ -510,7 +530,12 @@ def desktop_state(server, app_settings=None, now=None):
     settings = store.settings()
     app = app_settings if app_settings is not None else load_app_settings()
     all_workers = store.all('workers')
-    workers = [w for w in all_workers if not account or w.get('account_id') == account]
+    # Bug 2026-10-21: only coworkers of the selected account were listed, so coworkers working for a
+    # Main on another account always looked idle/missing in the sidebar. Every coworker with an active
+    # task is shown, whatever account it belongs to.
+    working = {t.get('worker_id') for t in store.all('tasks')
+               if t.get('worker_id') and t.get('state') in BUSY_TASK_STATES}
+    workers = [w for w in all_workers if not account or w.get('account_id') == account or w['id'] in working]
     by_id = {w['id']: w for w in all_workers}
 
     mains = collect_mains(store.all('chats'), all_workers, account)
@@ -525,20 +550,24 @@ def desktop_state(server, app_settings=None, now=None):
     tasks = store.all('tasks')
     active = {}
     for task in tasks:
-        if task.get('state') in ('running', 'sending', 'uncertain', 'reviewing', 'cancelling'):
+        if task.get('worker_id') and task.get('state') in BUSY_TASK_STATES:
             active[task.get('worker_id')] = task
     limit = int(_num(settings.get('context_token_limit'), 1200000)) or 1200000
     worker_rows, ask = [], None
     for worker in sorted(workers, key=lambda w: (w.get('purpose') != 'operator', w.get('purpose') != 'main',
                                                  str(w.get('label') or ''), w['id'])):
         purpose = worker.get('purpose')
-        if purpose not in ('worker', 'main', 'operator') or worker.get('enabled') is False:
+        # Managed Welcome Coworkers that have not joined yet are shown too, marked as being prepared.
+        preparing = (purpose == 'worker' and worker.get('join_state') == 'pending' and bool(worker.get('pool_admitted'))
+                     and not _gone(worker))
+        if purpose not in ('worker', 'main', 'operator') or (worker.get('enabled') is False and not preparing):
             continue
         usage = worker.get('context_usage') or {}
         task = active.get(worker['id']) or {}
         worker_rows.append(dict(id=worker['id'], label=str(worker.get('label') or worker['id'][-12:])[:80],
-                                purpose=purpose, state=str(worker.get('state') or ''),
-                                task_id=task.get('id', ''), task_title=str(task.get('title') or '')[:160],
+                                purpose=purpose, state='preparing' if preparing else str(worker.get('state') or ''),
+                                preparing=preparing,
+                                task_id=task.get('id', ''), task_title=_task_label(task)[:160],
                                 thread_id=worker.get('thread_id') or '',
                                 url=chat_url(worker['thread_id']) if worker.get('thread_id') else '',
                                 created_at=_num(worker.get('created_at') or worker.get('thread_created_at')
@@ -570,6 +599,9 @@ def desktop_state(server, app_settings=None, now=None):
                      goal=str(r.get('goal') or r.get('title') or '')[:200], operator=bool(r.get('operator')),
                      chat_id=str(r.get('chat_id') or ''), main_worker=str(r.get('main_worker') or ''),
                      needs_main=bool(r.get('needs_main')), summary=plain_run_summary(r), outcome=run_outcome(r),
+                     # Why the run waits for the Main (engine.py sets these per task); shown on the problem card.
+                     needs_main_reasons={str(k)[:100]: str(v)[:240] for k, v in
+                                         list((r.get('needs_main_reasons') if isinstance(r.get('needs_main_reasons'), dict) else {}).items())[:5]},
                      created=r.get('created'), finished=r.get('finished') or r.get('updated'),
                      tasks_total=sum(1 for t in tasks if t.get('run_id') == r['id']),
                      tasks_done=sum(1 for t in tasks if t.get('run_id') == r['id'] and t.get('state') == 'done'))
@@ -603,8 +635,13 @@ def desktop_state(server, app_settings=None, now=None):
     switches = sorted(store.all('main_switches'), key=lambda s: s.get('created') or 0)[-5:]
     limits = base.get('limits') or {}
     hide = {key[len('app_hide_'):]: bool(value) for key, value in app.items() if key.startswith('app_hide_')}
+    try:  # own chats (New chat dialog and chats the user renamed himself) for the 'Chats' section
+        from . import own_chats
+        private = own_chats.private_chats(store, account)
+    except Exception:
+        private = []
     return dict(ts=round(float(now), 3), connected=True, account_id=account,
-                mains=mains, hidden_threads=sorted(hidden),
+                mains=mains, private_chats=private, hidden_threads=sorted(hidden),
                 app_chat_filter=app.get('app_chat_filter') or 'mains_only', app_hide=hide,
                 declutter=app.get('app_declutter', True) is not False,
                 done_sound=app.get('app_done_sound', True) is not False,
@@ -616,7 +653,33 @@ def desktop_state(server, app_settings=None, now=None):
                           limit_per_min=int(limits.get('requests_per_min') or 180)),
                 chats=base.get('chats'), links=base.get('links'),
                 awaiting_main=base.get('awaiting_main'), stalled=base.get('stalled'),
-                stale_context_tasks=base.get('stale_context_tasks'))
+                stale_context_tasks=base.get('stale_context_tasks'),
+                token_budget=_token_budget(store, now), ai_disable=_ai_disable(store),
+                idle_mode=bool(store.settings().get('idle_mode', True)))
+
+
+def _token_budget(store, now):
+    """6-hour token budget for the Live view and the composer block (token_budget.public)."""
+    try:
+        from .token_budget import public
+        report = public(store, now=now)
+        report.pop('history', None)
+        report['by_worker'] = report.get('by_worker', [])[:12]
+        return report
+    except Exception:
+        return None
+
+
+def _ai_disable(store):
+    """Newest 'Notion AI was disabled' detections (ai_disable_detector), newest first."""
+    try:
+        from . import ai_disable_detector
+        rows = ai_disable_detector.reports(store, limit=3) if hasattr(ai_disable_detector, 'reports') else []
+        return [dict(at=r.get('detected_at') or r.get('at'), account=str(r.get('account') or '')[:80],
+                     tokens_6h=int(((r.get('budget') or {}).get('used')) or 0),
+                     cause=str(((r.get('causes') or [{}])[0] or {}).get('cause') or '')[:240]) for r in rows]
+    except Exception:
+        return []
 
 
 # ---- handlers ---------------------------------------------------------------
@@ -665,9 +728,38 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
                 return dict(record, duplicate=True)
         return server.action('/api/main/switch/start', {'request_id': 'desk-switch-' + time.strftime('%Y%m%d-%H%M')})
 
+    def app_chat_create(args):
+        # New chat dialog: Welcome chat, renamed to the user's name, then listed in NotionTool.
+        from . import own_chats
+        body = {k: args.get(k) for k in ('name', 'main', 'request_id') if k in args}
+        result = server.action('/api/app/chat/create', body) or {}
+        ident = result.get('id') or ''
+        deadline = clock() + wait
+        while ident and clock() < deadline:
+            ledger = store.get(own_chats.APP_LEDGER, ident) or {}
+            if ledger.get('state') == 'done' and ledger.get('thread_id'):
+                return dict(own_chats._public(ledger, False), url=chat_url(ledger['thread_id']))
+            if ledger.get('state') in ('failed', 'rename_failed'):
+                raise ValueError(ledger.get('error') or 'The chat could not be created')
+            sleep(1.0)
+        return dict(result, pending=True)
+
+    def app_chat_rename(args):
+        from . import own_chats
+        return server.action('/api/app/chat/rename', {k: args.get(k) for k in ('thread_id', 'name')})
+
+    def app_chat_promote(args):
+        from . import own_chats
+        return server.action('/api/app/chat/promote',
+                             {k: args.get(k) for k in ('main', 'thread_id', 'chat_id') if k in args})
+
+    handlers.update(app_chat_create=app_chat_create, app_chat_rename=app_chat_rename,
+                    app_chat_promote=app_chat_promote)
     handlers.update(state=state, runs=lambda args: state(args)['runs'], new_welcome_chat=new_welcome_chat,
                     settings_schema=settings_schema, app_settings_get=app_settings_get,
-                    app_settings_set=app_settings_set, main_switch_start=main_switch_start)
+                    app_settings_set=app_settings_set, main_switch_start=main_switch_start,
+                    main_refresh=lambda args: server.action('/api/main/refresh',
+                        dict(request_id=str((args or {}).get('request_id') or '')[:100])))
     return handlers
 
 
@@ -749,6 +841,7 @@ class DesktopShell(NotionShell):
             self.page_refresh = self.refresh_page(self.session)
             self.app.inject(source)
             self.script_id = self.app.script_id
+            self.enable_model_pin(self.session)  # the composer never sends 'Auto' (notion_shell.pin_config_body)
             self._started = True
             return self.info()
 
@@ -861,6 +954,81 @@ class DesktopController:
             self.thread.start()
         return self.status()
 
+    def _ensure_protocol(self):
+        """Undo the notion:// handler takeover of 2026-10-21 (the Store Notion ignores it)."""
+        if getattr(self, '_protocol_restored', False):
+            return
+        self._protocol_restored = True
+        try:
+            from . import protocol_forward
+            protocol_forward.restore()
+        except Exception:
+            pass
+
+    def _start_login_assist(self):
+        try:
+            from .window_login import LoginAssist
+            if getattr(self, '_assist', None) is None:
+                kwargs = {'http_get': self.http_get} if self.http_get is not None else {}
+                kwargs['on_signed_in'] = getattr(self.server, 'window_signed_in', None)
+                self._assist = LoginAssist(self.server.store, self.port, **kwargs)
+            self._assist.start()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.server.store.event('window_login_failed', message='assist: ' + str(exc)[:180])
+            except Exception:
+                pass
+
+    def _stop_login_assist(self):
+        assist = getattr(self, '_assist', None)
+        if assist is not None:
+            assist.stop()
+
+    def _quit_with_window(self, checks=3, interval=1.0):
+        """User closed the NotionTool window: quit NotionTool completely (user rule I49).
+
+        Stops the Notion app processes of the NotionTool profile (background/tray) and asks main.py to
+        exit, so a new start is a clean start. Only when the window is really gone (DevTools down on
+        every check), never on a short hiccup. Setting quit_with_window=False keeps the old behaviour."""
+        exit_event = getattr(self.server, 'exit_event', None)
+        if exit_event is None:
+            return False
+        try:
+            if self.server.store.settings().get('quit_with_window', True) is False:
+                return False
+        except Exception:
+            pass
+        for _ in range(checks):
+            if self.stop_event.wait(interval):
+                return True  # the app is stopping anyway
+            if self._devtools_up():
+                return False  # window still (or again) there: reattach instead
+        try:
+            self.server.store.event('desktop_app_quit', message='NotionTool window closed: NotionTool stops completely')
+        except Exception:
+            pass
+        try:
+            self.stopper(self.profile_dir)
+        except Exception:
+            pass
+        exit_event.set()
+        return True
+
+    def _await_reopen(self, interval=2.0):
+        """After the user closed the window: attach again as soon as it is reopened (second NotionTool start)."""
+        runner = threading.current_thread()
+
+        def watch():
+            if runner is not threading.current_thread():
+                runner.join()
+            while not self.stop_event.is_set():
+                if self._devtools_up():
+                    self.start()
+                    return
+                self.stop_event.wait(interval)
+
+        threading.Thread(target=watch, daemon=True, name='desktop-app-reopen').start()
+
     def _devtools_up(self):
         from .desktop_app import _default_http_get
         getter = self.http_get or _default_http_get
@@ -868,6 +1036,15 @@ class DesktopController:
             return isinstance(getter('http://127.0.0.1:%d/json/version' % self.port), dict)
         except Exception:
             return False
+
+    def _heal_error_page(self, shell):
+        """For about a minute after start: reload only Notion's 'Something went wrong' page (error_page_heal.py)."""
+        from . import error_page_heal
+        try:
+            error_page_heal.heal(lambda: getattr(getattr(shell, 'app', None), 'session', None),
+                                 self.stop_event, self.server.store)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _make_app(self):
         secrets = notion_shell.shell_secrets(self.server)
@@ -891,18 +1068,29 @@ class DesktopController:
             shell = DesktopShell(app, account, desktop_handlers(self.server, self.data_dir),
                                  secrets=notion_shell.shell_secrets(self.server))
             self.shell = shell
+            # The Store Notion swallows notion:// links, so 'Continue in desktop app' can never reach this
+            # window. window_login.py catches 'Continue in browser' and moves the session in via DevTools.
+            self._ensure_protocol()
+            self._start_login_assist()
             while True:
                 try:
                     shell.start()
                     break
                 except Exception as exc:  # noqa: BLE001
+                    # 'Continue in browser' returns via notion://; route it to this window (protocol_forward.py).
+                    self._ensure_protocol()
                     # Login screen or no workspace page yet: keep waiting until the user has logged in.
                     self.state = 'waiting_login'
                     self.error = 'Log in once in the NotionTool window (%s)' % (str(exc)[:120] or type(exc).__name__)
                     if self.stop_event.wait(5):
                         return
+            # The login assist keeps running: it idles on workspace pages and wakes up after a sign-out.
             self.state, self.error = 'running', ''
             self.server.store.event('desktop_app_started', message='NotionTool window attached on port %d' % self.port)
+            # After a restart Notion sometimes shows 'Oops! Something went wrong ... Refresh'. Reload that page
+            # once or twice from here (backend, not desktop JS) so the window is ready without a manual click.
+            threading.Thread(target=self._heal_error_page, args=(shell,), daemon=True,
+                             name='desktop-heal-error-page').start()
             # Cached state + non-blocking pusher with a 3 s heartbeat (desktop_state_cache.py). The old loop
             # pushed only on change, so an idle harness sent nothing and the overlay showed
             # 'lost connection to the harness' although the bridge was fine.
@@ -917,6 +1105,8 @@ class DesktopController:
                 self.stop_event.wait(self.push_interval)
             if not self.stop_event.is_set():
                 self.state, self.error = 'stopped', 'The NotionTool window was closed'
+                if not self._quit_with_window():
+                    self._await_reopen()
         except Exception as exc:
             self.state, self.error = 'failed', str(exc)[:300]
             try:

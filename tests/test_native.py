@@ -66,6 +66,17 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(adapter.network_budget.status()['paused'])
         self.assertTrue(adapter.clear_account_pause('a'))
         self.assertFalse(adapter.network_budget.status()['paused'])
+    def test_verified_sign_in_of_another_account_lifts_the_pause_but_keeps_the_blocked_one_out(self):
+        adapter = self.adapter()
+        other = adapter.create_account('other@example.com')
+        blocked = self.store.get('accounts', 'a'); blocked['state'] = 'ready'; self.store.put('accounts', blocked)
+        adapter.network_budget.pause('HTTP 401', account_id='a', status=401)
+        self.assertFalse(adapter.clear_account_pause(other['id']))  # not verified: stays paused
+        self.assertTrue(adapter.network_budget.status()['paused'])
+        self.assertTrue(adapter.clear_account_pause(other['id'], verified=True))
+        self.assertFalse(adapter.network_budget.status()['paused'])
+        self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
+
     def test_exactly_five_welcome_workers_and_one_welcome_main(self):
         adapter=self.adapter();result=adapter.ensure_team('a', create_main=True)
         self.assertEqual(result['welcome_chats'],6)

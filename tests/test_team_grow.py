@@ -25,11 +25,12 @@ class FakeBudget:
 class FakeAdapter:
     def __init__(self, store):
         self.store = store; self.calls = []; self.fail = None; self.network_budget = FakeBudget()
-    def ensure_team(self, ident):
+    def ensure_team(self, ident, create_main=False):
         self.calls.append(ident)
         if self.fail:
             raise ValueError(self.fail)
-        n = len([w for w in self.store.all('workers') if w['account_id'] == ident])
+        self.main_flags = getattr(self, 'main_flags', []) + [create_main]
+        n = len([w for w in self.store.all('workers') if w['account_id'] == ident and w.get('purpose') == 'worker'])
         for i in range(n, 3):
             self.store.put('workers', dict(id='w%d' % i, account_id=ident, purpose='worker', join_state='joined', enabled=True, state='ready', thread_id='t%d' % i))
         return {'account_id': ident}
@@ -62,6 +63,7 @@ class TeamGrowTests(unittest.TestCase):
         self.store = Store(self.tmp.name)
         self.store.put('settings', dict(id='app', per_account=3, max_workers=40))
         self.store.put('accounts', dict(id='a1', state='ready', slot=1, team_threads={'main': {'id': 'm', 'pending': False}}))
+        self.store.put('workers', dict(id='m', account_id='a1', purpose='main', join_state='joined', enabled=True, state='ready', thread_id='m'))
         self.adapter = FakeAdapter(self.store)
         self.clock = Clock()
         self.jobs = Jobs()
@@ -85,6 +87,14 @@ class TeamGrowTests(unittest.TestCase):
         self.assertEqual(self.jobs.titles, ['Grow Welcome Coworkers to 3'])
         self.assertIn('team_grow_started', self.kinds()); self.assertIn('team_grow_done', self.kinds())
         self.assertEqual(self.grower.public(), dict(account='a1', target=3, usable=3, growing=False, last_error='', waiting='', retry_at=0))
+
+    def test_missing_main_is_created_even_with_a_full_team(self):
+        self.store.delete('workers', 'm')
+        for i in range(3):
+            self.store.put('workers', worker('w%d' % i))
+        self.assertEqual(self.grower.check(), ['a1'])
+        self.assertEqual(self.jobs.titles, ['Create the Main and 3 Welcome Coworkers'])
+        self.assertEqual(self.adapter.main_flags, [True])
 
     def test_full_team_or_not_ready_account_starts_nothing(self):
         for i in range(3):
@@ -161,7 +171,10 @@ class TeamGrowTests(unittest.TestCase):
             stop.calls += 1
             return stop.calls > 2
         grower = Mock(); grower.maybe_check.side_effect = [RuntimeError('x'), []]
-        fake = SimpleNamespace(stop_event=SimpleNamespace(wait=wait), tick=lambda: None, team_grower=grower, store=Mock())
+        # The loop now checks stop_event.is_set() and waits on wake_event (0.25 s); each wait counts one round.
+        fake = SimpleNamespace(stop_event=SimpleNamespace(wait=wait, is_set=lambda: stop.calls >= 3),
+                               wake_event=SimpleNamespace(wait=wait, clear=lambda: None),
+                               tick=lambda: None, team_grower=grower, store=Mock())
         Engine._loop(fake)
         self.assertEqual(grower.maybe_check.call_count, 2)
         fake.store.event.assert_called_once_with('team_grow_check_failed', message='RuntimeError')

@@ -118,7 +118,23 @@ class CoworkerUpkeep:
             except Exception as exc:
                 self.blocked_until = now + FAIL_BACKOFF
                 self.store.event('coworker_refill_failed', message=type(exc).__name__ + ': ' + str(exc)[:200])
+        self.admit_refill_chats(account['id'])
         return dict(decision, created=created)
+
+    def admit_refill_chats(self, account_id):
+        """Refill (provision) chats are pool coworkers too: give them pool_admitted so they get a 'Coworker N' name."""
+        fixed = 0
+        with self.engine.lock:
+            for w in self.store.all('workers'):
+                if (w.get('account_id') == account_id and w.get('purpose', 'worker') == 'worker'
+                        and w.get('welcome') and w.get('join_state') == 'pending' and not w.get('pool_admitted')
+                        and w.get('state') not in ('retired', 'missing') and not w.get('retired')):
+                    w['pool_admitted'] = True
+                    self.store.put('workers', w)
+                    fixed += 1
+        if fixed:
+            self.store.event('coworker_refill_admitted', message='%d refill chat(s) admitted to the pool for naming' % fixed)
+        return fixed
 
     def context_rows(self):
         """Light rows (id, updated) and byte sizes of every thread_context record, without loading the documents."""

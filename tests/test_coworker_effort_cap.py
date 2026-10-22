@@ -23,11 +23,14 @@ class CapCoworkerTest(unittest.TestCase):
             self.assertEqual(ep.cap_coworker(level, 'worker'), level)
         self.assertIsNone(ep.cap_coworker(None, 'worker'))
 
-    def test_automatic_top_level_is_xhigh_for_coworkers(self):
-        self.assertEqual(ep.choose_reasoning_effort('worker', 'review', '', ALL)[0], 'xhigh')
+    def test_automatic_top_level_is_xhigh_only_for_the_hardest_work(self):
+        # User 2026-10-21: xhigh only for the hardest work (risk high); reviews run on high.
         self.assertEqual(ep.choose_reasoning_effort('worker', 'code', 'high', ALL)[0], 'xhigh')
-        self.assertEqual(ep.choose_reasoning_effort('', 'review', '', ALL)[0], 'xhigh')
+        self.assertEqual(ep.choose_reasoning_effort('worker', 'review', 'high', ALL)[0], 'xhigh')
+        self.assertEqual(ep.choose_reasoning_effort('worker', 'review', '', ALL)[0], 'high')
+        self.assertEqual(ep.choose_reasoning_effort('', 'review', 'low', ALL)[0], 'high')
         self.assertEqual(ep.choose_reasoning_effort('worker', 'code', '', ALL)[0], 'high')
+        self.assertEqual(ep.choose_reasoning_effort('worker', 'research', 'medium', ALL)[0], 'high')
 
     def test_main_automatic_keeps_max(self):
         self.assertEqual(ep.choose_reasoning_effort('main', '', '', ALL)[0], 'max')

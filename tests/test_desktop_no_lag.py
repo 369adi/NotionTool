@@ -144,7 +144,9 @@ class DesktopJsIsolationTest(unittest.TestCase):
     def test_harness_never_navigates_or_reloads_the_app_window(self):
         # Only these modules navigate, and only their own tabs: the separate harness browser tool, the Edge
         # robots.txt transport tab and the Notion shell's own tab (once at start). Never the app window.
-        own_tabs = {'browser.py', 'edge_transport.py', 'notion_shell.py'}
+        # window_login.py: only the signed-out login page, once, right after the sign-in cookies were set.
+        # error_page_heal.py: only Notion's own crash page ('Something went wrong ... Refresh'), max 2x after start.
+        own_tabs = {'browser.py', 'edge_transport.py', 'notion_shell.py', 'window_login.py', 'error_page_heal.py'}
         found = []
         for path in sorted(glob.glob(os.path.join(PKG, '*.py'))):
             if os.path.basename(path) in own_tabs:

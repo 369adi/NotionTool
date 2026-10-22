@@ -242,8 +242,10 @@ def rename_plan(workers, chats, saved, ledger=None, now=None):
             continue
         if worker.get('state') in RETIRED_STATES or worker.get('retired'):
             continue
-        if not worker.get('enabled') or worker.get('join_state') != 'joined':
-            continue
+        if not (worker.get('enabled') and worker.get('join_state') == 'joined'):
+            # Managed Welcome Coworkers still waiting for their join are named as well.
+            if not (worker.get('join_state') == 'pending' and _managed(worker, by_thread)):
+                continue
         if worker.get('state') in BUSY_STATES or worker.get('lease'):
             continue
         retry_at = worker.get('rename_retry_at') or 0

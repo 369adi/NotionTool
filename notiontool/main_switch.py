@@ -53,8 +53,9 @@ RUN_DONE = ('done',)
 RUN_FAILED = ('failed', 'cancelled')
 OPS_GAP_REASON = ('Brief is ready, but the handoff ops cannot repoint an operator Main yet '
                   '(MainHandoffOps repoints the new chat as a pool Main); no chat was created')
+from .agent_guard import PLAN_RULE  # noqa: E402
 RESUME_INSTRUCTIONS = ('You are now the operator Main of NotionTool. Read resume_brief, keep every fixed '
-                       'user rule, and continue from the next steps. Delegate work to the Coworkers. ' + GUARD_RULE)
+                       'user rule, and continue from the next steps. Delegate work to the Coworkers. ' + GUARD_RULE + ' ' + PLAN_RULE)
 _SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 
 # Rule I37: deterministic brief parts.

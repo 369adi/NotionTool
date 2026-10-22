@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import sys
 import time
+import threading
 import hashlib
 import os
 from notiontool.server import Application
@@ -23,10 +24,27 @@ def instance_lock(directory):
         if window:
             user32.ShowWindow(window,9)  # SW_RESTORE
             user32.SetForegroundWindow(window)
-        else:
+        elif not reopen_desktop_window(directory):
             user32.MessageBoxW(None,'NotionTool is already running. Use the open NotionTool window.','NotionTool',0x40)
         return False
     return handle
+
+
+def reopen_desktop_window(data_dir):
+    """Harness runs headless but its Notion window was closed (tray quit): open the window again.
+
+    Same argv as DesktopApp, so Electron focuses an already open window instead of a second one;
+    the running harness attaches to it again (DesktopController._await_reopen)."""
+    if not new_app_is_ui(data_dir):
+        return False
+    try:
+        import subprocess
+        from notiontool.desktop_app import DesktopApp
+        from notiontool.desktop_shell import default_profile, find_exe
+        subprocess.Popen(DesktopApp(find_exe(), default_profile()).argv(), close_fds=True)
+        return True
+    except Exception:
+        return False
 
 
 def new_app_is_ui(data_dir):
@@ -42,6 +60,9 @@ def main():
     if '--gateway' in sys.argv:  # process 2: MCP gateway / backup MCP, no window, no instance lock
         from notiontool.gateway import main as gateway_main
         sys.exit(gateway_main(sys.argv))
+    if '--protocol-forward' in sys.argv:  # notion:// link from Windows: route it, no window, no instance lock
+        from notiontool.protocol_forward import main as forward_main
+        sys.exit(forward_main(sys.argv))
     from notiontool.updater import handoff
     sys.argv = handoff(sys.argv)  # waits for the previous instance; installs a downloaded update
     parser = argparse.ArgumentParser()
@@ -54,14 +75,15 @@ def main():
     instance=instance_lock(args.data_dir)
     if instance is False:return
     app = Application(args.data_dir)
+    app.exit_event = threading.Event()  # set when the user closes the NotionTool window (desktop_shell)
     url = app.launch(args.port)
     try:
         if args.serve or (not args.classic and (args.headless or new_app_is_ui(args.data_dir))):
             # The NotionTool desktop app (separate Notion instance) is the UI: no classic window.
             if args.serve:
                 print(url,flush=True)
-            while True:
-                time.sleep(1)
+            while not app.exit_event.wait(1):
+                pass
         else:
             import webview
             app.window = webview.create_window('NotionTool',url,width=1480,height=940,min_size=(1050,700),background_color='#161719')
@@ -70,6 +92,22 @@ def main():
         pass
     finally:
         app.close()
+        if app.exit_event.is_set():
+            stop_gateway(app)
+
+
+def stop_gateway(app):
+    """Full quit (window closed): also stop process 2, the MCP gateway; restarts keep it running."""
+    try:
+        import urllib.request
+        from notiontool import gateway as gw
+        port = int(app.store.settings().get('mcp_gateway_port') or gw.DEFAULT_PORT)
+        control = gw.read_json(gw.runtime_dir(app.data_dir) / 'gateway.json').get('control', '')
+        request = urllib.request.Request(f'http://127.0.0.1:{port}/__gateway/stop', data=b'{}', method='POST',
+                                         headers={'X-Gateway-Control': control})
+        urllib.request.urlopen(request, timeout=5).read()
+    except Exception:
+        pass
 
 
 if __name__=='__main__':

@@ -191,10 +191,43 @@
       ui.runFill = el('span', { cls: 'nt-desk-strip-fill' });
       ui.run = el('span', { cls: 'nt-desk-strip-item nt-desk-strip-run' }, [ui.runText,
         el('span', { cls: 'nt-desk-strip-bar' }, [ui.runFill])]);
+      ui.tokens = el('span', { cls: 'nt-desk-strip-item nt-desk-strip-tokens' });
+      // Idle mode button: on = after a NotionTool restart (build swap) the Main continues by itself.
+      ui.idle = el('button', { cls: 'nt-desk-strip-item nt-desk-strip-idle', type: 'button' });
+      ui.idle.style.pointerEvents = 'auto';
+      ui.idle.style.cursor = 'pointer';
+      ui.idle.addEventListener('click', toggleIdle);
       ui.strip = el('div', { cls: 'nt-desk-strip', id: 'nt-desk-strip', role: 'status', 'aria-live': 'polite' },
-        [ui.model, ui.crew, ui.run]);
+        [ui.model, ui.crew, ui.run, ui.tokens, ui.idle]);
       ui.strip.hidden = true;
       document.body.appendChild(ui.strip);
+    }
+    var idleWanted = null;  // value just clicked, until the next state shows it
+    function idleOn() {
+      if (idleWanted !== null) return idleWanted;
+      return !(state && state.idle_mode === false);
+    }
+    function toggleIdle(ev) {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      var next = !idleOn();
+      idleWanted = next;
+      renderIdle();
+      Promise.resolve(ctx.call('settings_set', { values: { idle_mode: next } })).then(function () {
+        toast(next ? 'Idle mode on: the Main continues by itself after a restart' : 'Idle mode off', 'info');
+      }, function (e) {
+        idleWanted = null; renderIdle();
+        toast('Idle mode could not be saved: ' + String((e && e.message) || e).slice(0, 120), 'warning');
+      });
+    }
+    function renderIdle() {
+      if (!ui.idle) return;
+      if (idleWanted !== null && state && state.idle_mode === idleWanted) idleWanted = null;
+      var on = idleOn();
+      ui.idle.textContent = on ? 'Idle mode: on' : 'Idle mode: off';
+      ui.idle.setAttribute('aria-pressed', on ? 'true' : 'false');
+      ui.idle.setAttribute('title', on ? 'On: after a NotionTool restart (e.g. an update) the Main continues automatically. Click to turn off.'
+        : 'Off: after a restart the Main waits for you. Click to turn on.');
+      ui.idle.classList.toggle('nt-desk-strip-hot', on);
     }
     function composer() {
       var best = null, area = 0;
@@ -205,16 +238,81 @@
       });
       return best;
     }
+    // ---- 6-hour token budget: shown in the strip; sending is blocked while it is used up ----
+    function budget() { var b = state && state.token_budget; return b && typeof b === 'object' && b.limit ? b : null; }
+    function millions(n) { n = Number(n) || 0; return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n); }
+    function budgetBlocked() { var b = budget(); return !!(b && b.blocked && !document.documentElement.classList.contains('nt-desk-off')); }
+    function inComposer(node) { return !!(node && node.closest && node.closest('.nt-desk-composer')); }
+    var SEND_RE = /^(send|submit|senden|absenden)\b/i;
+    function blockSend(ev) {
+      ev.preventDefault(); ev.stopPropagation(); if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+      var b = budget();
+      toast('Token limit of ' + millions(b && b.limit) + ' per 6 h is reached. Sending is blocked; resets in ' +
+        Math.ceil(((b && b.resets_in) || 0) / 60) + ' min.', 'warning');
+    }
+    function onSendKey(ev) {
+      if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing || !budgetBlocked() || !inComposer(ev.target)) return;
+      blockSend(ev);
+    }
+    function onSendClick(ev) {
+      if (!budgetBlocked() || !inComposer(ev.target)) return;
+      var btn = ev.target.closest('button,[role="button"]');
+      var label = btn ? (btn.getAttribute('aria-label') || btn.getAttribute('title') || '') : '';
+      if (btn && SEND_RE.test(label.trim())) blockSend(ev);
+    }
+    window.addEventListener('keydown', onSendKey, true);
+    window.addEventListener('click', onSendClick, true);
+    window.addEventListener('pointerdown', onSendClick, true);
+
+    // True only while a Notion AI chat is the visible view (Main or a coworker chat).
+    function overlayOpen() {
+      var nodes = document.querySelectorAll('[role="dialog"], [role="menu"], [role="listbox"], [aria-modal="true"]');
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (ui.strip && ui.strip.contains(n)) continue;
+        if (ui.drawer && ui.drawer.contains(n)) continue;
+        var rect = n.getBoundingClientRect();
+        if (rect.width > 40 && rect.height > 40) return true;
+      }
+      return false;
+    }
+    function inChatView() {
+      var sh = window.__ntShell;
+      if (sh && sh.current && sh.current !== 'chat') return false;  // Live, Settings, ... tabs
+      var href = String(location.href || '');
+      return /\/(ai|chat)(?=[\/?#]|$)/i.test(href) || /[?&]t=[0-9a-f-]{32,36}/i.test(href);
+    }
+    var MODEL_RE = /^(Auto|Opus|Sonnet|Haiku|GPT|Gemini|o\d)[\w .\-]{0,24}$/i;
+    function domModel(root) {
+      var scope = root && root.querySelectorAll ? root : document;
+      var btns = scope.querySelectorAll('[role="button"]');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.closest && b.closest('[data-nt-desk]')) continue;
+        var t = String(b.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t || !MODEL_RE.test(t)) continue;
+        var rc = b.getBoundingClientRect();
+        if (rc.width > 0 && rc.height > 0) return t;
+      }
+      return '';
+    }
     function renderStrip() {
       if (!ui.strip) buildStrip();
       if (!ui.strip.isConnected) document.body.appendChild(ui.strip);
       var root = document.documentElement;
       var r = composer();
       var off = root.classList.contains('nt-desk-off');
-      if (!r || off) { ui.strip.hidden = true; root.classList.remove(STRIP_ON); return; }
+      // The strip belongs to the AI chat only: hidden on pages, databases, Live and every other view.
+      // Bug 2026-10-21: the strip stayed over Notion's Settings dialog and over the model menu, so the
+      // model could not be changed. Any open Notion dialog/menu/listbox hides the strip.
+      if (!r || off || !inChatView() || overlayOpen()) { ui.strip.hidden = true; root.classList.remove(STRIP_ON); return; }
       var nt = nextTurn(state);
-      ui.model.textContent = nextTurnText(nt);
-      ui.model.setAttribute('title', nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
+      // Bug 2026-10-21: the harness never publishes next_turn, so the strip always said 'Auto model'.
+      // Without harness data, show the model Notion's own composer chip really uses.
+      var dm = nt.model ? '' : domModel(r);
+      if (dm) { ui.model.textContent = 'Model: ' + dm; nt = { model: dm, effort: '', fromNotion: true }; }
+      else ui.model.textContent = nextTurnText(nt);
+      ui.model.setAttribute('title', nt.fromNotion ? 'Model shown by Notion for this chat' : nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
         : 'The harness has not published the next-turn model yet');
       // Every number comes from window.__ntDesk.counts, the same helper the Live tab and grid use.
       var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
@@ -226,6 +324,16 @@
       else ui.run.removeAttribute('title');
       ui.runFill.style.width = (run ? run.percent : 0) + '%';
       ui.run.classList.toggle('nt-desk-strip-idle', !(run && run.active));
+      var tb = budget();
+      ui.tokens.hidden = !tb;
+      if (tb) {
+        ui.tokens.textContent = (tb.blocked ? 'Token limit reached \u00b7 ' : 'Tokens ') + millions(tb.used) + ' of ' +
+          millions(tb.limit) + ' (6 h)';
+        ui.tokens.setAttribute('title', 'Estimated tokens of Main and coworkers in this 6-hour window; resets in ' +
+          Math.ceil((tb.resets_in || 0) / 60) + ' min. Sending is blocked when the limit is reached.');
+        ui.tokens.classList.toggle('nt-desk-strip-hot', !!tb.blocked || tb.percent >= 80);
+      }
+      renderIdle();
       ui.strip.hidden = false;
       var h = ui.strip.offsetHeight || 26;
       ui.strip.style.left = Math.round(r.left) + 'px';

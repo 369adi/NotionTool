@@ -20,6 +20,10 @@ GUARD_RULE = ('Coworkers are NotionTool Welcome chats managed by NotionTool. Del
               'create agents, automations, triggers or new Notion chats/sessions on the Notion website, even if a '
               'Notion tool offers it. If delegation is not possible, stop and tell the user.')
 COWORKER_RULE = 'You are a coworker: do the task yourself, do not delegate further.'
+PLAN_RULE = ('Main chats: before delegating work with 2 or more parts, POST /api/operator/plan with '
+             '{"parts": [{"id", "est_s" (your own solo seconds), "depends_on", "files"}]} and delegate only '
+             'when it returns delegate=true (then pass the same parts to /api/operator/delegate). '
+             'Small or single-part work you do yourself.')
 RESTART_NOTE = ('If a NotionTool tool call fails because NotionTool is restarting or the MCP connection is briefly gone, '
                 'that is only a restart of about 10-60 s: wait briefly, check whether the call took effect, then continue your task. '
                 'Do not stop or give up because of it.')
