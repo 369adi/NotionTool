@@ -560,8 +560,18 @@ class NotionClient:
         # getThreadTranscript returns the committed transcript (live check 2026-10-18: HTTP 200).
         # getInferenceTranscriptInferences is a debug endpoint (HTTP 400 'Transcript debugging is not enabled').
         # Errors reach the caller: recover() reconciles them, a 404 becomes ThreadMissing.
-        return self.call('getThreadTranscript',{'spaceId':self.info['space_id'],'threadId':thread,
-                                             'direction':'backward','limit':int(limit)})
+        # Live 2026-10-22 04:10: a long chat with big tool outputs exceeds the 32 MB Edge cap ('Response too
+        # large'). That is a size problem of one chat, not an outage: read a smaller window instead of failing,
+        # otherwise five such reads open the getThreadTranscript circuit for every chat (restart scan, wake).
+        limit = max(1, int(limit))
+        while True:
+            try:
+                return self.call('getThreadTranscript',{'spaceId':self.info['space_id'],'threadId':thread,
+                                                     'direction':'backward','limit':limit})
+            except Exception as exc:
+                if 'Response too large' not in str(exc) or limit <= 1:
+                    raise
+                limit = max(1, limit // 4)
 
 
 class NotionAdapter:

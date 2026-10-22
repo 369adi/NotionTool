@@ -138,13 +138,22 @@ class ChatContext:
         native = record.get('native_tokens', 0) if archived_at > base_at else 0
         if base_seq:
             observed = estimate_tokens({k: e for k, e in record['entities'].items() if e.get('sequence', 0) > base_seq})
+        elif base_at and not self.new_chat(worker, base_at):
+            observed = 0
         else:
-            observed = 0 if base_at else record['estimated_tokens']
+            # Never reset, or a new Welcome chat: its whole transcript is this generation's context
+            # (prompt + reply alone was about 43x too low after a new_welcome switch).
+            observed = record['estimated_tokens']
         tokens = max(local, observed, native + since_archive)
         turns = sum(bool(t.get('sent_at')) for t in tasks)
         return dict(estimated_tokens=tokens, turns=turns,
                     token_limit=int(settings.get('context_token_limit', 1200000)),
                     turn_limit=int(settings.get('context_turn_limit', 600)))
+
+    def new_chat(self, worker, base_at):
+        """True when context_base_at marks the switch into this new Welcome chat, not a same-chat reset."""
+        return any(g.get('successor') == worker['thread_id'] and g.get('mode') == 'new_welcome' and
+                   abs(float(g.get('archived_at') or 0) - base_at) < 120 for g in self.store.all('thread_generations'))
 
     def archive_native(self, client, worker):
         """Read the complete saved workflow message list using the existing record protocol."""
@@ -368,7 +377,8 @@ class ChatContext:
         base_seq = (transcript.get('session') or {}).get('sequence', 0)
         base_seq = base_seq if isinstance(base_seq, (int, float)) and not isinstance(base_seq, bool) else 0
         try:
-            head = (client.transcript(worker['thread_id']).get('session') or {}).get('sequence', base_seq)
+            # Only the session head is needed; a full window of a long chat can exceed the 32 MB Edge cap.
+            head = (client.transcript(worker['thread_id'], limit=5).get('session') or {}).get('sequence', base_seq)
             if isinstance(head, (int, float)) and not isinstance(head, bool):
                 base_seq = head
         except Exception:

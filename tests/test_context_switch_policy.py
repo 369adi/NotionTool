@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 
 from notiontool import desktop_settings as ds
-from notiontool.chat_context import (ChatContext, SWITCH_DEFAULTS, queued_ahead, switch_decision,
-                                     switch_message)
+from notiontool.chat_context import (ChatContext, SWITCH_DEFAULTS, estimate_tokens, queued_ahead,
+                                     switch_decision, switch_message)
 from notiontool.store import Store
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -122,7 +122,7 @@ class Adapter:
 
 class Client:
     info = {'space_id': '8d7d3dc4-6a0c-8164-897f-00036215c141'}
-    def transcript(s, tid): return {'session': {'status': 'idle', 'sequence': 5}}
+    def transcript(s, tid, limit=100): return {'session': {'status': 'idle', 'sequence': 5}}
 
 
 class Ctx(ChatContext):
@@ -245,6 +245,42 @@ class SettingsWiring(unittest.TestCase):
         for name in ('chat_context.py', 'server.py'):
             data = (ROOT / 'notiontool' / name).read_bytes()
             self.assertEqual(data.count(b'\n'), data.count(b'\r\n'), name)
+
+
+class UsageAfterNewWelcome(unittest.TestCase):
+    """After a new_welcome switch usage() must count the new chat's transcript, not only prompt + reply."""
+    BASE_AT = 1000.0
+
+    def setUp(self):
+        root = Path(__file__).parent / '.test-data'; root.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=root); self.store = Store(self.temp.name)
+    def tearDown(self): self.store.close(); self.temp.cleanup()
+
+    def build(self, switched=True):
+        if switched:
+            self.store.put('thread_generations', dict(id=OLD + ':2', worker_id='a:' + OLD, account_id='a',
+                           thread_id=OLD, successor=NEW, mode='new_welcome', archived_at=self.BASE_AT, base_seq=0))
+        w = dict(id='a:' + OLD, account_id='a', thread_id=NEW, purpose='worker', generation=2, welcome=True,
+                 context_base_seq=0, context_base_at=self.BASE_AT)
+        self.store.put('workers', w)
+        self.store.put('tasks', dict(id='t1', thread_id=NEW, sent_at=self.BASE_AT + 5, state='done',
+                                     submitted_prompt='p' * 300, raw_response='r' * 300))
+        entities = [dict(id='e%d' % i, sequence=i + 1, type='step', text=('tool output %d ' % i) * 4000)
+                    for i in range(6)]
+        transcript = {'session': {'status': 'idle', 'sequence': 6},
+                      'patches': [dict(op='put', entity=e) for e in entities]}
+        return w, transcript, sum(estimate_tokens(e) for e in entities)
+
+    def test_counts_new_chat_context_within_10_percent(self):
+        w, transcript, summed = self.build()
+        tokens = ChatContext(self.store).usage(w, transcript)['estimated_tokens']
+        self.assertLessEqual(abs(tokens - summed) / summed, 0.10, (tokens, summed))
+        self.assertGreater(tokens, 20 * estimate_tokens('p' * 300 + '\n' + 'r' * 300))  # old count: prompt + reply
+
+    def test_same_chat_reset_still_ignores_older_transcript(self):
+        w, transcript, summed = self.build(switched=False)
+        tokens = ChatContext(self.store).usage(w, transcript)['estimated_tokens']
+        self.assertEqual(tokens, estimate_tokens('p' * 300 + '\n' + 'r' * 300))
 
 
 if __name__ == '__main__':

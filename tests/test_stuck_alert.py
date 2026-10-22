@@ -51,7 +51,7 @@ class Client:
     def __init__(self, busy):
         self.busy = busy
 
-    def transcript(self, thread):
+    def transcript(self, thread, limit=100):
         return {'session': {'status': 'running' if self.busy else 'idle'}}
 
 

@@ -764,8 +764,19 @@ class Bridge:
                     self.snapshot_before_write(task, run, target)
                 else:
                     # Register the operator edit so coworker chats see it and leave the file alone.
-                    with self.engine.lock:
-                        file_registry.claim_operator(self.store, dev_path(args.get('path')))
+                    # Bounded wait (live 2026-10-22 04:13: an edit call never answered and the Main hung until
+                    # the user stopped it): a busy engine lock must never stall a file edit indefinitely.
+                    if self.engine.lock.acquire(timeout=10):
+                        try:
+                            file_registry.claim_operator(self.store, dev_path(args.get('path')))
+                        finally:
+                            self.engine.lock.release()
+                    else:
+                        try:
+                            self.store.event('operator_claim_skipped', message='Engine busy for 10 s; edit runs without registry claim',
+                                             path=str(args.get('path'))[:300])
+                        except Exception:
+                            pass
             return self.filter_dev_result(name, args, dev_call(name, args), area)
         if name=='nt_local_mcp':
             return self.local_refresh(str(args.get('server') or '') or None, bool(args.get('refresh')), schemas=bool(args.get('server')))

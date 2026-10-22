@@ -177,6 +177,7 @@ NOT_ACCEPTED_STATES = frozenset({"failed", "cancelled", "blocked"})
 DEFAULT_INTERVAL_S = 15.0
 BASELINE_AGE_S = 1800.0  # finished runs older than 30 min are marked as notified at start, never sent
 MIN_GAP_S = 60.0  # at most one wake message per Main chat per minute
+BUSY_WINDOW = 5  # transcript entries for the idle test; the session status comes with any window
 WAKE_MAX_RUNS = 5
 WAKE_SUMMARY_CHARS = 150
 WAKE_HEAD = "NotionTool (automatic): Cowork run finished."
@@ -354,7 +355,9 @@ class MainWake:
                 continue
             try:
                 client = self.adapter.client(account)
-                if self.chat_busy(client.transcript(thread) or {}):
+                # Only the session status is needed. The default 100 entries of a long Main exceed the 32 MB
+                # Edge cap ('Response too large', live 04:10) and open the transcript circuit for everyone.
+                if self.chat_busy(client.transcript(thread, limit=BUSY_WINDOW) or {}):
                     for run, _ in items:
                         key = self.record_id(run)
                         if key not in self.waited:
@@ -400,7 +403,7 @@ class MainWake:
                 continue
             try:
                 client = self.adapter.client(account)
-                if self.chat_busy(client.transcript(thread) or {}):
+                if self.chat_busy(client.transcript(thread, limit=BUSY_WINDOW) or {}):
                     continue  # delivered as soon as the Main chat is idle
             except Exception as exc:
                 self._failed(thread, exc)

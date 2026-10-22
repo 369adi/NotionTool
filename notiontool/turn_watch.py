@@ -35,6 +35,16 @@ RESTART_TEXT = ('Weiter (automatisch nach dem Neustart von NotionTool, Idle-Modu
                 'mach mit den offenen Punkten weiter, ohne nachzufragen.')
 RESTART_WINDOW = 900  # the turn ended at most 15 min before the restart
 RESTART_SETTLE = 20   # seconds after the start before the first restart continue
+# Restart cut: a NotionTool restart (build swap, update) makes Notion drop the running turn of every chat
+# that uses the NotionTool MCP (live 22.10. 22:13 and 03:26: tool result ok, then silence, no error entry).
+# After a restart EVERY such chat of the ready accounts gets one automatic continue, also the user's own chats.
+RESTART_CUT_TEXT = ('Weiter (automatisch: NotionTool wurde neu gestartet und hat deinen laufenden Turn unterbrochen). '
+                    'Mach genau dort weiter, wo du aufgehoert hast, ohne nachzufragen.')
+RESTART_CUT_BEFORE = 180  # newest step at most 3 min before the start ...
+RESTART_CUT_AFTER = 300   # ... or up to 5 min after it (a turn that died right after the restart)
+RESTART_CUT_QUIET = 30    # the chat wrote nothing for 30 s: Notion dropped the turn
+RESTART_SCAN_LIMIT = 30   # newest chats per account read per scan
+RESTART_SCAN_END = 660    # scans run until 11 min after the start
 CHECK_SECONDS = 30
 GRACE_SECONDS = 150  # a Main often thinks or waits on a slow tool for more than a minute between steps
 PENDING_TOOL_SECONDS = 420  # newest step is a tool call without result; every NotionTool tool times out well before this
@@ -58,13 +68,34 @@ PAUSE_MARKERS = ('interrupt', 'timeout')
 LIMIT_MARKERS = ('step_limit', 'limit_reached', 'max_steps', 'time_limit', 'paused', 'pause', 'confirm')
 
 
-def stamp(entity):
-    value = entity.get('created_at') or entity.get('createdAt') or entity.get('created_time') or 0
+def _seconds(value):
+    """Epoch seconds of a number (s or ms) or an ISO string ('2026-10-22T01:07:18.001Z'); 0.0 if unreadable."""
+    if isinstance(value, str) and value and not value.replace('.', '', 1).isdigit():
+        # getThreadTranscript writes ISO strings: float() failed on them, so every stamp was 0 and the
+        # restart continue / stall check never fired.
+        try:
+            from datetime import datetime, timezone
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            return 0.0
     try:
-        value = float(value)
+        value = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
     return value / 1000 if value > 1e11 else value
+
+
+def stamp(entity):
+    return _seconds(entity.get('created_at') or entity.get('createdAt') or entity.get('created_time') or 0)
+
+
+def done_stamp(entity):
+    """Newest time of an entry: its start or, for a tool step, when its result arrived."""
+    result = entity.get('result') if isinstance(entity.get('result'), dict) else {}
+    return max(stamp(entity), _seconds(result.get('completed_at') or 0))
 
 
 def text_of(value):
@@ -190,6 +221,33 @@ def restart_continue(transcript, started):
     visible = [e for e in relevant if _role(e) == 'user_message' and not _is_resume(e)]
     user_text = text_of(visible[-1].get('content', visible[-1].get('text', ''))) if visible else ''
     return dict(key='restart:' + key, user_text=user_text)
+
+
+def restart_cut(transcript, started, now):
+    """{'key', 'user_text'} when a NotionTool restart dropped this chat's turn, else None.
+
+    The chat is idle, its newest step is a tool step, an error or an unanswered user message (no reply)
+    and that step lies between RESTART_CUT_BEFORE before and RESTART_CUT_AFTER after the app start.
+    """
+    if transcript.get('session_pending') or session_state(transcript) != 'finished':
+        return None
+    entities = sorted((p.get('entity') or {} for p in (transcript.get('patches') or []) if p.get('op') == 'put'),
+                      key=lambda e: e.get('sequence') or 0)
+    relevant = [e for e in entities if _role(e)]
+    if not relevant or _role(relevant[-1]) == 'assistant_message':
+        return None
+    last = relevant[-1]
+    newest = max([done_stamp(e) for e in entities] + [done_stamp(last)])
+    if not newest or newest < started - RESTART_CUT_BEFORE or newest > started + RESTART_CUT_AFTER:
+        return None
+    if now - newest < RESTART_CUT_QUIET:
+        return None
+    key = str(last.get('id') or last.get('sequence') or '')
+    if not key:
+        return None
+    visible = [e for e in relevant if _role(e) == 'user_message' and not _is_resume(e)]
+    user_text = text_of(visible[-1].get('content', visible[-1].get('text', ''))) if visible else ''
+    return dict(key='restartcut:' + key, user_text=user_text)
 
 
 # A person types at most a few messages between two context checks; more means a counting artefact.
@@ -323,6 +381,10 @@ class TurnWatch:
                     self.check(worker)
                 except Exception as exc:  # one unreadable chat never stops the others
                     failed = failed or exc
+            try:
+                self.scan_restart_cuts()
+            except Exception as exc:
+                failed = failed or exc
             if failed and not self.blocked:
                 self.blocked = True
                 from .telemetry import classify
@@ -489,6 +551,52 @@ class TurnWatch:
                          message='Idle mode: NotionTool restarted after this Main finished; it continues automatically')
         self.spawn(self.send, worker, step, hit['key'], RESTART_TEXT)
         return step
+
+    def scan_restart_cuts(self):
+        """After a restart: one automatic continue for EVERY chat of the ready accounts whose turn the restart
+        dropped, also chats NotionTool does not manage (the user's own chats). Harness chats keep their
+        regular resume in check(). Setting restart_resume_all (default on) switches it off."""
+        if not self.store.settings().get('restart_resume_all', True):
+            return []
+        now = self.clock()
+        if now - self.started < RESTART_SETTLE or now - self.started > RESTART_SCAN_END:
+            return []
+        if budget_used_up(self.store, now):
+            return []
+        watched = {w.get('thread_id') for w in self.workers()}
+        state = self.store.get('turn_watch', 'restart_cuts') or {'id': 'restart_cuts', 'keys': []}
+        sent = []
+        for account in self.store.all('accounts'):
+            if account.get('state') != 'ready':
+                continue
+            client = self.adapter.client(account['id'])
+            for entry in list(client.threads() or [])[:RESTART_SCAN_LIMIT]:
+                tid = entry.get('id') if isinstance(entry, dict) else entry
+                ident = 'chat:' + str(tid)
+                if not tid or tid in watched or ident in self.sending:
+                    continue
+                try:
+                    hit = restart_cut(client.transcript(tid, limit=WINDOW), self.started, now)
+                except Exception as exc:  # one unreadable chat (live: 'Response too large') never stops the others
+                    self.store.event('turn_restart_cut_skipped', thread_id=tid, error=type(exc).__name__,
+                                     message='Restart check skipped one chat that could not be read')
+                    continue
+                if not hit or stop_requested(hit.get('user_text', '')):
+                    continue
+                key = str(tid) + ':' + hit['key']
+                if key in state['keys']:
+                    continue
+                state['keys'] = (list(state['keys']) + [key])[-200:]
+                self.store.put('turn_watch', state)
+                # purpose 'external': continue_turn keeps the chat's own model and effort (inherit_main_config).
+                worker = {'id': ident, 'account_id': account['id'], 'thread_id': tid, 'purpose': 'external'}
+                step = self.adapter.new_id(client.info['space_id'], '00aa')
+                self.sending.add(ident)
+                self.store.event('turn_restart_cut', thread_id=tid,
+                                 message='NotionTool restarted while this chat was working; it continues automatically')
+                self.spawn(self.send, worker, step, key, RESTART_CUT_TEXT)
+                sent.append(tid)
+        return sent
 
     def send(self, worker, step, key, text=RESUME_TEXT):
         from .network_budget import request_priority
