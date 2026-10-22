@@ -194,7 +194,9 @@ class Store:
                        context_token_limit=1200000, context_turn_limit=600, context_handoff_chars=24000,
                        host_api_port=8790, host_api_allow_network=False, host_api_bind='127.0.0.1',
                        coworker_fresh_context='threshold', context_replace_mode='soft',
-                       ui_mode='classic', dynamic_roles=False, role_definitions=[])
+                       ui_mode='classic', dynamic_roles=False, role_definitions=[],
+                       coworker_rotate_mode='new_welcome', main_context_policy='hint',
+                       coworker_delete_old_chat=True)
         return dict(defaults, **self.get('settings', 'app', {}))
 
     def remember(self, ident, text, source=''):
