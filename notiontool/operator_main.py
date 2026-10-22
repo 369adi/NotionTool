@@ -23,6 +23,8 @@ OPERATOR_TITLE = 'Operator Main'
 MAX_DELEGATED_TASKS = 40
 BUSY = ('busy', 'recovering')
 RESULT_LINE = 'End your answer with a final line RESULT: DONE, or RESULT: NOT DONE: <reason> if you could not fully do the task.'
+FULL_RESULT = 'Full result: '
+READ_FULL_HINT = 'Read a Full result file only when the review fails, tests fail or more detail is explicitly needed.'
 
 
 def result_done(result):
@@ -188,19 +190,26 @@ def result_summary(result):
             data = None
     if isinstance(data, dict):
         summary = data.get('summary') if isinstance(data.get('summary'), str) else ''
-        path = data.get('result_file')
-        if isinstance(path, str) and path.strip() and os.path.isfile(path.strip()):
+        from .run_context import valid_result_file
+        path = valid_result_file(data.get('result_file'))
+        if path:
             short = clean_summary(summary)
-            return (short + ' ' if short else '') + 'Full result: ' + path.strip()
+            return (short + ' ' if short else '') + FULL_RESULT + path
         return first_sentence(summary) if summary else ''
     match = re.search(r'^\s*(?:summary|zusammenfassung)\s*:\s*(.+)$', text, re.I | re.M)
     return first_sentence(match.group(1)) if match else ''
 
 
 def plain_task_summary(task):
-    """One plain sentence for a task: its own summary, else the first sentence of its result summary, else the title."""
+    """One plain sentence for a task: its own summary, else the first sentence of its result summary, else the title.
+
+    A result with a real result file always gives result_summary (summary plus 'Full result: <path>').
+    """
     task = task if isinstance(task, dict) else {}
-    return clean_summary(task.get('summary')) or result_summary(task.get('result')) or clean_summary(task.get('title'))
+    from_result = result_summary(task.get('result'))
+    if FULL_RESULT in from_result:
+        return from_result
+    return clean_summary(task.get('summary')) or from_result or clean_summary(task.get('title'))
 
 
 def plain_run_summary(run):
@@ -229,7 +238,8 @@ def _summary(engine, run, duplicate=False, warnings=None):
     tasks = [dict(id=t['id'], title=t.get('title', ''), summary=plain_task_summary(t), state=t.get('state', ''),
                   worker_id=t.get('worker_id', ''), stage=stage_of(t))
              for t in own]
-    return dict(ok=True, run_id=run['id'], state=run.get('state', ''), chat_id=run['chat_id'], tasks=tasks,
+    note = {'note': READ_FULL_HINT} if any(FULL_RESULT in str(t['summary'] or '') for t in tasks) else {}
+    return dict(ok=True, run_id=run['id'], state=run.get('state', ''), chat_id=run['chat_id'], tasks=tasks, **note,
                 quality=run.get('quality', 'fast'), stage=run.get('stage') or run_stage(own),
                 duplicate=duplicate, warnings=list(warnings or []),
                 # team_route: the DIRECT/TEAM decision and the split hint, stored on the run (None for older runs).
