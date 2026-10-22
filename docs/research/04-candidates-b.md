@@ -16,7 +16,7 @@ Out of scope: the app's screens and look.
 
 Baselines used (measured in this worktree or from the critique): store.py:43-44 sets only `journal_mode=WAL` and `synchronous=FULL`; no VACUUM, no auto_vacuum, no user_version anywhere in store.py; DB 325 MB with freelist 49,975 of 79,391 pages (63 %); NotionTool.spec:8-9 lists 9 hand-typed hiddenimports; tests/ has 0 hypothesis imports, 7 pytest imports, 59 time.sleep( calls; engine.py has 47 time.time/monotonic uses and only 12 injectable-clock spots; the repo has no `logging` use at all in notiontool/ (0 matches).
 
-## 1. Accepted candidates (8 of max 12)
+## 1. Accepted candidates (7 accepted candidates, max 12)
 
 Order = priority of the need. "Dev-time" = never shipped inside the EXE.
 
@@ -56,9 +56,10 @@ Order = priority of the need. "Dev-time" = never shipped inside the EXE.
 ### C4 - Declared transition table (technique, no library)  [need B2]
 - Prior art / links: https://github.com/fgmacedo/python-statemachine (MIT, release 3.2.2 on 2026-10-14, pure Python) and https://github.com/pytransitions/transitions (MIT) - only used as a model; NOT added as a dependency (see rejected list).
 - Licence: none needed (own code, about 40 lines). Windows: n/a.
+- Type: runtime (new module notiontool/task_states.py, shipped in the EXE)
 - Plugs into: a new small module `notiontool/task_states.py` (enum + `ALLOWED: dict[state, set[state]]`), used by the engine's single place that writes the task state, and by C3 as the oracle. `file_leases.LIVE_TASK_STATES` becomes a view of it.
 - Replaces / adds: replaces state strings checked in many places by one table; adds an assertion/telemetry event when an unlisted transition happens (log first, raise later).
-- Expected gain: every wrong-state bug becomes a visible "illegal transition X->Y" event instead of a lost task. Measure: count of `illegal_transition` events per week (baseline: not measurable today).
+- Expected gain: every wrong-state bug becomes a visible "illegal transition X->Y" event instead of a lost task. Measure: count of `illegal_transition` events per week Baseline (B2 of 02-plan-critique.md, measured 2026-10-22): (a) state-fix commits in the last 30 days: at least 10 (git log since 2026-09-22 = 317 commits; 14 match the keyword grep uncertain|orphan|stale|stuck|lost answer|wrong state|resend|resume; 10 of them are engine/task-state fixes: 24a732c, 4042ce9, acb87a4, 3a18fbf, 9d5d83f, be20ce3, 1eab199, d79e3f3, 7ab6987, 89011e0; the other 4 are UI-only or mixed, so 10 is a lower bound because the grep is keyword-based). (b) Tasks in uncertain or orphaned states per run: host API GET /api/metrics holds 1,201 tasks in 195 runs; 7 tasks have an attempt that ended in state uncertain (0.04 per run), 46 tasks carry error_class REMOTE_UNKNOWN (0.24 per run), 19 tasks sit in state blocked (0.10 per run). No task-level uncertain or orphaned state exists today, so these three counts are the closest measurable proxies; with C4 they become one direct count.
 - Risk: first run will show many legal-in-practice transitions; start in log-only mode. Effort: S-M.
 
 ### C5 - SQLite auto_vacuum=INCREMENTAL + a one-time VACUUM (technique)  [need B6]
@@ -73,24 +74,18 @@ Order = priority of the need. "Dev-time" = never shipped inside the EXE.
 - Link: https://www.sqlite.org/pragma.html#pragma_synchronous and https://www.sqlite.org/wal.html. Public domain, standard library.
 - Plugs into: `notiontool/store.py:44` (`synchronous=FULL` today).
 - Replaces / adds: replaces FULL with NORMAL. In WAL mode NORMAL is safe against an application crash and an OS crash that keeps the file system consistent; only the last commits can be lost after a power cut or a hard OS crash.
-- Expected gain: fewer fsyncs per commit; project memory measured about 2.5 ms per event and 8.7 ms per put. Measure: a micro-benchmark of 1,000 `append_event` and `put` calls under FULL and NORMAL on this PC (not yet run - the number must be measured before the change; if the gain is under 30 %, drop this).
+- Expected gain: fewer fsyncs per commit; project memory measured about 2.5 ms per event and 8.7 ms per put. Measure: a micro-benchmark of 1,000 `append_event` and `put` calls under FULL and NORMAL on this PC Measured on 2026-10-22 on this PC (Windows, Python 3.12.10, throwaway store in a temp folder, real `Store.event` = the append_event path, and `Store.put`, 1,000 calls each, 3 rounds per mode in alternating order, median shown; PC loaded by other coworker tasks): FULL 4.915 s for 1,000 events (4.92 ms each) and 4.435 s for 1,000 puts (4.43 ms each); NORMAL 0.383 s for 1,000 events (0.38 ms each) and 0.236 s for 1,000 puts (0.24 ms each). Gain: 92 % for events and 95 % for puts, well above the 30 % bar, so C6 is kept. All 3 FULL runs: events 2.378 / 5.651 / 4.915 s; all 3 NORMAL runs: 0.316 / 0.462 / 0.383 s (ranges do not overlap). Note: this is a per-write saving of about 4.5 ms; whether it matters for the user depends on the write rate, which was not measured.
+- Windows proof: standard `sqlite3` module of Python 3.12.10 on this PC; the benchmark above ran there; 0 MB added.
+- Type: runtime (one pragma line in notiontool/store.py, shipped in the EXE).
 - Risk: real durability trade-off. The owner must decide, because lost answers are already a pain point (I5). Mitigation: keep FULL for the `objects` table writes that hold task state and only use NORMAL for events, which means two connections - this conflicts with R12, so the simple all-NORMAL switch is the only variant offered here. Effort: S.
 
 ### C7 - PyInstaller `collect_submodules('notiontool')` in the spec  [need B4]
 - Link: https://github.com/pyinstaller/pyinstaller (docs: PyInstaller.utils.hooks.collect_submodules). Licence: GPL-2.0-or-later with the bootloader exception (the output may be distributed under any licence; PyInstaller is already the project's build tool, so no licence change). Last release v6.22.3 on 2026-09-12; commits 2026-10-22.
 - Windows proof: 2 win wheels on PyPI, already used in release.yml on windows-latest.
-- Plugs into: `NotionTool.spec:8-9` (`hiddenimports=[...]` with 9 hand-typed names, four of them - autopilot, context_archive, dag, role_policy - were added after the EXE failed) and `.github/workflows/release.yml`.
+- Plugs into: `NotionTool.spec:8-9` (`hiddenimports=[...]` with 9 hand-typed names, 5 of them own modules (_build, autopilot, context_archive, dag, role_policy); four of them - autopilot, context_archive, dag, role_policy - were added after the EXE failed) and `.github/workflows/release.yml`.
 - Replaces / adds: replaces the hand-typed list of own modules with `hiddenimports = collect_submodules('notiontool') + [...third-party...]`; adds a test that imports every module name in `notiontool/` (`pkgutil.walk_packages`) in the frozen EXE smoke step.
-- Expected gain: removes the whole class of "ModuleNotFoundError only in the EXE". Measure: number of hand-typed own-module entries (9 -> 0) and a frozen-build smoke test that imports all modules (baseline: none).
+- Expected gain: removes the whole class of "ModuleNotFoundError only in the EXE". Measure: number of hand-typed own-module entries (own-module entries 5 -> 0; the 4 third-party entries (webview.platforms.edgechromium, PIL, PIL.Image, PIL.ImageGrab) stay) and a frozen-build smoke test that imports all modules (baseline: none).
 - Risk: bundles modules that were left out on purpose (NOT WIRED ones), size grows by a few hundred KB; exclude test helpers by a filter. Effort: S.
-
-### C8 - zizmor (GitHub Actions workflow audit)  [need B4]
-- Link: https://github.com/zizmorcore/zizmor . Licence: MIT. Last activity: release v1.31.1 on 2026-10-15, commits 2026-10-22, 6,755 stars.
-- Windows proof: 2 win wheels (PyPI zizmor 1.31.1, Python >=3.11), no Python dependencies, offline mode available. Dev-time CLI, never shipped.
-- Plugs into: `.github/workflows/release.yml` (the workflow that builds the EXE and publishes the release and the sha256 file that updater.py:284-292 trusts).
-- Replaces / adds: adds an audit of the one workflow that signs off what the updater downloads (permissions, template injection, unpinned actions). Nothing exists today.
-- Expected gain: low but concrete: findings count for release.yml, target 0 high findings. Measure: `zizmor --offline .github/workflows` output. Honest note: with one workflow in a private repo this is a one-time check, not a weekly tool.
-- Risk: none for runtime. Effort: S.
 
 ## 2. Needs with no accepted candidate
 
@@ -121,8 +116,9 @@ Order = priority of the need. "Dev-time" = never shipped inside the EXE.
 | yoyo-migrations / alembic / sqlite-utils (Apache-2.0, 4.2.1) | not needed | R10: store.py has 5 `CREATE TABLE IF NOT EXISTS` statements and no migration history; `PRAGMA user_version` (stdlib) is enough when a first real migration comes |
 | modelcontextprotocol/servers: git, filesystem, time, memory, sequentialthinking, everything, fetch (v2.0.0, 2026-10-19; licence is moving from MIT to Apache-2.0, both fine) | node and uvx exist on the PC | R9/R11: git duplicates `nt_shell` git, filesystem duplicates nt_read_file/write/edit/list_dir, fetch duplicates `Invoke-WebRequest` through nt_shell; I could not name a weekly use with a call count; the other four are demos |
 | Serena (oraios/serena, 2.1.0, 2026-10-19, 30,616 stars) | PyPI licence GPL-3.0-or-later, 33 dependencies, needs language servers | R2 (GPL as runtime), R7 (size), R11 (duplicates nt_search_code / nt_file_outline); belongs to area A2/A5 if anywhere |
-| gitleaks (MIT, v8.30.1, 2026-03-21), detect-secrets (Apache-2.0, last release 2024-05-06) | | area A (secret scan; patch_mode already has one); detect-secrets also R1 |
+| gitleaks (MIT, v8.30.1, 2026-03-21), detect-secrets (Apache-2.0, last release 2024-05-06) | gitleaks MIT v8.30.1 2026-03-21; detect-secrets Apache-2.0 last release 2024-05-06; the existing scan is SECRET_TEXT in notiontool/patch_mode.py lines 42-112 | area A (secret scan; patch_mode already has one); detect-secrets also R1 |
 | pip-audit (Apache-2.0, 2.10.1, 2026-06-10) | 10 dependencies | R5: only 4 direct requirements, no number for the gain |
+| zizmor (MIT, v1.31.1, 2026-10-15, commits 2026-10-22, 6,755 stars; 2 win wheels on PyPI, Python >=3.11, no Python dependencies) (was C8) | audits only .github/workflows/release.yml (builds the EXE and the sha256 file that updater.py:284-292 trusts) | R5 and the goal's no-forced-finds rule: low gain, one workflow, so a one-time check and not a weekly tool; no need for a permanent candidate. See section 5 for the one-time manual run |
 
 ## 4. Proof from the owner PC (Windows, Python 3.12.10)
 
@@ -136,3 +132,5 @@ Order = priority of the need. "Dev-time" = never shipped inside the EXE.
 - C1 must be validated first (name-by-name parity of failed tests, then the parser change in patch_mode.py); C2-C4 are independent small steps.
 - C5 is the biggest measurable win in this area: about 200 MB free pages; the design question is only when VACUUM may run (single shared connection, R12).
 - Gap: coworkers have no web search; this role had to use `gh` and the PyPI API. A candidate for area A/B7 would be a web-search/fetch tool, but no server was proven to be called weekly.
+- zizmor (moved to the rejected list, was C8) can be run once by hand on .github/workflows/release.yml: `pipx run zizmor --offline .github/workflows` (or `pip install zizmor` into a temp folder). It is not a permanent tool; only act on findings that are real.
+- C6 was benchmarked (section 1): the gain is large, but it trades durability for speed after a power cut, so the owner must decide before the pragma changes. C4 and C6 are runtime changes; C1, C2, C3 and C5-tooling are dev-time.

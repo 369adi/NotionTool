@@ -9,8 +9,8 @@ rejected list).
 - No web-search tool or browser exists for this role. "Opened" means: the signed-in GitHub API (`gh api`, account
   logged in, 4,884 of 5,000 calls left after the run), the PyPI JSON API, the Codeberg API, one wheel downloaded to
   %TEMP% and listed, and local commands in this worktree. Blogs, benchmarks and the MCP registry were not read.
-- Every GitHub repo, every Windows release asset and every PyPI page that 03 section 5 marked UNVERIFIED was opened
-  in this run (section 1). The 403 gaps of Researcher A are closed.
+- Every GitHub repo, Windows release asset and PyPI page of both researchers was opened again in this run (section 1);
+  this confirms the links that 03 opened in its fix round.
 - Every integration point was checked with `git grep` in this worktree (section 2). Local: git 2.54.0.windows.1,
   Python 3.12.10, SQLite 3.49.1, `CREATE VIRTUAL TABLE ... USING fts5(x, tokenize=trigram)` works.
 - Still needs a local run, not a lookup: the Mergiraf replay and whether `git merge-tree --write-tree` uses a merge
@@ -34,9 +34,9 @@ rejected list).
 | tree-sitter | tree-sitter/py-tree-sitter | MIT | push 2026-08-30; PyPI 0.26.0 2026-06-30 | cp312 win_amd64 0.12 MB |
 | tree-sitter-language-pack | xberg-io/tree-sitter-language-pack (moved from Goldziher) | MIT | push 2026-10-22; PyPI 1.22.1 2026-10-12 | one wheel cp310-abi3-win_amd64 2.15 MB, opened: contains _native.pyd 5.5 MB and a `DownloadManager`, `download`, `download_all`, `cache_dir` API |
 | ast-grep | ast-grep/ast-grep | MIT | 0.51.0 on 2026-10-15 | app-x86_64-pc-windows-msvc.zip 15.5 MB; PyPI ast-grep-py cp312 win_amd64 5.17 MB; ast-grep-cli 16.68 MB |
-| ripgrep | BurntSushi/ripgrep | Unlicense | 15.2.0 on 2026-07-15 | ripgrep-15.2.0-x86_64-pc-windows-msvc.zip 1.7 MB (03 said 5 MB: wrong) |
+| ripgrep | BurntSushi/ripgrep | Unlicense | 15.2.0 on 2026-07-15 | ripgrep-15.2.0-x86_64-pc-windows-msvc.zip 1.7 MB |
 | difftastic | Wilfred/difftastic | MIT | 0.71.0 on 2026-09-18 | difft-0.71.0-x86_64-pc-windows-msvc.zip 10 MB |
-| mutmut | boxed/mutmut | BSD-3-Clause | 3.8.0 on 2026-09-12, push 2026-10-19 | no binary; py3-none-any wheel, 7 deps |
+| mutmut | boxed/mutmut | BSD-3-Clause | 3.8.0 on 2026-09-12, push 2026-10-19 | no binary; py3-none-any wheel, 7 deps; README: on Windows it must run inside WSL |
 | semgrep | semgrep/semgrep | LGPL-2.1 (PyPI LGPL-2.1-or-later) | 1.182.1 on 2026-10-22 | win_amd64 wheel 56.44 MB, 28 deps |
 | grep-ast | Aider-AI/grep-ast | Apache-2.0 | last push and release 0.9.0 on 2025-05-08 (17 months, R1 fails) | pure Python |
 | pytest-xdist | pytest-dev/pytest-xdist | MIT | push 2026-10-22; last release 3.8.0 2025-07-01 (R1 by activity) | pure Python |
@@ -46,7 +46,7 @@ rejected list).
 | PyInstaller | pyinstaller/pyinstaller | GPL-2.0-or-later with bootloader exception | PyPI 6.22.3 2026-09-12, push 2026-10-22 | already the build tool |
 | zizmor | zizmorcore/zizmor | MIT | v1.31.1 on 2026-10-15 | zizmor-x86_64-pc-windows-msvc.zip 8 MB; PyPI win_amd64 8.61 MB |
 
-No item is archived. Corrections to the researchers: ripgrep's Windows asset is 1.7 MB, not 5 MB; four repos moved to
+No item is archived. Corrections to the researchers: four repos moved to
 new owners (links in 03/04 still redirect); the tree-sitter-language-pack wheel has a download manager, so the offline
 risk named in 03 is real.
 
@@ -89,7 +89,7 @@ Order = value for NotionTool. "Dev" = dev-time, never in the EXE. "Cond" = keep 
 | K6 | A5 | Worktree hardening: core.longpaths, `worktree lock` for live tasks, retry `remove --force --force`, porcelain reconcile (Dev technique) | patch_mode 267-272, 423-425, `_remove` 618-622; new reconcile function in worker_gc.py | 64 registered worktrees and longpaths unset prove the baseline. Item (e) sparse-checkout is dropped: work/ and data/ are already ignored. |
 | K7 | A6 | msgspec Struct schema for plan, review and integrator results (runtime, 0.18 MB) | new notiontool/result_schema.py; the seven json.loads sites in engine.py and operator_roles.py; plain_protocol.py | Replaces seven ad-hoc reads with one strict decode that names the bad field, so the reason can go back to the coworker. 0 deps, BSD-3, win wheel. |
 | K8 | B1 | pytest + pytest-xdist + pytest-timeout as runner (Dev, Cond: parity) | patch_mode `verify` 371, `_FAILED_TEST` 155 (read `--junitxml` instead), TEST_TIMEOUT_S 37 | Only measured gain in both files (360 s vs 727 s under load). Condition: name-by-name parity of failed tests on a quiet PC; the gate stays unittest until then. |
-| K9 | B2 | Declared transition table (own technique, log-only first) | new notiontool/task_states.py; the single place that writes task state in engine.py; file_leases `LIVE_TASK_STATES` 20 becomes a view of it | About 40 lines, makes every wrong-state bug visible as an `illegal_transition` event. Oracle for K10. |
+| K9 | B2 | Declared transition table (own technique, log-only first) | new notiontool/task_states.py; the five task-state writes in engine.py at lines 637 (cancelled), 640 (cancelling), 1838 (cancelled), 1860 (done or result status) and 2226 (skipped); the three lists of live task states: file_leases.py:20 `LIVE_TASK_STATES` with 5 states (running, cancelling, uncertain, checkpoint, preparing), and engine.py:140 and bridge.py:183 `LIVE_TASK_STATES` with only running and uncertain. task_states.py replaces all three lists; the different sets must be merged on purpose (decide per caller whether cancelling, checkpoint and preparing count as live), not by copying one list over the others | About 40 lines, makes every wrong-state bug visible as an `illegal_transition` event. Oracle for K10. |
 | K10 | B2 | Hypothesis RuleBasedStateMachine (Dev, Cond: deterministic Notion fake) | new tests/test_engine_state_machine.py on engine `_dispatch`, `_complete`, `resolve_uncertain`, `retry_blocked` | 0 stateful tests today; targets the lost/resent-answer class. `derandomize=True` and under 30 s in the gate; drop if nothing is found after a fair try. Do after K9. |
 | K11 | B6 | auto_vacuum=INCREMENTAL + one VACUUM at start-up (technique) | store.py `Store.__init__` 43-44; idle step `PRAGMA incremental_vacuum(N)` | Biggest measurable store win: 63 % free pages (about 200 MB). Run before the engine threads start, on the one shared connection (R12); owner or Main starts it, coworkers cannot touch data/. |
 | K12 | B4 | PyInstaller `collect_submodules('notiontool')` + import-all smoke test | NotionTool.spec:8 hiddenimports; .github/workflows/release.yml smoke step | Removes the "ModuleNotFoundError only in the EXE" class; no new tool, PyInstaller is already used. |
@@ -119,7 +119,7 @@ Conditional extras (not counted in the 12, run once, keep only if the test says 
 | gitleaks in 04 rejected list | 04 | duplicate | same item as the conditional extra above (area A) |
 | ripgrep | 03 section 4 | R5 | already installed, 1.7 MB, but does not cut tool calls; FTS5 in K3 covers search |
 | difftastic | 03 section 4 | R5 | a diff viewer, not a merge tool |
-| mutmut | 03 section 4 | R5 | BSD-3, pure Python, active; needs many full test runs on a 64-727 s suite; the earlier "Windows unverified" reason is replaced by cost |
+| mutmut | 03 section 4 | R3/R5 | BSD-3, pure Python, active; but its README says that on Windows it must run inside WSL (R3: not native Windows), and it needs many full test runs on a 64-727 s suite (R5: cost far above gain) |
 | semgrep | 03 section 4 | R2/R7 | LGPL-2.1-or-later, 56.44 MB wheel, 28 deps |
 | grep-ast | 03 section 4 | R1 | last push and release 2025-05-08 |
 | jedi, griffe, pyright, LLMLingua/tiktoken, aider-chat package, tree-sitter-languages, detect-secrets, import-linter, pydeps, graphlib, pygit2, pydantic | 03 section 4 | as in 03 | reasons in 03 hold; not re-opened beyond section 1 |
