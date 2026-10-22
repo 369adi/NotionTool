@@ -2056,7 +2056,7 @@ class NotionAdapter:
         try:
             latest, done, _status = self.turn_outcome(client, thread_id)
         except Exception:
-            return None  # unknown, never 'finished': callers treat None as not proven idle; session checks still apply
+            return None  # unknown: only the empty-reply check (turn_running -> engine) treats None as busy; the two pre-send checks in send (_busy_now, after the checkpoint) treat it as not busy, as before
         # A turn without an outcome for longer than the task timeout counts as abandoned.
         limit = window if window is not None else self.store.settings()['task_timeout']
         return latest > done and time.time() * 1000 - latest < limit * 1000

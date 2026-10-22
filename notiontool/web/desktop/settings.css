@@ -109,6 +109,14 @@
   background: var(--nt-set-surface);
 }
 .nt-desk-set-empty { padding: 22px 18px; color: var(--nt-set-muted); }
+/* Spec cards (Context switch rule): group header 8px above the card, cards 24px apart, rows of at least
+   64px with padding 16 20, a 24px gap, a 220px right-aligned control column, help 4px under the label. */
+.nt-desk-set-group { margin: 24px 0 8px; font-size: 13px; line-height: 20px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; color: var(--nt-set-muted); }
+.nt-desk-set-card-spec { border-radius: 12px; }
+.nt-desk-set-card-spec .nt-desk-set-row { box-sizing: border-box; min-height: 64px; padding: 16px 20px; gap: 24px; }
+.nt-desk-set-card-spec .nt-desk-set-control { flex: 0 0 220px; width: 220px; display: flex; justify-content: flex-end; }
+.nt-desk-set-card-spec .nt-desk-set-help { margin-top: 4px; font-size: 12px; line-height: 18px; }
 .nt-desk-set-row {
   display: flex; align-items: center; gap: 24px; padding: 15px 18px; border-top: 1px solid var(--nt-set-line);
   transition: background 120ms ease, box-shadow 120ms ease;
@@ -248,6 +256,8 @@
   .nt-desk-set-brand-text, .nt-desk-set-sec-label, .nt-desk-set-side-foot, .nt-desk-set-kbd { display: none; }
   .nt-desk-set-body, .nt-desk-set-foot { padding-left: 20px; padding-right: 20px; }
   .nt-desk-set-row { flex-wrap: wrap; gap: 10px; }
+  .nt-desk-set-card-spec .nt-desk-set-row { flex-wrap: wrap; gap: 10px; }
+  .nt-desk-set-card-spec .nt-desk-set-control { flex: 1 1 100%; width: 100%; margin-top: 8px; justify-content: flex-start; }
 }
 
 /* ---- Settings tab view (Studio v3) ------------------------------------------------------- */
@@ -298,6 +308,8 @@
 html.nt-desk-compact .nt-desk-stab { padding: 14px 18px; }
 html.nt-desk-compact .nt-desk-stab-row { padding: 7px 0; }
 html.nt-desk-compact .nt-desk-stab-card { padding: 10px 14px; }
+html.nt-desk-compact .nt-desk-set-card-spec .nt-desk-set-row { min-height: 48px; padding: 8px 20px; }
+html.nt-desk-compact .nt-desk-set-group { margin-top: 16px; }
 html[data-nt-look="soft"] { --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .18); --nt-accent-soft: rgba(124, 92, 255, .08); }
 html[data-nt-look="strong"] { --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .55), 0 8px 30px rgba(124, 92, 255, .35), 0 0 44px rgba(34, 211, 238, .2);
   --nt-accent-soft: rgba(124, 92, 255, .26); }

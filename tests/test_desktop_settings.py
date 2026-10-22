@@ -14,6 +14,10 @@ SERVER_CLAMPS = {'max_workers': (1, 40), 'per_account': (1, 40), 'coworker_max_a
                  'token_budget_6h': (1000000, 500000000), 'burst_soft_15m': (100000, 100000000),
                  'burst_hard_15m': (100000, 200000000), 'burst_hard_60m': (100000, 500000000),
                  'burst_turns_5m': (5, 1000), 'burst_spacing_s': (1, 600)}
+# The measured Coworker switch rule (SWITCH_SETTINGS) and its /api/settings clamps.
+SWITCH_CLAMPS = {'switch_min_tokens': (0, 10000000), 'switch_base_tokens': (0, 1000000), 'switch_cost_s': (0, 3600),
+                 'switch_slope_ms_per_100k': (0, 600000), 'switch_error_permille_per_100k': (0, 1000),
+                 'switch_retry_s': (0, 3600), 'switch_remaining_tasks': (1, 50)}
 SERVER_BOOLS = {'coworker_delete_old_chat', 'main_auto_continue', 'turn_watch', 'auto_continue_on_done'}
 SERVER_CHOICES = {'coworker_fresh_context': ['threshold', 'every_task'], 'main_context_policy': ['hint', 'auto', 'ask']}
 
@@ -114,6 +118,54 @@ class DesktopSettingsTests(unittest.TestCase):
         css = (ROOT / 'notiontool' / 'web' / 'desktop' / 'settings.css').read_text(encoding='utf-8')
         self.assertIn('#F5B5441A', css)
         self.assertIn('.nt-desk-stab-seg-btn', css)
+
+    def test_switch_rule_entries_match_the_server(self):
+        switch = {entry['key']: entry for entry in ds.settings_schema({})['switch']}
+        self.assertEqual(set(switch), set(SWITCH_CLAMPS) | {'coworker_switch_policy'})
+        self.assertEqual(switch['coworker_switch_policy']['options'], ['threshold', 'measured'])
+        for key, bounds in SWITCH_CLAMPS.items():
+            entry = switch[key]
+            self.assertEqual(entry['type'], 'int')
+            self.assertFalse(entry['app_local'])
+            self.assertEqual((entry['min'], entry['max']), bounds, key)
+            self.assertTrue(entry['min'] <= entry['default'] <= entry['max'], key)
+        server = (ROOT / 'notiontool/server.py').read_text(encoding='utf-8')
+        for key, (low, high) in SWITCH_CLAMPS.items():
+            self.assertIn("('%s',%d,%d)" % (key, low, high), server)
+
+    def test_switch_rule_card_in_team_section(self):
+        js = (ROOT / 'notiontool/web/desktop/settings.js').read_text(encoding='utf-8')
+        block = js[js.index('var SECTION_OF_KEY = {'):]
+        mapping = dict(re.findall(r"(\w+): '(\w+)'", block[:block.index('};')]))
+        for entry in ds.SWITCH_SETTINGS:
+            self.assertEqual(mapping.get(entry['key']), 'team', entry['key'])
+        self.assertIn("var SWITCH_CARD = { section: 'team', title: 'Context switch rule' };", js)
+        self.assertIn('list(schema && schema.switch)', js)
+        # Spec rows: no 'Allowed: x to y' line for the switch card.
+        self.assertIn('rowFor(entry, section, true)', js)
+        self.assertIn('if (!noRange && kind ===', js)
+        # Saved through the existing save: server keys go into collect() server values -> settings_set.
+        self.assertIn("if (isAppLocal(entry)) app[key] = value; else server[key] = value;", js)
+        self.assertIn("call('settings_set', { values: data.server })", js)
+
+    def switch_css(self):
+        return (ROOT / 'notiontool/web/desktop/settings.css').read_text(encoding='utf-8')
+
+    def test_switch_card_wraps_on_narrow_width(self):
+        css = self.switch_css()
+        start = css.index('@media (max-width: 720px) {\n')
+        block = css[start:css.index('\n}', start)]
+        self.assertIn('.nt-desk-set-card-spec .nt-desk-set-row { flex-wrap: wrap; gap: 10px; }', block)
+        self.assertIn('.nt-desk-set-card-spec .nt-desk-set-control { flex: 1 1 100%; width: 100%; margin-top: 8px; '
+                      'justify-content: flex-start; }', block)
+
+    def test_switch_card_compact_mode(self):
+        css = self.switch_css()
+        compact = [line for line in css.splitlines() if line.startswith('html.nt-desk-compact ')]
+        self.assertIn('html.nt-desk-compact .nt-desk-set-card-spec .nt-desk-set-row { min-height: 48px; padding: 8px 20px; }',
+                      compact)
+        # Cards 16 px apart in compact mode: the group header above the switch card moves up to 16 px.
+        self.assertIn('html.nt-desk-compact .nt-desk-set-group { margin-top: 16px; }', compact)
 
     def test_files_use_lf(self):
         for rel in ('notiontool/desktop_settings.py', 'tests/test_desktop_settings.py'):
