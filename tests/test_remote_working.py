@@ -75,6 +75,45 @@ def test_transcript_body_cap_fits_long_coworker_chats():
     assert transport._MAX_BODY >= 32 * 1024 * 1024
 
 
+def _adapter_for_fallback(native):
+    a = adapter_with({'id': 't1'})
+    a.lock = threading.RLock()
+    a.transports = {'acc': native} if native is not None else {}
+    a.events = []
+    a.store.event = lambda kind, run, **kw: a.events.append(kind)
+    return a
+
+
+def test_failed_edge_read_falls_back_to_native_and_is_logged(monkeypatch):
+    class FakeClient:
+        def __init__(self, transport, identity):
+            self.transport = transport
+
+        def transcript(self, thread, limit=100):
+            return {'patches': [], 'session': {'status': 'idle'}, 'thread': thread, 'limit': limit}
+
+    monkeypatch.setattr(N, 'NotionClient', FakeClient)
+    a = _adapter_for_fallback(object())
+    got = a.recover_native({'account_id': 'acc'}, 'th', 12, {'id': 't1', 'run_id': 'r'}, OSError('Edge request timed out'))
+    assert got['thread'] == 'th' and got['limit'] == 12
+    assert a.events == ['recover_read_failed']
+
+
+def test_fallback_failure_returns_none_and_is_logged(monkeypatch):
+    class BrokenClient:
+        def __init__(self, transport, identity):
+            pass
+
+        def transcript(self, thread, limit=100):
+            raise OSError('offline')
+
+    monkeypatch.setattr(N, 'NotionClient', BrokenClient)
+    a = _adapter_for_fallback(object())
+    assert a.recover_native({'account_id': 'acc'}, 'th', 12, {'id': 't1'}, OSError('x')) is None
+    assert a.events == ['recover_read_failed', 'recover_native_failed']
+    assert _adapter_for_fallback(None).recover_native({'account_id': 'acc'}, 'th', 12, {'id': 't1'}, OSError('x')) is None
+
+
 def test_running_state_is_no_empty_proof():
     # 'running' must never count as proof of an empty finished turn (no resend).
     assert 'running' not in E.EMPTY_PROOF_STATES

@@ -1528,8 +1528,11 @@ class NotionAdapter:
                 transcript = self.client(worker['account_id']).transcript(thread_id, limit=limit or self.RECOVER_WINDOW)
         except ThreadMissing:
             raise  # HTTP 404 for the task's own chat: the worker is missing
-        except Exception:
-            raise PendingRemote() from None
+        except Exception as exc:
+            # B46: a failed read was silently swallowed, so a finished coworker could stay 'uncertain' forever.
+            transcript = self.recover_native(worker, thread_id, limit or self.RECOVER_WINDOW, task, exc)
+            if transcript is None:
+                raise PendingRemote() from None
         from .chat_context import ChatContext
         observed_worker = dict(worker, thread_id=thread_id)
         _rt1 = time.monotonic()
@@ -1612,6 +1615,33 @@ class NotionAdapter:
         live = self.note_remote_progress(task, own_turn, session, transcript)
         # A timeout is not evidence that the server didn't accept the POST.
         raise PendingRemote(state='running' if live else '', reason='remote_working' if live else '')
+
+    def recover_native(self, worker, thread_id, limit, task, exc):
+        """B46: the Edge tab can fail on large transcripts; read the same chat once, read-only, via the native transport.
+        Logs both failures so a stuck check is visible instead of silent. Returns None if that read fails too."""
+        run_id = task.get('run_id', '')
+        try:
+            self.store.event('recover_read_failed', run_id, task_id=task.get('id', ''),
+                             message=('%s: %s' % (type(exc).__name__, exc))[:200])
+        except Exception:
+            pass
+        try:
+            with self.lock:
+                native = self.transports.get(worker.get('account_id'))
+                identity = (self.store.get('accounts', worker.get('account_id'), {}) or {}).get('identity')
+            if native is None:
+                return None
+            with request_priority('verify'):
+                return NotionClient(native, identity).transcript(thread_id, limit=limit)
+        except ThreadMissing:
+            raise
+        except Exception as exc2:
+            try:
+                self.store.event('recover_native_failed', run_id, task_id=task.get('id', ''),
+                                 message=('%s: %s' % (type(exc2).__name__, exc2))[:200])
+            except Exception:
+                pass
+            return None
 
     def note_remote_progress(self, task, own_turn, session, transcript):
         """B46: record the newest step of our own turn. True while Notion still runs the turn and a new
