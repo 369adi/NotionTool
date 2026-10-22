@@ -75,6 +75,26 @@ def test_step_pause_latches_once_and_60_min_net_stops_again():
     assert [k for k, _ in s.events].count('step_limit_stop') == 2
 
 
+def test_step_estimate_learns_and_reserves_budget():
+    s = Store()
+    task = dict(task_class='code', model='m1')
+    assert step_guard.estimate(s, task) == step_guard.EST_DEFAULT
+    step_guard.note_turn_steps(s, task, 100)
+    step_guard.note_turn_steps(s, task, 200)  # moving average 100 + 0.3 x 100 = 130
+    assert step_guard.estimate(s, task) == 130
+    assert step_guard.estimate(s, dict(task_class='code', model='other')) == 130  # class fallback
+    assert step_guard.estimate(s, dict(task_class='review')) == 130  # all fallback
+    step_guard.add_steps(s, W, 790, now=NOW)
+    assert step_guard.start_wait(s, W2, NOW + 100)[0] == 0  # no task: old behaviour
+    wait, reason = step_guard.start_wait(s, W2, NOW + 100, task)  # 790 + 130 < 1000 ok
+    assert wait == 0
+    step_guard.add_steps(s, W, 100, now=NOW + 101)  # 890 + 130 > 1000: wait, nothing sent
+    wait, reason = step_guard.start_wait(s, W2, NOW + 200, task)
+    assert wait == 60 and 'step budget' in reason
+    with pytest.raises(RateLimited):
+        token_budget.refuse_if_burst(s, W2, NOW + 200, task=task)
+
+
 def test_weighted_steps_hit_before_plain_steps():
     s = Store()
     step_guard.add_steps(s, M, 500, now=NOW)  # 500 x 200k cap = 100M

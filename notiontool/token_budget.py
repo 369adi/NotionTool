@@ -453,12 +453,12 @@ def burst_state(store, now=None):
                 coworker_turns_5m=turns5, limits=lim, steps=steps)
 
 
-def refuse_if_burst(store, worker, now=None):
+def refuse_if_burst(store, worker, now=None, task=None):
     """Raise RateLimited (nothing sent) for a coworker turn while usage is too high for a short time."""
     if (worker or {}).get('purpose') != 'worker':
         return
     from . import step_guard
-    step_guard.refuse_start(store, worker, now)  # step pause, max parallel turns, start spacing
+    step_guard.refuse_start(store, worker, now, task)  # step pause, max parallel turns, start spacing
     state = burst_state(store, now)
     if state['level'] == 'ok' or (state['level'] == 'throttle' and not state['wait']):
         return

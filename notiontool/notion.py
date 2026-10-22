@@ -1535,7 +1535,7 @@ class NotionAdapter:
         # 6-hour token budget (token_budget.py): nothing is sent while the window is used up.
         from .token_budget import refuse_if_exhausted, refuse_if_burst, charge_send, charge_reply
         refuse_if_exhausted(self.store)
-        refuse_if_burst(self.store, worker)  # short-term burst guard: slows coworkers only
+        refuse_if_burst(self.store, worker, task=task)  # burst guard + step budget (estimate) for coworkers
         with self.store.lock:
             saved = self.store.get('tasks',task['id'])
             saved['before_seq'] = session.get('sequence',0)
@@ -1611,6 +1611,8 @@ class NotionAdapter:
                     counted = step_guard.count_new(self.store, worker, steps, counted)
             errors = [s for s in steps if isinstance(s,dict) and s.get('type')=='error']
             counted = step_guard.count_new(self.store, worker, steps, counted)
+            if worker.get('purpose') == 'worker' and not errors:
+                step_guard.note_turn_steps(self.store, task, counted)  # learns the steps per turn
             for err in errors:
                 # Notion's fair-use limit (UserRateLimitResponse / AI disabled): every chat of the account pauses.
                 detail = json.dumps(err, default=str)

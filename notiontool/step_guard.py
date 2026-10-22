@@ -273,7 +273,52 @@ def running_turns(store, account, exclude_worker=''):
     return count
 
 
-def start_wait(store, worker, now=None):
+# ---- step estimate per coworker turn ------------------------------------------
+# Moving average of the steps one coworker turn needs, per task_class|model (fallback: task_class, all).
+# A new turn starts only while steps_15m + estimate x (running turns + 1) stays below the hard limit,
+# so the 15 min stop is (almost) never reached.
+EST_KIND, EST_DEFAULT, EST_ALPHA = 'step_estimates', 60, 0.3
+
+
+def _est_keys(task):
+    task = task or {}
+    cls = str(task.get('task_class') or 'any')[:40]
+    model = str(task.get('model') or '')[:60]
+    return [cls + '|' + model, cls + '|', 'all|']
+
+
+def note_turn_steps(store, task, steps):
+    """Learn the steps of one finished coworker turn. Never raises."""
+    try:
+        steps = int(steps or 0)
+        if steps <= 0:
+            return
+        with _lock(store):
+            doc = dict(store.get(EST_KIND, 'avg') or {})
+            doc['id'] = 'avg'
+            avg = dict(doc.get('avg') or {})
+            for key in _est_keys(task):
+                old, n = (avg.get(key) or [0, 0])[:2]
+                avg[key] = [round(steps if not n else old + EST_ALPHA * (steps - old), 1), int(n) + 1]
+            doc['avg'] = dict(list(avg.items())[-MAX_KEYS:])
+            store.put(EST_KIND, doc)
+    except Exception:
+        pass
+
+
+def estimate(store, task):
+    """Expected steps of one turn of this task (int)."""
+    try:
+        avg = (store.get(EST_KIND, 'avg') or {}).get('avg') or {}
+        for key in _est_keys(task):
+            if key in avg and int(avg[key][1]) >= 1:
+                return max(1, int(round(float(avg[key][0]))))
+    except Exception:
+        pass
+    return EST_DEFAULT
+
+
+def start_wait(store, worker, now=None, task=None):
     """(seconds, reason) a coworker turn must wait before it is sent; (0, '') when it may go."""
     if (worker or {}).get('purpose') != 'worker':
         return 0, ''
@@ -286,6 +331,11 @@ def start_wait(store, worker, now=None):
     running = running_turns(store, account, str((worker or {}).get('id') or ''))
     if running >= lim['max_parallel_turns']:
         return 30, '%d coworker turns already run on this account (max %d)' % (running, lim['max_parallel_turns'])
+    if task is not None:
+        need = min(estimate(store, task) * (running + 1), lim['step_hard_15m'] // 2)
+        used = int(st.get('steps_15m') or 0)
+        if used + need > lim['step_hard_15m']:
+            return 60, 'step budget: %d used + ~%d expected > %d per 15 min' % (used, need, lim['step_hard_15m'])
     spacing = lim['start_spacing_s'] * (2 if st['level'] == 'throttle' else 1)
     gap = now - float(st.get('last_start') or 0)
     if gap < spacing:
@@ -295,9 +345,9 @@ def start_wait(store, worker, now=None):
     return 0, ''
 
 
-def refuse_start(store, worker, now=None):
+def refuse_start(store, worker, now=None, task=None):
     """Raise RateLimited (nothing sent) while a coworker turn must wait."""
-    wait, reason = start_wait(store, worker, now)
+    wait, reason = start_wait(store, worker, now, task)
     if not wait:
         return
     from .engine import RateLimited
