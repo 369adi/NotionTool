@@ -3,7 +3,7 @@
 Every INTERVAL seconds for the selected account: refresh the thread list (notion.py refresh marks
 unlisted chats 'missing'), retire coworkers that stayed missing for MISSING_GRACE seconds (a single
 listing glitch never retires a chat), give their queued tasks back to the queue and create new
-Welcome coworkers until the pool reaches the target (setting coworker_target, default 10).
+Welcome coworkers until the pool reaches the target (setting coworker_target, default: team_size = 'Coworkers per account').
 """
 
 import json
@@ -91,7 +91,13 @@ class CoworkerUpkeep:
                 if w.get('missing_since') and w.get('state') != 'missing':
                     w.pop('missing_since', None)
                     self.store.put('workers', w)
-            target = int(settings.get('coworker_target', DEFAULT_TARGET) or 0)
+            # Without an explicit coworker_target the pool follows 'Coworkers per account' (team_size,
+            # owner 2026-10-22: always exactly 5), not the old fixed default of 10.
+            if settings.get('coworker_target') is None:
+                from .team_size import team_size
+                target = team_size(settings)
+            else:
+                target = int(settings.get('coworker_target') or 0)
             decision = plan(workers, tasks, account['id'], target, now)
             for ident in decision['mark']:
                 w = self.store.get('workers', ident)

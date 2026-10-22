@@ -50,5 +50,23 @@ class ResetCoworkersTest(unittest.TestCase):
         self.assertFalse(re.match(pat, 'Coworker notes'))
 
 
+class UpkeepTargetTest(unittest.TestCase):
+    def test_refill_target_follows_team_size_without_coworker_target(self):
+        from notiontool import coworker_upkeep as cu
+        from tests import test_coworker_upkeep as tcu
+
+        class Store5(tcu.Store):
+            def settings(self):
+                return {'harness_account_id': tcu.ACC, 'per_account': 5}
+
+        store = Store5([tcu.w('c%d' % i) for i in range(4)])
+        adapter = tcu.Adapter()
+        out = cu.CoworkerUpkeep(store, adapter, tcu.Engine(), clock=lambda: 1000.0).once()
+        self.assertEqual((out['alive'], out['create']), (4, 1))  # 4 alive -> exactly 1 more, never up to 10
+        full = Store5([tcu.w('c%d' % i) for i in range(5)])
+        out = cu.CoworkerUpkeep(full, tcu.Adapter(), tcu.Engine(), clock=lambda: 1000.0).once()
+        self.assertEqual(out['create'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
