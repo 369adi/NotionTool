@@ -249,11 +249,15 @@ class DesktopSettingsUiTest(unittest.TestCase):
         css = re.sub(r'/\*.*?\*/', '', self.css, flags=re.S)
         classes = re.findall(r'\.(-?[A-Za-z_][\w-]*)', css)
         self.assertTrue(classes)
+        # Only exception: Notion's own top bar is hidden while our settings are open (it is only read, never changed).
         for name in classes:
+            # nt-shell-* is our own shell part (html.nt-shell-view-open), also allowed.
+            if name == 'notion-topbar' or name.startswith('nt-shell-'):
+                continue
             self.assertTrue(name.startswith('nt-desk-'), name)
         self.assertIn('.nt-desk-set-panel', css)
         self.assertIn('.nt-desk-set-modal', css)
-        self.assertNotIn('notion-', css)
+        self.assertNotIn('notion-', css.replace('.notion-topbar', ''))
         for name in re.findall(r"'(nt-[\w-]+)'", self.js):
             self.assertTrue(name.startswith('nt-desk-'), name)
 

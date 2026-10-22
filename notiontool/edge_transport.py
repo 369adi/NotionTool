@@ -3,6 +3,7 @@
 Streams are drained incrementally. An interrupted POST is never retried here.
 """
 import json
+import queue
 import re
 import threading
 import time
@@ -26,12 +27,156 @@ class EdgeTransport:
         self.woken_at = 0.0
         self.wake_logged_at = 0.0
         self.stall_wake_after = 8.0
+        # Responsiveness checks of the tab (see tab_frozen): limit per evaluation, short retry between the
+        # two checks, one shared time budget for both, and an own 60 s log timer for edge_tab_probe.
+        self.probe_timeout = 2.5
+        self.probe_retry_s = 0.5
+        self.probe_budget_s = 5.8
+        self.probe_logged_at = float('-inf')
+        # Shared stream poller: one DevTools call per tick for all active streams instead of one per stream.
+        self._watch_cv = threading.Condition()
+        self._watched = {}
+        self._poller = None
+
+    def _watch(self, target, key):
+        inbox = queue.Queue()
+        with self._watch_cv:
+            self._watched[key] = (target, inbox)
+            if self._poller is None or not self._poller.is_alive():
+                self._poller = threading.Thread(target=self._poll_loop, name='edge-poller', daemon=True)
+                self._poller.start()
+            self._watch_cv.notify_all()
+        return inbox
+
+    def _unwatch(self, key):
+        with self._watch_cv:
+            self._watched.pop(key, None)
+
+    def _poll_loop(self):
+        idle = 0
+        while True:
+            with self._watch_cv:
+                if not self._watched:
+                    self._watch_cv.wait(5)
+                    if not self._watched:
+                        self._poller = None
+                        return
+                groups = {}
+                for key, (target, inbox) in self._watched.items():
+                    tid = target.get('id') if isinstance(target, dict) else target
+                    groups.setdefault(tid or id(target), (target, []))[1].append((key, inbox))
+            flowing = False
+            for target, items in groups.values():
+                keys = [key for key, _ in items]
+                try:
+                    results = self.browser.evaluate(target, '''(keys => {
+                      const all = window.__notiontoolRequests || {}, out = {};
+                      // Up to ~2 MB per poll: 128 small chunks made multi-MB transcripts take many rounds.
+                      const take = c => { let n = 0, s = 0; while (n < c.length && n < 2048 && s < 2097152) s += c[n++].length; return c.splice(0, n).join(''); };
+                      for (const key of keys) {
+                        const q = all[key];
+                        out[key] = q ? {status:q.status, retry:q.retry, done:q.done, error:q.error, reason:q.reason || '',
+                          text:take(q.chunks), remaining:q.chunks.length} : null;
+                      }
+                      return out;
+                    })(''' + json.dumps(keys) + ')') or {}
+                    if len(keys) == 1 and keys[0] not in results and ('done' in results or 'status' in results):
+                        results = {keys[0]: results}
+                except Exception:
+                    for _, inbox in items:
+                        inbox.put({'_poll_error': True})
+                    continue
+                for key, inbox in items:
+                    result = results.get(key)
+                    if result and (result.get('text') or result.get('remaining')):
+                        flowing = True
+                    inbox.put(result)
+            # Fast while bytes flow, slower while the models think; the tab stays free for new sends.
+            idle = 0 if flowing else idle + 1
+            time.sleep(.1 if idle < 3 else min(.4, .1 * 1.5 ** (idle - 2)))
 
     @property
     def retry_after(self):
         return getattr(self.local, 'retry_after', 30)
 
-    def wake(self, target, force=False, reason='periodic'):
+    # One page task that answers through the tab's task queue. A MessageChannel message is not delayed by
+    # background timer throttling (a lone setTimeout is), but it does not run while the page is frozen.
+    # Whichever fires first resolves the promise.
+    PROBE_SCRIPT = ('new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(1); '
+                    'c.port2.postMessage(0); setTimeout(() => r(1), 0); })')
+
+    # Plain evaluation: answered by DevTools without a page task, so it separates a slow or broken
+    # DevTools link from a page whose task queue does not run.
+    PLAIN_SCRIPT = '1'
+
+    @staticmethod
+    def _timed_out(exc):
+        if isinstance(exc, TimeoutError):
+            return True
+        return 'timeout' in type(exc).__name__.lower() or 'timed out' in str(exc).lower()
+
+    def tab_check(self, target, deadline):
+        """One responsiveness check: 'active', 'miss', 'busy' or 'unreachable'.
+
+        Plain evaluation times out -> busy; fails with a connection or DevTools error -> unreachable;
+        answers but the message-channel task does not -> miss; both answer -> active.
+        """
+        def limit():
+            return max(0.1, min(self.probe_timeout, deadline - time.monotonic()))
+        try:
+            self.browser.evaluate(target, self.PLAIN_SCRIPT, limit())
+        except Exception as exc:
+            return 'busy' if self._timed_out(exc) else 'unreachable'
+        if deadline - time.monotonic() <= 0:
+            return 'busy'
+        try:
+            self.browser.evaluate(target, self.PROBE_SCRIPT, limit())
+        except Exception:
+            return 'miss'
+        return 'active'
+
+    def tab_frozen(self, target, cancel=None):
+        """Verdict of up to two checks a short retry apart; 'frozen' only after two misses in a row.
+
+        Returns 'active', 'busy', 'unreachable', 'miss' (one unconfirmed miss) or 'frozen'. Both checks
+        share one time budget (probe_budget_s); a set cancel flag skips the retry and the second check.
+        The old single 2 s setTimeout check failed on healthy tabs that were only busy draining a long
+        stream or throttled in the background.
+        """
+        deadline = time.monotonic() + self.probe_budget_s
+        first = self.tab_check(target, deadline)
+        if first == 'active' or (cancel is not None and cancel.is_set()):
+            return first
+        pause = min(self.probe_retry_s, max(0.0, deadline - time.monotonic()))
+        waiter = getattr(cancel, 'wait', None)
+        if waiter is not None:
+            if waiter(pause):
+                return first
+        else:
+            time.sleep(pause)
+        if deadline - time.monotonic() <= 0.1:
+            return first
+        second = self.tab_check(target, deadline)
+        if second == 'miss':
+            return 'frozen' if first == 'miss' else first
+        return second
+
+    def _log_probe(self, verdict, reason, started):
+        # Busy or unreachable after a forced wake: visible in the log, but never reported as frozen.
+        now = time.monotonic()
+        if now - self.probe_logged_at < 60:
+            return
+        self.probe_logged_at = now
+        event = getattr(self.store, 'event', None)
+        if event is None:
+            return
+        try:
+            event('edge_tab_probe', account_id=self.account_id, verdict=verdict, reason=str(reason)[:80],
+                  elapsed_ms=int((now - started) * 1000))
+        except Exception:
+            pass
+
+    def wake(self, target, force=False, reason='periodic', cancel=None):
         # Phase 4 Fix K: keep the hidden transport tab out of Edge's frozen lifecycle state.
         # A frozen tab still answers DevTools evaluations, but its fetch readers and timers stop:
         # a Notion stream that already ended is never read to its end and the task waits until
@@ -43,11 +188,13 @@ class EdgeTransport:
         self.woken_at = now
         frozen = None
         if force:
-            try:
-                self.browser.evaluate(target, 'new Promise(r => setTimeout(() => r(1), 0))', 2)
-                frozen = False
-            except Exception:
-                frozen = True
+            # A stalled stream is often only a long model think or a busy/background tab: 'frozen' only
+            # after two checks a short retry apart both missed while the plain evaluation answered.
+            started = time.monotonic()
+            verdict = self.tab_frozen(target, cancel)
+            frozen = verdict == 'frozen'
+            if verdict in ('busy', 'unreachable'):
+                self._log_probe(verdict, reason, started)
         try:
             wake = getattr(self.browser, 'wake', None)
             if wake is not None:
@@ -69,7 +216,9 @@ class EdgeTransport:
     def prepare(self):
         with self.lock:
             self.browser.ensure()
-            if self.ready_process is not self.browser.process:
+            # A reused Edge (started by an earlier NotionTool) has process None like ready_process:
+            # without the target check the transport target stayed None (send(None) TypeError).
+            if self.target is None or self.ready_process is not self.browser.process:
                 tabs = self.browser.tabs()
                 self.target = next((t for t in tabs if t.get('url') == self._base + '/robots.txt'), None)
                 if not self.target:
@@ -100,8 +249,20 @@ class EdgeTransport:
             # Navigation of the transport tab must never forward a request to another origin.
             if self.browser.evaluate(self.target, 'location.origin') != self._base:
                 raise OSError('Restore the Notion robots.txt transport tab before continuing')
+            self._hide_once()
             self.wake(self.target)
             return self.target
+
+    def _hide_once(self):
+        """The robots.txt transport window is never visible: moved off screen once per browser process."""
+        marker = (id(getattr(self.browser, 'process', None)), getattr(self.browser, 'port', 0))
+        if getattr(self, 'hidden_marker', None) == marker or getattr(self, 'shown_by_user', False):
+            return
+        self.hidden_marker = marker
+        hidden = getattr(self.browser, 'hidden', None)
+        hide = getattr(self.browser, 'hide_window', None)
+        if hidden is not None and hide is not None and hidden():
+            hide(self.target)
 
     def open(self):
         self.prepare()
@@ -138,23 +299,41 @@ class EdgeTransport:
         if not found:
             raise OSError('Edge did not open the Notion tab; the robots.txt transport tab is unchanged')
         try:
+            show = getattr(self.browser, 'show_window', None)
+            if show is not None:
+                self.shown_by_user = True  # the user asked for Notion in Edge: keep this window visible
+                show(found)
             self.browser.send(found, 'Page.bringToFront', {}, 10)
         except Exception:
             pass
         return {'opened': True, 'verified': True, 'account_id': self.account_id, 'transport': 'edge',
                 'tab_id': found.get('id'), 'url': found.get('url', url)}
 
+    def _ready_target(self):
+        # Fast path for every request once the tab is ready: no lock, no /json/version and no extra
+        # DevTools round trip. prepare() held the lock for three round trips per request, so parallel
+        # tasks (collect + verify of 8 coworkers) queued behind each other. The origin check now runs
+        # atomically inside the start script instead.
+        process = getattr(self.browser, 'process', None)
+        if (self.target is not None and process is not None and self.ready_process is process
+                and process.poll() is None):
+            self.wake(self.target)
+            return self.target
+        return self.prepare()
+
     def _start(self, path, body, headers, timeout, cancel):
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', path):
             raise ValueError('Invalid Notion endpoint')
-        target = self.prepare()
+        target = self._ready_target()
         ticket = self.budget.acquire(cancel, source=path)
         key = uuid.uuid4().hex
         # Forbidden browser headers are supplied by Edge itself.
         headers = {k: v for k, v in (headers or {}).items()
                    if k.lower() not in ('origin', 'referer', 'cookie', 'host', 'content-length')}
         headers['Content-Type'] = 'application/json'
-        script = r'''((key, path, body, headers, timeout) => {
+        script = r'''((key, path, body, headers, timeout, origin) => {
+          // Navigation of the transport tab must never forward a request to another origin.
+          if (location.origin !== origin) return 'origin';
           const all = window.__notiontoolRequests ||= {};
           const controller = new AbortController();
           const q = all[key] = {chunks: [], done: false, status: 0, size: 0, controller};
@@ -173,13 +352,25 @@ class EdgeTransport:
                 q.chunks.push(decoder.decode(value, {stream:true}));
               }
               q.chunks.push(decoder.decode());
-            } catch (_) { q.error = true; }
+            } catch (e) { q.error = true; q.reason = String((e && (e.name + ': ' + e.message)) || e).slice(0, 200); }
             finally { clearTimeout(timer); q.done = true; }
           })();
           return true;
         })'''
-        args = json.dumps([key, path, body, headers, timeout], ensure_ascii=True)
-        self.browser.evaluate(target, script + '(...' + args + ')')
+        args = json.dumps([key, path, body, headers, timeout, self._base], ensure_ascii=True)
+        try:
+            started = self.browser.evaluate(target, script + '(...' + args + ')')
+        except BaseException:
+            release = getattr(self.budget, 'release', None)
+            if release is not None:
+                release(ticket, 'failed', account_id=self.account_id)
+            raise
+        if started == 'origin':
+            self.ready_process = None  # next request takes the full prepare() path again
+            release = getattr(self.budget, 'release', None)
+            if release is not None:
+                release(ticket, 'neutral', account_id=self.account_id)
+            raise OSError('Restore the Notion robots.txt transport tab before continuing')
         return target, key, ticket
 
     def _chunks(self, path, body, headers, timeout, cancel=None):
@@ -188,16 +379,22 @@ class EdgeTransport:
         # Phase 3: every started request reports its outcome to the shared coordinator.
         begun, status, latency, outcome = time.monotonic(), 0, None, 'neutral'
         progress_at, last_seen = begun, None
+        inbox = self._watch(target, key)
         try:
             while time.monotonic() < deadline:
                 if cancel is not None and cancel.is_set():
                     raise NotionStreamError('Edge request interrupted; reconcile before reuse')
-                result = self.browser.evaluate(target, '''(key => {
-                  const q = window.__notiontoolRequests?.[key];
-                  if (!q) return null;
-                  return {status:q.status, retry:q.retry, done:q.done, error:q.error,
-                          text:q.chunks.splice(0, 128).join(''), remaining:q.chunks.length};
-                })(''' + json.dumps(key) + ')')
+                # One shared poller reads every active stream of this tab in a single DevTools call.
+                try:
+                    result = inbox.get(timeout=1.0)
+                except queue.Empty:
+                    if time.monotonic() - progress_at > self.stall_wake_after:
+                        self.wake(target, force=True, reason='stalled ' + path, cancel=cancel)
+                        progress_at = time.monotonic()
+                    continue
+                if isinstance(result, dict) and result.get('_poll_error'):
+                    outcome = 'failed'
+                    raise NotionStreamError('Edge request polling failed; reconcile before reuse')
                 if not result:
                     outcome = 'failed'
                     raise NotionStreamError('Edge request state lost; reconcile before reuse')
@@ -213,13 +410,17 @@ class EdgeTransport:
                     raise NotionHttpError(code)
                 if result.get('error'):
                     outcome = 'failed'
-                    raise NotionStreamError('Edge request interrupted; reconcile before reuse')
+                    # The browser's own reason (TypeError: Failed to fetch, AbortError, ...) used to be swallowed,
+                    # so a broken coworker could never be diagnosed from the log.
+                    why = str(result.get('reason') or '')[:200]
+                    raise NotionStreamError('Edge request interrupted; reconcile before reuse'
+                                            + (' (' + why + ')' if why else ''))
                 seen_now = (result.get('status'), result.get('remaining'), result.get('done'))
                 if result.get('text') or seen_now != last_seen:
                     progress_at, last_seen = time.monotonic(), seen_now
                 elif time.monotonic() - progress_at > self.stall_wake_after:
                     # Phase 4 Fix K: no new bytes for a while; a frozen tab would hold them back.
-                    self.wake(target, force=True, reason='stalled ' + path)
+                    self.wake(target, force=True, reason='stalled ' + path, cancel=cancel)
                     progress_at = time.monotonic()
                 if result.get('text'):
                     yield result['text']
@@ -227,10 +428,10 @@ class EdgeTransport:
                     outcome = 'ok'
                     self._save_cookies(target)
                     return
-                time.sleep(.1)
             outcome = 'failed'
             raise NotionStreamError('Edge request timed out; reconcile before reuse')
         finally:
+            self._unwatch(key)
             release = getattr(self.budget, 'release', None)
             if release is not None:
                 release(ticket, outcome, status=status, latency=latency, account_id=self.account_id)

@@ -76,10 +76,10 @@ INT_SETTINGS = ('max_workers', 'per_account', 'max_attempts', 'task_timeout', 'm
 CHOICE_SETTINGS = ('coworker_fresh_context', 'context_replace_mode', 'notion_transport', 'coworker_rotate_mode',
                    'main_context_policy')
 TEXT_SETTINGS = ('theme',)
-BOOL_SETTINGS = ('harness_enabled', 'mcp_full_access', 'mcp_browser_access', 'coworker_delete_old_chat')
+BOOL_SETTINGS = ('harness_enabled', 'mcp_full_access', 'mcp_browser_access', 'coworker_delete_old_chat', 'idle_mode')
 # Shown on the page even before they were saved once; the values are the server defaults.
 PAGE_DEFAULTS = {'coworker_rotate_mode': 'new_welcome', 'main_context_policy': 'hint',
-                 'coworker_delete_old_chat': False}
+                 'coworker_delete_old_chat': True, 'idle_mode': True}
 PAGE_EXCLUDED_SETTINGS = ('host_api_port', 'host_api_allow_network', 'host_api_bind', 'browser_path',
                           'public_mcp_url')
 
@@ -153,6 +153,113 @@ def _state_key(state):
     if isinstance(state, dict):
         state = {k: v for k, v in state.items() if k != 'ts'}
     return json.dumps(state, sort_keys=True, ensure_ascii=True, default=str)
+
+
+# ---- Model pin: the Notion composer must never send 'Auto' -----------------------------------
+# Notion's own UI sends an 'updated-config' step without model/reasoningEffort when the composer
+# chip fell back to Auto (seen live 2026-10-21: values {} and {modelFromUser: true}). The shell
+# pauses runInferenceTranscript requests of the page (CDP Fetch) and fills in the last explicit
+# choice the user made in the menu, else Opus + high. Explicit choices pass unchanged.
+PIN_DEFAULT_MODEL = 'albuquerque-quinn'  # Opus 5.5
+PIN_DEFAULT_EFFORT = 'high'
+PIN_PATTERN = '*runInferenceTranscript*'
+
+
+def _pin_log_path():
+    import sys
+    if getattr(sys, 'frozen', False):  # dist/NotionTool.exe -> <root>/data
+        return Path(sys.executable).resolve().parent.parent / 'data' / 'model_pin.log'
+    return Path(__file__).resolve().parents[1] / 'data' / 'model_pin.log'
+
+
+def pin_log(entry):
+    """Append one JSON line to data/model_pin.log (proof which model really went to Notion). Never raises."""
+    try:
+        path = _pin_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = dict(entry, at=time.strftime('%Y-%m-%d %H:%M:%S'))
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def request_shape(post):
+    """Small, content-free view of a runInferenceTranscript body: top-level keys, the step types and
+    every updated-config value (model/effort fields only, no message text). Finds where the composer's
+    real model choice lives. Never raises."""
+    try:
+        data = json.loads(post) if isinstance(post, str) else None
+        if not isinstance(data, dict):
+            return {}
+        steps = [s for s in data.get('transcript') or [] if isinstance(s, dict)]
+        configs = []
+        for step in steps:
+            if step.get('type') == 'updated-config':
+                value = step.get('value') if isinstance(step.get('value'), dict) else {}
+                configs.append({k: (v if isinstance(v, (str, int, float, bool)) or v is None else type(v).__name__)
+                                for k, v in value.items()})
+        top = {k: (v if isinstance(v, (str, int, float, bool)) and len(str(v)) < 80 else type(v).__name__)
+               for k, v in data.items() if k != 'transcript'}
+        def flat(value):
+            value = value if isinstance(value, dict) else {}
+            return {k: (v if isinstance(v, (str, int, float, bool)) or v is None else type(v).__name__)
+                    for k, v in value.items()}
+        base = next((s for s in steps if s.get('type') == 'config'), {})
+        return dict(top=top, step_types=[s.get('type') for s in steps][-12:], configs=configs[-3:],
+                    base_config=flat(base.get('value')), debug_overrides=flat(data.get('debugOverrides')))
+    except Exception:
+        return {}
+
+
+def sent_config(post):
+    """(model, effort) of the last updated-config step in a request body, or ('', '')."""
+    try:
+        data = json.loads(post) if isinstance(post, str) else None
+        steps = [s for s in (data or {}).get('transcript') or [] if isinstance(s, dict) and s.get('type') == 'updated-config']
+        value = steps[-1].get('value') or {} if steps else {}
+        return str(value.get('model') or ''), str(value.get('reasoningEffort') or '')
+    except Exception:
+        return '', ''
+
+
+def pin_config_body(post, pin):
+    """Patched JSON body (str) with model/effort filled in, or None when nothing changes.
+
+    pin is a dict updated with explicit picks found in the request (model, effort)."""
+    try:
+        data = json.loads(post) if isinstance(post, str) else None
+    except ValueError:
+        return None
+    transcript = data.get('transcript') if isinstance(data, dict) else None
+    if not isinstance(transcript, list):
+        return None
+    configs = [s for s in transcript if isinstance(s, dict) and s.get('type') == 'updated-config']
+    for step in configs:
+        value = step.get('value') if isinstance(step.get('value'), dict) else {}
+        model = str(value.get('model') or '')
+        if model and model.lower() != 'auto':
+            pin['model'] = model
+        effort = str(value.get('reasoningEffort') or '').strip().lower()
+        if effort and effort != 'auto':
+            pin['effort'] = effort
+    if not configs:
+        return None
+    last = configs[-1]
+    value = dict(last.get('value') if isinstance(last.get('value'), dict) else {})
+    changed = False
+    if not value.get('model') or str(value.get('model')).lower() == 'auto':
+        value['model'] = pin.get('model') or PIN_DEFAULT_MODEL
+        changed = True
+    if not value.get('reasoningEffort') or str(value.get('reasoningEffort')).lower() == 'auto':
+        # Never carry an old pick (e.g. a one-off 'low') into later turns: Auto effort is always high.
+        value['reasoningEffort'] = PIN_DEFAULT_EFFORT
+        changed = True
+    if not changed:
+        return None
+    value['modelFromUser'] = True
+    last['value'] = value
+    return json.dumps(data, ensure_ascii=False)
 
 
 class CdpSession:
@@ -311,6 +418,7 @@ class NotionShell:
                 session.send('Page.enable')
                 session.send('Runtime.enable')
                 session.send('Runtime.addBinding', {'name': BINDING})
+                self.enable_model_pin(session)
                 self.script_id = session.send('Page.addScriptToEvaluateOnNewDocument',
                                               {'source': source}).get('identifier', '')
                 session.send('Page.navigate', {'url': self.url})
@@ -394,18 +502,69 @@ class NotionShell:
     # ---- events -----------------------------------------------------------
     def _on_event(self, method, params):
         # Runs on the session reader thread: hand off, never block it (a reply waits for the reader).
-        if self._closed or method not in ('Runtime.bindingCalled', 'Runtime.executionContextCreated'):
+        if self._closed or method not in ('Runtime.bindingCalled', 'Runtime.executionContextCreated',
+                                          'Fetch.requestPaused'):
             return
         try:
             self.executor.submit(self._handle_event, method, params)
         except RuntimeError:
             pass
 
+    def enable_model_pin(self, session=None):
+        """Pause the page's runInferenceTranscript requests so 'Auto' never reaches Notion. Never raises."""
+        session = session or self.session
+        try:
+            session.send('Fetch.enable', {'patterns': [{'urlPattern': PIN_PATTERN, 'requestStage': 'Request'}]})
+            self.model_pin_on = True
+            error = ''
+        except Exception as exc:
+            self.model_pin_on = False
+            error = str(exc)[:200]
+        pin_log(dict(event='pin_enabled' if self.model_pin_on else 'pin_enable_failed',
+                     shell=type(self).__name__, account=str(getattr(self, 'account_id', ''))[:40], error=error))
+        return self.model_pin_on
+
+    def _pin_request(self, params):
+        import base64
+        ident = params.get('requestId')
+        if not ident:
+            return
+        request = params.get('request') or {}
+        patched = None
+        try:
+            if str(request.get('method') or '').upper() == 'POST':
+                pin = self.__dict__.setdefault('model_pin', {})
+                patched = pin_config_body(request.get('postData'), pin)
+        except Exception:
+            patched = None
+        args = {'requestId': ident}
+        if patched is not None:
+            args['postData'] = base64.b64encode(patched.encode('utf-8')).decode('ascii')
+            self.__dict__['model_pin_fixed'] = self.__dict__.get('model_pin_fixed', 0) + 1
+        try:
+            before = sent_config(request.get('postData'))
+            after = sent_config(patched) if patched is not None else before
+            pin_log(dict(event='request', account=str(getattr(self, 'account_id', ''))[:40],
+                         has_body=bool(request.get('postData')), page_model=before[0], page_effort=before[1],
+                         sent_model=after[0], sent_effort=after[1], patched=patched is not None,
+                         shape=request_shape(request.get('postData'))))
+        except Exception:
+            pass
+        try:
+            self.session.send('Fetch.continueRequest', args, 10)
+        except Exception:
+            try:
+                self.session.send('Fetch.continueRequest', {'requestId': ident}, 10)
+            except Exception:
+                pass
+
     def _handle_event(self, method, params):
         try:
             if self._closed:
                 return
-            if method == 'Runtime.bindingCalled':
+            if method == 'Fetch.requestPaused':
+                self._pin_request(params)
+            elif method == 'Runtime.bindingCalled':
                 if params.get('name') == BINDING:
                     self.dispatch(params.get('payload'))
             elif method == 'Runtime.executionContextCreated':

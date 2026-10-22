@@ -139,7 +139,7 @@ class FakeAdapter:
     def welcome_body(self, client, tid, model):
         return {'kind': 'welcome', 'threadId': tid}
 
-    def body(self, client, tid, step_id, prompt, model, create=False, computer=False):
+    def body(self, client, tid, step_id, prompt, model, create=False, computer=False, effort=None):
         return {'kind': 'user', 'threadId': tid, 'step': step_id, 'prompt': prompt}
 
     def ensure_thread_model(self, client, tid, model):

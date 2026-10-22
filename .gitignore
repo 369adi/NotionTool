@@ -60,3 +60,7 @@ Desktop.ini
 .idea/
 # Local agent memory: holds personal email, Notion account and space ids, local paths
 project-memory/
+
+# Editor/agent backups
+*.bak*
+*.bak_*

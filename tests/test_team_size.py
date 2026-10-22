@@ -45,8 +45,8 @@ class TeamSizeRules(unittest.TestCase):
         self.assertEqual(team_size({'max_workers': 3, 'per_account': 10}), 3)
         self.assertEqual(team_size({'max_workers': 40, 'per_account': 0}), 1)
         self.assertEqual(team_size({'max_workers': 99, 'per_account': 99}), 40)
-        self.assertEqual(team_size({'per_account': 'x'}), 10)
-        self.assertEqual(team_size({}), 10)
+        self.assertEqual(team_size({'per_account': 'x'}), 5)
+        self.assertEqual(team_size({}), 5)
         self.assertEqual(team_roles({'per_account': 3}), ['worker1', 'worker2', 'worker3'])
 
     def test_ledger_roles_are_ordered_and_include_roles_above_n(self):

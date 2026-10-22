@@ -733,3 +733,78 @@
     };
   };
 })();
+
+/* NT_PATCH_UI_2026_10_21: in-app image viewer. Clicking an image in a chat (or a link / window.open to an
+ * image file) shows it in a lightbox inside the app instead of a browser tab. Esc or click closes it.
+ * Respects the kill switch (html.nt-desk-off). Built with createElement/textContent only. */
+(function () {
+  'use strict';
+  if (window.top !== window || window.__ntImageViewer) return;
+  var IMG_URL = /\.(png|jpe?g|gif|webp|bmp|svg|avif)(\?|#|$)/i;
+  var FILE_HOST = /(^|\.)(file\.notion\.so|prod-files-secure\.s3[^/]*amazonaws\.com|img\.notionusercontent\.com)$/i;
+  var CHAT_SEL = '[data-message-id],[data-turn-id],[class*="chat" i],[class*="assistant" i]';
+  var box = null;
+  function off() { return document.documentElement.classList.contains('nt-desk-off'); }
+  function isImageUrl(u) {
+    if (!u) return false;
+    try {
+      var p = new URL(String(u), location.href);
+      if (p.protocol === 'data:' || p.protocol === 'blob:') return /^data:image\//i.test(String(u)) || p.protocol === 'blob:';
+      return IMG_URL.test(p.pathname) || (FILE_HOST.test(p.hostname) && /image|\.(png|jpe?g|gif|webp)/i.test(p.href)) ||
+        /\/image\/|\/signed\/.*\.(png|jpe?g|gif|webp)/i.test(p.pathname);
+    } catch (e) { return false; }
+  }
+  function close() { if (box && box.parentNode) box.parentNode.removeChild(box); box = null; }
+  function show(src, alt) {
+    close();
+    box = document.createElement('div');
+    box.setAttribute('data-nt-desk', 'image-viewer');
+    box.style.cssText = 'position:fixed;inset:0;z-index:2147483600;background:rgba(5,7,12,.88);display:flex;' +
+      'align-items:center;justify-content:center;cursor:zoom-out;';
+    var img = document.createElement('img');
+    img.src = src;
+    img.alt = alt || '';
+    img.style.cssText = 'max-width:94vw;max-height:90vh;object-fit:contain;border-radius:10px;' +
+      'box-shadow:0 20px 60px rgba(0,0,0,.6);cursor:default;';
+    var x = document.createElement('button');
+    x.type = 'button';
+    x.textContent = 'Close';
+    x.title = 'Close (Esc)';
+    x.style.cssText = 'position:fixed;top:16px;right:18px;padding:6px 12px;border-radius:8px;border:1px solid ' +
+      'rgba(255,255,255,.25);background:rgba(20,24,34,.9);color:#fff;cursor:pointer;font:600 13px system-ui;';
+    x.addEventListener('click', function (ev) { ev.preventDefault(); ev.stopPropagation(); close(); });
+    img.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    box.addEventListener('click', close);
+    box.appendChild(img);
+    box.appendChild(x);
+    (document.body || document.documentElement).appendChild(box);
+  }
+  document.addEventListener('keydown', function (ev) {
+    if (box && ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); close(); }
+  }, true);
+  document.addEventListener('click', function (ev) {
+    try {
+      if (off() || ev.button !== 0 || !ev.target || !ev.target.closest) return;
+      if (ev.target.closest('[data-nt-desk]')) return;
+      var link = ev.target.closest('a[href]');
+      if (link && isImageUrl(link.href)) {
+        ev.preventDefault(); ev.stopPropagation();
+        var inner = link.querySelector('img');
+        show(link.href, inner ? inner.alt : '');
+        return;
+      }
+      var img = ev.target.closest('img');
+      if (img && img.closest(CHAT_SEL) && (img.naturalWidth || img.width) >= 48) {
+        ev.preventDefault(); ev.stopPropagation();
+        show(img.currentSrc || img.src, img.alt);
+      }
+    } catch (e) { /* never throw into the page */ }
+  }, true);
+  var originalOpen = window.open;
+  window.open = function (url) {
+    try { if (!off() && isImageUrl(url)) { show(new URL(String(url), location.href).href, ''); return null; } }
+    catch (e) { /* fall through */ }
+    return originalOpen.apply(window, arguments);
+  };
+  window.__ntImageViewer = { show: show, close: close, isImageUrl: isImageUrl };
+})();

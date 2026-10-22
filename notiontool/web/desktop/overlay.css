@@ -2,6 +2,8 @@
  * Colours come from the theme part (--nt-* variables); every var() has a fallback so the
  * sidebar still looks right when the theme part is not loaded. */
 .nt-desk-hidden { display: none !important; }
+/* Sidebar footer icons next to 'New chat' (New page, Hot and fresh features). */
+html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
 
 /* Branded header at the top of the sidebar. */
 .nt-desk-brand {
@@ -138,9 +140,10 @@
 .nt-desk-progress-count { flex: none; font-variant-numeric: tabular-nums; color: #f1f4ff; }
 .nt-desk-card.nt-desk-no-run .nt-desk-progress, .nt-desk-card.nt-desk-no-run .nt-desk-progress-count { display: none; }
 .nt-desk-coworkers { margin: 6px 4px 12px; }
-.nt-desk-coworkers-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 8px; border: 0;
-  background: transparent; color: #8f9ab8; font: 600 11px/16px inherit; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
-.nt-desk-coworkers-head:hover { color: #f1f4ff; }
+.nt-desk-coworkers-head, .nt-desk-section-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 8px; border: 0;
+  background: transparent; color: #8f9ab8; font: 600 11px/16px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  letter-spacing: .08em; text-transform: uppercase; cursor: pointer; border-radius: 8px; }
+.nt-desk-coworkers-head:hover, .nt-desk-section-head:hover { color: #f1f4ff; }
 .nt-desk-chevron::before { content: '\25BE'; }
 .nt-desk-collapsed .nt-desk-chevron::before { content: '\25B8'; }
 .nt-desk-collapsed .nt-desk-coworker-list { display: none; }
@@ -156,6 +159,8 @@
 .nt-desk-chip { flex: none; padding: 1px 6px; border-radius: 999px; font-size: 10px; line-height: 14px; font-weight: 700;
   background: rgba(124, 92, 255, .22); color: #d9d0ff; }
 .nt-desk-model { background: rgba(34, 211, 238, .18); color: #a5f3fc; }
+.nt-desk-ailimit { white-space: nowrap; overflow: visible; margin-left: auto; background: rgba(34, 197, 94, .18); color: #bbf7d0; }
+.nt-desk-ailimit-low { background: rgba(239, 68, 68, .25); color: #fecaca; }
 .nt-desk-age-ok { background: rgba(255, 255, 255, .1); color: #d6dbea; }
 .nt-desk-age-amber { background: #f59e0b; color: #0b0d12; }
 .nt-desk-age-red { background: #ef4444; color: #ffffff; }
@@ -163,3 +168,104 @@
 .nt-desk-coworker-created { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #8f9ab8; }
 .nt-desk-row-age { flex: 0 0 auto; align-self: center; margin: 0 6px 0 auto; padding: 0 6px; font-size: 10px; line-height: 16px; border-radius: 999px; }
 .nt-desk-offline { margin-left: auto; background: #f59e0b; color: #0b0d12; text-transform: lowercase; }
+/* ---- Named chats: own New chat button, dialog, Chats section, gear menu (4 px grid, no glows) ---- */
+.nt-desk-heading { position: relative; }
+.nt-desk-icon-btn { position: absolute; top: 50%; right: -8px; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin-top: -10px; padding: 0; border: 0; border-radius: 4px; background: transparent;
+  color: var(--nt-muted, #8b93a7); font: 400 16px/20px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  letter-spacing: 0; text-transform: none; cursor: pointer; transition: background-color 120ms ease-out, color 120ms ease-out; }
+.nt-desk-icon-btn:hover { background: var(--nt-raised-hover, #1f2430); color: var(--nt-text, #e8eaf2); }
+.nt-desk-icon-btn:focus-visible, .nt-desk-gear:focus-visible, .nt-desk-btn:focus-visible, .nt-desk-input:focus-visible,
+.nt-desk-checkbox:focus-visible, .nt-desk-menu-item:focus-visible, .nt-desk-chat:focus-visible,
+.nt-desk-section-head:focus-visible, .nt-desk-coworkers-head:focus-visible {
+  outline: none; box-shadow: var(--nt-focus, 0 0 0 2px #12151d, 0 0 0 4px #7c5cff); }
+.nt-desk-scrim { position: fixed; inset: 0; z-index: 2147483000; background: var(--nt-bg-scrim, rgba(5, 6, 10, 0.64));
+  animation: nt-desk-fade 160ms ease-out; }
+.nt-desk-dialog { position: absolute; top: 20vh; left: 50%; box-sizing: border-box; width: 400px; max-width: calc(100vw - 32px);
+  transform: translateX(-50%); padding: 24px; border-radius: 12px; background: var(--nt-surface, #12151d);
+  border: 1px solid var(--nt-border, #262b38); box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5); color: var(--nt-text, #e8eaf2);
+  font: 400 14px/20px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif); text-align: left;
+  animation: nt-desk-rise 160ms ease-out; }
+@keyframes nt-desk-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes nt-desk-rise { from { opacity: 0; transform: translate(-50%, 4px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.nt-desk-dialog-title { margin: 0 0 4px; font-size: 16px; line-height: 24px; font-weight: 600; color: var(--nt-text, #e8eaf2); }
+.nt-desk-dialog-sub { margin: 0 0 20px; font-size: 12px; line-height: 16px; color: var(--nt-muted, #8b93a7); }
+.nt-desk-label { display: block; margin: 0 0 8px; font-size: 13px; line-height: 20px; font-weight: 500; color: var(--nt-text, #e8eaf2); }
+.nt-desk-input { display: block; box-sizing: border-box; width: 100%; height: 36px; margin: 0; padding: 0 12px; border-radius: 8px;
+  border: 1px solid var(--nt-border, #262b38); background: var(--nt-raised, #181c26); color: var(--nt-text, #e8eaf2);
+  font: 400 14px/20px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  transition: border-color 120ms ease-out, background-color 120ms ease-out; }
+.nt-desk-input:hover { border-color: var(--nt-border-strong, #3a4152); }
+.nt-desk-input::placeholder { color: var(--nt-disabled, #555c6e); }
+.nt-desk-input[aria-invalid="true"] { border-color: var(--nt-danger, #ef4444); }
+.nt-desk-field-msg { min-height: 16px; margin: 4px 0 0; font-size: 12px; line-height: 16px; color: var(--nt-muted, #8b93a7); }
+.nt-desk-field-msg.nt-desk-field-error { color: var(--nt-danger, #ef4444); }
+.nt-desk-check { display: flex; align-items: flex-start; gap: 12px; margin: 16px 0 0; cursor: pointer; }
+.nt-desk-checkbox { flex: none; width: 16px; height: 16px; margin: 2px 0 0; border-radius: 4px; accent-color: var(--nt-accent, #7c5cff); cursor: pointer; }
+.nt-desk-check-text { display: flex; flex-direction: column; min-width: 0; }
+.nt-desk-check-label { font-size: 13px; line-height: 20px; font-weight: 500; color: var(--nt-text, #e8eaf2); }
+.nt-desk-check-help { margin-top: 4px; font-size: 12px; line-height: 16px; color: var(--nt-muted, #8b93a7); }
+.nt-desk-banner { margin: 16px 0 0; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--nt-danger, #ef4444);
+  background: var(--nt-danger-wash, rgba(239, 68, 68, 0.12)); color: var(--nt-text, #e8eaf2); font-size: 12px; line-height: 16px; }
+.nt-desk-banner[hidden] { display: none; }
+.nt-desk-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 24px 0 0; }
+.nt-desk-btn { box-sizing: border-box; height: 32px; margin: 0; padding: 0 16px; border-radius: 8px; border: 1px solid transparent;
+  font: 600 13px/20px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif); cursor: pointer;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out; }
+.nt-desk-btn-ghost { background: transparent; border-color: var(--nt-border, #262b38); color: var(--nt-text, #e8eaf2); }
+.nt-desk-btn-ghost:hover { background: var(--nt-raised-hover, #1f2430); border-color: var(--nt-border-strong, #3a4152); }
+.nt-desk-btn-primary { min-width: 112px; background: var(--nt-accent, #7c5cff); color: #ffffff; }
+.nt-desk-btn-primary:hover { background: var(--nt-accent-hover, #8f74ff); }
+.nt-desk-btn-primary:active { background: var(--nt-accent-active, #6a4ae6); }
+.nt-desk-btn-danger { min-width: 112px; background: var(--nt-danger, #ef4444); color: #ffffff; }
+.nt-desk-btn-danger:hover { filter: brightness(1.08); }
+.nt-desk-btn[aria-disabled="true"] { cursor: progress; opacity: .72; filter: none; }
+.nt-desk-chats { margin: 8px 4px 4px; }
+.nt-desk-collapsed .nt-desk-chat-list { display: none; }
+.nt-desk-chat-list { display: flex; flex-direction: column; gap: 4px; padding-top: 4px; }
+.nt-desk-chat { position: relative; display: flex; align-items: center; gap: 8px; box-sizing: border-box; min-height: 32px;
+  padding: 4px 32px 4px 8px; border-radius: 8px; background: var(--nt-surface, #12151d); border: 1px solid var(--nt-border, #262b38);
+  color: var(--nt-text, #e8eaf2); font: 400 13px/20px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  cursor: pointer; transition: background-color 120ms ease-out, border-color 120ms ease-out; }
+.nt-desk-chat:hover { background: var(--nt-raised-hover, #1f2430); border-color: var(--nt-border-strong, #3a4152); }
+.nt-desk-chat-icon { flex: none; box-sizing: border-box; width: 8px; height: 8px; border-radius: 2px; border: 1px solid var(--nt-muted, #8b93a7); }
+.nt-desk-chat-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-desk-chat-empty { padding: 4px 8px; font-size: 12px; line-height: 16px; color: var(--nt-muted, #8b93a7); }
+.nt-desk-gear { position: absolute; top: 50%; right: 4px; z-index: 1; display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; margin-top: -12px; padding: 0; border: 0; border-radius: 4px; background: var(--nt-raised, #181c26);
+  color: var(--nt-muted, #8b93a7); font: 400 14px/24px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif);
+  cursor: pointer; opacity: 0; transition: opacity 120ms ease-out, background-color 120ms ease-out, color 120ms ease-out; }
+.nt-desk-main-row > .nt-desk-gear { top: 4px; margin-top: 0; }
+.nt-desk-main-row:hover > .nt-desk-gear, .nt-desk-main-row:focus-within > .nt-desk-gear, .nt-desk-chat:hover > .nt-desk-gear,
+.nt-desk-chat:focus-within > .nt-desk-gear, .nt-desk-gear[aria-expanded="true"], .nt-desk-gear:focus-visible { opacity: 1; }
+.nt-desk-gear:hover, .nt-desk-gear[aria-expanded="true"] { background: var(--nt-raised-hover, #1f2430); color: var(--nt-text, #e8eaf2); }
+@media (hover: none) { .nt-desk-gear { opacity: 1; } }
+.nt-desk-menu { position: fixed; z-index: 2147483001; box-sizing: border-box; min-width: 184px; padding: 4px; border-radius: 8px;
+  background: var(--nt-surface, #12151d); border: 1px solid var(--nt-border, #262b38); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  animation: nt-desk-fade 120ms ease-out; }
+.nt-desk-menu-item { display: block; box-sizing: border-box; width: 100%; margin: 0; padding: 4px 8px; border: 0; border-radius: 4px;
+  background: transparent; color: var(--nt-text, #e8eaf2); text-align: left;
+  font: 400 13px/20px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif); cursor: pointer;
+  transition: background-color 120ms ease-out, color 120ms ease-out; }
+.nt-desk-menu-item:hover, .nt-desk-menu-item:focus { outline: none; background: var(--nt-accent-wash, rgba(124, 92, 255, 0.12)); }
+.nt-desk-menu-danger { color: var(--nt-danger, #ef4444); }
+.nt-desk-menu-danger:hover, .nt-desk-menu-danger:focus { background: var(--nt-danger-wash, rgba(239, 68, 68, 0.12)); }
+.nt-desk-menu-item[aria-disabled="true"] { color: var(--nt-disabled, #555c6e); background: transparent; cursor: not-allowed; }
+/* Long chats: the browser skips layout + paint of off-screen messages (overlay.js applyRenderSkip). */
+[data-nt-cv] > div { content-visibility: auto; contain-intrinsic-size: auto 300px; }
+/* Tail mode (overlay.js): older messages leave style/layout until the user scrolls to the top. */
+/* The few visible tail rows are near the viewport anyway; content-visibility placeholders
+   (300px) resolving to real heights made the chat wobble up and down after a switch. */
+[data-nt-cv][data-nt-tl2] > div { content-visibility: visible; contain-intrinsic-size: none; }
+[data-nt-cv][data-nt-tl2="1"] > div:nth-last-child(n+9),
+[data-nt-cv][data-nt-tl2="8"] > div:nth-last-child(n+9),
+[data-nt-cv][data-nt-tl2="20"] > div:nth-last-child(n+21),
+[data-nt-cv][data-nt-tl2="40"] > div:nth-last-child(n+41),
+[data-nt-cv][data-nt-tl2="80"] > div:nth-last-child(n+81) { display: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  .nt-desk-dialog { animation: nt-desk-fade 160ms ease-out; }
+  .nt-desk-icon-btn, .nt-desk-gear, .nt-desk-chat, .nt-desk-btn, .nt-desk-input, .nt-desk-menu-item { transition: none; }
+}
+
+/* chat switch: hidden while rows mount and the view settles at the bottom (no wobble) */
+[data-nt-sw] { opacity: 0 !important; }

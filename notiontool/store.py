@@ -186,7 +186,7 @@ class Store:
         return f'{row[0]}:{row[1]}'
 
     def settings(self):
-        defaults = dict(id='app', max_workers=40, per_account=10, coworker_max_age_hours=22,
+        defaults = dict(id='app', max_workers=40, per_account=5, coworker_max_age_hours=22,
                        automatic_setup=False, background_remote=False, bridge_auto=False,
                        remote_mcp_enabled=False, advertise_project_tools=False,
                        max_attempts=3, task_timeout=900, max_fix_rounds=2, tool_parallelism=4,
@@ -194,7 +194,13 @@ class Store:
                        context_token_limit=1200000, context_turn_limit=600, context_handoff_chars=24000,
                        host_api_port=8790, host_api_allow_network=False, host_api_bind='127.0.0.1',
                        coworker_fresh_context='threshold', context_replace_mode='soft',
-                       ui_mode='classic', dynamic_roles=False, role_definitions=[])
+                       # Coworker switch rule (chat_context.switch_decision; docs/CONTEXT_SWITCH_BENCH.md 'Defaults').
+                       coworker_switch_policy='measured', switch_min_tokens=400000, switch_base_tokens=12000,
+                       switch_cost_s=76, switch_slope_ms_per_100k=3514, switch_error_permille_per_100k=0,
+                       switch_retry_s=60, switch_remaining_tasks=3,
+                       ui_mode='classic', dynamic_roles=False, role_definitions=[],
+                       coworker_rotate_mode='new_welcome', main_context_policy='hint',
+                       coworker_delete_old_chat=True)
         return dict(defaults, **self.get('settings', 'app', {}))
 
     def remember(self, ident, text, source=''):

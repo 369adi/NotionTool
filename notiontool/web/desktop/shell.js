@@ -436,12 +436,7 @@
       placeholder: function (tab, box) {
         box.appendChild(mk('div', { cls: 'nt-shell-empty-title' }, TAB_LABEL[tab] || ''));
         box.appendChild(mk('div', { cls: 'nt-shell-empty-text' }, PLACEHOLDER[tab] || ''));
-        var part = window.__ntDeskMounted && window.__ntDeskMounted[tab];
-        if (part && typeof part.open === 'function') {
-          var btn = mk('button', { type: 'button', cls: 'nt-shell-btn' }, 'Open ' + (TAB_LABEL[tab] || tab));
-          btn.addEventListener('click', function () { try { part.open(); } catch (e) { warn('open failed', e); } });
-          box.appendChild(btn);
-        }
+        // No 'Open' button: views register themselves and render directly in the tab.
       },
       chatBadge: function () {
         var tab = nativeTab(findTopRow(sidebar()), 'chat');
@@ -567,6 +562,25 @@
       var brand = sb.querySelector('[data-nt-desk="brand"]');
       if (!brand) return;
       if (!brand.classList.contains(CLS_BRAND)) brand.classList.add(CLS_BRAND);
+      // Notion collapses its own workspace/profile switcher (height 0, opacity 0, pointer-events none)
+      // and our brand header sits where it used to be. Forward clicks so the profile menu opens again
+      // (bug 2026-10-21: profile could no longer be clicked).
+      if (!brand.__ntSwitchBound) {
+        brand.__ntSwitchBound = true;
+        brand.style.cursor = 'pointer';
+        brand.setAttribute('role', 'button');
+        brand.setAttribute('aria-label', 'Workspace and profile');
+        brand.addEventListener('click', function (ev) {
+          var t0 = ev.target;
+          if (t0 && t0.closest && t0.closest('[data-nt-desk="conn"]')) return;
+          var sw = document.querySelector('.notion-sidebar-switcher');
+          if (!sw) return;
+          var t = sw.querySelector('[role=button]') || sw;
+          ev.preventDefault();
+          ev.stopPropagation();
+          t.click();
+        });
+      }
       var dot = null;
       var kids = brand.children || [];
       for (var i = 0; i < kids.length; i++) if (kids[i].getAttribute('data-nt-desk') === 'conn') { dot = kids[i]; break; }
@@ -666,7 +680,7 @@
     coworkers.start();
     tick = setInterval(schedule, 5000);
     if (typeof MutationObserver === 'function' && doc.body) {
-      observer = new MutationObserver(schedule);
+      observer = new MutationObserver((window.__ntIdle2 || (window.__ntIdle2 = function (fn) { var w = window; if (!w.__ntScrollHook) { w.__ntScrollHook = true; var mark = function () { w.__ntLastScroll = Date.now(); }; w.addEventListener('scroll', mark, { capture: true, passive: true }); w.addEventListener('wheel', mark, { capture: true, passive: true }); w.addEventListener('keydown', function () { w.__ntLastKey = Date.now(); }, { capture: true, passive: true }); } var t = 0, rowT = 0, lastRow = 0, lastArgs = []; var rowOnly = function (recs) { if (!recs || !recs.length) return false; for (var i = 0; i < recs.length; i++) { var n = recs[i] && recs[i].target; if (n && n.nodeType !== 1) n = n.parentElement; if (!n || !n.closest || !n.closest('[data-nt-cv] > div')) return false; } return true; }; return function idleRun() { var self = this; lastArgs = arguments; var wait = Math.max((w.__ntLastScroll || 0) + 400, (w.__ntLastKey || 0) + 1200) - Date.now(); if (wait > 0) { if (!t) t = setTimeout(function () { t = 0; idleRun.apply(self, lastArgs); }, wait + 20); return; } if (rowOnly(arguments[0])) { var due = lastRow + 4000 - Date.now(); if (due > 0) { if (!rowT) rowT = setTimeout(function () { rowT = 0; lastRow = Date.now(); fn.apply(self, lastArgs); }, due); return; } lastRow = Date.now(); } fn.apply(this, arguments); }; }))(schedule));
       observer.observe(doc.body, { childList: true, subtree: true });
     }
 

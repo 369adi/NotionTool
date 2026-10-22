@@ -136,10 +136,10 @@ def run(rotator, jobs):
 
 class Helpers(unittest.TestCase):
     def test_setting_default_and_clamp(self):
-        self.assertEqual(max_age_hours({}), 23)
+        self.assertEqual(max_age_hours({}), 22)
         self.assertEqual(max_age_hours({'coworker_max_age_hours': 0}), 1)
         self.assertEqual(max_age_hours({'coworker_max_age_hours': 500}), 72)
-        self.assertEqual(max_age_hours({'coworker_max_age_hours': 'x'}), 23)
+        self.assertEqual(max_age_hours({'coworker_max_age_hours': 'x'}), 22)
 
     def test_epoch_formats(self):
         self.assertEqual(epoch(T0 * 1000), T0)
@@ -169,7 +169,7 @@ class Helpers(unittest.TestCase):
 class Rotation(unittest.TestCase):
     def test_young_chat_is_left_alone(self):
         store, adapter, rotator, jobs, clock = setup()
-        clock.now = T0 + 22 * HOUR
+        clock.now = T0 + 21 * HOUR
         self.assertEqual(run(rotator, jobs), [])
         self.assertEqual(adapter.created, [])
 
@@ -306,7 +306,7 @@ class Wiring(unittest.TestCase):
     def test_settings_and_state(self):
         from notiontool import desktop_settings, notion_shell
         entry = [e for e in desktop_settings.HARNESS_SETTINGS if e['key'] == 'coworker_max_age_hours'][0]
-        self.assertEqual((entry['min'], entry['max'], entry['default']), (1, 72, 23))
+        self.assertEqual((entry['min'], entry['max'], entry['default']), (1, 72, 22))
         self.assertIn('coworker_max_age_hours', notion_shell.INT_SETTINGS)
         with open('notiontool/server.py', encoding='utf-8', newline='') as handle:
             source = handle.read()

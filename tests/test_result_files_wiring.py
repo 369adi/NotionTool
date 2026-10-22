@@ -35,7 +35,9 @@ class WiringBase(unittest.TestCase):
 
 class PromptTest(WiringBase):
     def test_coworker_prompt_has_result_file_hint(self):
-        text = plain_protocol._prompt_text(self.task(), self.run_(), '', 'tok', True)
+        # Build 21: the hint only comes together with the project tool line (needs a project folder).
+        run = dict(self.run_(), project_path=self.tmp.name)
+        text = plain_protocol._prompt_text(self.task(), run, '', 'tok', True)
         path = result_files.path_for('r1', 't1')
         self.assertIn('nt_write_file', text)
         self.assertIn(path, text)

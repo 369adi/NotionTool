@@ -27,6 +27,7 @@ import uuid
 from .team_size import team_roles
 
 CHECK_S = 300
+NAME_CHECK_S = 60  # naming pass between full checks (cheap; skipped when nothing to rename)
 BACKOFF_S = 900
 DEFAULT_MAX_AGE_HOURS = 22
 MIN_AGE_HOURS, MAX_AGE_HOURS = 1, 72
@@ -105,13 +106,63 @@ class TeamRotator:
         """Called from the engine loop: at startup, then at most every CHECK_S seconds. Never raises."""
         now = self.clock()
         if self.next_check is not None and now < self.next_check:
+            # fast naming: a new chat after a context switch gets its name within NAME_CHECK_S,
+            # not only at the next 5-min check (measured 22.10: up to 5 min delay)
+            next_name = getattr(self, 'next_name', None)
+            if next_name is None or now >= next_name:
+                self.next_name = now + NAME_CHECK_S
+                try:
+                    self.name_pass()
+                except Exception:
+                    pass
             return []
         self.next_check = now + CHECK_S
+        self.next_name = now + NAME_CHECK_S
         try:
-            return self.check()
+            started = self.check()
         except Exception as exc:
             self.store.event('team_rotation_failed', message='Rotation check failed: ' + type(exc).__name__)
-            return []
+            started = []
+        self.name_pass()
+        self.cleanup_pass()
+        return started
+
+    def cleanup_pass(self):
+        """Periodically delete retired Coworker chats (setting coworker_delete_old_chat, default on). Never raises."""
+        if not self.store.settings().get('coworker_delete_old_chat', True) or self.budget_reason():
+            return 0
+        try:
+            from . import retired_chats
+            return len(retired_chats.delete_retired(self.store, self.adapter, limit=10).get('deleted') or [])
+        except Exception as exc:
+            self.store.event('coworker_old_chat_delete_failed', message='Cleanup failed: ' + type(exc).__name__)
+            return 0
+
+    def name_pass(self):
+        """Periodic naming (rule I41): idle joined Coworkers of every ready account get 'Coworker N'.
+
+        Skipped while the network budget is paused or cooling down. Never raises; a failed
+        account records coworker_rename_failed and is tried again at the next check.
+        """
+        if self.budget_reason():
+            return 0
+        from .chat_pool import name_coworkers
+        renamed = 0
+        for account in self.store.all('accounts'):
+            ident = account.get('id')
+            if account.get('state') != 'ready' or not ident:
+                continue
+            with self.lock:
+                if ident in self.rotating:
+                    continue
+            try:
+                client = self.adapter.client(ident)
+                result = name_coworkers(self.adapter, client, ident, None, self.clock(), self.store)
+                renamed += len(result.get('renamed') or [])
+            except Exception as exc:
+                self.store.event('coworker_rename_failed', message='Coworker naming failed: ' + type(exc).__name__,
+                                 account_id=ident)
+        return renamed
 
     def budget_reason(self):
         budget = getattr(self.adapter, 'network_budget', None)
@@ -157,6 +208,36 @@ class TeamRotator:
             self.store.put('workers', worker)
         return len(workers)
 
+    def relink(self, account_id):
+        """Point ledger roles whose chat is unknown at enabled Coworkers that no role tracks.
+
+        Without a role a Coworker never age-rotates; the age guard then hides it and the team shrinks.
+        Only confirmed (non-pending) roles are reused; nothing is created or sent.
+        """
+        account = self.store.get('accounts', account_id) or {}
+        ledger = dict(account.get('team_threads') or {})
+        if not ledger:
+            return 0
+        workers = [w for w in self.store.all('workers') if w.get('account_id') == account_id]
+        known = {w.get('thread_id') for w in workers if w.get('purpose', 'worker') == 'worker' and w.get('state') != 'missing'}
+        tracked = {(item or {}).get('id') for item in ledger.values() if isinstance(item, dict)}
+        free = sorted((role for role, item in ledger.items() if role.startswith('worker') and isinstance(item, dict)
+                       and not item.get('pending') and not item.get('rotates') and item.get('id') not in known),
+                      key=lambda r: (len(r), r))
+        loose = sorted((w for w in workers if w.get('purpose', 'worker') == 'worker' and w.get('enabled')
+                        and w.get('state') == 'ready' and w.get('thread_id') and w['thread_id'] not in tracked),
+                       key=lambda w: epoch(w.get('created_at')) or 0)
+        linked = 0
+        for role, worker in zip(free, loose):
+            ledger[role] = dict(ledger[role], id=worker['thread_id'], pending=False)
+            linked += 1
+            self.store.event('team_role_relinked', message='Role ' + role + ' now tracks ' + str(worker.get('label') or worker['id']),
+                             account_id=account_id, role=role, worker_id=worker['id'])
+        if linked:
+            account['team_threads'] = ledger
+            self.store.put('accounts', account)
+        return linked
+
     # selection --------------------------------------------------------------------------------
 
     def candidate(self, account, now):
@@ -174,13 +255,14 @@ class TeamRotator:
             if not worker or worker.get('purpose', 'worker') != 'worker' or worker.get('state') == 'missing':
                 continue
             age = age_seconds(worker, now)
-            if age is None or age < limit:
+            forced = bool(worker.get('compress_requested'))
+            if not forced and (age is None or age < limit):
                 continue
             reason = busy_reason(worker, tasks, rotations)
             if reason:
                 waiting[worker['id']] = reason
                 continue
-            due.append((-age, role, worker))
+            due.append((-(age or 0) - (10 ** 9 if forced else 0), role, worker))
         if not due:
             return None, None, waiting
         _, role, worker = min(due, key=lambda entry: (entry[0], entry[1]))
@@ -198,6 +280,7 @@ class TeamRotator:
                 if ident in self.rotating or now < self.failed_until.get(ident, 0):
                     continue
             self.backfill(ident, now)
+            self.relink(ident)
             account = self.store.get('accounts', ident) or account
             pending = pending_roles(account)
             ledger = account.get('team_threads') or {}
@@ -251,8 +334,16 @@ class TeamRotator:
             self.last_error.pop(ident, None)
         if result.get('postponed'):
             return result
-        self.store.event('team_rotation_done', message=role + ' moved to a fresh Welcome chat; the old chat is retired and kept',
+        delete_old = self.store.settings().get('coworker_delete_old_chat', True)
+        self.store.event('team_rotation_done', message=role + ' moved to a fresh Welcome chat; the old chat is retired and '
+                         + ('deleted' if delete_old else 'kept'),
                          account_id=ident, role=role, worker_id=worker_id, thread_id=result.get('thread_id', ''))
+        try:
+            from . import retired_chats
+            if delete_old:
+                retired_chats.delete_retired(self.store, self.adapter)
+        except Exception as exc:
+            self.store.event('coworker_old_chat_delete_failed', message=str(exc)[:200], account_id=ident)
         return result
 
     def _set_enabled(self, worker_id, enabled):
@@ -323,6 +414,12 @@ class TeamRotator:
                               created_at=now, created_at_source='created')
                 self.store.put('workers', worker)
         adapter.apply_chat_pool(ident, client)
+        try:
+            # Rule I41: the replacement keeps the slot number (ledger role workerK -> 'Coworker K') once joined.
+            from .chat_pool import name_coworkers
+            name_coworkers(adapter, client, ident, None, now, self.store)
+        except Exception as exc:
+            self.store.event('coworker_rename_failed', message='Coworker naming failed: ' + str(exc)[:200], account_id=ident)
         return {'role': role, 'thread_id': new_key, 'retired': worker_id}
 
     def public(self, account_id=''):
