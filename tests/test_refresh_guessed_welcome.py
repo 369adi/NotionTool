@@ -2,13 +2,17 @@
 
 The simulated Notion lists chats only through the space record, so every listed id is 'guessed' (like live
 Notion since v23.13.20261017). Uses the real NotionAdapter code through FakeNotionAdapter(force=True).
+A private chat the app creates through a create_main operation is confirmed by run_create itself (mains.py).
 """
 import tempfile
+import threading
+import types
 import unittest
 import uuid
 from pathlib import Path
 
 from notiontool import fake_notion
+from notiontool.mains import Mains
 from notiontool.store import Store
 
 
@@ -84,6 +88,34 @@ class GuessedWelcomeTests(unittest.TestCase):
         # The user's own chats (unknown guessed ids) never become workers.
         for tid, title in self.seeded.items():
             self.assertNotIn(tid, workers, title + ' must stay skipped')
+
+    def test_private_create_main_is_confirmed_by_run_create(self):
+        # A private app-created chat is not in team_threads, so refresh() skips its guessed id;
+        # run_create must still end 'done' with a disabled worker for exactly that chat.
+        app = types.SimpleNamespace(store=self.store, adapter=self.adapter,
+                                    engine=types.SimpleNamespace(lock=threading.RLock()))
+        mains = Mains(app)
+        self.adapter.refresh(self.account_id)  # signed in -> ready (model checked), as before any Create Main
+        self.assertEqual(self.store.get('accounts', self.account_id)['state'], 'ready')
+        op, created = mains.request_create(self.account_id, 'private-chat-1', purpose='private')
+        self.assertTrue(created)
+        op = mains.run_create(op['id'])
+        self.assertEqual(op['state'], 'done', [entry['message'] for entry in op.get('log', [])])
+        self.assertEqual(op['error'], '')
+        tid = norm(op['thread_id'])
+        self.assertNotIn(tid, self.seeded)
+        workers = self.worker_threads()
+        self.assertIn(tid, workers)
+        self.assertEqual(workers[tid]['id'], self.account_id + ':' + op['thread_id'])
+        self.assertEqual(workers[tid]['purpose'], 'private')
+        self.assertFalse(workers[tid]['enabled'])
+        self.assertIsNone(self.store.get('chats', 'c_' + op['id'].replace(':', '_')))  # no Main chat record
+        # A separate unknown guessed id (the user's own chats) still gets no worker.
+        for other, title in self.seeded.items():
+            self.assertNotIn(other, workers, title + ' must stay skipped')
+        # Resuming the finished operation changes nothing.
+        self.assertEqual(mains.run_create(op['id'])['state'], 'done')
+        self.assertEqual(set(self.worker_threads()), set(workers))
 
 
 if __name__ == '__main__':
