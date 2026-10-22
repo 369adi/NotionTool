@@ -1712,6 +1712,17 @@ def usage_response(store):
     report['by_task'] = ledger.get('by_task', {})
     report['by_role'] = ledger.get('by_role', {})
     report['by_model'] = ledger.get('by_model', {})
+    try:
+        from . import step_guard
+        st = step_guard.public(store)
+        lim = st.get('limits') or {}
+        report['steps'] = dict(level=st.get('level'), reason=st.get('reason'), account=st.get('account'),
+                               steps_15m=st.get('steps_15m', 0), steps_60m=st.get('steps_60m', 0),
+                               steps_48h=st.get('steps_48h', 0), hard_15m=lim.get('step_hard_15m'),
+                               hard_60m=lim.get('step_hard_60m'), soft_48h=lim.get('step_soft_48h'),
+                               hard_48h=lim.get('step_hard_48h'))
+    except Exception:
+        report['steps'] = {}
     return report
 
 
