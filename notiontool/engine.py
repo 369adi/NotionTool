@@ -187,7 +187,7 @@ HEAL_BASE, HEAL_CAP = 60, 600  # seconds: 60, 120, 240, 480, 600, 600, ...
 LIMIT_STOP_EVENT = 'limit_stop'
 LIMIT_RESUME_EVENT = 'limit_resume'
 LIMIT_PAUSED_BY = 'token_limit'
-LIMIT_CHECK_SECONDS = 2.0   # cheap ledger check at most every 2 s (engine clock)
+LIMIT_CHECK_SECONDS = 1.0   # cheap ledger check at most every 1 s (engine clock; design cache <= 1 s)
 LIMIT_CLEAR_SECONDS = 5.0   # hysteresis: two clear checks at least 5 s apart before the latch clears
 
 
@@ -222,6 +222,15 @@ class Engine:
     def _restore(self):
         # Persisted assignment IDs fence old reports even after an app restart.
         for task in self.store.all('tasks'):
+            if task.get('paused_by') == LIMIT_PAUSED_BY and task['state'] == 'retry':
+                # The token-limit latch lives in memory only: after a restart the first check rebuilds it from
+                # the ledger (and the dispatch gate holds coworker tasks again while the limit is still hit).
+                # A stale pause mark and stop message must not survive the restart.
+                task.pop('paused_by', None)
+                if str(task.get('error') or '').startswith('Stopped by token limit'):
+                    task['error'] = ''
+                self.store.put('tasks', task)
+                continue
             if task['state'] in ('running', 'cancelling'):
                 if task.get('submission_phase') == 'preparing':
                     cancelled = self.store.get('runs', task.get('run_id'), {}).get('state') == 'cancelled'
@@ -1912,7 +1921,14 @@ class Engine:
                 task['prompt'] += '\nPlease correct this problem in the response: '+str(exc)
         except Exception as exc:
             failure=exc
-            if info.get('limit_stop') and (run or {}).get('state') != 'cancelled':
+            if info.get('limit_stop') and (run or {}).get('state') == 'cancelled':
+                # The run was cancelled while the token limit held this turn: the run cancel wins (not retry,
+                # not blocked, no presend failover).
+                failure=None
+                self._release(info['worker_id'], info['lease'])
+                task.pop('paused_by', None)
+                task.update(state='cancelled', error='')
+            elif info.get('limit_stop'):
                 # Token hard limit stopped this turn: never failed, never the presend failover, never resent.
                 failure=None
                 self._limit_hold(task, info, exc)
