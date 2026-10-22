@@ -230,6 +230,8 @@ class Application:
                             run = app.store.get('runs',query.get('id',[''])[0])
                             if not run:
                                 return self.response(404,{'error':'Run not found'})
+                            if query.get('compact',[''])[0] in ('1','true','yes') and app.store.settings().get('api_run_compact',True):
+                                return self.response(200,compact_run_response(app.engine,run))
                             return self.response(200,{'run':{k:v for k,v in run.items() if k!='context'},
                                 'tasks':[app.safe_task(t) for t in app.engine.tasks(run['id'])]})
                         if method=='GET' and path=='/api/request':
@@ -264,8 +266,7 @@ class Application:
                         if method=='GET' and path=='/api/patch':
                             return self.response(200,app.engine.patch_status())
                         if method=='GET' and path=='/api/usage':
-                            from .backup import usage_report
-                            return self.response(200,usage_report(app.store))
+                            return self.response(200,usage_response(app.store))
                         if method=='GET' and path=='/api/report':
                             task = app.store.get('tasks',query.get('id',[''])[0])
                             return self.response(200,{'task':app.safe_task(task),'result':task['result'],'partial':task.get('raw_response') or task.get('partial','')})
