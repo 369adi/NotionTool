@@ -405,13 +405,15 @@ def status(root=None):
             'fake_notion': bool(st.get('fake')), 'startup_errors': startup_errors(data), 'log_tail': _tail(log, 10)}
 
 
-def check(root=None, port=DEFAULT_PORT, settle_seconds=8, keep=False):
+def check(root=None, port=DEFAULT_PORT, settle_seconds=8, keep=False, fake=True):
     """Start the test app from the current code, let it run a moment, collect errors, stop it.
 
     verdict 'passed' only when it booted, still serves after settle_seconds and logged no failures.
+    fake=True (default, like start()) boots it on the simulated Notion; fake=False is the plain test
+    instance exactly as before (no accounts, no simulated Notion, no Notion-data loops).
     """
     root, data, _, log = _paths(root)
-    started = start(root, port)
+    started = start(root, port, fake=bool(fake))
     if not started.get('ok'):
         stop(root)
         return dict(started, verdict='failed')
@@ -426,18 +428,94 @@ def check(root=None, port=DEFAULT_PORT, settle_seconds=8, keep=False):
     reasons = ([] if serving else ['stopped answering']) + errors + (['traceback in the log'] if traceback else [])
     return {'verdict': 'passed' if passed else 'failed', 'port': started['port'],
             'boot_seconds': started.get('boot_seconds'), 'reasons': reasons,
-            'log_tail': '' if passed else tail, 'kept_running': bool(keep)}
+            'log_tail': '' if passed else tail, 'kept_running': bool(keep), 'fake_notion': bool(fake)}
 
 
 # --- simulated Notion inside the test app (called by server.launch in fake mode) ---------------------
 
+def _outcome(status):
+    """Same outcome mapping as EdgeTransport._chunks for the NetworkBudget."""
+    if status == 429:
+        return 'rate_limited'
+    if status in (401, 403):
+        return 'blocked'
+    if status >= 500:
+        return 'failed'
+    if status >= 400:
+        return 'invalid'
+    return 'ok'
+
+
+def _budget_transport(transport, budget):
+    """Wrap one FakeTransport so every request/stream acquires and releases a real NetworkBudget ticket."""
+    request, stream, account = transport.request, transport.stream, getattr(transport, 'account_key', '')
+
+    def budgeted_request(path, body, headers=None, timeout=45, **kw):
+        ticket, began = budget.acquire(None, source=path), time.monotonic()
+        try:
+            status, text = request(path, body, headers, timeout, **kw)
+        except BaseException:
+            budget.release(ticket, 'failed', account_id=account)
+            raise
+        if status == 429:
+            transport.retry_after = budget.limited(transport.retry_after)
+        budget.release(ticket, _outcome(status), status, time.monotonic() - began, account_id=account)
+        return status, text
+
+    def budgeted_stream(path, body, headers=None, timeout=60, cancel=None):
+        ticket, began = budget.acquire(cancel, source=path), time.monotonic()
+        outcome, status = 'failed', 0
+        try:
+            for line in stream(path, body, headers, timeout=timeout, cancel=cancel):
+                yield line
+            outcome, status = 'ok', 200
+        except GeneratorExit:
+            outcome = 'neutral'
+            raise
+        except BaseException as exc:
+            status = int(getattr(exc, 'status', 0) or 0)
+            outcome = _outcome(status) if status else 'failed'
+            raise
+        finally:
+            budget.release(ticket, outcome, status, time.monotonic() - began, account_id=account)
+
+    transport.request, transport.stream, transport.budgeted = budgeted_request, budgeted_stream, True
+
+
+def route_through_budget(adapter):
+    """Send the simulated connection through the adapter's real NetworkBudget (pacing, pause, circuit_open).
+
+    EdgeTransport acquires a budget ticket per request; FakeTransport does not, so without this the
+    circuit breaker could never open in fake mode. Returns True when the budget is in the path.
+    """
+    budget = getattr(adapter, 'network_budget', None)
+    if budget is None or not hasattr(budget, 'acquire'):
+        return False
+    plain_client, lock = adapter.client, threading.Lock()
+
+    def client(account_id, anonymous=False):
+        made = plain_client(account_id, anonymous)
+        transport = getattr(made, 'transport', None)
+        with lock:
+            if transport is not None and not getattr(transport, 'budgeted', False):
+                _budget_transport(transport, budget)
+        return made
+
+    adapter.client = client
+    return True
+
+
 def boot_fake_notion(app):
     """Fake mode of the test app: simulated Notion, seeded store and the real Notion-data loops."""
+    if getattr(app, 'test_instance', False) is not True:
+        raise RuntimeError('Simulated Notion refused: only the test app (NOTIONTOOL_TEST_INSTANCE=1) may use it')
     from . import fake_notion
     from .coworker_upkeep import CoworkerUpkeep
     from .main_wake import MainWake
     state = fake_notion.install(app.adapter)
     app.fake_notion = state
+    if route_through_budget(app.adapter):
+        app.store.event('fake_notion_budget', message='Simulated requests go through the real NetworkBudget')
     added = fake_notion.seed_scenario(app.store, state)  # the one shared seed (same records as the unit tests)
     threading.Thread(target=app.turn_watch.loop, daemon=True, name='turn-watch').start()
     app.coworker_upkeep = CoworkerUpkeep(app.store, app.adapter, app.engine)
@@ -615,6 +693,9 @@ def _sc_too_large(root, port, data, fs):
                                         thread_id=c.get('thread_id')) for c in (reads or [])]
     skipped = [e for e in events if e['kind'] == 'turn_restart_cut_skipped' and cowork in json.dumps(e)]
     circuit = [e for e in events if e['kind'] == 'circuit_open']
+    # circuit_open can only fire when the simulated requests pass the real NetworkBudget (route_through_budget).
+    routed = bool(_events(data, 0.0, ('fake_notion_budget',)))
+    circuit_check = 'checked' if routed else 'not_applicable: the simulated connection bypasses the NetworkBudget'
     reasons = []
     if not reads:
         reasons.append('the test app never retried the too-large Coworker transcript')
@@ -623,7 +704,7 @@ def _sc_too_large(root, port, data, fs):
     if circuit:
         reasons.append('circuit_open event seen')
     return _result(not reasons, reasons, events, transcript_reads=len(reads or []), coworker_thread=cowork,
-                   note='FakeTransport does not pass through NetworkBudget, so circuit_open cannot fire in fake mode')
+                   circuit_open_check=circuit_check)
 
 
 def _sc_deleted_chat(root, port, data, fs):
@@ -740,16 +821,30 @@ def scenario(name, root=None, port=DEFAULT_PORT, keep=False):
                 log_tail='' if outcome['passed'] else tail, kept_running=bool(keep))
 
 
+def _flag(value, default):
+    """Tool arguments may arrive as bool, number or text ('false', '0', 'no', 'off')."""
+    if value is None or value == '':
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ('0', 'false', 'no', 'off')
+    return bool(value)
+
+
 def run(action='check', **kw):
+    """nt_test_app entry. fake defaults to True (simulated Notion); fake=False is the plain test instance."""
     action = str(action or 'check')
+    port = kw.get('port') or DEFAULT_PORT
+    fake, keep = _flag(kw.get('fake'), True), _flag(kw.get('keep'), False)
     if action == 'start':
-        return start(port=kw.get('port') or DEFAULT_PORT)
+        return start(port=port, fake=fake)
     if action == 'stop':
         return stop()
     if action == 'status':
         return status()
     if action == 'check':
-        return check(port=kw.get('port') or DEFAULT_PORT, keep=bool(kw.get('keep')))
+        return check(port=port, keep=keep, fake=fake)
     if action == 'scenario':
-        return scenario(kw.get('name'), port=kw.get('port') or DEFAULT_PORT, keep=bool(kw.get('keep')))
+        if not fake:
+            raise ValueError('scenarios need the simulated Notion: fake must be true')
+        return scenario(kw.get('name'), port=port, keep=keep)
     raise ValueError('action must be start, status, stop, check or scenario')
