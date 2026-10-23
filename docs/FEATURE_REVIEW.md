@@ -430,3 +430,31 @@ Ich habe 8 der roten Tests einzeln laufen lassen (27 s). **Alle 8 sind auch alle
 - Die Gesamtnote bleibt bei rund **6,0 / 10**.
 
 **Neuer Top-Fix (vor Rang 1):** Eine Merge-Sperre bei roten Tests. Der Patch-Modus darf nur mergen, wenn die betroffenen Testdateien grün sind.
+
+## Nachprüfung Teil 2: die restlichen 12 Tests (23.10., 23:20)
+
+**Backtest-Limits (6 Tests):** Allein gestartet laufen alle 8 Tests in `test_backtest_limits` **grün** (14 s). Im vollen Lauf waren sie rot. Ursache: Andere Tests vorher lassen echte Netz-, Socket- oder DB-Spuren zurück. Der Guard-Test merkt das und schlägt an. Das ist **kein Fehler im Netz-Budget**, sondern eine **fehlende Isolation zwischen Tests**.
+
+- Folge für Feature 8 (Netz-Budget): Die Note bleibt 7,5. Die Funktion ist belegt.
+- Fix: Herausfinden, welcher Test vorher echte Verbindungen öffnet. Den Guard als Fixture für jeden Test nutzen und nicht nur als `test_0`.
+
+**Pool-Tests `test_limits.EightSlotTests` (7 Tests inkl. `one_disabled_slot`):** Auch allein **alle rot** (66 s), alle mit der gleichen Meldung: „Coordinator did not reach expected state: executing“. Die Tasks werden also nie fertig.
+
+- Eine gemeinsame Ursache ist sehr wahrscheinlich. Die Klasse nutzt `fixtures.EngineTests.worker/pump/tearDown`, dieselbe Grundlage wie `test_engine` und `test_telemetry`, die auch rot sind.
+- **Vermutung (nicht bewiesen):** Im Telemetrie-Test bekommt der Fake-Worker `INVALID_REQUEST` und der Task bleibt bei `retry`. Wenn das Fake-Notion eine neue Angabe im Request (z. B. Modell `opus` oder `reasoningEffort`) ablehnt, hängen alle Engine-Tests auf diese Art.
+- Folge für Feature 2 (Slots/Failover): Die Note bleibt 6,5, aber die Ausfall-Fälle sind im Moment **gar nicht durch Tests abgesichert**.
+
+### Gesamtbild der 20 roten Tests
+
+| Gruppe | Anzahl | Art |
+|---|---|---|
+| Backtest-Limits | 6 | Isolation zwischen Tests, kein Code-Fehler |
+| Pool / EightSlotTests | 7 | Vermutlich ein gemeinsamer Fehler in der Engine-Testbasis oder im Fake |
+| Review- und Fix-Runden | 2 | Entscheidung nötig: 1 oder 2 Runden |
+| Chat-Titel nach dem Anlegen | 1 | Echter Fehler (Gegend Main-Wechsel) |
+| Retry statt blocked | 1 | Test nicht an neue Logik angepasst |
+| Wartezeit lange Aufrufe | 1 | Test veraltet |
+| Einstellungs-Seite `idle_mode` | 1 | UI zeigt Server-Wert nicht |
+| Zeilenenden server.py | 1 | Folge des CRLF/LF-Mix |
+
+**Bester nächster Hebel:** Die `INVALID_REQUEST`-Ursache im Fake beziehungsweise in der Engine-Testbasis finden. Wenn die Vermutung stimmt, werden damit bis zu 9 Tests auf einmal grün.
