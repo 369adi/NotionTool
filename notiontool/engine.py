@@ -152,7 +152,7 @@ ACTIVE = {'approach', 'planning', 'executing', 'reviewing', 'fixing', 'integrati
 TERMINAL = {'done', 'failed', 'blocked', 'cancelled'}
 
 # Bridge tools that only read; any other tool call in an attempt counts as a possible write (rule I5).
-READ_ONLY_TOOLS = ('read_file', 'list_files', 'context', 'screen_windows', 'screen_capture', 'nt_list_dir', 'nt_search_code')
+READ_ONLY_TOOLS = ('read_file', 'list_files', 'context', 'screen_windows', 'screen_capture', 'nt_list_dir', 'nt_search_code', 'db_query', 'db_schema')
 
 
 def harness_enabled(chat, settings):

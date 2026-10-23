@@ -32,7 +32,12 @@ TOOLS = {
     'run_shell': ('Run a bounded PowerShell command in the project folder (any folder via cwd with full PC access)',
                   {'command':{'type':'string'},'timeout':{'type':'integer'},'cwd':{'type':'string'}}),
     'memory': ('Persist a durable project finding', {'text':{'type':'string'}}),
+    'db_query': ('Read-only SQL on the NotionTool database: exactly one SELECT or WITH statement; rows default 50, max 500; '
+                 'each cell max 300 characters, whole result max 6000; stops after 30 s. Works for every role',
+                 {'sql':{'type':'string'},'limit':{'type':'integer'}}),
+    'db_schema': ('List the tables and columns of the NotionTool database (read-only; works for every role)', {}),
 }
+DB_TOOLS = ('db_query', 'db_schema')
 
 BROWSER_TOOLS = {
     'browser_tabs': ('List open browser tabs (id, title, url)', {}),
@@ -514,6 +519,9 @@ class Bridge:
                 if name in BROWSER_ACTIONS:
                     detail = args.get('url') or args.get('selector') or args.get('text') or args.get('expression') or ''
                     self._tool_started(run['id'],task_id=task['id'],tool=name,message='Browser: '+name+' '+str(detail)[:200])
+            elif name in DB_TOOLS:
+                # Read-only for every role; the query itself runs below, outside the coordinator lock.
+                self._tool_started(run['id'],task_id=task['id'],tool=name,message='Database: '+(str(args.get('sql',''))[:200] if name=='db_query' else 'schema'))
             elif name=='context':
                 wanted = args.get('task_id')
                 if args.get('thread_id'):
@@ -603,6 +611,9 @@ class Bridge:
                     return write_with_eol(path,text)
         if name in TOOL_SERVER:
             return rea.tools() if name.endswith('_tools') else rea.call(str(args.get('name','')), args.get('arguments') or {})
+        if name in DB_TOOLS:
+            # Read-only and bounded (30 s); runs outside the coordinator lock.
+            return self.db_call(name, args)
         if name == 'screen_capture':
             # Worker capture: checked against the shared capture gate first (Phase 7).
             return self.worker_capture(args, task, run)
@@ -653,6 +664,21 @@ class Bridge:
         with lock:
             counts[task['id']] = counts.get(task['id'], 0) + 1
         return result
+
+    def db_path(self):
+        """The app database file: the store folder plus backup.DB_FILE (the name the Store itself uses)."""
+        from .backup import DB_FILE
+        directory = getattr(self.store, 'directory', None)
+        if not directory:
+            raise ValueError('No database folder is configured')
+        return Path(directory) / DB_FILE
+
+    def db_call(self, name, args):
+        """db_query / db_schema: read-only access to the app database for every role."""
+        from . import db_query
+        if name == 'db_schema':
+            return db_query.schema(self.db_path())
+        return db_query.run_query(self.db_path(), args.get('sql'), args.get('limit'))
 
     def local_call(self, name, args):
         """Local MCP tool (Roblox, Blender, REA) for the owner connection, without a worker assignment."""
