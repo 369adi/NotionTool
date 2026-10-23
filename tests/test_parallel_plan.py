@@ -4,10 +4,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from notiontool.parallel_plan import (PLAN_PART_CAP, PLAN_PART_KIND, budget_limit, choose_coworkers,  # noqa: E402
-                                      delegation_decision, est_factor, est_factor_gain, expected_wall_time,
-                                      finish_plan_part, independent_parts, levels, plan_part_records,
-                                      prune_plan_parts, ratio_report, young_coworkers)
+from notiontool.parallel_plan import (DELEGATION, PLAN_PART_CAP, PLAN_PART_KIND, budget_limit,  # noqa: E402
+                                      choose_coworkers, delegation_decision, est_factor, est_factor_gain,
+                                      expected_wall_time, finish_plan_part, finish_task_part, independent_parts,
+                                      levels, plan_part_records, plan_report, prune_plan_parts, ratio_report,
+                                      record_plan, without_factor, young_coworkers)
 
 
 def indep(n, files=None):
@@ -186,6 +187,109 @@ class TestEstVersusReal(unittest.TestCase):
         self.assertEqual(delegation_decision(parts, 10, dict(est_factor=None)), base)
         doubled = delegation_decision(parts, 10, dict(est_factor=2.0))
         self.assertEqual(doubled['solo_s'], 2 * base['solo_s'])
+
+
+class FakeStore:
+    """Just the objects-table API that parallel_plan uses: get, all (insertion order), put, batch."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def get(self, kind, ident, default=None):
+        return self.rows.get((kind, str(ident)), default)
+
+    def all(self, kind):
+        return [dict(v) for (k, _), v in self.rows.items() if k == kind]
+
+    def put(self, kind, doc):
+        self.rows[(kind, str(doc['id']))] = dict(doc)
+        return doc
+
+    def batch(self, records, deletes=()):
+        for kind, doc in records:
+            self.put(kind, doc)
+        for kind, ident in deletes:
+            self.rows.pop((kind, str(ident)), None)
+
+
+class TestPlanPartStore(unittest.TestCase):
+    def test_cap_is_2000(self):
+        self.assertEqual(PLAN_PART_CAP, 2000)
+
+    def test_record_plan_saves_est_and_role_without_real_seconds(self):
+        store = FakeStore()
+        ids = record_plan(store, 'pl1', [dict(id='a', est_s=60, role='coder'), dict(id='b', est_s=30)], now=5.0)
+        self.assertEqual(ids, ['pl1:a', 'pl1:b'])
+        rec = store.get(PLAN_PART_KIND, 'pl1:a')
+        self.assertEqual((rec['plan_id'], rec['part_id'], rec['role'], rec['est_s'], rec['real_s']),
+                         ('pl1', 'a', 'coder', 60.0, None))
+        self.assertEqual(store.get(PLAN_PART_KIND, 'pl1:b')['role'], 'unknown')
+        self.assertEqual(record_plan(store, 'pl2', None), [])
+
+    def test_finish_task_part_stores_real_seconds_once(self):
+        store = FakeStore()
+        record_plan(store, 'pl1', [dict(id='a', est_s=60)], now=1.0)
+        task = dict(plan_part='pl1:a', state='done', started=100.0, finished=190.0, specialty='reviewer')
+        done = finish_task_part(store, task)
+        self.assertEqual(done['real_s'], 90.0)
+        self.assertEqual(store.get(PLAN_PART_KIND, 'pl1:a')['real_s'], 90.0)
+        self.assertEqual(store.get(PLAN_PART_KIND, 'pl1:a')['role'], 'reviewer')  # unknown role takes the specialty
+        self.assertIsNone(finish_task_part(store, dict(task, finished=999.0)))  # a second call changes nothing
+        self.assertEqual(store.get(PLAN_PART_KIND, 'pl1:a')['real_s'], 90.0)
+
+    def test_finish_task_part_ignores_failed_unlinked_and_broken_tasks(self):
+        store = FakeStore()
+        record_plan(store, 'pl1', [dict(id='a', est_s=60)], now=1.0)
+        base = dict(plan_part='pl1:a', state='done', started=10.0, finished=20.0)
+        for bad in (dict(base, state='blocked'), dict(base, plan_part=''), dict(base, plan_part='nope:x'),
+                    dict(base, started=None, created=None), dict(base, finished=5.0)):
+            self.assertIsNone(finish_task_part(store, bad))
+        self.assertIsNone(finish_task_part(store, None))  # never raises
+        self.assertIsNone(store.get(PLAN_PART_KIND, 'pl1:a')['real_s'])
+
+    def test_report_on_fixed_records(self):
+        store = FakeStore()
+        for rec in done_parts('coder', [(10, 10 * r) for r in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)]):
+            store.put(PLAN_PART_KIND, rec)
+        for rec in done_parts('review', [(100, 50), (100, 150)]):
+            store.put(PLAN_PART_KIND, rec)
+        store.put(PLAN_PART_KIND, plan_part_records('open', [dict(id='a', est_s=5)], now=1.0, role='coder')[0])  # unfinished
+        rep = plan_report(store)
+        self.assertEqual(rep['records'], 13)
+        self.assertEqual(rep['measured'], 12)
+        self.assertEqual(rep['roles']['coder'], dict(n=10, median=5.5, p90=9.0))
+        self.assertEqual(rep['roles']['review'], dict(n=2, median=1.0, p90=1.5))
+        self.assertEqual(rep['applied_factor'], 1.0)
+        self.assertNotIn('gain', rep)
+        self.assertIn('gain', plan_report(store, gain=True))
+        self.assertEqual(plan_report(FakeStore())['roles'], {})
+
+    def test_record_plan_prunes_the_oldest_beyond_the_cap(self):
+        store = FakeStore()
+        for n in range(PLAN_PART_CAP - 1):  # 1999 old records, created = 0 .. 1998
+            store.put(PLAN_PART_KIND, plan_part_records('old%d' % n, [dict(id='a', est_s=1)], now=float(n))[0])
+        ids = record_plan(store, 'new', [dict(id='a', est_s=1), dict(id='b', est_s=1), dict(id='c', est_s=1)],
+                          now=5000.0)
+        left = [r['id'] for r in store.all(PLAN_PART_KIND)]
+        self.assertEqual(len(left), PLAN_PART_CAP)
+        self.assertNotIn('old0:a', left)  # the two oldest went
+        self.assertNotIn('old1:a', left)
+        self.assertIn('old2:a', left)
+        self.assertTrue(all(i in left for i in ids))  # the new records stay
+
+    def test_record_plan_cap_argument(self):
+        store = FakeStore()
+        for n in range(5):
+            record_plan(store, 'p%d' % n, [dict(id='a', est_s=1)], now=float(n), cap=3)
+        self.assertEqual([r['id'] for r in store.all(PLAN_PART_KIND)], ['p2:a', 'p3:a', 'p4:a'])
+
+    def test_factor_is_measured_never_applied(self):
+        parts = [dict(id='a', est_s=120), dict(id='b', est_s=120)]
+        base = delegation_decision(parts, 10)
+        self.assertEqual(DELEGATION['est_factor'], 1.0)
+        self.assertEqual(without_factor(dict(est_factor=3.0, cw_fixed_s=50)), dict(cw_fixed_s=50))
+        self.assertIsNone(without_factor(None))
+        self.assertEqual(delegation_decision(parts, 10, without_factor(dict(est_factor=3.0))), base)
 
 
 # ---------------------------------------------------------------- backtest (not a unit test)

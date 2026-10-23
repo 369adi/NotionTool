@@ -337,7 +337,12 @@ lane touches it.
 | P | rank 7 (replay first) and the patch_mode half of rank 2 | .gitattributes, patch_mode.py, tools/merge_replay.py (new), tests/test_patch_mode.py |
 | C | rank 8 | code_index.py (new), devtools.py, bridge.py, context_pack.py, tests/test_code_index.py (new) |
 | G | rank 10 | server.py, store.py, parallel_plan.py, tests/test_parallel_plan.py |
-| M | rank 12 (trial, off by default) | local_mcp.py (no stored default exists: local_mcp.py:95 enabled() falls back to False; new entry in SERVERS next to the blender entry at local_mcp.py:62 with setting='web_enabled'), tests/test_rea.py |
+| M | rank 12 (trial, off by default) | local_mcp.py (no stored default exists: local_mcp.py:95 enabled() falls back to False; new entry in SERVERS next to the blender entry at local_mcp.py:62 with setting='web_enabled'), notiontool/bridge.py (role filter in tools() and refusal in _call, commit f73af38), tests/test_rea.py |
+
+Lanes C and M both touch `notiontool/bridge.py`. Lane M changes the role filter in `tools()` and the refusal in
+`_call` (commit f73af38). Lane C (rank 8) must be rebased onto f73af38 before it merges, and its merge must keep the
+`role_allowed` import, the `role_allowed` check in `tools()` and the "not offered to the ... role" refusal in `_call`;
+then run `python -m unittest tests.test_rea tests.test_code_index`.
 
 ### Batch 3 - gate, engine states, token calibration
 

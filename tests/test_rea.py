@@ -51,9 +51,9 @@ class ReaTests(unittest.TestCase):
     def test_settings_offer_the_local_builtins_disabled_by_default(self):
         store = SimpleNamespace(settings=lambda: {}, all=lambda kind: [])
         servers = McpServers(SimpleNamespace(store=store)).public()
-        self.assertEqual([s['id'] for s in servers], ['builtin_rea', 'builtin_roblox', 'builtin_blender', 'builtin_codebase_memory'])
+        self.assertEqual([s['id'] for s in servers], ['builtin_rea', 'builtin_roblox', 'builtin_blender', 'builtin_web', 'builtin_codebase_memory'])
         self.assertFalse(any(s['enabled'] for s in servers))
-        self.assertEqual([s['toggle'] for s in servers], ['rea_enabled', 'roblox_enabled', 'blender_enabled', 'codebase_memory_enabled'])
+        self.assertEqual([s['toggle'] for s in servers], ['rea_enabled', 'roblox_enabled', 'blender_enabled', 'web_enabled', 'codebase_memory_enabled'])
 
     def test_bridge_tools_follow_the_toggles(self):
         from notiontool.bridge import Bridge
@@ -115,6 +115,74 @@ class ReaTests(unittest.TestCase):
             'params': {'name': 'rea_call', 'arguments': {'name': 'some_tool'}}})
         self.assertTrue(result['result']['isError'])
         bridge.local_client.assert_not_called()
+
+
+class WebSearchServerTests(unittest.TestCase):
+    def bridge(self, settings):
+        from notiontool.bridge import Bridge
+        return Bridge(SimpleNamespace(settings=lambda: settings), None)
+
+    def test_web_is_off_by_default(self):
+        from notiontool import local_mcp
+        server = local_mcp.BY_KEY['web']
+        self.assertEqual(server['setting'], 'web_enabled')
+        self.assertFalse(local_mcp.enabled({}, server))
+        self.assertIn('web_enabled', local_mcp.SETTINGS)
+        bridge = self.bridge({})
+        for role in (None, 'researcher', 'implementer'):
+            names = bridge.tools(role)
+            self.assertNotIn('web_tools', names)
+            self.assertNotIn('web_call', names)
+
+    def test_web_is_offered_only_to_research_roles_when_on(self):
+        bridge = self.bridge({'web_enabled': True})
+        for role in ('researcher',):
+            names = bridge.tools(role)
+            self.assertIn('web_tools', names)
+            self.assertIn('web_call', names)
+        for role in ('implementer', 'reviewer', 'planner', 'architect', 'quality_planner'):
+            names = bridge.tools(role)
+            self.assertNotIn('web_tools', names, role)
+            self.assertNotIn('web_call', names, role)
+        self.assertIn('web_tools', bridge.tools())  # owner / operator view is unchanged
+        self.assertNotIn('blender_tools', bridge.tools('researcher'))  # other servers stay toggle-only
+
+    def test_servers_without_roles_stay_offered_to_every_role(self):
+        bridge = self.bridge({'blender_enabled': True})
+        self.assertIn('blender_call', bridge.tools('implementer'))
+        self.assertIn('blender_call', bridge.tools('researcher'))
+
+    def test_missing_package_reports_not_installed_and_does_not_fail(self):
+        from unittest.mock import patch
+        from notiontool import local_mcp
+        with patch.object(local_mcp, 'web_search_path', return_value=''):
+            entry = next(s for s in local_mcp.public({'web_enabled': True}) if s['id'] == 'builtin_web')
+            self.assertFalse(entry['installed'])
+            self.assertTrue(entry['enabled'])
+            self.assertIn('Not installed', entry['hint'])
+            self.assertEqual(local_mcp.BY_KEY['web']['command'](), ['duckduckgo-mcp-server'])
+            bridge = self.bridge({'web_enabled': True})
+            bridge.close_local = Mock()
+            bridge.local_client = Mock(side_effect=OSError('not found'))
+            result = {e['server']: e for e in bridge.local_refresh('web')}
+            self.assertFalse(result['web']['ok'])
+            self.assertIn('not found', result['web']['error'])
+
+    def test_installed_check_that_raises_is_reported_as_not_installed(self):
+        from unittest.mock import patch
+        from notiontool import local_mcp
+        with patch.object(local_mcp, 'web_search_path', side_effect=RuntimeError('boom')):
+            entry = next(s for s in local_mcp.public({}) if s['id'] == 'builtin_web')
+        self.assertFalse(entry['installed'])
+        self.assertFalse(entry['enabled'])
+
+    def test_installed_package_is_reported_ready(self):
+        from unittest.mock import patch
+        from notiontool import local_mcp
+        with patch.object(local_mcp, 'web_search_path', return_value='C:/tools/duckduckgo-mcp-server.exe'):
+            entry = next(s for s in local_mcp.public({}) if s['id'] == 'builtin_web')
+            self.assertTrue(entry['installed'])
+            self.assertEqual(local_mcp.BY_KEY['web']['command'](), ['C:/tools/duckduckgo-mcp-server.exe'])
 
 
 if __name__ == '__main__':
