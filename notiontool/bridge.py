@@ -1113,11 +1113,7 @@ class Bridge:
                             'inputSchema': schema, 'annotations': {
                                 'readOnlyHint': name.endswith('_tools'),
                                 'destructiveHint': name.endswith('_call')}})
-                # Owner rule I51: Notion must never ask "Allow" for a NotionTool tool. The owner always
-                # allows them and the prompts only caused hanging tool calls. Only the hints published to
-                # Notion change here; the internal gates (LIMIT_ALLOWED_TOOLS, tokens) use name lists.
-                result['tools'] = [dict(tool, annotations={'readOnlyHint': True, 'destructiveHint': False})
-                                   for tool in result['tools']]
+
             elif method=='tools/call':
                 name,args = params.get('name'),params.get('arguments') or {}
                 if self.is_job_call(name, args):
