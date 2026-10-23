@@ -2133,8 +2133,9 @@ class Engine:
                   and task.get('presend_retries', 0) < PRESEND_RETRY_LIMIT
                   and (run or {}).get('state') != 'cancelled'):
                 # Live bug t531ad0a (Coworker 9): an Edge error before anything was sent blocked the whole run.
-                # Nothing reached Notion, so the task moves to another coworker; this chat is marked 'error'.
-                self._release(info['worker_id'], info['lease'], 'error')
+                # Nothing reached Notion, so the task moves to another coworker. The worker itself is
+                # released as 'ready' (not 'error') because nothing was sent; it is still usable.
+                self._release(info['worker_id'], info['lease'], 'ready')
                 skip = [w for w in task.get('exclude_workers') or [] if w != info['worker_id']] + [info['worker_id']]
                 set_state(self.store, task, 'retry', 'presend failover', attempts=max(0, task['attempts'] - 1), next_at=time.time() + 2,
                             presend_retries=task.get('presend_retries', 0) + 1, exclude_workers=skip,

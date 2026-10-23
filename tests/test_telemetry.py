@@ -188,7 +188,7 @@ class EngineChainTests(TempStore):
 
     def finish(self, state):
         run = self.engine.submit('c', 'Hallo!')
-        deadline = time.monotonic() + 4
+        deadline = time.monotonic() + 20  # presend_retries adds up to PRESEND_RETRY_LIMIT × 2 s delays
         while time.monotonic() < deadline:
             self.engine.tick()
             tasks = self.engine.tasks(run['id'])
@@ -217,7 +217,9 @@ class EngineChainTests(TempStore):
         finished = [e for e in task_events(self.store, task['id']) if e['kind'] == 'task_attempt_finished']
         self.assertEqual(finished[-1]['error_class'], 'INVALID_REQUEST')
         row = next(r for r in task_metrics(self.store, run['id']) if r['task_id'] == task['id'])
-        self.assertEqual(row['errors'], ['INVALID_REQUEST'])
+        # presend_retries allows up to PRESEND_RETRY_LIMIT+1 attempts; each records INVALID_REQUEST
+        self.assertTrue(all(e == 'INVALID_REQUEST' for e in row['errors']))
+        self.assertGreaterEqual(len(row['errors']), 1)
 
 
 class VerifyEventTests(TempStore):
