@@ -2052,6 +2052,15 @@ class NotionAdapter:
         # Owner rule 2026-10-22: a stored Coworker effort (older task, stale value) stays in medium..high.
         effort = final_effort(client, model, effort, worker.get('purpose', ''))
         body = self.body(client, worker['thread_id'], step_id, text, model, computer=True, effort=effort)
+        if text is None:
+            # Owner 2026-10-24: the same request as Notion's own 'Continue' button (runFromStep with promptKey
+            # max_iterations.continue, Notion 7.40): no new user step, so nothing is written into the chat;
+            # the server goes on from the chat it already has.
+            body['transcript'] = [s for s in body.get('transcript') or [] if s.get('type') != 'user']
+            body.pop('submittedUserStepId', None)
+            body['isPartialTranscript'] = True
+            body['createThread'] = False
+            body['generateTitle'] = False
         timeout = float(self.store.settings().get('task_timeout') or 1800)
         try:
             for _ in client.transport.stream('runInferenceTranscript', body, client.headers(), timeout=timeout):
@@ -2061,6 +2070,13 @@ class NotionAdapter:
                 raise ThreadMissing(worker['thread_id'], 'runInferenceTranscript') from None
             raise
         return True
+
+    def click_continue(self, worker, step_id, task=None):
+        """Auto-continue like a click on Notion's 'Continue' button: no message appears in the chat.
+
+        Works for every chat, also in the background (not only the one open in the app window).
+        """
+        return self.continue_turn(worker, None, step_id, task=task)
 
     def thread_busy(self, client, thread_id, window=None):
         """True while Notion has not written the outcome of the latest turn in this chat."""

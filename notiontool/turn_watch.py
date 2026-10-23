@@ -63,6 +63,11 @@ STALL_SECONDS = 600  # chat still says 'running' but nothing new for 10 min: a h
 DONE_QUIET_SECONDS = 20  # quiet after the last finished task; short gaps between dependent tasks never trigger
 MAX_CHAIN = 5
 MAX_CHAIN_OPERATOR = 20  # the operator Main may work in idle mode for hours
+# Click mode (setting resume_click, default on; owner 2026-10-24): a stopped turn is continued like a click on
+# Notion's 'Continue' button (no message in the chat), after resume_grace_seconds (default below), without a
+# cap (resume_max_chain, 0 = unlimited). Each click needs a new stopped entry, so a turn without progress is
+# never clicked twice. Turns that stopped long before this start (old chats) are left alone.
+CLICK_GRACE_SECONDS = 30
 CHAIN_WINDOW = 1800   # without a visible user message, a resume within 30 min continues the chain
 WINDOW = 40           # newest transcript entries read per check
 PAGE_MAX = 1000       # count_steps pages back up to this many entries to reach the last seen entry
@@ -716,10 +721,18 @@ class TurnWatch:
         # Idle mode: every Main chat (purpose 'main' or the operator Main) may keep working on its own
         # for hours; coworker turns keep the short chain. Not tied to one account.
         operator = worker.get('purpose') in (OPERATOR, 'main')
-        limit = MAX_CHAIN_OPERATOR if operator else MAX_CHAIN
+        click = self.click_mode()
+        settings = self.store.settings()
+        if click:
+            limit = int(settings.get('resume_max_chain') or 0) or float('inf')  # 0 = unlimited (owner 2026-10-24)
+        else:
+            limit = MAX_CHAIN_OPERATOR if operator else MAX_CHAIN
         now = self.clock()
+        if click and found['stamp'] and found['stamp'] < self.started - RESTART_CUT_BEFORE:
+            return None  # stopped long before this start: old chats are not clicked (owner 2026-10-24)
         since = found['stamp'] or self.first_seen.setdefault(worker['id'] + ':' + found['key'], now)
-        need = PENDING_TOOL_SECONDS if found.get('pending') else GRACE_SECONDS
+        grace = float(settings.get('resume_grace_seconds') or CLICK_GRACE_SECONDS) if click else GRACE_SECONDS
+        need = PENDING_TOOL_SECONDS if found.get('pending') else grace
         if now - since < need:
             return None
         if budget_used_up(self.store, now):
@@ -741,6 +754,8 @@ class TurnWatch:
                 return None
             steps = list(state.get('steps') or [])
             ours = bool(set(found['user_ids']) & set(steps))
+            if click and found['user_ids'] and set(found['user_ids']) == set(state.get('user_ids') or []):
+                ours = True  # a click writes no message: the same user message means the same chain
             unknown = not found['user_ids'] and now - state.get('at', 0) < CHAIN_WINDOW
             chain = state.get('chain', 0) + 1 if (ours or unknown) else 1
             if chain > limit:
@@ -754,7 +769,7 @@ class TurnWatch:
                 return None
             step = self.adapter.new_id(client.info['space_id'], '00aa')
             state.update(key=found['key'], previous_key=state.get('key', ''), chain=chain, at=now,
-                         steps=(steps + [step])[-10:])
+                         steps=(steps + [step])[-10:], user_ids=list(found['user_ids'])[-10:])
             fresh['resume'] = state
             self.store.put('workers', fresh)
             for task in self.store.all('tasks'):
@@ -765,7 +780,9 @@ class TurnWatch:
             self.sending.add(worker['id'])
         self.store.event('turn_stalled' if found.get('stalled') else 'turn_interrupted', worker_id=worker['id'],
                          thread_id=worker['thread_id'], after=found['kind'],
-                         chain=chain, message='Interrupted turn detected; NotionTool sends an automatic continue message')
+                         chain=chain, mode='click' if click else 'message',
+                         message=('Stopped turn detected; NotionTool clicks Continue (no message)' if click else
+                                  'Interrupted turn detected; NotionTool sends an automatic continue message'))
         self.spawn(self.send, worker, step, found['key'])
         return step
 
@@ -856,7 +873,9 @@ class TurnWatch:
             # The resume uses the task's own model when the adapter supports it (notion.py continue_turn).
             task = next((t for t in self.store.all('tasks') if t.get('worker_id') == worker['id'] and _active(t)), None)
             with request_priority('rest'):
-                if task is not None and self.resume_takes_task():
+                if text == RESUME_TEXT and self.click_mode():
+                    sent = self.click(worker, step, task)
+                elif task is not None and self.resume_takes_task():
                     sent = self.adapter.continue_turn(worker, text, step, task=task)
                 else:
                     sent = self.adapter.continue_turn(worker, text, step)
@@ -866,6 +885,26 @@ class TurnWatch:
             self.revert(worker, key, 'turn_resume_failed', type(exc).__name__ + ': ' + str(exc)[:200])
         finally:
             self.sending.discard(worker['id'])
+
+    def click_mode(self):
+        """Setting resume_click (default on): continue like a click on Notion's Continue button (no message)."""
+        if not callable(getattr(self.adapter, 'click_continue', None)):
+            return False
+        settings = getattr(self.store, 'settings', None)
+        return bool((settings() if callable(settings) else {}).get('resume_click', True))
+
+    def click(self, worker, step, task):
+        try:
+            return self.adapter.click_continue(worker, step, task=task)
+        except Exception as exc:
+            if getattr(exc, 'status', None) not in (400, 422):
+                raise
+            self.store.event('turn_click_fallback', worker_id=worker['id'], thread_id=worker['thread_id'],
+                             message='Notion rejected the Continue click (HTTP %s); sending the continue '
+                                     'message instead' % exc.status)
+        if task is not None and self.resume_takes_task():
+            return self.adapter.continue_turn(worker, RESUME_TEXT, step, task=task)
+        return self.adapter.continue_turn(worker, RESUME_TEXT, step)
 
     def resume_takes_task(self):
         cached = getattr(self, '_resume_takes_task', None)

@@ -1998,6 +1998,26 @@
       return best;
     }
 
+    // After the switch settled Notion sometimes still moved the chat (late scroll restore, rows mounting above):
+    // the view jumped up to older messages although nobody scrolled (user report 2026-10-24). For STICK_MS after
+    // a switch the chat is held at its newest message until the user scrolls up, drags or presses an up key.
+    var STICK_MS = 15000;
+    var STICK_GAP_PX = 150;
+    var stick = null;
+    var UP_KEYS = { PageUp: 1, ArrowUp: 1, Home: 1 };
+    function startStick(key) { stick = key ? { key: key, until: Date.now() + STICK_MS } : null; }
+    function holdBottom() {
+      if (!stick) return false;
+      if (stick.key !== threadFromHref(location.href) || Date.now() > stick.until) { stick = null; return false; }
+      var el = cachedScroller;
+      if (!el || !el.isConnected || !el.getClientRects().length) { el = findScroller(); cachedScroller = el; }
+      if (el && el.scrollHeight - el.clientHeight - el.scrollTop > STICK_GAP_PX) {
+        el.scrollTop = el.scrollHeight;
+        window.__ntStickFix = (window.__ntStickFix || 0) + 1;
+      }
+      return true;
+    }
+
     var SWITCH_HIDE_MAX_MS = 2500;
     function revealChat() {
       var hidden = document.querySelectorAll('[data-nt-sw]');
@@ -2011,10 +2031,17 @@
         lastChatKey = key;
         pendingScroll = key ? { key: key, start: Date.now(), until: Date.now() + SCROLL_WAIT_MS, height: -1, stable: 0 } : null;
         lastSwitchDone = Date.now();
+        stick = null;
         revealChat();
       }
-      if (!pendingScroll) return;
-      if (pendingScroll.key !== key || Date.now() > pendingScroll.until) { pendingScroll = null; revealChat(); return; }
+      if (!pendingScroll) {
+        if (holdBottom() && !scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { stick = null; } }, 250);
+        return;
+      }
+      if (pendingScroll.key !== key || Date.now() > pendingScroll.until) {
+        if (pendingScroll.key === key) startStick(key);
+        pendingScroll = null; revealChat(); return;
+      }
       // Always search fresh after a chat switch: a cached scroller can belong to the previous chat
       // (still in the DOM, hidden) and the new chat then stayed at the top (regression 17d4482).
       var el = findScroller();
@@ -2036,14 +2063,36 @@
           pendingScroll.revealed = true;
           revealChat();
         }
-        if (pendingScroll.stable >= 3 && Date.now() - pendingScroll.start >= SCROLL_MIN_MS) { pendingScroll = null; lastSwitchDone = Date.now(); revealChat(); return; }
+        if (pendingScroll.stable >= 3 && Date.now() - pendingScroll.start >= SCROLL_MIN_MS) {
+          pendingScroll = null; lastSwitchDone = Date.now(); revealChat(); startStick(key);
+          if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { stick = null; } }, 250);
+          return;
+        }
       }
       if (!scrollTimer) scrollTimer = setTimeout(function () { scrollTimer = 0; try { applyChatScroll(); } catch (e) { pendingScroll = null; revealChat(); } }, 250);
     }
 
-    window.addEventListener('wheel', cancelScroll, { capture: true, passive: true });
-    window.addEventListener('touchmove', cancelScroll, { capture: true, passive: true });
-    document.addEventListener('keydown', cancelScroll, true);
+    // Only a real upward user move ends the bottom pin: scrolling down, typing or a sidebar click keeps it
+    // (any key or wheel used to cancel the switch scroll early, then a late Notion scroll jumped up).
+    function editable(t) {
+      return !!(t && t.closest && t.closest('[contenteditable="true"],textarea,input'));
+    }
+    function userScrolls(ev) {
+      if (ev.type === 'wheel' && !(ev.deltaY < 0)) return;
+      if (ev.type === 'keydown' && (!UP_KEYS[ev.key] || editable(ev.target))) return;
+      if (ev.type === 'mousedown' && (editable(ev.target) || !(cachedScroller && cachedScroller.contains &&
+          cachedScroller.contains(ev.target)))) return;
+      cancelScroll();
+      stick = null;
+    }
+    window.addEventListener('wheel', userScrolls, { capture: true, passive: true });
+    window.addEventListener('touchmove', userScrolls, { capture: true, passive: true });
+    window.addEventListener('mousedown', userScrolls, { capture: true, passive: true });
+    document.addEventListener('keydown', userScrolls, true);
+    // A late jump fires a scroll event on the chat: undo it in the same frame instead of 250 ms later.
+    document.addEventListener('scroll', function (ev) {
+      if (stick && !pendingScroll && ev.target === cachedScroller) { try { holdBottom(); } catch (e) { stick = null; } }
+    }, { capture: true, passive: true });
 
     // ---- scheduling ----------------------------------------------------------------------
     function run() {
