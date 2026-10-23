@@ -1,8 +1,10 @@
 import os
+import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
-from notiontool import eol_guard
+from notiontool import bridge, eol_guard
 from notiontool.eol_guard import BOM, detect, dominant, normalize, report
 
 
@@ -123,6 +125,105 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(info["bom"])
         self.assertEqual(info["style"], "none")
         self.assertEqual(info["dominant"], "lf")
+
+
+def _git_init(folder):
+    try:
+        done = subprocess.run(["git", "init", "-q", str(folder)], capture_output=True)
+    except OSError:
+        return False
+    return done.returncode == 0
+
+
+class BridgeWriteTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def put(self, name, data):
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def make_repo(self, attributes):
+        if not _git_init(self.root):
+            self.skipTest("git is not available")
+        (self.root / ".gitattributes").write_bytes(attributes)
+
+    def test_lf_text_into_crlf_file_keeps_crlf(self):
+        path = self.put("a.txt", b"a\r\nb\r\n")
+        result = bridge.write_with_eol(path, "x\ny\nz\n")
+        self.assertEqual(path.read_bytes(), b"x\r\ny\r\nz\r\n")
+        self.assertEqual(result["bytes"], 9)
+        self.assertEqual(result["eol"], "crlf")
+        self.assertEqual(result["eol_changed"], "lf->crlf")
+
+    def test_crlf_text_into_lf_file_keeps_lf(self):
+        path = self.put("a.txt", b"a\nb\n")
+        result = bridge.write_with_eol(path, "x\r\ny\r\n")
+        self.assertEqual(path.read_bytes(), b"x\ny\n")
+        self.assertEqual(result["eol_changed"], "crlf->lf")
+
+    def test_same_ending_reports_no_change(self):
+        path = self.put("a.txt", b"a\nb\n")
+        result = bridge.write_with_eol(path, "x\ny\n")
+        self.assertEqual(path.read_bytes(), b"x\ny\n")
+        self.assertNotIn("eol_changed", result)
+        self.assertEqual(result["written"], str(path))
+
+    def test_existing_bom_is_kept(self):
+        path = self.put("a.txt", BOM + b"a\r\n")
+        bridge.write_with_eol(path, "z\n")
+        self.assertEqual(path.read_bytes(), BOM + b"z\r\n")
+
+    def test_bom_in_text_dropped_for_file_without_bom(self):
+        path = self.put("a.txt", b"a\n")
+        result = bridge.write_with_eol(path, "\ufeffz\n")
+        self.assertEqual(path.read_bytes(), b"z\n")
+        self.assertTrue(result["bom_dropped"])
+
+    def test_mixed_existing_file_is_written_as_given(self):
+        path = self.put("a.txt", b"1\r\n2\n3\r\n")
+        result = bridge.write_with_eol(path, "x\ny\r\nz\n")
+        self.assertEqual(path.read_bytes(), b"x\ny\r\nz\n")
+        self.assertEqual(result["eol_kept"], "mixed")
+        self.assertNotIn("eol_changed", result)
+
+    def test_new_md_follows_eol_attribute(self):
+        self.make_repo(b"*.md text eol=crlf\n*.txt text eol=lf\n")
+        md = self.root / "new.md"
+        result = bridge.write_with_eol(md, "a\nb\n")
+        self.assertEqual(md.read_bytes(), b"a\r\nb\r\n")
+        self.assertEqual(result["eol_changed"], "lf->crlf")
+        txt = self.root / "new.txt"
+        bridge.write_with_eol(txt, "a\r\nb\r\n")
+        self.assertEqual(txt.read_bytes(), b"a\nb\n")
+
+    def test_new_md_without_attribute_gets_lf(self):
+        self.make_repo(b"*.py text eol=crlf\n")
+        md = self.root / "new.md"
+        result = bridge.write_with_eol(md, "a\r\nb\r\n")
+        self.assertEqual(md.read_bytes(), b"a\nb\n")
+        self.assertEqual(result["eol_changed"], "crlf->lf")
+
+    def test_new_file_outside_a_repo_gets_lf(self):
+        md = self.root / "new.md"
+        bridge.write_with_eol(md, "a\r\nb\n")
+        self.assertEqual(md.read_bytes(), b"a\nb\n")
+
+    def test_existing_file_without_newline_follows_attribute(self):
+        self.make_repo(b"*.md text eol=crlf\n")
+        md = self.put("one.md", b"one line")
+        bridge.write_with_eol(md, "a\nb\n")
+        self.assertEqual(md.read_bytes(), b"a\r\nb\r\n")
+
+    def test_eol_attribute_values(self):
+        self.make_repo(b"a.md eol=crlf\nb.md eol=lf\nc.md -text\n")
+        self.assertEqual(bridge.eol_attribute(self.root / "a.md"), "crlf")
+        self.assertEqual(bridge.eol_attribute(self.root / "b.md"), "lf")
+        self.assertEqual(bridge.eol_attribute(self.root / "c.md"), "lf")
+        self.assertEqual(bridge.eol_attribute(self.root / "d.md"), "lf")
 
 
 if __name__ == "__main__":

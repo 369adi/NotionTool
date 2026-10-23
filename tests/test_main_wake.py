@@ -332,6 +332,25 @@ class MainWakeLoopTests(unittest.TestCase):
         self.add("r1", state="fixing")
         self.assertEqual(self.wake.tick(), [])
 
+    def test_one_wake_only_after_the_last_run_of_the_main(self):
+        # owner 2026-10-23: no wake after every run, only when the very last coworker is done
+        self.add("r1")
+        self.add("r2", state="executing", tasks=("running",))
+        self.assertEqual(self.wake.tick(), [])
+        self.assertEqual(self.sent, [])
+        self.add("r2", state="done", tasks=("running",))
+        self.assertEqual(self.wake.tick(), [])  # run done but a task still open
+        self.add("r2", state="done", tasks=("done",))
+        self.assertEqual(sorted(self.wake.tick()), ["r1", "r2"])
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0]["prompt"].startswith("NotionTool (automatic): Cowork runs finished."))
+
+    def test_confirmed_or_other_main_runs_do_not_hold_back(self):
+        self.add("r1")
+        self.add("r2", state="executing", tasks=("running",), confirmed_at=T0 - 5)
+        self.add("r3", state="executing", tasks=("running",), main_worker="acc:other-thread")
+        self.assertEqual(self.wake.tick(), ["r1"])
+
     def test_waits_while_chat_busy_then_sends_when_idle(self):
         self.add("r1")
         self.adapter.cl.status = "running"

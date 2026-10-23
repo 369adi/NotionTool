@@ -56,7 +56,48 @@ def new_app_is_ui(data_dir):
         return False
 
 
+def self_test_imports(report_path=None, importer=None, package='notiontool'):
+    """Import every module of the package (--self-test-imports). Returns 0, or 1 when a module fails.
+
+    The report (count and one 'FAILED <module>: <error>' line per failure) goes to stdout and, when given, to
+    report_path; the EXE has no console, so the release workflow reads the file. importer is for tests."""
+    import importlib
+    import pkgutil
+    import traceback
+    importer = importer or importlib.import_module
+    names = [package]
+    failed = []
+
+    def on_error(name):
+        failed.append((name, traceback.format_exc(limit=3).strip().splitlines()[-1]))
+
+    try:
+        root = importer(package)
+        for info in pkgutil.walk_packages(root.__path__, package + '.', onerror=on_error):
+            names.append(info.name)
+    except BaseException as exc:
+        failed.append((package, f'{type(exc).__name__}: {exc}'))
+    for name in names:
+        try:
+            importer(name)
+        except BaseException as exc:  # SystemExit from a module counts as a failure too
+            failed.append((name, f'{type(exc).__name__}: {exc}'))
+    if len(names) < 2 and not failed:
+        failed.append((package, 'no submodules found'))
+    lines = [f'imported {len(names) - len(failed)} of {len(names)} modules'] + [f'FAILED {n}: {e}' for n, e in failed]
+    text = '\n'.join(lines)
+    if report_path:
+        Path(report_path).write_text(text + '\n', encoding='utf-8')
+    if sys.stdout:
+        print(text, flush=True)
+    return 1 if failed else 0
+
+
 def main():
+    if '--self-test-imports' in sys.argv:  # hidden: release check on the built EXE, no window, no data dir, no lock
+        position = sys.argv.index('--self-test-imports') + 1
+        report = sys.argv[position] if position < len(sys.argv) and not sys.argv[position].startswith('-') else None
+        sys.exit(self_test_imports(report))
     if '--gateway' in sys.argv:  # process 2: MCP gateway / backup MCP, no window, no instance lock
         from notiontool.gateway import main as gateway_main
         sys.exit(gateway_main(sys.argv))
