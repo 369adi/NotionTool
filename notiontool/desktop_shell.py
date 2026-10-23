@@ -40,8 +40,14 @@ MOUNT_ORDER = ('theme', 'chrome', 'declutter', 'sidebar', 'shell', 'live', 'sett
 DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_schema', 'app_settings_get',
                                               'app_settings_set', 'main_switch_start', 'app_chat_create',
                                               'app_chat_rename', 'app_chat_promote', 'main_refresh',
-                                              'chat_context_switch')
+                                              'chat_context_switch', 'chat_ages', 'chat_age_switch')
 CREATE_WAIT = 150.0
+# I50 chat age (sidebar): the overlay asks through ctx.call('chat_ages' / 'chat_age_switch'); desktop JS
+# never opens network connections itself (test_desktop_no_lag), so the shell calls these routes.
+CHAT_AGES_PATH = '/api/chat/ages'
+CHAT_SWITCH_PATH = '/api/chat/context_switch'
+CHAT_AGE_TIMEOUT = 5.0
+UI_PORT = 8790
 SWITCH_ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
 
 _BOOT_HEAD = '''(function(){
@@ -731,9 +737,76 @@ def _ai_disable(store):
 
 
 # ---- handlers ---------------------------------------------------------------
-def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monotonic, wait=CREATE_WAIT):
+class HostApiError(Exception):
+    """An /api/ call of the desktop shell failed (status 0 = no connection)."""
+
+    def __init__(self, status, message):
+        Exception.__init__(self, message)
+        self.status = int(status or 0)
+
+
+def host_api(server, timeout=CHAT_AGE_TIMEOUT, opener=None):
+    """call(method, path, body=None) -> dict against the local NotionTool UI server (UI token auth)."""
+    import urllib.error
+    import urllib.request
+
+    def call(method, path, body=None):
+        port = int(getattr(server, 'port', 0) or UI_PORT)
+        data = None if body is None else json.dumps(body).encode('utf-8')
+        req = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path), data=data, method=method)
+        req.add_header('X-NotionTool-Token', str(getattr(server, 'token', '') or ''))
+        req.add_header('Accept', 'application/json')
+        if data is not None:
+            req.add_header('Content-Type', 'application/json')
+        use = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with use.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode('utf-8') or '{}').get('error', '')
+            except Exception:  # noqa: BLE001 - the status code is enough
+                detail = ''
+            raise HostApiError(exc.code, str(detail or 'HTTP %s' % exc.code)[:200])
+        except (OSError, ValueError) as exc:
+            raise HostApiError(0, 'NotionTool is not reachable (' + type(exc).__name__ + ')')
+        try:
+            payload = json.loads(raw.decode('utf-8') or '{}')
+        except ValueError:
+            raise HostApiError(0, 'NotionTool sent an invalid answer')
+        return payload if isinstance(payload, dict) else {}
+    return call
+
+
+def _age_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number >= 0 else None
+
+
+def chat_age_rows(payload):
+    """GET /api/chat/ages -> the rows the sidebar needs (thread ids normalised like the overlay)."""
+    rows = []
+    for chat in (payload or {}).get('chats') or []:
+        if not isinstance(chat, dict):
+            continue
+        thread = re.sub(r'[^0-9a-f]', '', str(chat.get('thread_id') or '').lower())
+        if not thread:
+            continue
+        rows.append(dict(worker_id=str(chat.get('worker_id') or ''), thread_id=thread,
+                         title=str(chat.get('title') or '')[:120], purpose=str(chat.get('purpose') or ''),
+                         created_at=chat.get('created_at'), age_h=_age_number(chat.get('age_h')),
+                         blocked=bool(chat.get('blocked'))))
+    return rows
+
+
+def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monotonic, wait=CREATE_WAIT,
+                     host_call=None):
     handlers = notion_shell.default_handlers(server)
     store = server.store
+    api = host_call or host_api(server)
 
     def state(args):
         return desktop_state(server, load_app_settings(data_dir))
@@ -819,8 +892,36 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
             body['chat_id'] = str(args['chat_id'])
         return dict(server.action('/api/main/switch/start', body) or {}, kind='main')
 
+    def chat_ages(args):
+        # I50: GET /api/chat/ages for the sidebar age chips (on load and every 60 s). A missing route
+        # (backend part not merged yet) or an offline app is no error: the sidebar shows no chips.
+        try:
+            payload = api('GET', CHAT_AGES_PATH)
+        except HostApiError as exc:
+            text = ('Chat ages are not available yet: the backend route is missing' if exc.status == 404
+                    else 'Chat ages are not available: ' + str(exc))
+            return dict(api_ok=False, chats=[], warn_h=None, limit_h=None, error=text[:200])
+        return dict(api_ok=True, chats=chat_age_rows(payload), warn_h=_age_number(payload.get('warn_h')),
+                    limit_h=_age_number(payload.get('limit_h')), error='')
+
+    def chat_age_switch(args):
+        # I50: Context Switch button -> POST /api/chat/context_switch {worker_id}.
+        worker_id = str((args or {}).get('worker_id') or '').strip()
+        if not worker_id:
+            raise ValueError('Context switch needs a chat with a worker id')
+        try:
+            result = api('POST', CHAT_SWITCH_PATH, {'worker_id': worker_id[:100]})
+        except HostApiError as exc:
+            if exc.status == 404:
+                raise ValueError('Context switch is not available yet: the backend route is missing')
+            raise ValueError('Context switch failed: ' + str(exc))
+        thread = re.sub(r'[^0-9a-f]', '', str(result.get('thread_id') or '').lower())
+        return dict(worker_id=str(result.get('worker_id') or worker_id), thread_id=thread,
+                    url=chat_url(thread) if thread else '')
+
     handlers.update(app_chat_create=app_chat_create, app_chat_rename=app_chat_rename,
-                    app_chat_promote=app_chat_promote, chat_context_switch=chat_context_switch)
+                    app_chat_promote=app_chat_promote, chat_context_switch=chat_context_switch,
+                    chat_ages=chat_ages, chat_age_switch=chat_age_switch)
     handlers.update(state=state, runs=lambda args: state(args)['runs'], new_welcome_chat=new_welcome_chat,
                     settings_schema=settings_schema, app_settings_get=app_settings_get,
                     app_settings_set=app_settings_set, main_switch_start=main_switch_start,

@@ -314,6 +314,92 @@
     ageClass: ageClass, ageLabel: ageLabel, coworkerRows: coworkerRows,
     createdText: createdText, ageBadge: ageBadge, coworkerAges: coworkerAges, ensureHeading: ensureHeading };
 
+  // ---- I50 chat age: pure helpers (window.__ntDesk.chatAgeUtil) ---------------------------
+  // The ages come from GET /api/chat/ages, loaded on mount and every 60 s. Desktop JS never opens a
+  // network connection itself (test_desktop_no_lag), so it asks the desktop shell through
+  // ctx.call('chat_ages'); the Context Switch button uses ctx.call('chat_age_switch') which the shell
+  // sends as POST /api/chat/context_switch. warn_h / limit_h come from the backend; AGE_AMBER_H and
+  // AGE_RED_H are only the fallback when they are missing.
+  var CHAT_AGES_ROUTE = '/api/chat/ages';
+  var CHAT_SWITCH_ROUTE = '/api/chat/context_switch';
+  var CHAT_AGE_REFRESH_MS = 60000;
+  var LOCK_GLYPH = '\uD83D\uDD12';
+
+  function agePositive(value) {
+    var n = Number(value);
+    return value != null && value !== '' && isFinite(n) && n >= 0 ? n : null;
+  }
+
+  function ageLimits(warnH, limitH) {
+    var limit = agePositive(limitH) || AGE_RED_H;
+    var warn = agePositive(warnH) || AGE_AMBER_H;
+    return { warn: Math.min(warn, limit), limit: limit };
+  }
+
+  // '25m', '2h', '21h', '23h+' (at or above the limit).
+  function chatAgeText(hours, limitH) {
+    var h = agePositive(hours);
+    if (h == null) return '';
+    var limit = ageLimits(null, limitH).limit;
+    if (h >= limit) return Math.floor(limit) + 'h+';
+    if (h < 1) return Math.max(1, Math.floor(h * 60)) + 'm';
+    return Math.floor(h) + 'h';
+  }
+
+  // 'unknown' (no chip) | 'ok' | 'warn' (orange, from warn_h) | 'locked' (red, from limit_h or blocked).
+  function chatAgeLevel(hours, blocked, warnH, limitH) {
+    if (blocked) return 'locked';
+    var h = agePositive(hours);
+    if (h == null) return 'unknown';
+    var lim = ageLimits(warnH, limitH);
+    if (h >= lim.limit) return 'locked';
+    if (h >= lim.warn) return 'warn';
+    return 'ok';
+  }
+
+  function chatAgeTitle(level, label, limitH) {
+    var limit = Math.floor(ageLimits(null, limitH).limit);
+    if (level === 'locked') return 'Send locked: this chat is ' + label + ' old. Use Context Switch to continue in a fresh chat.';
+    if (level === 'warn') return 'Chat age ' + label + ': sending locks at ' + limit + ' h. Use Context Switch to start a fresh chat.';
+    if (level === 'switching') return 'Context Switch is running ...';
+    return 'Chat age ' + label + ' (sending locks at ' + limit + ' h)';
+  }
+
+  function chatAgeKey(thread) { return String(thread || '').toLowerCase().replace(/[^0-9a-f]/g, ''); }
+
+  // Reply of ctx.call('chat_ages') -> { at, warn_h, limit_h, chats: { threadKey: entry } }.
+  function chatAgeMap(reply, atMs) {
+    reply = reply || {};
+    var lim = ageLimits(reply.warn_h, reply.limit_h);
+    var out = { at: Number(atMs) || 0, warn_h: lim.warn, limit_h: lim.limit, chats: {} };
+    var list = Array.isArray(reply.chats) ? reply.chats : [];
+    var nowS = (Number(atMs) || 0) / 1000;
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i] || {};
+      var key = chatAgeKey(c.thread_id);
+      if (!key) continue;
+      var hours = agePositive(c.age_h);
+      if (hours == null && c.created_at != null) hours = ageHours(c.created_at, nowS);
+      out.chats[key] = { thread: key, worker_id: String(c.worker_id || ''), title: String(c.title || ''),
+        purpose: String(c.purpose || ''), hours: hours, blocked: !!c.blocked };
+    }
+    return out;
+  }
+
+  // Age now, counted on from the last load (the chip keeps moving between two loads).
+  function chatAgeNow(entry, nowMs, atMs) {
+    var h = entry ? agePositive(entry.hours) : null;
+    if (h == null) return null;
+    var extra = (Number(nowMs) || 0) - (Number(atMs) || 0);
+    return extra > 0 ? h + extra / 3600000 : h;
+  }
+
+  function chatSwitchArgs(entry) { return { worker_id: String((entry && entry.worker_id) || '') }; }
+
+  window.__ntDesk.chatAgeUtil = { route: CHAT_AGES_ROUTE, switchRoute: CHAT_SWITCH_ROUTE, refreshMs: CHAT_AGE_REFRESH_MS,
+    chatAgeText: chatAgeText, chatAgeLevel: chatAgeLevel, chatAgeTitle: chatAgeTitle, chatAgeMap: chatAgeMap,
+    chatAgeNow: chatAgeNow, chatAgeKey: chatAgeKey, chatSwitchArgs: chatSwitchArgs };
+
   // ---- Named chats (own New chat dialog, Chats section, gear menu): pure helpers ------------
   // Actions go through ctx.call only: app_chat_create / app_chat_rename / app_chat_promote, which
   // the desktop shell maps to the app chat create, rename and promote routes.
@@ -1004,6 +1090,132 @@
         marked[i].removeAttribute('data-nt-desk');
         marked[i].removeAttribute('data-nt-desk-thread');
       }
+    }
+
+    // ---- I50 chat age: age chip + Context Switch button on every chat row -----------------
+    // Rows: Notion chat rows (Mains included), own Coworker rows and own private chat rows. Only own
+    // nodes are added; Notion's nodes only get our children, never a change of their own content.
+    var chatAges = chatAgeMap(null, 0);
+    var agesFetchedAt = 0;
+    var agesBusy = false;
+    var ageSwitching = {};
+    var AGE_ROW_MARKS = ['chat-row', 'coworker', 'private-chat'];
+
+    // Loads GET /api/chat/ages (CHAT_AGES_ROUTE) through the desktop shell. Called on mount, from the
+    // 5 s watchdog once CHAT_AGE_REFRESH_MS (60 s) have passed, and after a Context Switch.
+    function refreshChatAges() {
+      if (stopped || agesBusy || typeof ctx.call !== 'function') return;
+      agesBusy = true;
+      agesFetchedAt = Date.now();
+      Promise.resolve().then(function () {
+        return ctx.call('chat_ages', {});
+      }).then(function (reply) {
+        agesBusy = false;
+        // Route missing (backend not merged yet) or app offline: keep the last known ages.
+        if (reply && reply.api_ok !== false) chatAges = chatAgeMap(reply, Date.now());
+        schedule();
+      }, function () { agesBusy = false; });
+    }
+
+    function applyChatAges(root) {
+      if (!root) return;
+      var now = Date.now();
+      var rows = root.querySelectorAll('[data-nt-desk-thread]');
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        if (AGE_ROW_MARKS.indexOf(row.getAttribute('data-nt-desk') || '') < 0) continue;
+        var key = chatAgeKey(row.getAttribute('data-nt-desk-thread'));
+        styleChatAge(row, key ? (chatAges.chats[key] || null) : null, now);
+      }
+    }
+
+    function styleChatAge(row, entry, now) {
+      var chip = null, btn = null, old = [];
+      for (var i = 0; i < row.children.length; i++) {
+        var kid = row.children[i];
+        var mark = kid.getAttribute('data-nt-desk');
+        if (mark === 'chat-age') chip = kid;
+        else if (mark === 'age-switch') btn = kid;
+        else if (mark === 'age' || (kid.classList && kid.classList.contains('nt-desk-age'))) old.push(kid);
+      }
+      var hours = entry ? chatAgeNow(entry, now, chatAges.at) : null;
+      var level = !entry ? 'unknown' : (ageSwitching[entry.thread] ? 'switching'
+        : chatAgeLevel(hours, entry.blocked, chatAges.warn_h, chatAges.limit_h));
+      // The older per-row badge (styleAge / coworker chip) steps aside while our chip shows the age.
+      for (var j = 0; j < old.length; j++) {
+        var want = level === 'unknown' ? '' : 'none';
+        if (old[j].style && old[j].style.display !== want) old[j].style.display = want;
+      }
+      if (level === 'unknown') {
+        if (chip) dropOwn(chip);
+        if (btn) dropOwn(btn);
+        if (row.getAttribute('data-nt-age-level')) row.removeAttribute('data-nt-age-level');
+        return;
+      }
+      var label = level === 'switching' ? 'Switching' : chatAgeText(hours, chatAges.limit_h);
+      if (!chip) { chip = el('span', { 'data-nt-desk': 'chat-age' }); row.appendChild(chip); }
+      setCls(chip, 'nt-desk-chip nt-desk-chat-age nt-desk-chat-age-' + level);
+      setText(chip, (level === 'locked' ? LOCK_GLYPH + ' ' : '') + label);
+      var title = chatAgeTitle(level, label, chatAges.limit_h);
+      if (chip.getAttribute('title') !== title) chip.setAttribute('title', title);
+      if (row.getAttribute('data-nt-age-level') !== level) row.setAttribute('data-nt-age-level', level);
+      if (!btn) { btn = ageSwitchButton(entry.thread); row.appendChild(btn); }
+      var disabled = level === 'switching' || !entry.worker_id;
+      if (btn.disabled !== disabled) btn.disabled = disabled;
+      setCls(btn, 'nt-desk-chip nt-desk-age-switch' + (level === 'locked' ? ' nt-desk-age-switch-locked'
+        : level === 'warn' ? ' nt-desk-age-switch-warn' : ''));
+      setText(btn, level === 'switching' ? 'Switching ...' : 'Context Switch');
+    }
+
+    function ageSwitchButton(thread) {
+      var btn = el('button', { cls: 'nt-desk-chip nt-desk-age-switch', type: 'button', 'data-nt-desk': 'age-switch',
+        text: 'Context Switch', title: 'Context Switch: continue this chat in a fresh chat', 'aria-label': 'Context Switch' });
+      // The button sits inside the chat row: its presses never open the chat.
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'keydown'].forEach(function (type) {
+        btn.addEventListener(type, stopEv);
+      });
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        ageContextSwitch(thread);
+      });
+      return btn;
+    }
+
+    // Context Switch: ctx.call('chat_age_switch') -> POST /api/chat/context_switch (CHAT_SWITCH_ROUTE).
+    function ageContextSwitch(thread) {
+      var entry = chatAges.chats[thread];
+      if (!entry || !entry.worker_id) {
+        ctx.toast('Context Switch is not possible: the age of this chat is not loaded yet.', 'error');
+        return;
+      }
+      if (ageSwitching[thread]) return;  // double click: one switch only
+      ageSwitching[thread] = true;
+      schedule();
+      Promise.resolve().then(function () {
+        return ctx.call('chat_age_switch', chatSwitchArgs(entry));
+      }).then(function (result) {
+        result = checkResult(result);
+        delete ageSwitching[thread];
+        ctx.toast((entry.title || 'Chat') + ': Context Switch done, the fresh chat is ready.', 'info');
+        reloadAfterSwitch(entry, result);
+      }, function (err) {
+        delete ageSwitching[thread];
+        schedule();
+        ctx.toast('Context Switch failed: ' + failText(err), 'error');
+      });
+    }
+
+    // "Reload the page" after a switch: desktop JS never reloads or navigates the app window (safety
+    // rule, test_desktop_no_lag), so the sidebar reloads instead: fresh ages, a new sidebar pass, and a
+    // Main/private chat opens its fresh chat through Notion's own sidebar row. Coworker chats are never
+    // opened in the app.
+    function reloadAfterSwitch(entry, result) {
+      agesFetchedAt = 0;
+      refreshChatAges();
+      schedule();
+      var key = chatAgeKey(result && result.thread_id);
+      if (key && entry.purpose !== 'worker') openChat(key, (result && result.url) || '');
     }
 
     // ---- Named chats: own New chat dialog, Chats section, gear menu ------------------------
@@ -1817,6 +2029,7 @@
         applyCoworkers(state, root);
         collapseEmpty(root);
       } catch (e) { /* branding is cosmetic; never break the filter or the New chat routing */ }
+      try { applyChatAges(sidebarRoot()); } catch (e) { /* I50 age chips are cosmetic */ }
       try { applyPendingOpen(); } catch (e) { pendingOpen = null; }
       try { applyChatScroll(); } catch (e) { pendingScroll = null; }
       try { applyRenderSkip(); } catch (e) { /* performance only */ }
@@ -1837,6 +2050,7 @@
       attributeFilter: ['aria-selected', 'aria-current', 'href'] });
     unsub = ctx.onState(function () { schedule(); });
     run();
+    refreshChatAges();  // I50: chat ages once on load ...
     // Permanent sidebar check (bug 2026-10-22, after a PC restart the Mains list stayed empty):
     // Notion can load its chat list late without a mutation we react to. Every 5 s, if the harness
     // is online but no chat row is marked yet, re-apply the sidebar. Cheap: one querySelector.
@@ -1845,6 +2059,8 @@
       try {
         var st = typeof ctx.getState === 'function' ? ctx.getState() : null;
         if (!online(st)) return;
+        // ... and every CHAT_AGE_REFRESH_MS (60 s) on this one timer (no second interval).
+        if (Date.now() - agesFetchedAt >= CHAT_AGE_REFRESH_MS) refreshChatAges();
         var root = sidebarRoot();
         if (!root || !root.querySelector('[data-nt-desk="chat-row"]')) schedule();
       } catch (e) { /* never break the page */ }

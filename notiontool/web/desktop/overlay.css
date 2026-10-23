@@ -161,9 +161,46 @@ html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
 .nt-desk-model { background: rgba(34, 211, 238, .18); color: #a5f3fc; }
 .nt-desk-ailimit { white-space: nowrap; overflow: visible; margin-left: auto; background: rgba(34, 197, 94, .18); color: #bbf7d0; }
 .nt-desk-ailimit-low { background: rgba(239, 68, 68, .25); color: #fecaca; }
-.nt-desk-age-ok { background: rgba(255, 255, 255, .1); color: #d6dbea; }
-.nt-desk-age-amber { background: #f59e0b; color: #0b0d12; }
-.nt-desk-age-red { background: #ef4444; color: #ffffff; }
+/* I50 chat age tokens (design spec): one muted grey, orange from warn_h (20 h), red from limit_h (23 h). */
+:root {
+  --nt-age-ok-bg: rgba(255, 255, 255, .06);
+  --nt-age-ok-fg: #8a90a2;
+  --nt-age-warn-bg: rgba(249, 115, 22, .16);
+  --nt-age-warn-border: rgba(249, 115, 22, .45);
+  --nt-age-warn-fg: #fb923c;
+  --nt-age-lock-bg: #dc2626;
+  --nt-age-lock-fg: #ffffff;
+  --nt-age-lock-soft: rgba(220, 38, 38, .12);
+  --nt-age-lock-line: rgba(248, 113, 113, .45);
+  --nt-age-lock-text: #f87171;
+  --nt-age-lock-text-strong: #fecaca;
+}
+.nt-desk-age-ok { background: var(--nt-age-ok-bg, rgba(255, 255, 255, .06)); color: var(--nt-age-ok-fg, #8a90a2); }
+.nt-desk-age-amber { background: var(--nt-age-warn-bg, rgba(249, 115, 22, .16)); color: var(--nt-age-warn-fg, #fb923c);
+  box-shadow: inset 0 0 0 1px var(--nt-age-warn-border, rgba(249, 115, 22, .45)); }
+.nt-desk-age-red { background: var(--nt-age-lock-bg, #dc2626); color: var(--nt-age-lock-fg, #ffffff); }
+/* I50: age chip + Context Switch button on every sidebar chat row (height 18, 4 px grid). */
+.nt-desk-chat-age, .nt-desk-age-switch { flex: 0 0 auto; align-self: center; box-sizing: border-box; height: 18px;
+  padding: 0 6px; border-radius: 999px; font: 600 10px/18px var(--nt-font, inherit); font-variant-numeric: tabular-nums;
+  white-space: nowrap; }
+.nt-desk-chat-age { margin: 0 4px 0 auto; min-width: 28px; text-align: center; }
+.nt-desk-chat-age-ok { background: var(--nt-age-ok-bg, rgba(255, 255, 255, .06)); color: var(--nt-age-ok-fg, #8a90a2); }
+.nt-desk-chat-age-warn { background: var(--nt-age-warn-bg, rgba(249, 115, 22, .16)); color: var(--nt-age-warn-fg, #fb923c);
+  box-shadow: inset 0 0 0 1px var(--nt-age-warn-border, rgba(249, 115, 22, .45)); }
+.nt-desk-chat-age-locked { background: var(--nt-age-lock-bg, #dc2626); color: var(--nt-age-lock-fg, #ffffff); }
+.nt-desk-chat-age-switching { background: var(--nt-age-ok-bg, rgba(255, 255, 255, .06)); color: var(--nt-age-ok-fg, #8a90a2); }
+.nt-desk-age-switch { margin: 0 4px 0 0; border: 0; cursor: pointer; background: rgba(124, 92, 255, .16); color: #d9d0ff; }
+.nt-desk-age-switch:hover { background: rgba(124, 92, 255, .28); }
+.nt-desk-age-switch:focus-visible { outline: none; box-shadow: var(--nt-focus, 0 0 0 2px #12151d, 0 0 0 4px #7c5cff); }
+.nt-desk-age-switch:disabled { cursor: default; opacity: .55; }
+.nt-desk-age-switch-warn { background: var(--nt-age-warn-bg, rgba(249, 115, 22, .16)); color: var(--nt-age-warn-fg, #fb923c); }
+.nt-desk-age-switch-locked { background: var(--nt-age-lock-soft, rgba(220, 38, 38, .12)); color: var(--nt-age-lock-text-strong, #fecaca);
+  box-shadow: inset 0 0 0 1px var(--nt-age-lock-line, rgba(248, 113, 113, .45)); }
+/* Row highlight: orange when the chat nears the limit, red when sending is locked. */
+[data-nt-age-level="warn"] { box-shadow: inset 2px 0 0 var(--nt-age-warn-fg, #fb923c); }
+[data-nt-age-level="locked"] { box-shadow: inset 2px 0 0 var(--nt-age-lock-bg, #dc2626);
+  background-color: var(--nt-age-lock-soft, rgba(220, 38, 38, .12)); }
+.nt-desk-chat[data-nt-desk-thread] .nt-desk-chat-age { margin: 0 8px 0 auto; }
 .nt-desk-age-rotating { box-shadow: 0 0 0 1px rgba(255, 255, 255, .55); }
 .nt-desk-coworker-created { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #8f9ab8; }
 .nt-desk-row-age { flex: 0 0 auto; align-self: center; margin: 0 6px 0 auto; padding: 0 6px; font-size: 10px; line-height: 16px; border-radius: 999px; }
