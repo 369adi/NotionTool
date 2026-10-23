@@ -30,10 +30,17 @@ def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str)
 
 
+TOKEN_DIVISOR = 3.0
+
+
 def estimate_tokens(value):
-    """ceil(utf8 bytes / 3) of a string, or of the canonical JSON of any other value."""
+    """The one token estimate (rank 9, step 1): ceil(utf8 bytes / 3) of a string, or of the canonical JSON of any other value.
+
+    chat_context.py and bench/context_switch.py import this function instead of keeping their own copy. It lives here
+    because this module must stay stdlib-only (ModuleSafetyTests) and so cannot import chat_context.
+    """
     text = value if isinstance(value, str) else canonical_json(value)
-    return math.ceil(len(text.encode('utf-8')) / 3)
+    return math.ceil(len(text.encode('utf-8')) / TOKEN_DIVISOR)
 
 
 def record_size(record):

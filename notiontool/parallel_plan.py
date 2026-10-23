@@ -226,6 +226,7 @@ DELEGATION = {
     'cw_slowdown': 1.15,    # a coworker re-reads context; assumed until the heavy bench measures it
     'min_save_s': 30.0,     # delegate only when it saves at least this much ...
     'min_save_ratio': 0.2,  # ... and at least 20 % of the solo time
+    'est_factor': 1.0,      # multiplies every est_s; 1.0 until est_factor() proves it shrinks the error (rank 10)
 }
 
 
@@ -239,7 +240,7 @@ def delegation_decision(parts, free_young=10, stats=None):
     st = dict(DELEGATION)
     st.update({k: v for k, v in (stats or {}).items() if k in DELEGATION and v is not None})
     parts = [p for p in (parts or []) if isinstance(p, dict)]
-    est = [float(p.get('est_s') or 0) for p in parts]
+    est = [float(p.get('est_s') or 0) * float(st['est_factor']) for p in parts]
     solo = sum(est)
     if len(parts) < 2 or free_young < 2:
         return dict(delegate=False, count=0, solo_s=round(solo, 1), parallel_s=None, saved_s=0.0,
@@ -303,3 +304,95 @@ def choose_coworkers(tasks, free_coworkers, stats=None):
     else:
         reason = '%d, bound by %s; limits: %s; expected %.0f s' % (count, ' and '.join(binding), parts, times[count])
     return count, reason + excluded
+
+
+# ---------------------------------------------------------------- est_s versus real seconds (rank 10)
+# Pure helpers, no I/O. The server keeps one record of kind PLAN_PART_KIND per plan part: plan_part_records() when
+# /api/operator/plan answers, finish_plan_part() when the task ends, prune_plan_parts() to cap the table, and
+# ratio_report() for the median and 90th percentile of real/est per role. The factor stays read-only:
+# delegation_decision() only uses stats['est_factor'] (default 1.0), and est_factor_gain() says whether it helps.
+PLAN_PART_KIND = 'plan_part'
+PLAN_PART_CAP = 500
+
+
+def _num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def plan_part_records(plan_id, parts, now=None, role=None):
+    """One record per plan part: id '<plan_id>:<part_id>', plan_id, part_id, role, est_s, created, real_s=None."""
+    out = []
+    for n, p in enumerate(p for p in (parts or []) if isinstance(p, dict)):
+        part_id = str(p['id']) if p.get('id') not in (None, '') else str(n)
+        est = p.get('est_s')
+        out.append(dict(id='%s:%s' % (plan_id, part_id), plan_id=str(plan_id), part_id=part_id,
+                        role=str(p.get('role') or role or 'unknown'),
+                        est_s=float(est) if _num(est) and est >= 0 else None, created=now, real_s=None))
+    return out
+
+
+def finish_plan_part(record, real_s):
+    """Copy of record with the real busy seconds; an invalid or negative real_s leaves it unchanged."""
+    rec = dict(record or {})
+    if _num(real_s) and real_s >= 0:
+        rec['real_s'] = float(real_s)
+    return rec
+
+
+def prune_plan_parts(records, cap=PLAN_PART_CAP):
+    """Ids of the oldest records beyond cap (by created, then id), so the objects table cannot grow without bound."""
+    rows = [r for r in (records or ()) if isinstance(r, dict) and r.get('id') is not None]
+    excess = len(rows) - max(0, int(cap))
+    if excess <= 0:
+        return []
+    rows.sort(key=lambda r: (float(r['created']) if _num(r.get('created')) else 0.0, str(r['id'])))
+    return [r['id'] for r in rows[:excess]]
+
+
+def _usable_parts(records):
+    return [r for r in (records or ()) if isinstance(r, dict) and _num(r.get('est_s')) and _num(r.get('real_s'))
+            and r['est_s'] > 0 and r['real_s'] > 0]
+
+
+def _percentile(values, q):
+    vs = sorted(values)
+    return vs[max(0, min(len(vs) - 1, int(-(-q * len(vs) // 1)) - 1))]  # nearest rank
+
+
+def ratio_report(records):
+    """{role: dict(n, median, p90)} of real_s / est_s, plus the key 'all'. Only parts with both numbers count."""
+    from statistics import median
+    by_role = {}
+    usable = _usable_parts(records)
+    for r in usable:
+        by_role.setdefault(str(r.get('role') or 'unknown'), []).append(r['real_s'] / r['est_s'])
+    by_role['all'] = [r['real_s'] / r['est_s'] for r in usable]
+    return {role: dict(n=len(v), median=round(float(median(v)), 3), p90=round(float(_percentile(v, 0.9)), 3))
+            for role, v in by_role.items() if v}
+
+
+def est_factor(records, min_n=20):
+    """Median real/est of the usable records, or 1.0 with fewer than min_n of them."""
+    from statistics import median
+    ratios = [r['real_s'] / r['est_s'] for r in _usable_parts(records)]
+    return float(median(ratios)) if len(ratios) >= max(1, int(min_n)) else 1.0
+
+
+def est_factor_gain(records, min_n=20):
+    """Leave-one-out check per role: median relative error of est_s versus est_s * factor, against real_s.
+
+    Returns dict(n, error_plain, error_factor, shrinks). Feed the factor to delegation_decision only when shrinks.
+    """
+    from statistics import median
+    usable = _usable_parts(records)
+    plain, scaled = [], []
+    for i, r in enumerate(usable):
+        role = r.get('role')
+        others = [o for j, o in enumerate(usable) if j != i and o.get('role') == role]
+        factor = est_factor(others, min_n)
+        plain.append(abs(r['est_s'] - r['real_s']) / r['real_s'])
+        scaled.append(abs(r['est_s'] * factor - r['real_s']) / r['real_s'])
+    if not usable:
+        return dict(n=0, error_plain=None, error_factor=None, shrinks=False)
+    ep, ef = float(median(plain)), float(median(scaled))
+    return dict(n=len(usable), error_plain=round(ep, 4), error_factor=round(ef, 4), shrinks=ef < ep)

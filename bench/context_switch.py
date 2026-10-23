@@ -77,10 +77,8 @@ def connect_ro(path):
     return sqlite3.connect(uri, uri=True)
 
 
-def estimate_tokens(value):
-    """Same rule as notiontool/chat_context.py:13-15."""
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    return math.ceil(len(text.encode('utf-8')) / 3)
+# The one token estimate (rank 9, step 1): imported, not copied. ceil(utf-8 bytes / 3).
+from notiontool.context_archive import estimate_tokens  # noqa: E402,F401
 
 
 def num(value):

@@ -10,9 +10,69 @@ from .store import uid
 from .agent_guard import GUARD_RULE, COWORKER_RULE
 
 
-def estimate_tokens(value):
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    return math.ceil(len(text.encode('utf-8')) / 3)
+# The one token estimate is defined in context_archive.py (stdlib-only, so no import cycle); re-exported here.
+from .context_archive import TOKEN_DIVISOR, canonical_json, estimate_tokens  # noqa: E402,F401
+
+CONTENT_KINDS = ('code', 'prose', 'json')
+
+
+def _text_of(value):
+    return value if isinstance(value, str) else canonical_json(value)
+
+
+# Calibration helpers (rank 9, steps 2-3). Pure and not wired in: estimate_tokens above stays the rule in use.
+# They need (text, real token count) pairs; notiontool does not store real counts yet (see the result note).
+
+def content_kind(value):
+    """'json' for parseable JSON text or any non-string value, 'code' for symbol-heavy text, else 'prose'."""
+    if not isinstance(value, str):
+        return 'json'
+    text = value.strip()
+    if text[:1] in ('{', '['):
+        try:
+            json.loads(text)
+            return 'json'
+        except ValueError:
+            pass
+    symbols = sum(1 for ch in text if ch in '{}[]()<>;=_#/\\|*&$')
+    return 'code' if text and symbols / len(text) >= 0.06 else 'prose'
+
+
+def fit_divisors(samples, min_samples=30):
+    """Fit bytes-per-token per content kind from (value, real_tokens) pairs.
+
+    A kind with fewer than min_samples usable pairs keeps TOKEN_DIVISOR.
+    Returns dict(divisors={kind: float}, counts={kind: int}, fitted=[kind, ...]).
+    """
+    from statistics import median
+    ratios = {k: [] for k in CONTENT_KINDS}
+    for value, real in samples or ():
+        if isinstance(real, bool) or not isinstance(real, (int, float)) or real <= 0:
+            continue
+        size = len(_text_of(value).encode('utf-8'))
+        if size:
+            ratios[content_kind(value)].append(size / float(real))
+    divisors = {k: TOKEN_DIVISOR for k in CONTENT_KINDS}
+    fitted = []
+    for kind, rs in ratios.items():
+        if len(rs) >= max(1, int(min_samples)):
+            divisors[kind] = round(float(median(rs)), 3)
+            fitted.append(kind)
+    return dict(divisors=divisors, counts={k: len(v) for k, v in ratios.items()}, fitted=fitted)
+
+
+def calibrated_tokens(value, divisors=None):
+    """estimate_tokens with a per-kind divisor; without divisors it equals estimate_tokens."""
+    divisor = float((divisors or {}).get(content_kind(value)) or TOKEN_DIVISOR)
+    return math.ceil(len(_text_of(value).encode('utf-8')) / divisor)
+
+
+def calibration_error(samples, divisors=None):
+    """Median |estimate - real| / real over (value, real_tokens) pairs, or None without usable pairs."""
+    from statistics import median
+    errs = [abs(calibrated_tokens(v, divisors) - r) / float(r) for v, r in (samples or ())
+            if isinstance(r, (int, float)) and not isinstance(r, bool) and r > 0]
+    return float(median(errs)) if errs else None
 
 
 def excerpt(text, cap):

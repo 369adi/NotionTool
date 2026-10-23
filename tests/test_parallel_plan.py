@@ -4,8 +4,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from notiontool.parallel_plan import (budget_limit, choose_coworkers, expected_wall_time, independent_parts,  # noqa: E402
-                                      levels, young_coworkers)
+from notiontool.parallel_plan import (PLAN_PART_CAP, PLAN_PART_KIND, budget_limit, choose_coworkers,  # noqa: E402
+                                      delegation_decision, est_factor, est_factor_gain, expected_wall_time,
+                                      finish_plan_part, independent_parts, levels, plan_part_records,
+                                      prune_plan_parts, ratio_report, young_coworkers)
 
 
 def indep(n, files=None):
@@ -116,6 +118,74 @@ class TestParallelPlan(unittest.TestCase):
         self.assertEqual(expected_wall_time(tasks, 1, stats), 280)
         # unknown task time uses the 163 s bench default
         self.assertEqual(expected_wall_time([dict(id='x')], 1, dict(overhead_s=0)), 163)
+
+
+def done_parts(role, pairs):
+    out = []
+    for n, (est, real) in enumerate(pairs):
+        rec = plan_part_records('p%s%d' % (role, n), [dict(id='a', est_s=est)], now=n, role=role)[0]
+        out.append(finish_plan_part(rec, real))
+    return out
+
+
+class TestEstVersusReal(unittest.TestCase):
+    def test_records_per_part(self):
+        parts = [dict(id='a', est_s=60, role='coder'), dict(est_s=None), 'junk', dict(id='c', est_s=-5)]
+        recs = plan_part_records('plan1', parts, now=7.0, role='fallback')
+        self.assertEqual([r['id'] for r in recs], ['plan1:a', 'plan1:1', 'plan1:c'])
+        self.assertEqual([r['role'] for r in recs], ['coder', 'fallback', 'fallback'])
+        self.assertEqual([r['est_s'] for r in recs], [60.0, None, None])
+        self.assertTrue(all(r['plan_id'] == 'plan1' and r['real_s'] is None and r['created'] == 7.0 for r in recs))
+        self.assertEqual(plan_part_records('x', None), [])
+        self.assertEqual(PLAN_PART_KIND, 'plan_part')
+
+    def test_finish_stores_real_seconds_without_mutating(self):
+        rec = plan_part_records('p', [dict(id='a', est_s=10)])[0]
+        self.assertEqual(finish_plan_part(rec, 25)['real_s'], 25.0)
+        self.assertIsNone(rec['real_s'])
+        for bad in (None, -1, True, 'x'):
+            self.assertIsNone(finish_plan_part(rec, bad)['real_s'])
+
+    def test_report_median_and_p90_per_role(self):
+        recs = done_parts('coder', [(10, 10 * r) for r in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)])
+        recs += done_parts('review', [(100, 50), (100, 150)])
+        recs += done_parts('review', [(0, 5), (None, 5), (10, None)])  # unusable: ignored
+        rep = ratio_report(recs)
+        self.assertEqual(rep['coder'], dict(n=10, median=5.5, p90=9.0))
+        self.assertEqual(rep['review'], dict(n=2, median=1.0, p90=1.5))
+        self.assertEqual(rep['all']['n'], 12)
+        self.assertEqual(ratio_report([]), {})
+
+    def test_factor_needs_enough_data_and_is_median(self):
+        recs = done_parts('coder', [(10, 20)] * 19)
+        self.assertEqual(est_factor(recs), 1.0)
+        self.assertEqual(est_factor(recs + done_parts('coder', [(10, 20)])), 2.0)
+        self.assertEqual(est_factor(recs, min_n=5), 2.0)
+
+    def test_gain_shrinks_only_when_estimates_are_biased(self):
+        biased = done_parts('coder', [(10, 20 + i % 3) for i in range(30)])  # real is about twice est_s
+        gain = est_factor_gain(biased)
+        self.assertEqual(gain['n'], 30)
+        self.assertTrue(gain['shrinks'])
+        self.assertLess(gain['error_factor'], gain['error_plain'])
+        exact = done_parts('coder', [(10, 10)] * 30)
+        self.assertFalse(est_factor_gain(exact)['shrinks'])
+        self.assertEqual(est_factor_gain([]), dict(n=0, error_plain=None, error_factor=None, shrinks=False))
+
+    def test_prune_keeps_the_newest(self):
+        recs = done_parts('coder', [(1, 1)] * 5)
+        self.assertEqual(prune_plan_parts(recs, cap=5), [])
+        self.assertEqual(prune_plan_parts(recs, cap=3), ['pcoder0', 'pcoder1'] and [recs[0]['id'], recs[1]['id']])
+        self.assertEqual(len(prune_plan_parts(recs, cap=0)), 5)
+        self.assertGreaterEqual(PLAN_PART_CAP, 100)
+
+    def test_delegation_factor_is_off_by_default_and_opt_in(self):
+        parts = [dict(id='a', est_s=120), dict(id='b', est_s=120)]
+        base = delegation_decision(parts, 10)
+        self.assertEqual(delegation_decision(parts, 10, dict(est_factor=1.0)), base)
+        self.assertEqual(delegation_decision(parts, 10, dict(est_factor=None)), base)
+        doubled = delegation_decision(parts, 10, dict(est_factor=2.0))
+        self.assertEqual(doubled['solo_s'], 2 * base['solo_s'])
 
 
 # ---------------------------------------------------------------- backtest (not a unit test)
