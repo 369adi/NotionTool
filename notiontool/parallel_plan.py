@@ -311,8 +311,11 @@ def choose_coworkers(tasks, free_coworkers, stats=None):
 # /api/operator/plan answers, finish_plan_part() when the task ends, prune_plan_parts() to cap the table, and
 # ratio_report() for the median and 90th percentile of real/est per role. The factor stays read-only:
 # delegation_decision() only uses stats['est_factor'] (default 1.0), and est_factor_gain() says whether it helps.
+# TODO(rank 10): the factor is only MEASURED here (plan_report / ratio_report). It is deliberately NOT applied:
+# delegation_decision keeps est_factor=1.0, and server.py strips est_factor from request stats (without_factor).
+# Feed it to delegation_decision only after est_factor_gain() says shrinks=True over >= 20 finished parts per role.
 PLAN_PART_KIND = 'plan_part'
-PLAN_PART_CAP = 500
+PLAN_PART_CAP = 2000  # at most this many records; record_plan() prunes the oldest beyond it
 
 
 def _num(value):
@@ -396,3 +399,75 @@ def est_factor_gain(records, min_n=20):
         return dict(n=0, error_plain=None, error_factor=None, shrinks=False)
     ep, ef = float(median(plain)), float(median(scaled))
     return dict(n=len(usable), error_plain=round(ep, 4), error_factor=round(ef, 4), shrinks=ef < ep)
+
+
+# Store glue: one object per plan part (kind PLAN_PART_KIND in the objects table), never event() rows.
+def new_plan_id():
+    import uuid
+    return 'pl' + uuid.uuid4().hex[:12]
+
+
+def without_factor(stats):
+    """stats without est_factor: the factor is measured only, a request can never switch it on (see TODO above)."""
+    if not isinstance(stats, dict):
+        return stats
+    return {k: v for k, v in stats.items() if k != 'est_factor'}
+
+
+def record_plan(store, plan_id, parts, now=None, role=None, cap=PLAN_PART_CAP):
+    """Save plan id, part id, role and est_s of every part, then prune the oldest records beyond cap.
+
+    Returns the record ids. real_s stays None until finish_task_part() fills it.
+    """
+    import time
+    recs = plan_part_records(plan_id, parts, time.time() if now is None else now, role)
+    if not recs:
+        return []
+    store.batch([(PLAN_PART_KIND, r) for r in recs])
+    old = prune_plan_parts(store.all(PLAN_PART_KIND), cap)
+    if old:
+        store.batch([], deletes=[(PLAN_PART_KIND, i) for i in old])
+    return [r['id'] for r in recs]
+
+
+def finish_task_part(store, task, now=None):
+    """A delegated task ended 'done': store its real seconds on the record task['plan_part'] (set by delegate).
+
+    Real seconds = finished - started (created when it never started). Never raises; returns the record or None.
+    """
+    try:
+        pid = task.get('plan_part')
+        if not pid or task.get('state') != 'done':
+            return None
+        rec = store.get(PLAN_PART_KIND, pid)
+        if not rec or rec.get('real_s') is not None:
+            return None
+        begun = task.get('started') or task.get('created')
+        end = task.get('finished') or now
+        if not (_num(begun) and _num(end)):
+            return None
+        done = finish_plan_part(rec, end - begun)
+        if done.get('real_s') is None:
+            return None
+        spec = str(task.get('specialty') or '')
+        if done.get('role') == 'unknown' and spec and spec != 'executor':
+            done['role'] = spec
+        store.put(PLAN_PART_KIND, done)
+        return done
+    except Exception:  # noqa: BLE001 - measuring must never break a task
+        return None
+
+
+def plan_report(store, gain=False):
+    """Median and p90 of real/est per role over the stored records (GET /api/operator/plan_report).
+
+    Measured only: applied_factor is what delegation_decision uses (always 1.0 here); gain=True adds the
+    leave-one-out check est_factor_gain().
+    """
+    recs = store.all(PLAN_PART_KIND)
+    out = dict(kind=PLAN_PART_KIND, cap=PLAN_PART_CAP, records=len(recs), measured=len(_usable_parts(recs)),
+               roles=ratio_report(recs), suggested_factor=round(est_factor(recs), 3),
+               applied_factor=DELEGATION['est_factor'])
+    if gain:
+        out['gain'] = est_factor_gain(recs)
+    return out

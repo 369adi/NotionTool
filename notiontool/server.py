@@ -273,6 +273,9 @@ class Application:
                         if method=='GET' and (path=='/api/notes' or path.startswith('/api/notes/')):
                             from .notes_routes import http_route as notes_http_route
                             return self.response(*notes_http_route(app,path,query))
+                        if method=='GET' and path=='/api/operator/plan_report':
+                            from .parallel_plan import plan_report  # rank 10: median and p90 of real/est per role (measured only)
+                            return self.response(200,plan_report(app.store,query.get('gain',[''])[0] in ('1','true','yes')))
                         if method=='GET' and path=='/api/history/search':
                             from . import templates  # Live History search over all runs and tasks, limit 50
                             return self.response(200,templates.http_search(app,query))
@@ -1119,22 +1122,39 @@ class Application:
                 return register_operator(self.store, str(body.get('worker_id') or ''), str(body.get('project_path') or ''))
             if path=='/api/operator/plan':
                 # Ask before delegating: does calling Coworkers save time for these parts (measured costs)?
-                from .parallel_plan import delegation_decision
+                from .parallel_plan import delegation_decision, new_plan_id, record_plan, without_factor
                 from .coworker_age_guard import young
                 free = [w for w in self.store.all('workers') if w.get('purpose') == 'worker' and w.get('enabled')]
-                return delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), body.get('stats'))
+                # without_factor: est_factor is measured (GET /api/operator/plan_report), never applied from a request.
+                decision = delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), without_factor(body.get('stats')))
+                # Rank 10: keep est_s per part (objects table, kind plan_part) to compare it with the real seconds later.
+                plan_id = new_plan_id()
+                try:
+                    record_plan(self.store, plan_id, body.get('parts'), time.time())
+                    decision = dict(decision, plan_id=plan_id)  # pass plan_id to /api/operator/delegate to link the tasks
+                except Exception as exc:  # noqa: BLE001 - measuring must never break the answer
+                    self.store.event('plan_record_failed', message=str(exc)[:200])
+                return decision
             if path=='/api/operator/delegate':
                 from .operator_main import delegate
                 decision = None
+                plan_id = str(body.get('plan_id') or '')[:60]
                 if body.get('parts'):
                     # Small work is faster solo (bench: 30 s alone vs ~60 s fixed cost per coworker).
-                    from .parallel_plan import delegation_decision
+                    from .parallel_plan import delegation_decision, new_plan_id, record_plan, without_factor
                     from .coworker_age_guard import young
                     free = [w for w in self.store.all('workers') if w.get('purpose') == 'worker' and w.get('enabled')]
-                    decision = delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), body.get('stats'))
+                    decision = delegation_decision(body.get('parts'), len(young(self.store, free, time.time())), without_factor(body.get('stats')))
                     if not decision['delegate'] and not body.get('force'):
                         raise ValueError('Do it yourself: ' + decision['reason'] + '. Nothing was delegated; send force=true to delegate anyway.')
-                result = delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''), quality=str(body.get('quality') or ''))
+                    if not plan_id:
+                        # No earlier /api/operator/plan call: record the parts now so est_s is still measured.
+                        plan_id = new_plan_id()
+                        try:
+                            record_plan(self.store, plan_id, body.get('parts'), time.time())
+                        except Exception as exc:  # noqa: BLE001
+                            self.store.event('plan_record_failed', message=str(exc)[:200])
+                result = delegate(self.engine, str(body.get('chat_id') or ''), body.get('goal', ''), body.get('tasks'), str(body.get('request_id') or ''), summary=body.get('summary', ''), quality=str(body.get('quality') or ''), plan_id=plan_id)
                 if decision is not None and isinstance(result, dict):
                     result['delegation'] = decision
                 return result
