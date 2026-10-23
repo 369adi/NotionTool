@@ -27,6 +27,14 @@ PLAN_RULE = ('Main chats: before delegating work with 2 or more parts, POST /api
 RESTART_NOTE = ('If a NotionTool tool call fails because NotionTool is restarting or the MCP connection is briefly gone, '
                 'that is only a restart of about 10-60 s: wait briefly, check whether the call took effect, then continue your task. '
                 'Do not stop or give up because of it.')
+# Karpathy guidelines (github.com/multica-ai/andrej-karpathy-skills, MIT; full text: skills/karpathy-guidelines/SKILL.md).
+# Sent with every prompt; prompt_once keeps it to the first prompt of a chat.
+KARPATHY_RULE = ('Work rules (Karpathy guidelines): 1) Think first: state your assumptions, name unclear points and '
+                 'tradeoffs, never pick an interpretation silently; if something blocks you, report it instead of guessing. '
+                 '2) Simplicity: the minimum code that solves the task, no speculative features, options or abstractions. '
+                 '3) Surgical changes: touch only what the task needs, match the existing style, remove only what your '
+                 'own change made unused. 4) Goal-driven: turn the task into checks (e.g. a test that reproduces the bug, '
+                 'then make it pass) and loop until they are verified.')
 
 EVENT = 'forbidden_agent_action'
 PROBLEM_TITLE = 'A chat tried to create a Notion agent instead of using coworkers'
@@ -44,7 +52,7 @@ _NEST_KEYS = ('args', 'arguments', 'toolArguments', 'input', 'parameters', 'para
 def with_rule(text, coworker=False):
     """text plus GUARD_RULE (and COWORKER_RULE for Coworker prompts), each added only once."""
     text = str(text or '').rstrip()
-    for rule in (GUARD_RULE, COWORKER_RULE if coworker else '', RESTART_NOTE if coworker else ''):
+    for rule in (GUARD_RULE, COWORKER_RULE if coworker else '', RESTART_NOTE if coworker else '', KARPATHY_RULE):
         if rule and rule not in text:
             text = (text + '\n' + rule) if text else rule
     return text

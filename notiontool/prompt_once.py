@@ -7,7 +7,7 @@ short note. worker['prompt_sent'] = {thread, base, hashes} records what this cha
 """
 import hashlib
 
-from .agent_guard import GUARD_RULE, COWORKER_RULE
+from .agent_guard import GUARD_RULE, COWORKER_RULE, KARPATHY_RULE
 
 NOTE = 'Rules, project and overall request: as in my earlier messages in this chat (still valid).'
 EXEC_HEAD = 'My overall request (for context; other parts are handled separately):\n'
@@ -27,7 +27,7 @@ def _blocks(run):
     memory = str(run.get('context') or '')
     if memory.strip():
         found.append('\nFor reference, our completed earlier work:\n' + memory + '\n')
-    found += [GUARD_RULE, COWORKER_RULE]
+    found += [GUARD_RULE, COWORKER_RULE, KARPATHY_RULE]
     try:
         from .plain_protocol import SCREEN_TOOLS_LINE, NOTES_HINT
         found.append(SCREEN_TOOLS_LINE)
