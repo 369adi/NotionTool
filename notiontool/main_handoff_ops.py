@@ -527,6 +527,21 @@ class MainHandoffOps:
         prompt.update(acked=True, acked_at=self.now(), first_task_done=True, switch=True)
         records.append((PROMPTS, prompt))
         self.store.batch(records, deletes)  # the pool Main ledger (team_threads.main) is left alone
+        # Rename the old operator Main thread in Notion so it no longer shows as 'Main'.
+        if old_worker and old_worker['id'] != new_worker['id']:
+            old_tid = old_worker.get('thread_id')
+            if old_tid:
+                try:
+                    import time as _time
+                    from datetime import datetime as _dt
+                    date_str = _dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d')
+                    self.adapter.rename_thread(self._client(), old_tid,
+                                              'Main (Archive %s)' % date_str)
+                    self._event('main_switch_old_renamed', 'Old operator Main renamed to archive',
+                                handoff_id=handoff['id'], thread_id=old_tid)
+                except Exception as exc:
+                    self._event('main_switch_old_rename_failed', str(exc)[:200],
+                                handoff_id=handoff['id'])
         try:
             handoff_files.mark_acked(self.folder(), self.file_id(), self.now())
         except handoff_files.UnknownWorkerError:
