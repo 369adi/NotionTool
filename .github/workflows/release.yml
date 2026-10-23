@@ -26,6 +26,16 @@ jobs:
           "BUILD = ${{ github.run_number }}`nCOMMIT = '${{ github.sha }}'`nREPO = '${{ github.repository }}'`n" | Set-Content -Encoding utf8 notiontool/_build.py
       - name: Build EXE
         run: python -m PyInstaller --noconfirm NotionTool.spec
+      - name: Self-test imports in the built EXE
+        shell: pwsh
+        run: |
+          $report = 'dist/import-check.txt'
+          Remove-Item $report -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath dist/NotionTool.exe -ArgumentList '--self-test-imports', $report -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report }
+          if (-not (Test-Path $report)) { throw 'NotionTool.exe --self-test-imports wrote no report' }
+          if ($p.ExitCode -ne 0) { throw "NotionTool.exe --self-test-imports failed with exit code $($p.ExitCode)" }
+          Remove-Item $report
       - name: Checksum
         shell: pwsh
         run: (Get-FileHash dist/NotionTool.exe -Algorithm SHA256).Hash.ToLower() | Set-Content -NoNewline dist/NotionTool.exe.sha256
