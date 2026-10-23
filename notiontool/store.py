@@ -52,6 +52,34 @@ class Store:
         self.db.execute("CREATE INDEX IF NOT EXISTS event_task ON events(json_extract(doc, '$.task_id'))")
         self.db.commit()
         self.projects = {}
+        self.compact()
+
+    # Free pages above this share are given back to the disk at start (incremental, cheap).
+    COMPACT_FREE_SHARE = 0.2
+
+    def compact(self):
+        """Switch the db to auto_vacuum=INCREMENTAL once (needs one full VACUUM) and return free pages.
+
+        Runs at start, before any worker thread uses the db. Never raises: a busy or read-only db
+        simply stays as it is.
+        """
+        try:
+            with self.lock:
+                mode = self.db.execute('PRAGMA auto_vacuum').fetchone()[0]
+                if mode != 2:
+                    self.db.execute('PRAGMA auto_vacuum=INCREMENTAL')
+                    self.db.execute('VACUUM')  # only once: afterwards the mode is stored in the file
+                    return 'vacuum'
+                pages = self.db.execute('PRAGMA page_count').fetchone()[0]
+                free = self.db.execute('PRAGMA freelist_count').fetchone()[0]
+                if pages and free / pages > self.COMPACT_FREE_SHARE:
+                    # every result row frees one page: without fetchall only the first page is freed
+                    self.db.execute('PRAGMA incremental_vacuum').fetchall()
+                    self.db.commit()
+                    return 'incremental'
+        except sqlite3.Error:
+            return 'skipped'
+        return ''
 
     SCHEMA_VERSION = 2
 
