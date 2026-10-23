@@ -275,8 +275,13 @@ def restart_continue(transcript, started):
     key = str(last.get('id') or last.get('sequence') or '')
     if not key:
         return None
-    visible = [e for e in relevant if _role(e) == 'user_message' and not _is_resume(e)]
-    user_text = text_of(visible[-1].get('content', visible[-1].get('text', ''))) if visible else ''
+    visible = [e for e in relevant if _role(e) == 'user_message' and not _is_resume(e)
+               and RESTART_TEXT[:40] not in text_of(e.get('content', e.get('text', '')))]
+    if not visible:
+        # A fresh chat (e.g. 'New Chat' -> Welcome greeting only) has no work to continue: the user never asked
+        # it for anything, so a restart must not push it into the open points of another Main (live 23.10. Main 20).
+        return None
+    user_text = text_of(visible[-1].get('content', visible[-1].get('text', '')))
     return dict(key='restart:' + key, user_text=user_text)
 
 
