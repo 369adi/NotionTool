@@ -29,12 +29,16 @@ RESTART_NOTE = ('If a NotionTool tool call fails because NotionTool is restartin
                 'Do not stop or give up because of it.')
 # Karpathy guidelines (github.com/multica-ai/andrej-karpathy-skills, MIT; full text: skills/karpathy-guidelines/SKILL.md).
 # Sent with every prompt; prompt_once keeps it to the first prompt of a chat.
-KARPATHY_RULE = ('Work rules (Karpathy guidelines): 1) Think first: state your assumptions, name unclear points and '
-                 'tradeoffs, never pick an interpretation silently; if something blocks you, report it instead of guessing. '
-                 '2) Simplicity: the minimum code that solves the task, no speculative features, options or abstractions. '
-                 '3) Surgical changes: touch only what the task needs, match the existing style, remove only what your '
-                 'own change made unused. 4) Goal-driven: turn the task into checks (e.g. a test that reproduces the bug, '
-                 'then make it pass) and loop until they are verified.')
+# Only the Main asks the user; a Coworker never waits for answers, it reports blockers in its result.
+_KARPATHY_HEAD = ('Work rules (Karpathy guidelines): 1) Think first: state your assumptions, name unclear points and '
+                  'tradeoffs, never pick an interpretation silently; ')
+_KARPATHY_TAIL = ('2) Simplicity: the minimum code that solves the task, no speculative features, options or abstractions. '
+                  '3) Surgical changes: touch only what the task needs, match the existing style, remove only what your '
+                  'own change made unused. 4) Goal-driven: turn the task into checks (e.g. a test that reproduces the bug, '
+                  'then make it pass) and loop until they are verified.')
+KARPATHY_RULE = _KARPATHY_HEAD + ('do not ask questions or wait for answers; if something blocks you, report it in '
+                                  'your result instead of guessing. ') + _KARPATHY_TAIL
+KARPATHY_MAIN_RULE = _KARPATHY_HEAD + 'if the request is unclear, ask the user before you start. ' + _KARPATHY_TAIL
 
 EVENT = 'forbidden_agent_action'
 PROBLEM_TITLE = 'A chat tried to create a Notion agent instead of using coworkers'
@@ -52,7 +56,8 @@ _NEST_KEYS = ('args', 'arguments', 'toolArguments', 'input', 'parameters', 'para
 def with_rule(text, coworker=False):
     """text plus GUARD_RULE (and COWORKER_RULE for Coworker prompts), each added only once."""
     text = str(text or '').rstrip()
-    for rule in (GUARD_RULE, COWORKER_RULE if coworker else '', RESTART_NOTE if coworker else '', KARPATHY_RULE):
+    for rule in (GUARD_RULE, COWORKER_RULE if coworker else '', RESTART_NOTE if coworker else '',
+                 KARPATHY_RULE if coworker else KARPATHY_MAIN_RULE):
         if rule and rule not in text:
             text = (text + '\n' + rule) if text else rule
     return text
