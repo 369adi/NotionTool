@@ -140,7 +140,7 @@ def test_install_desk_actions_is_idempotent_and_keeps_markers():
 def test_server_route_and_install_crlf():
     data = (PKG / 'server.py').read_bytes()
     assert data.count(b"path=='/api/history/search'") == 1
-    assert data.count(b'templates.install_desk_actions()') == 2
+    assert data.count(b'templates.install_desk_actions()') == 3
     for line in data.split(b'\n'):
         if b'/api/history/search' in line or b'templates.install_desk_actions()' in line or b'templates.http_search' in line:
             assert line.endswith(b'\r')
