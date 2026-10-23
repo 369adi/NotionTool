@@ -243,6 +243,47 @@ def stuck_tasks(tasks, runs_by_id, alerted, checks=STUCK_CHECKS, alive=None):
     return found
 
 
+# Red-main alarm: a merge that waits because main itself is red never finishes on its own.
+RED_KIND = "main_red_alerts"  # store kind; record id = red main commit
+RED_AFTER_S = 300.0  # waiting this long on the same red main commit is reported once
+RED_HEAD = "NotionTool (automatic): Merges blocked - main is red."
+RED_NEXT = ("Next for the Main: run the failing tests on main, fix or update them, commit; the waiting "
+            "merges retry by themselves as soon as main changes.")
+
+
+def red_blocked(tasks, runs_by_id, alerted, now, after=RED_AFTER_S):
+    """{red_commit: [(run, task), ...]} for merges waiting on a red main for at least `after` seconds."""
+    out = {}
+    for task in tasks:
+        red = str(task.get("patch_main_red") or "")
+        if not red or red in alerted or task.get("patch_state") != "waiting":
+            continue
+        result = task.get("patch_result") or {}
+        if now - _num(result.get("at"), now) < after:
+            continue
+        run = runs_by_id.get(task.get("run_id"))
+        if not run or not run.get("operator"):
+            continue
+        out.setdefault(red, []).append((run, task))
+    return out
+
+
+def build_red_message(red_commit, items):
+    lines = [RED_HEAD, "- main " + red_commit[:10] + " fails its own tests; " + str(len(items)) + " merge(s) wait:"]
+    failing = []
+    for run, task in items[:5]:
+        lines.append("  - " + str(task.get("id")) + " (" + _one_line(task.get("title") or "")[:60] + ")")
+        for name in (task.get("patch_result") or {}).get("failing") or []:
+            if name not in failing:
+                failing.append(name)
+    if len(items) > 5:
+        lines.append("  - and " + str(len(items) - 5) + " more")
+    if failing:
+        lines.append("- failing: " + ", ".join(str(n) for n in failing[:5]))
+    lines.append(RED_NEXT)
+    return "\n".join(lines)
+
+
 def build_stuck_message(items):
     lines = [STUCK_HEAD]
     for run, task in items[:WAKE_MAX_RUNS]:
@@ -400,6 +441,10 @@ class MainWake:
             self.stuck_tick(now)
         except Exception as exc:
             self._failed("stuck", exc)
+        try:
+            self.red_tick(now)
+        except Exception as exc:
+            self._failed("red", exc)
         groups = {}
         for run, tasks in self.finished():
             if self.store.get(WAKE_KIND, self.record_id(run)):
@@ -497,6 +542,34 @@ class MainWake:
             ids = [t["id"] for _, t in group]
             self._event("stuck_alert_sent", ", ".join(ids), task_ids=ids, account_id=account)
             sent.extend(ids)
+        return sent
+
+    def red_tick(self, now):
+        """Report each red main commit that blocks merges once to the Main chat; returns the commits sent."""
+        alerted = {r.get("id") for r in self.store.all(RED_KIND)}
+        runs = {r.get("id"): r for r in self.store.all("runs")}
+        sent = []
+        for red, items in red_blocked(self.store.all("tasks"), runs, alerted, now).items():
+            account, thread = self.thread_of(items[0][0])
+            if not thread or now - self.last_sent.get(thread, -MIN_GAP_S) < MIN_GAP_S:
+                continue
+            try:
+                client = self.adapter.client(account)
+                if self.chat_busy(client.transcript(thread, limit=BUSY_WINDOW) or {}):
+                    continue  # delivered as soon as the Main chat is idle
+            except Exception as exc:
+                self._failed(thread, exc)
+                continue
+            # recorded before sending: never a second alarm for the same red commit
+            self.store.put(RED_KIND, dict(id=red, thread_id=thread, at=now, task_ids=[t["id"] for _, t in items]))
+            self.last_sent[thread] = now
+            try:
+                self._send(client, thread, build_red_message(red, items))
+            except Exception as exc:
+                self._failed(thread, exc)
+                continue
+            self._event("main_red_alert_sent", red, main_commit=red, account_id=account)
+            sent.append(red)
         return sent
 
     def _failed(self, thread, exc):
