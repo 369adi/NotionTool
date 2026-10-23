@@ -2,6 +2,7 @@
 
 No Notion, no harness: the coworker is simulated by editing files in its worktree.
 """
+import importlib.util
 import os
 import shutil
 import stat
@@ -13,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 
-from notiontool import patch_mode
+from notiontool import patch_mode, worker_gc
 
 GIT = shutil.which('git')
 
@@ -391,6 +392,226 @@ class PatchModeHelpersTest(unittest.TestCase):
         self.assertIsNone(patch_mode._secret_kind('def add(a, b): return a + b'))
         self.assertTrue(patch_mode.FORBIDDEN_PATH.search('data/notion.db'))
         self.assertFalse(patch_mode.FORBIDDEN_PATH.search('notiontool/patch_mode.py'))
+
+
+RUFF = importlib.util.find_spec('ruff') is not None
+
+
+def git_config(cwd, key):
+    proc = subprocess.run(['git', 'config', '--get', key], cwd=str(cwd), capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+@unittest.skipUnless(GIT, 'git is not installed; patch mode needs a real git')
+class PatchModeHardeningTest(unittest.TestCase):
+    """Rank 1 (rerere, zdiff3, histogram), rank 4 (ruff lint gate) and rank 5 (worktree hardening)."""
+    setUp = PatchModeTest.setUp
+    tearDown = PatchModeTest.tearDown
+    _create = PatchModeTest._create
+    task = PatchModeTest.task
+    main_sha = PatchModeTest.main_sha
+    edit = PatchModeTest.edit
+
+    # ---- rank 1: repo config, zdiff3, rerere ----------------------------------
+    def test_repo_config_is_set_only_where_unset(self):
+        before = {key: git_config(self.root, key) for key, _ in patch_mode.REPO_CONFIG}
+        git(self.root, 'config', 'diff.algorithm', 'patience')  # the owner's choice wins
+        self.pm.prepare(self.task('t1', 's1', 'Say hi'))
+        done = self.pm.repo_config
+        self.assertEqual(done['diff.algorithm'], 'kept')
+        self.assertEqual(git_config(self.root, 'diff.algorithm'), 'patience')
+        for key, value in patch_mode.REPO_CONFIG:
+            if key == 'diff.algorithm':
+                continue
+            if before[key] is None:
+                self.assertEqual((done[key], git_config(self.root, key)), ('set', value))
+            else:
+                self.assertEqual((done[key], git_config(self.root, key)), ('kept', before[key]))
+
+    def test_rerere_replays_the_same_conflict_resolution_and_the_gate_still_runs(self):
+        t1 = self.task('t1', 's1', 'Add accepts numbers as text')
+        t2 = self.task('t2', 's2', 'Add works with floats')
+        t3 = self.task('t3', 's3', 'Add works with floats too')
+        for t in (t1, t2, t3):
+            self.pm.prepare(t)
+        if git_config(self.root, 'rerere.enabled') == 'false':
+            self.skipTest('rerere is switched off in the git config of this machine')
+        self.edit(t1, 'demoapp/calc.py', 'return a + b', 'return int(a) + int(b)')
+        for t in (t2, t3):
+            self.edit(t, 'demoapp/calc.py', 'return a + b', 'return float(a) + float(b)')
+        self.assertEqual(self.pm.merge(t1)['status'], 'merged')
+        first = self.pm.merge(t2)
+        self.assertEqual(first['status'], 'conflict', first)
+        self.assertEqual(len(self.created), 1)
+        # The coworker solves it once in t2's worktree; git rerere records that resolution.
+        wt2 = Path(self.pm.worktree_path(t2))
+        subprocess.run(['git', 'merge', 'main'], cwd=str(wt2), capture_output=True)
+        if git_config(self.root, 'merge.conflictStyle') == 'zdiff3':
+            self.assertIn('|||||||', (wt2 / 'demoapp' / 'calc.py').read_text(encoding='utf-8'))
+        write(wt2 / 'demoapp' / 'calc.py', CALC.replace('return a + b', 'return float(int(a)) + float(int(b))'))
+        self.pm.collect(t2)
+        # The same conflict on t3 now merges without a coworker, through the secret scan and the tests.
+        result = self.pm.merge(t3)
+        self.assertEqual(result['status'], 'merged', result)
+        self.assertEqual(result['rerere']['files'], ['demoapp/calc.py'])
+        self.assertTrue(result['tests']['green'])
+        self.assertIn('float(int(a))', (self.root / 'demoapp' / 'calc.py').read_text(encoding='utf-8'))
+        self.assertEqual(len(self.created), 1)
+
+    # ---- rank 4: ruff lint gate -----------------------------------------------
+    def test_lint_is_skipped_with_a_note_when_ruff_is_missing(self):
+        self.pm._lint_argv = lambda files: [sys.executable, '-I', '-S', '-m', 'ruff', 'check', '--select',
+                                            patch_mode.LINT_RULES, '--output-format', 'json'] + list(files)
+        t = self.task('t1', 's1', 'Use an undefined name')
+        self.pm.prepare(t)
+        self.edit(t, 'demoapp/text.py', 'GREETING = "hello"', 'GREETING = undefined_name')
+        result = self.pm.merge(t)
+        self.assertEqual(result['status'], 'merged', result)
+        lint = result['tests']['commands'][0]
+        self.assertEqual(lint['name'], 'lint')
+        self.assertTrue(lint['ok'] and lint['skipped'], lint)
+        self.assertEqual(lint['note'], patch_mode.LINT_MISSING_NOTE)
+
+    @unittest.skipUnless(RUFF, 'ruff is not installed')
+    def test_lint_fails_a_new_undefined_name(self):
+        t = self.task('t1', 's1', 'Use an undefined name')
+        self.pm.prepare(t)
+        self.edit(t, 'demoapp/text.py', 'GREETING = "hello"', 'GREETING = undefined_name')
+        before = self.main_sha()
+        result = self.pm.merge(t)
+        self.assertEqual(result['status'], 'red', result)
+        lint = result['tests']['commands'][0]
+        self.assertEqual((lint['name'], lint['ok']), ('lint', False), lint)
+        self.assertEqual([f['code'] for f in lint['new']], ['F821'])
+        self.assertIn('undefined_name', lint['tail'])
+        self.assertEqual(self.main_sha(), before)
+
+    @unittest.skipUnless(RUFF, 'ruff is not installed')
+    def test_lint_ignores_an_old_unused_import_in_a_touched_file(self):
+        write(self.root / 'demoapp' / 'old.py', 'import os\n\nVALUE = 1\n')
+        git(self.root, 'add', '-A')
+        git(self.root, 'commit', '-q', '-m', 'old F401')
+        t = self.task('t1', 's1', 'Touch old.py')
+        self.pm.prepare(t)
+        self.edit(t, 'demoapp/old.py', 'VALUE = 1', 'VALUE = 2')
+        result = self.pm.merge(t)
+        self.assertEqual(result['status'], 'merged', result)
+        lint = result['tests']['commands'][0]
+        self.assertEqual((lint['name'], lint['ok'], lint['known'], lint['new']), ('lint', True, 1, []), lint)
+
+    # ---- rank 5: worktree hardening -------------------------------------------
+    def test_a_live_task_worktree_is_locked_and_survives_prune(self):
+        t = self.task('t1', 's1', 'Say hi')
+        path = Path(self.pm.prepare(t))
+        remove_tree(path)  # the folder is gone for a moment (Windows, an antivirus, a user)
+        git(self.root, 'worktree', 'prune')
+        entries = worker_gc.parse_worktree_porcelain(git(self.root, 'worktree', 'list', '--porcelain'))
+        mine = [e for e in entries if Path(e['path']).resolve() == path.resolve()]
+        self.assertEqual(len(mine), 1, entries)
+        self.assertEqual((mine[0]['locked'], mine[0]['lock_reason']), (True, 't1'))
+        result = self.pm._remove(path, 'task/s1')
+        self.assertTrue(result['worktree_removed'], result)
+        self.assertEqual(len(worker_gc.parse_worktree_porcelain(git(self.root, 'worktree', 'list', '--porcelain'))), 1)
+        self.assertEqual(git(self.root, 'branch', '--list', 'task/*'), '')
+
+    def test_remove_retries_a_forced_remove_with_back_off(self):
+        t = self.task('t1', 's1', 'Say hi')
+        path = Path(self.pm.prepare(t))
+        write(path / 'demoapp' / 'scratch.txt', 'untracked, so the plain remove refuses\n')
+        real_git, forced = self.pm._git, []
+
+        def flaky(args, *more, **kw):
+            if args[:2] == ['worktree', 'remove'] and '--force' in args:
+                forced.append(list(args))
+                if len(forced) < 3:
+                    return subprocess.CompletedProcess(args, 1, '', 'Permission denied')
+            return real_git(args, *more, **kw)
+
+        self.pm._git = flaky
+        self.pm.remove_backoff = (0.01, 0.01, 0.01)
+        result = self.pm._remove(path, 'task/s1')
+        self.assertTrue(result['worktree_removed'], result)
+        self.assertEqual(result['attempts'], 4)  # one plain remove, two failed forced ones, then success
+        self.assertEqual(forced[-1][:4], ['worktree', 'remove', '--force', '--force'])
+        self.assertFalse(path.exists())
+
+    def test_reconcile_removes_only_stale_finished_worktrees(self):
+        now = time.time()
+        old = now - 10 * 86400
+        stale = [dict(self.task('t%d' % i, 's%d' % i, 'Stale %d' % i), state=state, finished=old)
+                 for i, state in ((1, 'done'), (2, 'failed'), (3, 'cancelled'))]
+        live = dict(self.task('t4', 's4', 'Live'), state='running')
+        reviewed = dict(self.task('t5', 's5', 'Reviewed'), state='done', finished=old)
+        review = dict(self.task('t6', 's6', 'Review of t5'), state='queued', review_of='t5')
+        for t in stale + [live, reviewed]:
+            self.pm.prepare(t)
+        result = self.pm.reconcile_worktrees(stale + [live, reviewed, review], max_age_days=7, now=now)
+        self.assertEqual(sorted(Path(p).name for p in result['removed']), ['t1', 't2', 't3'], result['plan'])
+        self.assertEqual(result['before'] - result['after'], 3)
+        for t in stale:
+            self.assertFalse(Path(self.pm.worktree_path(t)).exists())
+        for t in (live, reviewed):
+            self.assertTrue(Path(self.pm.worktree_path(t)).exists())
+        reasons = {Path(item['path']).name: item['reason'] for item in result['plan']}
+        self.assertIn('live task t4', reasons['t4'])
+        self.assertIn('live review task t6', reasons['t5'])
+        self.assertEqual(git(self.root, 'branch', '--list', 'task/s1'), '')
+
+
+class PatchModeHardeningHelpersTest(unittest.TestCase):
+    def test_conflict_hunks_show_ours_base_and_theirs_for_zdiff3(self):
+        text = ('a\nb\n<<<<<<< main\n    return int(a)\n||||||| base\n    return a\n=======\n'
+                '    return float(a)\n>>>>>>> task/s\nc\n')
+        hunks = patch_mode.conflict_hunks(text)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual((hunks[0]['ours'], hunks[0]['base'], hunks[0]['theirs']),
+                         ('    return int(a)', '    return a', '    return float(a)'))
+        self.assertIn('||||||| base', hunks[0]['text'])
+        plain = patch_mode.conflict_hunks('<<<<<<< main\nx\n=======\ny\n>>>>>>> t\n')
+        self.assertEqual((plain[0]['ours'], plain[0]['base'], plain[0]['theirs']), ('x', None, 'y'))
+
+    def test_lint_findings_match_per_file_rule_and_message_not_line(self):
+        key = patch_mode.PatchMode._lint_key
+        a = dict(path='m.py', line=3, code='F811', message='Redefinition of unused `f` from line 1')
+        b = dict(path='m.py', line=9, code='F811', message='Redefinition of unused `f` from line 7')
+        self.assertEqual(key(a), key(b))
+        self.assertEqual(patch_mode.PatchMode._lint_path('C:\\x\\wt\\pkg\\m.py', 'C:\\x\\wt', ['m.py', 'pkg/m.py']),
+                         'pkg/m.py')
+
+    def test_reconcile_plan_keeps_live_reviewed_foreign_locked_and_unnamed_worktrees(self):
+        root = os.path.join(tempfile.gettempdir(), 'nt-plan', 'repo')
+
+        def wt(name):
+            return os.path.join(root, 'work', 'worktrees', name).replace('\\', '/')
+
+        porcelain = '\n'.join([
+            'worktree %s' % root.replace('\\', '/'), 'HEAD aaa', 'branch refs/heads/main', '',
+            'worktree %s' % wt('a1'), 'HEAD bbb', 'branch refs/heads/task/sa', 'locked a1', '',
+            'worktree %s' % wt('b1'), 'HEAD ccc', 'branch refs/heads/task/sb', '',
+            'worktree %s' % wt('c1'), 'HEAD ddd', 'branch refs/heads/task/sc', 'locked owner keeps this', '',
+            'worktree %s' % wt('orphan'), 'HEAD eee', 'branch refs/heads/task/zz', '',
+            'worktree %s' % wt('_main-0123456789ab'), 'HEAD fff', 'detached', '',
+            'worktree %s' % wt('d1'), 'HEAD ggg', 'branch refs/heads/task/sd', 'prunable gitdir points nowhere', '',
+            'worktree %s' % wt('e1'), 'HEAD hhh', 'branch refs/heads/task/se', '',
+        ])
+        entries = worker_gc.parse_worktree_porcelain(porcelain)
+        self.assertEqual(len(entries), 8)
+        self.assertEqual((entries[1]['branch'], entries[1]['locked'], entries[1]['lock_reason']), ('task/sa', True, 'a1'))
+        self.assertTrue(entries[5]['detached'] and entries[6]['prunable'])
+        now, old = 10 * 86400.0 + 5, 5.0
+        tasks = [dict(id='a1', step_id='sa', state='done', finished=old),
+                 dict(id='b1', step_id='sb', state='done', finished=old),
+                 dict(id='b2', state='running', review_of='b1'),
+                 dict(id='c1', step_id='sc', state='done', finished=old),
+                 dict(id='d-other', state='blocked', finished=old, patch_worktree=wt('d1')),
+                 dict(id='e1', step_id='se', state='done', finished=now - 3600)]
+        plan = worker_gc.plan_worktree_reconcile(porcelain, tasks, now, max_age_days=7, main_path=root,
+                                                 worktrees_dir=os.path.join(root, 'work', 'worktrees'),
+                                                 ages={wt('_main-0123456789ab'): old})
+        actions = {os.path.basename(item['path']): item['action'] for item in plan}
+        self.assertEqual(actions, {'repo': 'keep', 'a1': 'remove', 'b1': 'keep', 'c1': 'keep', 'orphan': 'keep',
+                                   '_main-0123456789ab': 'remove', 'd1': 'remove', 'e1': 'keep'})
+        self.assertEqual(tasks[0]['state'], 'done')  # pure: the input is not changed
 
 
 if __name__ == '__main__':

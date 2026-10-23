@@ -11,13 +11,16 @@ Used by the engine only when the app setting patch_mode is on (default off). Flo
 
 Never force-pushes. Never commits data/, work/, caches, logs, databases or files that look like secrets.
 """
+import collections
 import contextlib
 import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -63,6 +66,22 @@ EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za
 SAFE_EMAIL_DOMAIN = re.compile(
     r'(^|\.)(example\.(com|org|net)|example|test|invalid|localhost)$|^users\.noreply\.github\.com$', re.I)
 MARKER = re.compile(r'^(<{7}|>{7})( |$)')
+
+# Repo config that patch mode sets once in the project repo, only for keys that are unset (an owner value wins).
+# rerere replays a conflict resolution a coworker already made, zdiff3 adds the common base to conflict hunks,
+# histogram gives cleaner diffs, core.longpaths keeps deep worktree paths working on Windows.
+REPO_CONFIG = (('rerere.enabled', 'true'), ('rerere.autoupdate', 'true'), ('merge.conflictStyle', 'zdiff3'),
+               ('diff.algorithm', 'histogram'), ('core.longpaths', 'true'))
+_RERERE_LINE = re.compile(r"^(?:Resolved|Staged) '(.+)' using previous resolution", re.M)
+# Lint gate: a fixed, small rule set (undefined names, redefinitions, unused imports, syntax errors).
+# Only findings that the same files on main do not have fail, so an old F401 (e.g. an __init__ re-export) stays green.
+LINT_NAME = 'lint'
+LINT_RULES = 'F821,F811,F401,E9'
+LINT_TIMEOUT_S = 300
+LINT_MISSING_NOTE = 'ruff is not installed; lint skipped'
+# A forced worktree removal is retried after these pauses (Windows may still hold a file for a moment).
+REMOVE_BACKOFF_S = (0.2, 0.5, 1.0, 2.0)
+RECONCILE_MAX_AGE_DAYS = 7
 
 
 class GitError(RuntimeError):
@@ -119,7 +138,11 @@ def _secret_kind(text):
 
 
 def conflict_hunks(text, context=CONTEXT_LINES):
-    """Only the conflicting parts of a file with conflict markers, each with a few lines around it."""
+    """Only the conflicting parts of a file with conflict markers, each with a few lines around it.
+
+    Each hunk also names its sides: ours (after <<<<<<<), base (the diff3/zdiff3 section after |||||||,
+    None for the plain merge style) and theirs (after =======), so the brief shows ours, base and theirs.
+    """
     lines = (text or '').splitlines()
     hunks, i = [], 0
     while i < len(lines):
@@ -127,8 +150,18 @@ def conflict_hunks(text, context=CONTEXT_LINES):
             end = i
             while end < len(lines) and not lines[end].startswith('>>>>>>>'):
                 end += 1
+            sides, part = dict(ours=[], base=None, theirs=[]), 'ours'
+            for line in lines[i + 1:end]:
+                if part == 'ours' and line.startswith('|||||||'):
+                    sides['base'], part = [], 'base'
+                elif part != 'theirs' and line.rstrip() == '=======':
+                    part = 'theirs'
+                else:
+                    sides[part].append(line)
             start, stop = max(0, i - context), min(len(lines), end + 1 + context)
-            hunks.append(dict(line=i + 1, text='\n'.join(lines[start:stop])))
+            hunks.append(dict(line=i + 1, text='\n'.join(lines[start:stop]), ours='\n'.join(sides['ours']),
+                              base=None if sides['base'] is None else '\n'.join(sides['base']),
+                              theirs='\n'.join(sides['theirs'])))
             i = end + 1
         else:
             i += 1
@@ -145,6 +178,8 @@ def _git_env():
 
 _ROOT_LOCKS = {}
 _ROOT_LOCKS_GUARD = threading.Lock()
+_CONFIGURED = {}  # normcase(root) -> {key: 'set' | 'kept'}: the repo config is checked once per process
+_CONFIG_GUARD = threading.Lock()
 
 
 def _root_lock(root):
@@ -201,6 +236,9 @@ class PatchMode:
         self._queue = None
         self._queue_guard = threading.Lock()
         self._baseline = {}  # (main commit, argv) -> test run on clean main; main is red or green per commit
+        self._lint_baseline = {}  # (base commit, path) -> Counter of the ruff findings that file has there
+        self.remove_backoff = REMOVE_BACKOFF_S
+        self.repo_config = None  # {key: 'set'|'kept'|'error'} after the first prepare or merge
 
     # ---- git ---------------------------------------------------------------
     def _git(self, args, cwd=None, check=True, timeout=GIT_TIMEOUT_S, input=None):
@@ -233,6 +271,47 @@ class PatchMode:
     def _common_dir(self):
         return (self.root / self._out(['rev-parse', '--git-common-dir'])).resolve()
 
+    # ---- repo setup --------------------------------------------------------
+    def _configure_repo(self):
+        """Set REPO_CONFIG in the project repo once, only for keys that are unset in every config scope.
+
+        A value the owner chose (local, global or system) always wins. Returns {key: 'set'|'kept'|'error'}.
+        """
+        if self.repo_config is not None:
+            return self.repo_config
+        root_key = os.path.normcase(str(self.root))
+        with _CONFIG_GUARD:
+            done = _CONFIGURED.get(root_key)
+            if done is None:
+                done = {}
+                for key, value in REPO_CONFIG:
+                    try:
+                        found = self._git(['config', '--get', key], check=False).returncode
+                        if found == 0:
+                            done[key] = 'kept'
+                        elif found == 1:  # 1: the key is not set anywhere
+                            self._git(['config', '--local', key, value])
+                            done[key] = 'set'
+                        else:
+                            done[key] = 'error'
+                    except (GitError, OSError):
+                        done[key] = 'error'
+                if 'error' not in done.values():
+                    _CONFIGURED[root_key] = done
+        if 'error' not in done.values():
+            self.repo_config = done
+        return done
+
+    def _rerere_ready(self):
+        """True when git rerere is not switched off and has recorded at least one resolution."""
+        if self._git(['config', '--bool', '--get', 'rerere.enabled'], check=False).stdout.strip() == 'false':
+            return False
+        try:
+            cache = self._common_dir() / 'rr-cache'
+            return cache.is_dir() and any(cache.iterdir())
+        except (GitError, OSError):
+            return False
+
     # ---- names -------------------------------------------------------------
     def branch_name(self, task):
         if task.get('patch_branch'):
@@ -258,11 +337,13 @@ class PatchMode:
         """Create (or reuse) the task worktree from main HEAD. Returns its absolute path."""
         path, branch = self.worktree_path(task), self.branch_name(task)
         self._git(['check-ref-format', '--branch', branch])
+        self._configure_repo()
         self._ensure_ignored()
         if (path / '.git').exists():
             current = self._out(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=path)
             if current != branch:
                 raise GitError('%s is on branch %s, not %s' % (path, current, branch))
+            self._lock_worktree(path, task)
             return str(path)
         self._git(['worktree', 'prune'])
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -270,7 +351,15 @@ class PatchMode:
             self._git(['worktree', 'add', '-q', str(path), branch])
         else:
             self._git(['worktree', 'add', '-q', '-b', branch, str(path), self.base])
+        self._lock_worktree(path, task)
         return str(path)
+
+    def _lock_worktree(self, path, task):
+        """Lock a live task's worktree (reason: its task id), so `git worktree prune` never drops it.
+
+        _remove and reconcile_worktrees unlock it again. An already locked worktree stays as it is.
+        """
+        return self._git(['worktree', 'lock', '--reason', task_key(task), str(path)], check=False).returncode == 0
 
     def _ensure_ignored(self):
         """The worktrees folder must never show up in the main checkout."""
@@ -342,13 +431,15 @@ class PatchMode:
 
     # ---- 3. verify ---------------------------------------------------------
     def test_commands(self, task, cwd):
-        """The task's own test files (planned or changed) plus the desktop suite."""
+        """Lint on the changed .py files, the task's own test files (planned or changed), the desktop suite."""
         cwd = Path(cwd)
         names = [str(f).replace('\\', '/') for f in task.get('files') or []]
+        changed = []
         try:
-            names += [f['path'] for f in self.diff_stats(task, cwd=cwd)['files']]
+            changed = [f['path'] for f in self.diff_stats(task, cwd=cwd)['files']]
         except GitError:
             pass
+        names += changed
         modules = []
         for name in names:
             match = re.match(r'^(?:\./)?(tests/test_\w+)\.py$', name)
@@ -358,6 +449,9 @@ class PatchMode:
             if (cwd / (match.group(1) + '.py')).is_file() and module not in modules:
                 modules.append(module)
         commands = []
+        lint = sorted({name for name in changed if name.endswith('.py') and (cwd / name).is_file()})
+        if lint:
+            commands.append((LINT_NAME, self._lint_argv(lint)))
         if modules:
             commands.append(('task tests', [self.python, '-m', 'unittest'] + modules))
         if (cwd / 'tests').is_dir():
@@ -374,7 +468,10 @@ class PatchMode:
         started = time.monotonic()
         results = []
         for name, argv in self.test_commands(task, path):
-            result = self._run_tests(name, argv, path)
+            if name == LINT_NAME:
+                result = self._run_lint(argv, path)
+            else:
+                result = self._run_tests(name, argv, path)
             results.append(result)
             if not result['ok']:
                 break
@@ -398,6 +495,128 @@ class PatchMode:
         return dict(name=name, command=' '.join(argv[1:]), argv=list(argv), code=code, ok=ok, timed_out=timed_out,
                     seconds=round(time.monotonic() - started, 2), tail=out[-2000:])
 
+    # ---- 3a. lint: only findings that main does not have fail -------------
+    def _lint_argv(self, files):
+        return [self.python, '-m', 'ruff', 'check', '--select', LINT_RULES, '--output-format', 'json'] + list(files)
+
+    @staticmethod
+    def _lint_key(finding):
+        """Findings match per (file, rule, message), not per line, so code that only moved is not new."""
+        message = re.sub(r'\bline \d+', 'line N', finding.get('message') or '')
+        return finding.get('path'), finding.get('code'), message
+
+    @staticmethod
+    def _lint_path(name, cwd, files):
+        full = name.replace('\\', '/')
+        for rel in sorted(files, key=len, reverse=True):
+            if full == rel or full.endswith('/' + rel):
+                return rel
+        try:
+            return os.path.relpath(name, str(cwd)).replace('\\', '/')
+        except ValueError:
+            return full
+
+    def _ruff(self, argv, cwd, files):
+        """Run ruff. Returns (exit code, findings or None, note); None means skipped (ruff missing or broken)."""
+        env = dict(os.environ)
+        env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONIOENCODING='utf-8', NO_COLOR='1')
+        try:
+            proc = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True, encoding='utf-8',
+                                  errors='replace', timeout=min(self.test_timeout, LINT_TIMEOUT_S),
+                                  creationflags=_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return None, None, 'ruff timed out; lint skipped'
+        except OSError as exc:
+            return None, None, 'ruff could not start (%s); lint skipped' % exc
+        err = (proc.stderr or '').strip()
+        if re.search(r"No module named '?ruff'?(\s|$)", err):
+            return proc.returncode, None, LINT_MISSING_NOTE
+        try:
+            data = json.loads(proc.stdout or '[]')
+        except ValueError:
+            data = None
+        if proc.returncode not in (0, 1) or not isinstance(data, list):
+            return proc.returncode, None, 'ruff failed (exit %s); lint skipped: %s' % (
+                proc.returncode, (err or proc.stdout or '').strip()[-300:])
+        findings = []
+        for item in data:
+            if isinstance(item, dict):
+                findings.append(dict(path=self._lint_path(item.get('filename') or '', cwd, files),
+                                     line=(item.get('location') or {}).get('row'),
+                                     code=item.get('code') or 'syntax-error', message=item.get('message') or ''))
+        return proc.returncode, findings, ''
+
+    def _run_lint(self, argv, cwd):
+        """ruff check on the changed .py files; red only for findings the same files on main do not have.
+
+        The baseline is the merge-base with main (inside _merge, after main was merged in, that is main
+        itself), cached per (commit, file). When ruff is missing or cannot run, the step is skipped with a
+        note and stays green.
+        """
+        started = time.monotonic()
+        files = list(argv[len(self._lint_argv([])):])
+        res = dict(name=LINT_NAME, command=' '.join(argv[1:]), argv=list(argv), code=None, ok=True,
+                   timed_out=False, seconds=0, tail='', skipped=False, note='', new=[], known=0)
+        code, findings, note = self._ruff(argv, cwd, files)
+        res['code'] = code
+        if findings is None:
+            res.update(skipped=True, note=note, tail=note, seconds=round(time.monotonic() - started, 2))
+            return res
+        try:
+            base = self._out(['merge-base', self.base, 'HEAD'], cwd=cwd)
+        except GitError:
+            base = ''
+        left = self._lint_known(base, files, cwd) if base else collections.Counter()
+        new = []
+        for finding in findings:
+            key = self._lint_key(finding)
+            if left[key] > 0:
+                left[key] -= 1
+            else:
+                new.append(finding)
+        known = len(findings) - len(new)
+        lines = ['%s:%s: %s %s' % (f['path'], f['line'], f['code'], f['message']) for f in new[:20]]
+        if new:
+            lines.append('%d new ruff finding(s); %d already on %s are ignored' % (len(new), known, self.base))
+        else:
+            lines.append('No new ruff findings (%d already on %s are ignored)' % (known, self.base))
+        res.update(ok=not new, new=new[:20], known=known, tail='\n'.join(lines)[-2000:],
+                   seconds=round(time.monotonic() - started, 2))
+        return res
+
+    def _lint_known(self, base, files, cwd):
+        """Counter of the ruff findings the files already have at commit `base` (a file new there has none)."""
+        todo = [rel for rel in files if (base, rel) not in self._lint_baseline]
+        if todo:
+            if len(self._lint_baseline) > 512:
+                self._lint_baseline.clear()
+            tmp = Path(tempfile.mkdtemp(prefix='nt-lint-'))
+            try:
+                present = []
+                for rel in todo:
+                    self._lint_baseline[(base, rel)] = collections.Counter()
+                    blob = self._git(['show', '%s:%s' % (base, rel)], cwd=cwd, check=False)
+                    if blob.returncode == 0:
+                        target = tmp / rel
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(blob.stdout.encode('utf-8'))
+                        present.append(rel)
+                if present:
+                    _code, found, _note = self._ruff(self._lint_argv(present), tmp, present)
+                    if found is None:  # baseline run failed: do not cache an empty baseline
+                        for rel in present:
+                            self._lint_baseline.pop((base, rel), None)
+                    for finding in found or []:
+                        bucket = self._lint_baseline.get((base, finding['path']))
+                        if bucket is not None:
+                            bucket[self._lint_key(finding)] += 1
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        total = collections.Counter()
+        for rel in files:
+            total.update(self._lint_baseline.get((base, rel)) or {})
+        return total
+
     # ---- 3b. baseline: is main itself red? -------------------------------
     def main_baseline(self, failed, main_sha):
         """Run the commands that failed in the task copy again on a clean checkout of main_sha.
@@ -409,8 +628,8 @@ class PatchMode:
         todo = []
         for r in failed:
             argv = r.get('argv')
-            if not argv or not main_sha:
-                continue
+            if not argv or not main_sha or r.get('name') == LINT_NAME:
+                continue  # lint compares with main on its own: only new findings fail
             key = (main_sha, tuple(argv))
             if key in self._baseline:
                 out['commands'].append(self._baseline[key])
@@ -543,18 +762,25 @@ class PatchMode:
         if not stats['files_changed'] and self._is_ancestor(branch, self.base):
             result['cleanup'] = self._remove(path, branch)
             return dict(result, status='nothing', message='The task changed no files; nothing to merge')
+        self._configure_repo()
         probe = self._git(['merge-tree', '--write-tree', '--name-only', self.base, branch], check=False)
-        if probe.returncode == 1:
-            return self._conflict(task, result, probe.stdout, old_main)
-        if probe.returncode != 0:
+        if probe.returncode not in (0, 1):
             return dict(result, status='error', message=(probe.stderr or probe.stdout).strip()[-600:])
         before = self.rev('HEAD', cwd=path)
-        joined = self._git(['merge', '-q', '--no-edit', '-m', 'Merge %s into %s' % (self.base, branch), self.base],
-                           cwd=path, check=False)
-        if joined.returncode != 0:
-            self._git(['merge', '--abort'], cwd=path, check=False)
-            return dict(result, status='error',
-                        message='git merge failed: ' + (joined.stderr or joined.stdout).strip()[-600:])
+        if probe.returncode == 1:
+            # A real conflict. git rerere may know it already (a coworker solved the same hunks before); then
+            # the merge is committed here and still goes through the secret scan and the tests below.
+            replay = self._rerere_merge(path, branch)
+            if replay is None:
+                return self._conflict(task, result, probe.stdout, old_main)
+            result['rerere'] = replay
+        else:
+            joined = self._git(['merge', '-q', '--no-edit', '-m', 'Merge %s into %s' % (self.base, branch),
+                                self.base], cwd=path, check=False)
+            if joined.returncode != 0:
+                self._git(['merge', '--abort'], cwd=path, check=False)
+                return dict(result, status='error',
+                            message='git merge failed: ' + (joined.stderr or joined.stdout).strip()[-600:])
         head = self.rev('HEAD', cwd=path)
         scan = self.secret_scan(old_main, head, cwd=path)
         result['scan'] = scan
@@ -616,12 +842,95 @@ class PatchMode:
         return now == new, 'main is at %s' % now
 
     def _remove(self, path, branch):
-        removed = self._git(['worktree', 'remove', str(path)], check=False).returncode == 0
+        """Unlock and remove a task worktree. A merged branch gets a forced remove, retried with back-off."""
+        self._git(['worktree', 'unlock', str(path)], check=False)
+        removed, attempts = self._git(['worktree', 'remove', str(path)], check=False).returncode == 0, 1
         if not removed and self._is_ancestor(branch, self.base):
-            removed = self._git(['worktree', 'remove', '--force', str(path)], check=False).returncode == 0
+            removed, tries = self._force_remove(path)
+            attempts += tries
         self._git(['worktree', 'prune'], check=False)
         deleted = removed and self._git(['branch', '-q', '-d', branch], check=False).returncode == 0
-        return dict(worktree_removed=removed, branch_deleted=deleted)
+        return dict(worktree_removed=removed, branch_deleted=deleted, attempts=attempts)
+
+    def _force_remove(self, path):
+        """`git worktree remove --force --force`, retried after self.remove_backoff pauses while Windows still
+        holds a file. Returns (removed, tries)."""
+        tries = 0
+        for delay in (0,) + tuple(self.remove_backoff):
+            if delay:
+                time.sleep(delay)
+            tries += 1
+            if self._git(['worktree', 'remove', '--force', '--force', str(path)], check=False).returncode == 0:
+                return True, tries
+            if not Path(path).exists():
+                return True, tries  # the folder is gone; prune drops the registration
+        return False, tries
+
+    def _rerere_merge(self, path, branch):
+        """On a real conflict, let git rerere replay resolutions a coworker already made for the same hunks.
+
+        Only when rerere solved every conflicted file the merge is committed; returns dict(resolved, files,
+        note). Otherwise the merge is aborted and None is returned (the conflict goes to a coworker).
+        """
+        if not self._rerere_ready():
+            return None
+        message = 'Merge %s into %s' % (self.base, branch)
+        joined = self._git(['merge', '--no-edit', '-m', message, self.base], cwd=path, check=False)
+        files = sorted(set(_RERERE_LINE.findall((joined.stdout or '') + '\n' + (joined.stderr or ''))))
+        if joined.returncode == 0:
+            return dict(resolved=True, files=files, note='The real merge had no conflict left')
+        unmerged = [n for n in self._git(['diff', '--name-only', '--diff-filter=U'], cwd=path,
+                                         check=False).stdout.splitlines() if n.strip()]
+        remaining = [n for n in self._git(['rerere', 'remaining'], cwd=path, check=False).stdout.splitlines()
+                     if n.strip()]
+        solved = bool(files) and not remaining and all(n in files for n in unmerged)
+        if solved and unmerged:  # rerere.autoupdate is off: stage what rerere resolved
+            solved = self._git(['add', '--'] + unmerged, cwd=path, check=False).returncode == 0
+        if solved:
+            solved = self._git(['commit', '-q', '--no-verify', '--no-edit'], cwd=path, check=False).returncode == 0
+        if not solved:
+            self._git(['merge', '--abort'], cwd=path, check=False)
+            return None
+        return dict(resolved=True, files=files,
+                    note='git rerere replayed an earlier conflict resolution for %s; the secret scan and the '
+                         'tests still check the result' % ', '.join(files))
+
+    # ---- worktree reconcile ------------------------------------------------
+    def reconcile_worktrees(self, tasks, max_age_days=RECONCILE_MAX_AGE_DAYS, now=None, dry_run=False):
+        """Remove worktrees whose tasks are all finished for longer than max_age_days.
+
+        Reads `git worktree list --porcelain`; worker_gc.plan_worktree_reconcile decides, so a worktree that
+        a live task names, or that a live review reads (review_of, see bridge.worktree), is never removed.
+        Branches are only deleted with `branch -d`: an unmerged branch and its commits stay. Returns the plan
+        with the number of registered worktrees before and after.
+        """
+        from . import worker_gc
+        now = time.time() if now is None else now
+        entries = worker_gc.parse_worktree_porcelain(self._git(['worktree', 'list', '--porcelain']).stdout)
+        ages = {}
+        for entry in entries:
+            with contextlib.suppress(OSError):
+                ages[entry['path']] = Path(entry['path']).stat().st_mtime
+        plan = worker_gc.plan_worktree_reconcile(entries, tasks, now, max_age_days=max_age_days,
+                                                 main_path=str(self.root),
+                                                 worktrees_dir=str(self.root / WORKTREES), ages=ages)
+        removed = []
+        for item in plan:
+            if item['action'] != 'remove' or dry_run:
+                continue
+            path = Path(item['path'])
+            self._git(['worktree', 'unlock', str(path)], check=False)
+            ok, tries = self._force_remove(path) if path.exists() else (True, 0)
+            item.update(removed=ok, attempts=tries, branch_deleted=False)
+            if ok:
+                self._git(['worktree', 'prune'], check=False)
+                if item.get('branch'):
+                    item['branch_deleted'] = self._git(['branch', '-q', '-d', item['branch']],
+                                                       check=False).returncode == 0
+                removed.append(item['path'])
+        after = worker_gc.parse_worktree_porcelain(self._git(['worktree', 'list', '--porcelain'],
+                                                             check=False).stdout)
+        return dict(before=len(entries), after=len(after), removed=removed, plan=plan, dry_run=bool(dry_run))
 
     # ---- conflicts ---------------------------------------------------------
     def _conflict(self, task, result, output, old_main):
@@ -683,6 +992,7 @@ class PatchMode:
             lines.append('Goal of the change on %s (%s): %s' % (
                 self.base, other.get('task_id') or other.get('commit') or 'no task', other['goal']))
         lines += ['', 'Conflicting hunks. Between <<<<<<< and ======= is %s; between ======= and >>>>>>> is this task.'
+                  ' In the zdiff3 style the part from ||||||| up to ======= is the common base both sides started from.'
                   % self.base]
         for item in conflicts:
             lines += ['', 'File %s:' % item['path']]

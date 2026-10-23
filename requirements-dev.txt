@@ -1,0 +1,11 @@
+# Developer tools for NotionTool (not needed to run the app). Install: python -m pip install -r requirements-dev.txt
+# The patch-mode gate runs `python -m ruff check` when ruff is installed and skips with a note when it is not.
+ruff>=0.6
+pytest>=8.0
+pytest-xdist>=3.5
+pytest-timeout>=2.3
+mypy>=1.10
+hypothesis>=6.100
+time-machine>=2.14
+coverage>=7.5
+diff-cover>=9.0

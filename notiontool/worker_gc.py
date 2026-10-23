@@ -14,7 +14,13 @@ Worker states come from the existing code:
   skips these records (notion.py:474).
 The Main is the worker with purpose "main" (notion.py:478) or role "main".
 Tasks are tied to workers through task["worker_id"] (engine.py:540).
+
+plan_worktree_reconcile (with parse_worktree_porcelain) decides which git
+worktrees can go: only those whose tasks are all finished for longer than
+max_age_days and that no live or reviewing task still needs. It is pure in
+the same way; PatchMode.reconcile_worktrees does the removal.
 """
+import os
 
 READY = "ready"
 BUSY = "busy"
@@ -155,3 +161,162 @@ def count_pool(workers):
         else:
             counts["coworkers_busy"] += 1
     return counts
+
+
+TERMINAL_TASK_STATES = frozenset({"done", "failed", "blocked", "cancelled"})  # engine.TERMINAL
+PENDING_PATCH_STATES = frozenset({"waiting", "merging"})
+BASELINE_PREFIX = "_main-"  # PatchMode.main_baseline copies of clean main
+DAY_S = 86400.0
+
+
+def parse_worktree_porcelain(text):
+    """Parse `git worktree list --porcelain` into a list of dicts.
+
+    Each entry has path, head, branch (without refs/heads/), locked,
+    lock_reason, prunable, bare and detached. The first entry is the main
+    worktree.
+    """
+    entries, current = [], None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip():
+            current = None
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current = {"path": value, "head": "", "branch": "", "locked": False, "lock_reason": "",
+                       "prunable": False, "bare": False, "detached": False}
+            entries.append(current)
+        elif current is None:
+            continue
+        elif key == "HEAD":
+            current["head"] = value
+        elif key == "branch":
+            current["branch"] = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
+        elif key == "locked":
+            current["locked"], current["lock_reason"] = True, value
+        elif key in ("prunable", "bare", "detached"):
+            current[key] = True
+    return entries
+
+
+def _norm_path(path):
+    return os.path.normcase(os.path.normpath(str(path))) if path else ""
+
+
+def _is_live(task):
+    return str(task.get("state") or "") not in TERMINAL_TASK_STATES
+
+
+def _task_names(task):
+    names = set()
+    for key in ("id", "task_id", "step_id"):
+        if task.get(key) not in (None, ""):
+            names.add(("id", str(task[key])))
+    if task.get("patch_branch"):
+        names.add(("branch", str(task["patch_branch"])))
+    if task.get("patch_worktree"):
+        names.add(("path", _norm_path(task["patch_worktree"])))
+    return names
+
+
+def _entry_names(entry):
+    path = entry.get("path") or ""
+    names = {("path", _norm_path(path)), ("id", os.path.basename(os.path.normpath(path)))}
+    branch = entry.get("branch") or ""
+    if branch:
+        names.add(("branch", branch))
+        if branch.startswith("task/"):
+            names.add(("id", branch[len("task/"):]))
+    if entry.get("lock_reason"):
+        names.add(("id", entry["lock_reason"]))
+    return names
+
+
+def _stamp(task):
+    for key in ("finished", "updated", "created"):
+        if _number(task.get(key)):
+            return task[key]
+    return None
+
+
+def plan_worktree_reconcile(worktrees, tasks, now, max_age_days=7, main_path=None, worktrees_dir=None,
+                            ages=None):
+    """Return [{path, branch, action, reason, tasks}] in listing order.
+
+    action is "remove" or "keep". worktrees is the porcelain text or its
+    parsed entries; ages maps a worktree path to a time (e.g. the folder
+    mtime) used when no task has one. A worktree is removed only when tasks
+    name it (worktree path, folder name, branch or lock reason), all of them
+    are finished (done, failed, blocked, cancelled), none has a pending
+    patch state, no live review task reads it (review_of names one of them)
+    and the newest finished time is older than max_age_days. Old "_main-*"
+    baseline copies need no task. Always kept: the main worktree, anything
+    outside worktrees_dir, a worktree no task names, one locked by something
+    else than a task, and one whose age is unknown.
+    """
+    entries = parse_worktree_porcelain(worktrees) if isinstance(worktrees, str) else list(worktrees or ())
+    tasks = [t for t in (tasks or ()) if isinstance(t, dict)]
+    ages = {_norm_path(k): v for k, v in (ages or {}).items()}
+    limit = float(max_age_days) * DAY_S
+    main = _norm_path(main_path)
+    inside = _norm_path(worktrees_dir)
+    index, reviews = {}, {}
+    for task in tasks:
+        for name in _task_names(task):
+            index.setdefault(name, []).append(task)
+        if task.get("review_of") not in (None, "") and _is_live(task):
+            reviews.setdefault(str(task["review_of"]), []).append(str(task.get("id")))
+    result = []
+    for number, entry in enumerate(entries):
+        path = entry.get("path") or ""
+        norm = _norm_path(path)
+        item = {"path": path, "branch": entry.get("branch") or "", "action": "keep", "reason": "", "tasks": []}
+        result.append(item)
+        if number == 0 or entry.get("bare") or (main and norm == main):
+            item["reason"] = "kept because the main worktree is never removed"
+            continue
+        if inside and not norm.startswith(inside.rstrip(os.sep) + os.sep):
+            item["reason"] = "kept because it is not inside %s" % worktrees_dir
+            continue
+        named = []
+        for name in _entry_names(entry):
+            for task in index.get(name, ()):
+                if not any(task is seen for seen in named):
+                    named.append(task)
+        ids = sorted({str(t.get("id")) for t in named if t.get("id") not in (None, "")})
+        item["tasks"] = ids
+        live = sorted({str(t.get("id")) for t in named if _is_live(t)})
+        if live:
+            item["reason"] = "kept because live task %s names it" % ", ".join(live)
+            continue
+        readers = sorted({r for i in ids for r in reviews.get(i, ())})
+        if readers:
+            item["reason"] = "kept because live review task %s reads it" % ", ".join(readers)
+            continue
+        pending = sorted({str(t.get("id")) for t in named if t.get("patch_state") in PENDING_PATCH_STATES})
+        if pending:
+            item["reason"] = "kept because the patch of task %s still waits for its merge" % ", ".join(pending)
+            continue
+        lock_reason = entry.get("lock_reason") or ""
+        if entry.get("locked") and ("id", lock_reason) not in index:
+            item["reason"] = ("kept because it is locked by something else than a task (%s)"
+                              % (lock_reason or "no reason"))
+            continue
+        baseline = os.path.basename(os.path.normpath(path)).startswith(BASELINE_PREFIX)
+        if not named and not baseline:
+            item["reason"] = "kept because no task names it"
+            continue
+        stamps = [s for s in (_stamp(t) for t in named) if s is not None]
+        stamp = max(stamps) if stamps else ages.get(norm)
+        if not _number(stamp):
+            item["reason"] = "kept because its age is unknown"
+            continue
+        days = (now - stamp) / DAY_S
+        if now - stamp < limit:
+            item["reason"] = "kept because it finished %.1f days ago (limit %s days)" % (days, max_age_days)
+            continue
+        item["action"] = "remove"
+        what = ("its tasks %s are all finished" % ", ".join(ids)) if ids else "it is an old main baseline copy"
+        item["reason"] = "removed because %s, newest %.1f days ago" % (what, days)
+    return result
