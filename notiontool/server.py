@@ -1144,7 +1144,11 @@ class Application:
                    % (old, Application.chat_switch_limit()))
         client = self.adapter.client(worker['account_id'])
         task = dict(id='', run_id=str(body.get('run_id') or '')[:100])
-        moved = ChatContext(self.store).fresh_welcome(self.adapter, client, worker, task, dict(handoff=handoff),
+        main = worker.get('purpose') != 'worker'
+        # Manual switch: the old chat is never deleted (it stays in the sidebar archive), only renamed;
+        # a Main's old chat becomes '<label> (archived)', a Coworker's keeps the retire_old title.
+        switch_adapter = ManualSwitchAdapter(self.adapter, archived_title(label) if main else None)
+        moved = ChatContext(self.store).fresh_welcome(switch_adapter, client, worker, task, dict(handoff=handoff),
                                                       worker.get('context_usage') or {})
         new = (moved or {}).get('thread_id') or ''
         if not new or new == old:
@@ -1153,11 +1157,23 @@ class Application:
         with self.store.lock:
             fresh = self.store.get('workers', worker_id) or dict(moved)
             fresh.update(created_at=now, thread_created_at=now)
-            if fresh.get('purpose') != 'worker' and label:
+            if main and label:
                 fresh['label'] = label  # a Main keeps its name
             self.store.put('workers', fresh)
+        renamed = None
+        if main and label:
+            # The new Notion chat is titled 'Welcome to Notion'; give it the Main's name. A failed rename
+            # never undoes the switch (the worker already moved); it is only reported.
+            try:
+                self.adapter.rename_thread(client, new, label)
+                renamed = True
+            except Exception as exc:  # noqa: BLE001
+                renamed = False
+                self.store.event('chat_context_switch_rename_failed', '', worker_id=worker_id,
+                                 message=(new + ': ' + type(exc).__name__ + ': ' + str(exc))[:250])
         self.store.event('chat_context_switch', '', worker_id=worker_id, message=old + ' -> ' + new)
-        return dict(ok=True, worker_id=worker_id, chat_id=chat_id, thread_id=new, old_thread_id=old)
+        return dict(ok=True, worker_id=worker_id, chat_id=chat_id, thread_id=new, old_thread_id=old,
+                    renamed=renamed)
 
     @staticmethod
     def chat_switch_limit():
@@ -1909,6 +1925,33 @@ def compact_run_response(engine, run):
                           model=str(model or ''), worker_id=t.get('worker_id', ''),
                           summary=' '.join(str(plain_task_summary(t) or '').split())[:200]))
     return {'run': {k: run.get(k) for k in ('id', 'state', 'title', 'stage') if k in run}, 'tasks': tasks}
+
+
+def archived_title(label):
+    """Notion title of a Main's old chat after a manual context switch (I50), e.g. 'Main 3 (archived)'."""
+    return (str(label or 'Main').strip()[:80] or 'Main') + ' (archived)'
+
+
+class ManualSwitchAdapter:
+    """Adapter view for POST /api/chat/context_switch (I50: rename instead of delete).
+
+    ChatContext.retire_old deletes the old chat when the adapter has delete_thread; a manual switch must
+    keep it (it is listed in the sidebar archive via retired_threads), so delete_thread is hidden here and
+    retire_old falls back to rename_thread. retired_title (Mains) replaces the Coworker retire title.
+    Every other attribute is the real adapter's."""
+    delete_thread = None
+
+    def __init__(self, adapter, retired_title=None):
+        self._adapter = adapter
+        self._retired_title = retired_title
+
+    def __getattr__(self, name):
+        if name.startswith('__') or name in ('_adapter', '_retired_title'):
+            raise AttributeError(name)
+        return getattr(self._adapter, name)
+
+    def rename_thread(self, client, tid, title):
+        return self._adapter.rename_thread(client, tid, self._retired_title or title)
 
 
 def compact_enabled(store):

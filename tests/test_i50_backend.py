@@ -245,6 +245,49 @@ class ContextSwitchTests(unittest.TestCase):
         self.assertEqual(status, 200, data)
         self.assertEqual(self.store.get('workers', 'w2')['thread_id'], FakeAdapter.NEW)
 
+    def test_main_switch_renames_old_and_new_chat(self):
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data['renamed'])
+        self.assertIn((OLD_THREAD, 'Main chat (archived)'), self.app.adapter.renamed)
+        self.assertIn((FakeAdapter.NEW, 'Main chat'), self.app.adapter.renamed)
+
+    def test_manual_switch_never_deletes_the_old_chat(self):
+        deleted = []
+        self.app.adapter.delete_thread = lambda client, tid: deleted.append(tid)
+        for worker_id in ('w1', 'w2'):
+            status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': worker_id})
+            self.assertEqual(status, 200, data)
+        self.assertEqual(deleted, [])  # rename instead of delete: the old chats stay in the sidebar archive
+        titles = [title for tid, title in self.app.adapter.renamed]
+        self.assertIn('Main chat (archived)', titles)
+        self.assertIn('Cowork (retired)', titles)  # a Coworker keeps the normal retire title
+        self.assertIsNone(data['renamed'])  # a Coworker's new chat is named by the pool, not here
+
+    def test_failed_rename_of_the_new_chat_keeps_the_switch(self):
+        adapter = FakeAdapter()
+        def rename(client, tid, title):
+            if tid == FakeAdapter.NEW:
+                raise RuntimeError('rename endpoint down')
+            adapter.renamed.append((tid, title))
+        adapter.rename_thread = rename
+        self.app.adapter = adapter
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
+        self.assertEqual(status, 200, data)
+        self.assertFalse(data['renamed'])
+        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], FakeAdapter.NEW)
+        self.assertIn('chat_context_switch_rename_failed', self.store.events)
+
+    def test_manual_switch_adapter_hides_delete_only(self):
+        adapter = FakeAdapter()
+        adapter.delete_thread = lambda client, tid: None
+        view = server_mod.ManualSwitchAdapter(adapter, 'X (archived)')
+        self.assertIsNone(getattr(view, 'delete_thread', None))
+        self.assertEqual(view.new_id('s', '00a9'), FakeAdapter.NEW)
+        view.rename_thread(None, 'old', 'Cowork (retired)')
+        self.assertEqual(adapter.renamed, [('old', 'X (archived)')])
+        self.assertEqual(server_mod.archived_title(''), 'Main (archived)')
+
     def test_bad_requests_are_400(self):
         for body in ({}, {'chat_id': 'c_plain'}, {'chat_id': 'nope'}, {'worker_id': 'nope'}):
             status, data = call(self.app, 'POST', '/api/chat/context_switch', body)
