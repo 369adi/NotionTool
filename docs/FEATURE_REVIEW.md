@@ -458,3 +458,7 @@ Ich habe 8 der roten Tests einzeln laufen lassen (27 s). **Alle 8 sind auch alle
 | Zeilenenden server.py | 1 | Folge des CRLF/LF-Mix |
 
 **Bester nächster Hebel:** Die `INVALID_REQUEST`-Ursache im Fake beziehungsweise in der Engine-Testbasis finden. Wenn die Vermutung stimmt, werden damit bis zu 9 Tests auf einmal grün.
+
+## Korrektur (23.10., 23:30)
+
+Die Vermutung oben (`INVALID_REQUEST` im Fake) stimmt für die Pool-Tests **nicht**. In `test_per_slot_cap_three_queues_remaining_work` bleibt der Run ohne Fehler bei `executing`. Die Tasks erreichen den Fake-Adapter gar nicht. `INVALID_REQUEST` kommt nur im Telemetrie-Test vor, und dort ist er absichtlich ausgelöst. Die Ursache liegt also vor dem Senden (Planung, Queue, Budget oder Slot-Auswahl). Die Fix-Aufträge stehen in `docs/FIX_AUFTRAEGE.md`.
