@@ -126,3 +126,19 @@ def test_scan_continues_every_dropped_chat_once(monkeypatch):
     assert watch.scan_restart_cuts() == []  # once per dropped turn
     clock[0] = START + tw.RESTART_SCAN_END + 1
     assert watch.scan_restart_cuts() == []
+
+
+def test_scan_skips_archived_main_threads(monkeypatch):
+    # A just-switched old Main (archived_main/archived_operator/operator_candidate) never gets a restart-cut continue.
+    monkeypatch.setattr(tw, 'budget_used_up', lambda store, now: False)
+    dropped = lambda: transcript([user(1, START - 200), tool(2, START + 20, START + 25)])
+    client = FakeClient({'oldmain': dropped(), 'oldop': dropped(), 'cand': dropped(), 'userchat': dropped()})
+    adapter, store = FakeAdapter(client), FakeStore()
+    for wid, tid, purpose in [('w1', 'oldmain', 'archived_main'), ('w2', 'oldop', 'archived_operator'),
+                              ('w3', 'cand', 'operator_candidate')]:
+        store.put('workers', {'id': wid, 'thread_id': tid, 'purpose': purpose, 'account_id': 'acc', 'enabled': False})
+    watch = tw.TurnWatch(store, adapter, FakeEngine(), clock=lambda: START + 120)
+    watch.started = START
+    watch.spawn = lambda fn, *args: fn(*args)
+    assert watch.scan_restart_cuts() == ['userchat']
+    assert [t for t, _, _ in adapter.sent] == ['userchat']
