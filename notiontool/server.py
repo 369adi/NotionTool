@@ -224,6 +224,8 @@ class Application:
                             return self.response(200,app.snapshot())
                         if method=='GET' and path=='/api/health':
                             return self.response(200,app.health())
+                        if method=='GET' and path=='/api/chat/ages':
+                            return self.response(200,app.chat_ages())  # I50: chat_id -> {age_s, created_at}
                         if method=='GET' and path=='/api/chats':
                             return self.response(200,{'chats':app.chat_list()})
                         if method=='GET' and path=='/api/run':
@@ -1043,6 +1045,41 @@ class Application:
 
     RESEND_REFUSAL = 'Retry would resend work that already reached Notion'
 
+    CHAT_TOO_OLD = 'chat_too_old'
+
+    def chat_age(self, chat, now=None):
+        """I50: {age_s, created_at} of one harness chat; both None while the creation time is unknown.
+
+        The Notion thread of the chat's Main worker counts first (created_at, thread_created_at), then the
+        chat record (created_at, created). Times are UTC epoch seconds (team_rotation.epoch)."""
+        from .team_rotation import epoch
+        now = time.time() if now is None else now
+        chat = chat or {}
+        worker = (self.store.get('workers', chat['main_worker']) or {}) if chat.get('main_worker') else {}
+        created = 0.0
+        for value in (worker.get('created_at'), worker.get('thread_created_at'), chat.get('created_at'), chat.get('created')):
+            created = epoch(value)
+            if created:
+                break
+        if not created:
+            return dict(age_s=None, created_at=None)
+        return dict(age_s=int(max(0.0, now - created)), created_at=created)
+
+    def chat_ages(self, now=None):
+        """GET /api/chat/ages: chat_id -> {age_s, created_at} for every known harness chat."""
+        now = time.time() if now is None else now
+        return {c['id']: Application.chat_age(self, c, now) for c in self.store.all('chats') if c.get('id')}
+
+    def require_young_chat(self, chat_id, now=None):
+        """I50 hard send block: a chat 23 h or older (coworker_age_guard.HARD_MAX_AGE_HOURS) is never written to.
+        Raises ValueError (HTTP 400) before anything reaches the engine or Notion. Unknown age is not blocked."""
+        from .coworker_age_guard import HARD_MAX_AGE_HOURS, HARD_MAX_AGE_S
+        age = Application.chat_age(self, self.store.get('chats', chat_id), now)['age_s']
+        if age is not None and age >= HARD_MAX_AGE_S:
+            raise ValueError('%s: this chat is %.1f h old (limit %d h); sending is blocked. '
+                             'Use Context switch (POST /api/chat/context_switch).'
+                             % (Application.CHAT_TOO_OLD, age / 3600.0, HARD_MAX_AGE_HOURS))
+
     def retry_run_request(self, body):
         """POST /api/run/retry {id, allow_resend}: (status, payload). Only the engine's resend refusal becomes 409."""
         try:
@@ -1178,7 +1215,15 @@ class Application:
                 if chat['folder_id'] and not self.store.get('folders',chat['folder_id']):
                     raise ValueError('Folder not found')
                 return self.store.put('chats',chat)
+            if path=='/api/chat/context_switch':
+                # I50 stub for the Context switch button: answers ok, changes and sends nothing (real switch comes later).
+                chat_id = str(body.get('chat_id') or '').strip()[:100]
+                if not chat_id:
+                    raise ValueError('Choose a chat (chat_id) to switch')
+                return {'ok':True,'chat_id':chat_id}
             if path=='/api/send':
+                # I50 hard send block: a chat 23 h or older is refused (400) before the engine or Notion sees the text.
+                Application.require_young_chat(self, body['chat_id'])
                 return self.engine.submit(body['chat_id'],str(body.get('text','')),body.get('request_id',''))
             if path=='/api/step_guard/seed':
                 # Fill the 48 h step counter from history (hour start -> steps); the larger value per hour wins.
