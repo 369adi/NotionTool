@@ -17,7 +17,9 @@ label, since, expires).
 
 import math
 
-LIVE_TASK_STATES = frozenset({'running', 'cancelling', 'uncertain', 'checkpoint', 'preparing'})
+from .task_states import LEASE_LIVE_STATES
+
+LIVE_TASK_STATES = LEASE_LIVE_STATES  # task_states.LEASE_LIVE_STATES: the same five states as before
 MAIN_TASK = 'main'
 MAIN_LABEL = 'Main'
 MAX_LEASE_S = 60

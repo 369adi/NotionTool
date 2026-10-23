@@ -22,6 +22,7 @@ from .network_budget import CircuitOpen, NetworkBudget, RemotePaused, backoff, r
 from . import proof as task_proof
 from . import patch_mode as patch_mod
 from . import stale_tasks as stale_mod
+from .task_states import RUN_LIVE_STATES, set_state
 import subprocess
 from .timeouts import task_limit
 
@@ -161,7 +162,7 @@ def harness_enabled(chat, settings):
 
 # Fix V2: like bridge.LIVE_TASK_STATES. An uncertain task may still be working in Notion
 # (the stream ended, the turn goes on), so its lease stays valid for writes.
-LIVE_TASK_STATES = ('running', 'uncertain')
+LIVE_TASK_STATES = RUN_LIVE_STATES  # task_states.RUN_LIVE_STATES; the 5-state lease set is a different set
 
 # Streaming telemetry (Engine._partial): at most one task store write per task in this window.
 TELEMETRY_SECONDS = 5
@@ -281,10 +282,10 @@ class Engine:
             if task['state'] in ('running', 'cancelling'):
                 if task.get('submission_phase') == 'preparing':
                     cancelled = self.store.get('runs', task.get('run_id'), {}).get('state') == 'cancelled'
-                    task.update(state='cancelled' if cancelled else 'retry', next_at=0, attempts=max(0, task.get('attempts',1)-1))
+                    set_state(self.store, task, 'cancelled' if cancelled else 'retry', 'restart: nothing was sent', next_at=0, attempts=max(0, task.get('attempts',1)-1))
                     self.store.put('tasks', task)
                     continue
-                task.update(state='uncertain', reconcile_at=time.time(), error='Recovering the previous API request')
+                set_state(self.store, task, 'uncertain', 'restart: recovering the previous request', reconcile_at=time.time(), error='Recovering the previous API request')
                 self.store.put('tasks', task)
         assigned = {t.get('worker_id'):t for t in self.store.all('tasks') if t['state'] == 'uncertain' or t.get('remote_unknown')}
         for worker in self.store.all('workers'):
@@ -567,7 +568,7 @@ class Engine:
                 return False  # unknown is not empty; never resend on a failed check
         self._release(info['worker_id'], info['lease'])
         task.pop('remote_unknown', None)
-        task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry', next_at=time.time() + 5,
+        set_state(self.store, task, 'cancelled' if run['state'] == 'cancelled' else 'retry', 'empty reply', next_at=time.time() + 5,
                     reconcile_checks=0, remote_done_at=0, partial='',
                     error='Notion finished with an empty reply; retrying on a free coworker')
         self.store.event('empty_reply_retry', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
@@ -658,10 +659,10 @@ class Engine:
             self.store.put('runs', run)
             for task in self.tasks(run_id):
                 if task['state'] in ('queued', 'retry'):
-                    task['state'] = 'cancelled'
+                    set_state(self.store, task, 'cancelled', 'run cancelled')
                     self.store.put('tasks', task)
                 elif task['state'] == 'running':
-                    task['state'] = 'cancelling'
+                    set_state(self.store, task, 'cancelling', 'run cancelled')
                     self.store.put('tasks', task)
                 elif task['state'] in ('blocked', 'uncertain') and self._worker_ai_disabled(task):
                     # Notion AI is off on the worker account, so Notion can never confirm this turn.
@@ -670,8 +671,9 @@ class Engine:
                         self._release(task['worker_id'], task.get('lease', ''))
                     for key in ('remote_unknown', 'side_effect_hold', 'reconcile_at'):
                         task.pop(key, None)
-                    task.update(state='cancelled', error='Cancelled with its run: the worker account has Notion AI '
-                                'disabled, so Notion can never confirm this turn. Nothing was resent.')
+                    set_state(self.store, task, 'cancelled', 'run cancelled, worker AI disabled',
+                              error='Cancelled with its run: the worker account has Notion AI '
+                                    'disabled, so Notion can never confirm this turn. Nothing was resent.')
                     self.store.put('tasks', task)
             for info in self.inflight.values():
                 if info['run_id'] == run_id:
@@ -926,18 +928,18 @@ class Engine:
                            'reached the harness, and the Main checked the work directly.')
                 if note:
                     summary += ' ' + note
-                task.update(state='done', requires_review=False, error='',
-                            result=json.dumps(dict(status='done', summary=summary + '\nRESULT: DONE'), ensure_ascii=False))
+                set_state(self.store, task, 'done', 'accepted by the Main', requires_review=False, error='',
+                          result=json.dumps(dict(status='done', summary=summary + '\nRESULT: DONE'), ensure_ascii=False))
             elif unsent:
                 why = ('Notion proves the prompt never arrived: thread %s has its latest user turn at %d ms, more than '
                        '60 s before the send at %d s, and that turn completed at %d ms (status %s)'
                        % (unsent['thread_id'], unsent['latest_user_ms'], unsent['sent_at'], unsent['completed_ms'],
                           unsent['status'] or '-'))
-                task.update(state='failed', unsent_proof=unsent,
-                            error=('Abandoned by the Main; %s; nothing was resent. %s' % (why, note)).strip()[:600])
+                set_state(self.store, task, 'failed', 'abandoned by the Main, prompt never arrived', unsent_proof=unsent,
+                          error=('Abandoned by the Main; %s; nothing was resent. %s' % (why, note)).strip()[:600])
             else:
-                task.update(state='failed',
-                            error=('Abandoned by the Main after reconciliation; nothing was resent. ' + note).strip()[:400])
+                set_state(self.store, task, 'failed', 'abandoned by the Main',
+                          error=('Abandoned by the Main after reconciliation; nothing was resent. ' + note).strip()[:400])
             task.update(main_resolution=resolution, resolved_at=now, finished=now)
             self.store.put('tasks', task)
             extra = dict(proof=unsent) if unsent else {}
@@ -972,7 +974,7 @@ class Engine:
                         self.store.event('resend_refused', task['run_id'], task_id=task['id'], message=hazard)
                         continue
                     task.pop('paused_by', None)
-                    task.update(state='queued', error='', next_at=0)
+                    set_state(self.store, task, 'queued', 'resume after account block', error='', next_at=0)
                     self.store.put('tasks', task)
                     requeued += 1
                     runs.add(task['run_id'])
@@ -1023,7 +1025,7 @@ class Engine:
                     if task['id'] in hazards:
                         task.pop('side_effect_hold', None)
                         self.store.event('manual_resend', run_id, task_id=task['id'], message=hazards[task['id']])
-                    task.update(state='queued', attempts=0, error='', next_at=0)
+                    set_state(self.store, task, 'queued', 'retry blocked', attempts=0, error='', next_at=0)
                     task.pop('paused_by', None)
                     self.store.put('tasks', task)
             self.store.put('runs', run)
@@ -1469,15 +1471,15 @@ class Engine:
             # Nothing reached Notion: the chat is fine, the attempt is not used, the task waits for the limit.
             self._release(info['worker_id'], info['lease'])
             task.pop('remote_unknown', None)
-            task.update(state='retry', attempts=max(0, task['attempts'] - 1), next_at=now + wait,
-                        paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
-                        error='Stopped by token limit before anything was sent; waits until the limit clears '
-                              '(about %d s)' % int(wait))
+            set_state(self.store, task, 'retry', 'token limit, nothing was sent', attempts=max(0, task['attempts'] - 1), next_at=now + wait,
+                      paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
+                      error='Stopped by token limit before anything was sent; waits until the limit clears '
+                            '(about %d s)' % int(wait))
         else:
             # I5: the turn may have left; it is read back by reconcile, never resent.
-            task.update(state='uncertain', remote_unknown=False, reconcile_checks=task.get('reconcile_checks', 0) + 1,
-                        reconcile_at=time.time() + 5, paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
-                        error='Stopped locally by token limit; the Notion turn is read back, never resent')
+            set_state(self.store, task, 'uncertain', 'token limit, turn may have left', remote_unknown=False, reconcile_checks=task.get('reconcile_checks', 0) + 1,
+                      reconcile_at=time.time() + 5, paused_by=LIMIT_PAUSED_BY, limit_stopped_at=now,
+                      error='Stopped locally by token limit; the Notion turn is read back, never resent')
             worker = self.store.get('workers', info['worker_id'])
             if worker:
                 worker['state'] = 'recovering'
@@ -1562,7 +1564,7 @@ class Engine:
                             continue
                         deps = [self.store.get('tasks', d) for d in task['deps']]
                         if any(not d or d['state'] in ('failed', 'blocked', 'cancelled') for d in deps):
-                            task.update(state='blocked', error='A dependency failed')
+                            set_state(self.store, task, 'blocked', 'dependency failed', error='A dependency failed')
                             self.store.put('tasks', task)
                             continue
                         if any(d['state'] != 'done' for d in deps) or self._conflicts(task, run):
@@ -1671,12 +1673,12 @@ class Engine:
     def _dispatch(self, task, run, worker):
         account=self.store.get('accounts',worker['account_id'],{})
         if task['role']=='executor' and task['files'] and not account.get('bridge_connected'):
-            task.update(state='blocked',error='Connect NotionTool PC tools before executing tasks that change project files')
+            set_state(self.store, task, 'blocked', 'PC tools not connected', error='Connect NotionTool PC tools before executing tasks that change project files')
             self.store.put('tasks',task)
             return
-        task.update(state='running', worker_id=worker['id'], lease=secrets.token_urlsafe(32),
-                    step_id=uid(), started=time.time(), attempts=task['attempts']+1, error='', partial='',
-                    thread_id=worker['thread_id'], submission_phase='preparing')
+        set_state(self.store, task, 'running', 'dispatch', worker_id=worker['id'], lease=secrets.token_urlsafe(32),
+                  step_id=uid(), started=time.time(), attempts=task['attempts']+1, error='', partial='',
+                  thread_id=worker['thread_id'], submission_phase='preparing')
         if task.get('paused_by') == LIMIT_PAUSED_BY:
             task.pop('paused_by', None)  # a fresh attempt after a token-limit wait (nothing was sent before)
         # H2 (t3ec11e437): reconcile state belongs to one attempt; a new attempt starts from zero.
@@ -1839,7 +1841,7 @@ class Engine:
                          message=('The coworker again reported no access to the project; its chat is taken out of the pool'
                                   if removed else 'The coworker did not load its tools; the task is tried again'))
         if not task.get('no_access_retried'):
-            task.update(no_access_retried=True, state='retry', next_at=time.time(), error='')
+            set_state(self.store, task, 'retry', 'no tool access', no_access_retried=True, next_at=time.time(), error='')
             task['attempts'] = max(0, task.get('attempts', 1) - 1)
 
     def _tool_access_ok(self, worker_id):
@@ -1862,7 +1864,7 @@ class Engine:
             task['raw_response'] = text
             self._release(info['worker_id'], info['lease'])
             if run['state'] == 'cancelled':
-                task['state'] = 'cancelled'
+                set_state(self.store, task, 'cancelled', 'run cancelled')
             else:
                 data = plain_protocol.normalize(task,text) if getattr(self.adapter,'response_mode','json')=='plain' else json_object(text)
                 if plain_protocol.provider_error(data.get('summary','')):
@@ -1884,7 +1886,7 @@ class Engine:
                             validate_models({'tasks':data['fixes']})
                 elif data.get('status') not in ('done', 'blocked', 'failed') or not isinstance(data.get('summary'), str):
                     raise ContractError('Result needs status and summary')
-                task['state'] = 'done' if task['role'] in ('planner', 'reviewer') else data['status']
+                set_state(self.store, task, 'done' if task['role'] in ('planner', 'reviewer') else data['status'], 'reported result')
                 task['result'] = json.dumps(data, ensure_ascii=False)
                 task['requires_review']=bool(data.get('requires_review'))
                 task['error'] = data.get('summary', '') if task['state'] != 'done' else ''
@@ -1911,8 +1913,8 @@ class Engine:
         except ModelVerificationError as exc:
             failure=exc
             self._release(info['worker_id'],info['lease'])
-            task.update(state='blocked',error=str(exc),finished=time.time(),
-                        model_verification='unverified' if exc.reason=='missing' else 'mismatch',reported_model_ids=exc.reported)
+            set_state(self.store, task, 'blocked', 'model verification failed', error=str(exc), finished=time.time(),
+                      model_verification='unverified' if exc.reason=='missing' else 'mismatch', reported_model_ids=exc.reported)
             task.pop('remote_unknown',None)
             self.store.event('model_verification_failed',task['run_id'],task_id=task['id'],
                              expected_model_id=exc.expected,reported_model_ids=exc.reported,message=str(exc))
@@ -1941,9 +1943,9 @@ class Engine:
                 # Notion recorded this turn as failed without a reply; a later new turn is not a blind resend.
                 task.pop('remote_unknown', None)
                 info['verified_retry'] = True
-            task.update(state=('cancelled' if exc.free and (run or {}).get('state') == 'cancelled' else
+            set_state(self.store, task, ('cancelled' if exc.free and (run or {}).get('state') == 'cancelled' else
                                'blocked' if busy_over else
-                               'retry' if exc.free or task['attempts']<self.store.settings()['max_attempts'] else 'blocked'),
+                               'retry' if exc.free or task['attempts']<self.store.settings()['max_attempts'] else 'blocked'), 'rate limited',
                         next_at=time.time()+exc.seconds,
                         error=(('The chat stayed busy for %d checks; nothing was sent' % task['busy_waits']) if busy_over else
                                exc.message or 'Notion rate limit; account cooldown applied'))
@@ -1951,17 +1953,17 @@ class Engine:
                 # A failed turn that already used tools or claimed files is not retried automatically.
                 info.pop('verified_retry', None)
                 self._hold_for_reconcile(task, info)
-                task.update(state='cancelled' if (run or {}).get('state') == 'cancelled' else 'blocked',
+                set_state(self.store, task, 'cancelled' if (run or {}).get('state') == 'cancelled' else 'blocked', 'attempt had side effects',
                             error='The attempt used tools or claimed files before it failed; it will not be resent automatically')
         except TransientInference as exc:
             failure=exc
             self._release(info['worker_id'],info['lease'])
-            task.update(state='retry' if task['attempts']<self.store.settings()['max_attempts'] else 'blocked',
+            set_state(self.store, task, 'retry' if task['attempts']<self.store.settings()['max_attempts'] else 'blocked', 'transient inference error',
                         next_at=time.time()+backoff(task['attempts'], base=1, cap=60),error=str(exc)[:300])
         except ContextCheckpointPending as exc:
             failure=exc
             self._release(info['worker_id'], info['lease'])
-            task.update(state='cancelled' if run['state']=='cancelled' else 'retry',
+            set_state(self.store, task, 'cancelled' if run['state']=='cancelled' else 'retry', 'context checkpoint pending',
                         attempts=max(0, task['attempts']-1), next_at=time.time()+10,
                         error='Waiting for a verified context checkpoint; assignment has not been submitted')
         except ResetNotAccepted as exc:
@@ -1978,7 +1980,7 @@ class Engine:
                     worker['context_base_at'] = max(0, task.get('sent_at', time.time()) - 1)
                 self.store.put('workers', worker)
             task.pop('remote_unknown', None)
-            task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry', context_reset=False,
+            set_state(self.store, task, 'cancelled' if run['state'] == 'cancelled' else 'retry', 'context reset not accepted', context_reset=False,
                         attempts=max(0, task['attempts'] - 1), next_at=time.time() + 5,
                         error='Context replacement was not accepted by Notion (verified); continuing in the same chat')
             self.store.event('context_reset_fallback', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
@@ -1993,7 +1995,7 @@ class Engine:
                 # The task limit only slows the checks down; it never blocks, resends or abandons.
                 overdue = time.time()-task['started'] > task_limit(self.store.settings(), task)+120
                 checks=task.get('reconcile_checks',0)+1
-                task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks,
+                set_state(self.store, task, 'uncertain', 'turn state unknown, reconcile', remote_unknown=False, reconcile_checks=checks,
                             reconcile_at=time.time()+(300 if overdue else max(min(60,5*2**min(checks-1,4)), getattr(exc,'seconds',0))),
                             error='Awaiting confirmation from Notion; request will not be resent')
                 worker = self.store.get('workers', info['worker_id'])
@@ -2002,12 +2004,12 @@ class Engine:
             elif isinstance(exc, CircuitOpen):
                 # Refused locally before anything was sent: no attempt used, nothing to reconcile.
                 self._release(info['worker_id'], info['lease'])
-                task.update(state='cancelled' if run['state'] == 'cancelled' else 'retry',
+                set_state(self.store, task, 'cancelled' if run['state'] == 'cancelled' else 'retry', 'circuit open, nothing sent',
                             attempts=max(0, task['attempts']-1), next_at=time.time()+exc.seconds, error=str(exc)[:300])
             else:
                 # ACCOUNT_BLOCKED pause: nothing was sent; the task waits for a manual resume.
                 self._release(info['worker_id'], info['lease'])
-                task.update(state='cancelled' if run['state'] == 'cancelled' else 'blocked',
+                set_state(self.store, task, 'cancelled' if run['state'] == 'cancelled' else 'blocked', 'account blocked, nothing sent',
                             attempts=max(0, task['attempts']-1), paused_by='account_blocked', error=str(exc)[:400])
         except PendingRemote as exc:
             failure=exc
@@ -2038,7 +2040,7 @@ class Engine:
                     self.store.event('remote_stalled', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
                                      message='The coworker chat shows no new step for %d min; nothing is resent'
                                              % (REMOTE_QUIET_MINUTES,))
-                task.update(state='uncertain', remote_unknown=False, reconcile_checks=checks, reconcile_at=now+delay,
+                set_state(self.store, task, 'uncertain', 'pending remote, reconcile', remote_unknown=False, reconcile_checks=checks, reconcile_at=now+delay,
                             done_poll_since=since, done_poll_fast=slot_free, remote_working=working,
                             error=(working_text(stored, now) if working else
                                    'Awaiting confirmation from Notion; request will not be resent'))
@@ -2070,7 +2072,7 @@ class Engine:
                 worker.update(state='missing', enabled=False)
                 self.store.put('workers', worker)
             task.pop('remote_unknown', None)
-            task.update(state='blocked', finished=time.time(),
+            set_state(self.store, task, 'blocked', 'Notion thread missing', finished=time.time(),
                         error='The assigned Notion thread is missing; nothing was resent')
             self.store.event('worker_thread_missing', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
                              thread_id=exc.thread_id, message=str(exc)[:200])
@@ -2086,13 +2088,13 @@ class Engine:
             if self._attempt_writes(task):
                 # I5: the attempt may have changed something; it is reconciled, never resent.
                 self._hold_for_reconcile(task, info)
-                task.update(state='cancelled' if stopped else 'blocked',
+                set_state(self.store, task, 'cancelled' if stopped else 'blocked', 'inference error after writes',
                             error=error + '; the attempt used write tools or claimed files, so it is reconciled, not resent')
             elif not stopped and not task.get('inference_retry') and task['attempts'] < self.store.settings()['max_attempts']:
-                task.update(state='retry', inference_retry=True, next_at=self.clock()+backoff(task['attempts'], base=1, cap=60),
+                set_state(self.store, task, 'retry', 'inference error, read-only retry', inference_retry=True, next_at=self.clock()+backoff(task['attempts'], base=1, cap=60),
                             error=error + '; the attempt only read, so it is retried once')
             else:
-                task.update(state='cancelled' if stopped else 'blocked', error=error)
+                set_state(self.store, task, 'cancelled' if stopped else 'blocked', 'inference error', error=error)
         except ContractError as exc:
             failure=exc
             self._release(info['worker_id'], info['lease'])
@@ -2100,7 +2102,7 @@ class Engine:
             provider_failed=isinstance(exc,plain_protocol.ProviderReplyError)
             safe_provider_retry=(provider_failed and not task.get('files') and
                               getattr(text,'verified_terminal_reply',False) and not getattr(text,'tool_activity',True))
-            task.update(state='retry' if not declined and (not provider_failed or safe_provider_retry) and task['attempts']<self.store.settings()['max_attempts'] else 'blocked',
+            set_state(self.store, task, 'retry' if not declined and (not provider_failed or safe_provider_retry) and task['attempts']<self.store.settings()['max_attempts'] else 'blocked', 'contract error',
                         next_at=self.clock()+(backoff(task['attempts'], base=1, cap=60) if provider_failed else 2), error=str(exc))
             if declined:
                 task['error'] = 'Notion declined the request; see the saved response. No automatic repetition.'
@@ -2116,7 +2118,7 @@ class Engine:
                 failure=None
                 self._release(info['worker_id'], info['lease'])
                 task.pop('paused_by', None)
-                task.update(state='cancelled', error='')
+                set_state(self.store, task, 'cancelled', 'run cancelled while token limit held the turn', error='')
             elif info.get('limit_stop'):
                 # Token hard limit stopped this turn: never failed, never the presend failover, never resent.
                 failure=None
@@ -2125,7 +2127,7 @@ class Engine:
                 # Fix M: a cancel that won the race is not a chat failure; nothing was sent.
                 failure=None
                 self._release(info['worker_id'], info['lease'])
-                task.update(state='cancelled' if (run or {}).get('state') == 'cancelled' else 'retry',
+                set_state(self.store, task, 'cancelled' if (run or {}).get('state') == 'cancelled' else 'retry', 'cancelled before submission',
                             attempts=max(0, task['attempts']-1), next_at=time.time(), error='')
             elif (not task.get('sent_at') and task.get('submission_phase') == 'preparing'
                   and task.get('presend_retries', 0) < PRESEND_RETRY_LIMIT
@@ -2134,14 +2136,14 @@ class Engine:
                 # Nothing reached Notion, so the task moves to another coworker; this chat is marked 'error'.
                 self._release(info['worker_id'], info['lease'], 'error')
                 skip = [w for w in task.get('exclude_workers') or [] if w != info['worker_id']] + [info['worker_id']]
-                task.update(state='retry', attempts=max(0, task['attempts'] - 1), next_at=time.time() + 2,
+                set_state(self.store, task, 'retry', 'presend failover', attempts=max(0, task['attempts'] - 1), next_at=time.time() + 2,
                             presend_retries=task.get('presend_retries', 0) + 1, exclude_workers=skip,
                             error='')
                 self.store.event('presend_failover', task['run_id'], task_id=task['id'], worker_id=info['worker_id'],
                                  message='Nothing was sent; moved to another coworker: ' + str(exc)[:200])
             else:
                 self._release(info['worker_id'], info['lease'], 'error')
-                task.update(state='blocked', error=str(exc)[:400])
+                set_state(self.store, task, 'blocked', 'unexpected error', error=str(exc)[:400])
         if info.get('limit_stop') and task['state'] == 'uncertain':
             # Sent before the stop (PendingRemote / inference path): read back by reconcile, never resent (I5).
             task.update(paused_by=LIMIT_PAUSED_BY, limit_stopped_at=self.clock(),
@@ -2211,7 +2213,7 @@ class Engine:
                 if not worker or worker.get('account_id') != selected_account(self.store):
                     continue
             if not worker:
-                task.update(state='blocked', error='The assigned Notion thread is missing')
+                set_state(self.store, task, 'blocked', 'assigned Notion thread missing', error='The assigned Notion thread is missing')
                 self.store.put('tasks', task)
                 continue
             cancel = threading.Event()
@@ -2253,7 +2255,7 @@ class Engine:
             # the audit trail, never repeated, and need not discard other useful
             # suggestions or prevent the main chat from planning the real work.
             for task in problems:
-                task['state']='skipped'
+                set_state(self.store, task, 'skipped', 'declined approach suggestion')
                 self.store.put('tasks',task)
             self.store.event('approach_fallback',run['id'],message='Planning continues with the available suggestions; declined requests were not repeated')
             problems=[]

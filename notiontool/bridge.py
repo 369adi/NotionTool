@@ -56,6 +56,7 @@ REA_TOOLS = {
 from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled, role_allowed as local_role_allowed
 READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewer')
 from . import long_calls
+from .task_states import RUN_LIVE_STATES
 from . import token_budget
 # Hard usage limit (owner rule: ALL chats stop at once, the Main too): while the 6 h token budget
 # is used up, Bridge.limit_gate refuses every tool with a LIMIT_STOP: error, for the Main (no
@@ -227,7 +228,7 @@ for _tool in OPERATOR_TOOLS:
 
 # Fix V: an uncertain task may still be working in Notion (the stream ended but the
 # turn goes on). Keep its capability alive so its tool calls are not rejected.
-LIVE_TASK_STATES = ('running', 'uncertain')
+LIVE_TASK_STATES = RUN_LIVE_STATES  # task_states.RUN_LIVE_STATES: the same two states as before
 
 class Bridge:
     def __init__(self, store, engine, browser=None):
