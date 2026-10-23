@@ -63,6 +63,30 @@ PATCH_MODE_DEFAULT = True
 _READ_ONLY_RE = re.compile(r'\bread[- ]only\b', re.I)
 
 
+_WORKTREE_PREFIX = re.compile(r'^work/worktrees/[^/]+/')
+
+
+def machine_check_path(relative):
+    """Map a declared file to the path the machine check must look at, or None to skip it.
+
+    Coworkers list files with their worktree prefix (work/worktrees/<task>/x.py); after the merge
+    the file lives at x.py in the project root and the worktree may already be gone. Scratch files
+    under work/ or data/ and _tmp_* helpers are never merged by design, so they are not checked.
+    """
+    path = str(relative or '').replace('\\', '/')
+    while path.startswith('./'):
+        path = path[2:]
+    path = path.lstrip('/')
+    path = _WORKTREE_PREFIX.sub('', path)
+    if not path:
+        return None
+    if path.split('/', 1)[0] in ('work', 'data'):
+        return None
+    if path.rsplit('/', 1)[-1].startswith('_tmp_'):
+        return None
+    return path
+
+
 def task_is_read_only(task):
     """True only for an explicit read-only task: the read_only flag, a 'read-only' title, or a prompt that
     starts with 'read-only'. Quoted context further down the prompt (e.g. an old audit line) never counts;
@@ -705,8 +729,11 @@ class Engine:
                 except ValueError:
                     problems.append('outside the project folder: ' + name)
                     continue
-                if not (root / relative).exists():
-                    problems.append('missing: ' + relative)
+                checked = machine_check_path(relative)
+                if checked is None:
+                    continue
+                if not (root / checked).exists():
+                    problems.append('missing: ' + checked)
             return dict(passed=not problems, detail='; '.join(problems)[:300])
 
         criteria = build_done_definition(task['id'], dict(criteria=[dict(
