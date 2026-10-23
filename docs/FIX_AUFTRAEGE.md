@@ -193,3 +193,134 @@ Damit ist **A3 entschieden** und es gibt einen neuen Auftrag **A15**. A3 und A15
 - Jeder Auftrag misst vorher und nachher seine Laufzeit. Ein Fix, der etwas langsamer macht, ist nicht fertig.
 - Teure Modelle (Opus high/max) nur, wo das Risiko es braucht.
 - Wartezeiten in der Queue (Executor p90 664 s, Planner p90 415 s) sind genauso wichtig wie die Laufzeit. A1 (Pool hängt) und A7 (Merge-Sperre) dürfen keine neue Wartezeit erzeugen.
+
+---
+
+## Nachtrag 24.10., 00:55 – Richtigstellung: gemeint ist das Rollen-System
+
+> „Ich meinte generell, dass alles durch Rollen bis zur Bewertung geht. Schwere Prompts dauern sehr lange, und es läuft nur ein Coworker gleichzeitig. Der ganze Durchlauf soll schneller gehen und trotzdem bessere Qualität bringen.“
+
+**A15 wird durch A16 ersetzt.** Die Punkte aus A15 zum Design-Schritt gehen in A16 auf.
+
+### Messwerte (7 Tage, DB nur lesen: `work\_review_parallel_ro.py`, `work\_review_parallel2_ro.py`)
+
+| Was | Wert | Bedeutung |
+|---|---|---|
+| Gleichzeitige Tasks (wenn etwas läuft) | Median **2**, p90 5 | |
+| Zeit, in der nur **1** Task läuft | **39 %** | Das bestätigt „nur ein Coworker“ |
+| Arbeit ÷ Wanduhr pro Run | Median **1,7** | Runs laufen fast hintereinander |
+| `worker_budget` = 1 | **60 von 163 Runs** | Viele Runs dürfen nur 1 Coworker nutzen |
+| Tasks mit Abhängigkeit | Median 40 %, p90 90 % | Viele Teile warten unnötig |
+| Notion-Rate-Limits (429) | **0** | Das Netz bremst **nicht** |
+| Adaptives Parallel-Limit | nur 3–5, 6-mal wegen Latenz gesenkt | Nicht die Hauptbremse |
+| Typische Rollen-Kette | `executor > reviewer > executor > reviewer > executor > reviewer (> executor)` | 3–4 Fix-Runden hintereinander |
+| Reviewer-Modell | `opus/high` 231 von 236 | Jedes Review teuer und langsam |
+| Executor-Modell | `opus/high` 332, `opus` 134, `opus/max` 27, Sonnet ~50 | Fast alles Opus |
+| Executor-Dauer nach Prompt-Länge | < 2000 Zeichen: Median **152 s**; 2000–6000: Median **383 s** | Schwere Prompts = 2,5-mal langsamer |
+| Review-Urteile (grob gezählt) | fail 87, pass 24, unklar 119 | Viele Runden, weil Runde 1 oft durchfällt |
+
+### Ursachen (nach Wirkung sortiert)
+
+1. **Zu kleines Worker-Budget.** 60 Runs bekamen `worker_budget` 1. Dann läuft wirklich nur ein Coworker, egal wie viele Slots frei sind.
+2. **Zu viele Abhängigkeiten im Plan.** Teile, die andere Dateien betreffen, warten trotzdem aufeinander.
+3. **Serielle Fix-Schleife mit bis zu 4 Runden.** Jede Runde ist ein neuer schwerer Opus-Prompt. Mit A3 (max. 2 Runden) wird das schon kürzer.
+4. **Runde 1 fällt zu oft durch.** Grund: unklare Abnahme-Kriterien und kein Maschinen-Check vor dem Review. Das kostet Zeit **und** Qualität.
+5. **Schwere Prompts.** Ein langer Kontext wird in jeden Task kopiert. Ab 2000 Zeichen dauert ein Task 2,5-mal so lange.
+6. **Opus für fast alles,** auch für Reviews von normalem Code und für Design.
+
+## A16 – Rollen-Durchlauf schneller **und** besser – TEAM, Opus 5.5 / high (Umsetzung), unabhängiges Review (I14)
+
+Das ist jetzt der **wichtigste Auftrag**. Er gehört in Welle 1, zusammen mit A1 und A3.
+
+### Teil 1 – Mehr Coworker gleichzeitig
+- Die Stelle finden, an der `worker_budget` gesetzt wird. Ein Run mit 2 oder mehr unabhängigen Teilen bekommt mindestens so viele Coworker, wie es unabhängige Teile gibt (bis zur Slot-Grenze).
+- `worker_budget` 1 nur bei echten Ein-Teil-Aufgaben.
+- Der Planer setzt `depends_on` nur bei echter Datei-Überschneidung oder echter Ergebnis-Abhängigkeit. Teile mit verschiedenen Dateien laufen parallel.
+- Rollen überlappen: Das Review von Teil A läuft, während Teil B noch gebaut wird.
+
+### Teil 2 – Weniger Runden durch bessere erste Runde
+- **Maschinen-Check vor jedem AI-Review:** betroffene Tests, `nt_test_app check` und Syntax/Lint laufen automatisch. Ist das rot, geht es direkt zurück an den Executor, ohne Review-Prompt.
+- **Klare Abnahme-Kriterien** sind Pflicht in jedem Plan-Teil (welcher Test, welches Verhalten). Ohne Kriterien startet kein Task.
+- Der Executor bekommt dieselben Kriterien und prüft sich selbst, bevor er abgibt.
+- **Fix im selben Coworker-Chat:** Der Kontext bleibt da, nur die Review-Punkte werden nachgeschickt, kein neuer schwerer Prompt.
+- Max. 2 Review-Runden (A3).
+
+### Teil 3 – Leichtere Prompts
+- Gemeinsamer Run-Kontext liegt **einmal als Datei** im Run-Ordner. Der Prompt nennt nur den Pfad und die betroffenen Dateien.
+- Zielgröße: Executor-Prompt unter 2000 Zeichen im Median (heute p90 2984, max 50485).
+- Reviewer bekommt nur: Diff, Abnahme-Kriterien, Ergebnis vom Maschinen-Check.
+
+### Teil 4 – Modell nach Risiko (I35)
+- Executor: Sonnet 5.5 / high für normale, klar beschriebene Teile. Opus 5.5 / high für Kern-Logik, Nebenläufigkeit, Sicherheit, Migration. `opus/max` nur auf ausdrücklichen Wunsch.
+- Reviewer: Sonnet 5.5 / medium für normalen Code, Opus 5.5 / high für riskante Teile.
+- Architect/Design nur bei 3+ Teilen oder neuer Oberfläche, sonst überspringen. Wenn er läuft: kurze feste Vorlage, Zeitlimit 180 s.
+- Das echte Modell pro Turn messen (A12), damit die Wahl auch wirklich ankommt.
+
+### Qualität darf nicht sinken – Schutzregeln
+- Das unabhängige Review (I14) bleibt für jeden Code-Task. Nur das Modell wird nach Risiko gewählt.
+- Ein Task wird nie `done` ohne grünen Maschinen-Check **und** bestandenes Review.
+- Sinkt die Erstrunden-Quote oder steigt die Zahl der Nacharbeiten nach `done`, wird das Modell für diese Art von Task automatisch wieder erhöht.
+
+### Messung und Ziele (vorher/nachher mit den Skripten oben)
+
+| Kennzahl | Heute | Ziel |
+|---|---|---|
+| Zeit mit nur 1 Task (wenn etwas läuft) | 39 % | **unter 15 %** |
+| Arbeit ÷ Wanduhr pro Run (Median) | 1,7 | **mindestens 3** |
+| Runs mit `worker_budget` 1 bei 2+ Teilen | viele | **0** |
+| Review besteht in Runde 1 | ~10–20 % (grob) | **mindestens 60 %** |
+| Review-Runden pro Task | bis 4 | **max. 2** |
+| Executor-Prompt Median | ~1000 Zeichen, lange Ausreißer | **unter 2000, max 6000** |
+| Dauer eines Runs mit 4 Teilen | messen | **mindestens 40 % schneller** |
+| Nacharbeit nach `done` | messen | **nicht höher als heute** |
+
+Dazu kommen eigene Events für `review_first_pass` (ja/nein), `machine_check` (grün/rot, Dauer) und `worker_budget` (Wert, Anzahl unabhängiger Teile).
+
+### Dateien (Startpunkte)
+`notiontool/operator_main.py` (Plan, Delegation, `worker_budget`, Design-Skip), `notiontool/engine.py` (Review-Schleife, `_complete`), Prompt-Bau für Coworker, Modell-/Effort-Policy, `notiontool/network_budget.py` (nur prüfen, ist nicht die Hauptbremse).
+
+### Abnahme
+- Tests für: Budget gleich Anzahl unabhängiger Teile, kein `depends_on` ohne Datei-Überschneidung, Maschinen-Check vor Review, Fix im selben Chat, Modellwahl nach Risiko, max. 2 Runden.
+- Live-Backtest: derselbe Auftrag mit 4 Teilen einmal vorher und einmal nachher. Gemessen werden Dauer, Parallelität, Runden und Ergebnis-Qualität (Tests grün, Review-Urteil).
+- Die Ziel-Tabelle vorher und nachher ausfüllen.
+
+### Reihenfolge innerhalb von A16
+1. Teil 1 (Budget + Abhängigkeiten): schnellster Gewinn.
+2. Teil 2 (Maschinen-Check + Fix im selben Chat): spart Runden und verbessert die Qualität.
+3. Teil 3 und Teil 4 parallel.
+
+---
+
+## Fester Mess-Auftrag für A16 (vorher/nachher gleich)
+
+Zweck: Derselbe Auftrag läuft **vor** und **nach** A16. So ist der Gewinn bei Tempo und Qualität klar messbar. Er läuft in einem Wegwerf-Ordner und ändert keinen Harness-Code.
+
+**Ordner:** `C:\Users\liket\Downloads\NotionTool-harness\NotionTool\work\bench\a16\<datum-uhrzeit>\` (jedes Mal neu)
+
+**Text für `/api/send` (immer wörtlich gleich):**
+
+```
+Mess-Auftrag A16. Projektordner: work\bench\a16\<datum-uhrzeit>. Baue 4 unabhängige kleine Python-Module mit pytest-Tests. Jedes Modul hat eine eigene Datei und eine eigene Testdatei, es gibt keine gemeinsamen Dateien.
+1. durations.py: parse("1h30m") -> 5400, unterstützt d/h/m/s, Fehler bei leerem oder falschem Text (ValueError). Mindestens 8 Tests.
+2. slugify.py: slugify("Ärger & Co. 2026!") -> "aerger-co-2026", Umlaute ersetzen, max. 60 Zeichen, nie Bindestrich am Anfang/Ende. Mindestens 8 Tests.
+3. csvsum.py: summarize(pfad) -> {spalte: {min, max, mean}} nur für Zahlenspalten, leere Zellen ignorieren, Datei ohne Zahlen -> {}. Mindestens 6 Tests mit tmp_path.
+4. ratelimit.py: TokenBucket(rate, capacity, clock) mit allow() -> bool, Uhr injizierbar, keine echten sleeps in Tests. Mindestens 6 Tests.
+Abnahme: python -m pytest im Projektordner ist grün, keine Abhängigkeiten außer der Standardbibliothek und pytest.
+```
+
+**Erwartung an einen guten Durchlauf:** 4 Teile ohne `depends_on`, `worker_budget` 4, 4 Coworker gleichzeitig, kein Architect, Modell Sonnet 5.5 für Executor und Review, höchstens 2 Review-Runden pro Teil.
+
+**Messprotokoll (pro Lauf eine Zeile):**
+
+| Datum | Run-ID | Wanduhr bis done | max. gleichzeitig | Arbeit ÷ Wanduhr | worker_budget | Runden pro Teil | Review Runde 1 bestanden | Modelle | pytest | Bemerkung |
+|---|---|---|---|---|---|---|---|---|---|---|
+| vorher | | | | | | | | | | |
+| nachher | | | | | | | | | | |
+
+Werte aus `/api/run?id=<run>&compact=1` und `work\_review_parallel_ro.py` (nur lesen).
+
+**Erfolg:** Wanduhr mindestens 40 % kürzer, max. gleichzeitig 4, Review Runde 1 bei mindestens 3 von 4 Teilen bestanden, pytest grün.
+
+## Hinweis Main 20
+
+`/api/chats` (24.10., 01:20): **Main 20** steht bei rund **10,2 Mio Tokens** in 44 Turns (vor ein paar Stunden noch ~4,1 Mio). Das ist weit über jedem sinnvollen Limit. Er sollte keine neuen Aufträge bekommen, bevor A10 (Context-Limit für Mains) erledigt oder Main 20 gewechselt ist.
