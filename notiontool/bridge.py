@@ -70,7 +70,7 @@ from . import token_budget
 # started before the limit keeps running (it is not killed); nt_job_result still reads its result.
 LIMIT_ALLOWED_TOOLS = frozenset((
     'mcp_servers', 'mcp_list_tools', long_calls.JOB_TOOL,
-    'nt_read_file', 'nt_list_dir', 'nt_search_code', 'nt_file_outline', 'nt_memory_read',
+    'nt_read_file', 'nt_list_dir', 'nt_search_code', 'nt_file_outline', 'nt_find_symbol', 'nt_memory_read',
     'nt_screen_windows', 'nt_screen_capture', 'screen_windows', 'screen_capture',
     'read_file', 'list_files', 'context',
 ))
@@ -210,7 +210,7 @@ _SNAPSHOT_SEQ = itertools.count(1)
 # lies inside the project, e.g. NotionTool working on itself. Keys use file_registry.path_key.
 DATA_FOLDER_REFUSAL = ('%s refused: %s is inside the NotionTool data folder (coworker snapshots and app state); '
                        'bridge project tools never list, search, outline or change files there.')
-DEV_GUARDED = {'nt_list_dir': 'Listing', 'nt_search_code': 'Search', 'nt_file_outline': 'Outline',
+DEV_GUARDED = {'nt_list_dir': 'Listing', 'nt_search_code': 'Search', 'nt_file_outline': 'Outline', 'nt_find_symbol': 'Symbol search',
                'nt_write_file': 'Write', 'nt_edit_file': 'Edit'}
 _HIT_PATH = re.compile(r'^(.*?):\d+: ')
 
@@ -764,6 +764,18 @@ class Bridge:
                 if not match or not self.in_area(dev_path(match.group(1)), area):
                     kept.append(hit)
             return dict(result, results=kept)
+        if name == 'nt_find_symbol':
+            # Hits are 'path:line: ...' relative to the index root; drop those inside the data area.
+            base = Path(str(result.get('root') or dev_path((args or {}).get('path') or '.')))
+            out = dict(result)
+            for key in ('definitions', 'callers', 'importers'):
+                kept = []
+                for hit in result.get(key) or []:
+                    match = _HIT_PATH.match(str(hit))
+                    if not match or not self.in_area(base / match.group(1), area):
+                        kept.append(hit)
+                out[key] = kept
+            return out
         return result
 
     def role_is_read_only(self, role):

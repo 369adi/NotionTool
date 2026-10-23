@@ -69,6 +69,7 @@ TOOLS = [
     {'name': 'nt_list_dir', 'description': 'Dev: list a folder; recursive mode skips build, cache and data folders.', 'annotations': RO, 'inputSchema': _schema({'path': S, 'recursive': B, 'max_entries': I})},
     {'name': 'nt_search_code', 'description': 'Codebase: regex search over source files (glob filter like *.py). Returns path:line: text.', 'annotations': RO, 'inputSchema': _schema({'pattern': S, 'path': S, 'glob': S, 'ignore_case': B, 'max_results': I}, ['pattern'])},
     {'name': 'nt_file_outline', 'description': 'Codebase: classes, functions and methods of a .py file, or functions and element ids of a .js/.html file, with line numbers.', 'annotations': RO, 'inputSchema': _schema({'path': S})},
+    {'name': 'nt_find_symbol', 'description': 'Codebase: find a Python symbol (function, class or method, optionally Class.method) in one call: its definitions, callers and importers as path:line. Uses a per-worktree index that re-parses changed files before each query, so it is never stale.', 'annotations': RO, 'inputSchema': _schema({'name': S, 'path': S, 'max_results': I}, ['name'])},
     {'name': 'nt_memory_read', 'description': 'Project memory: read the durable notes of a project (default NotionTool): goals, architecture, decisions, status, open tasks. project="*" lists projects.', 'annotations': RO, 'inputSchema': _schema({'project': S})},
     {'name': 'nt_memory_update', 'description': 'Project memory: replace (or append to) one "## section" of a project memory file. Update after every significant change.', 'annotations': {'readOnlyHint': False, 'destructiveHint': False}, 'inputSchema': _schema({'project': S, 'section': S, 'content': S, 'append': B}, ['section', 'content'])},
     {'name': 'nt_test_app', 'description': 'Test app: start an isolated second NotionTool from the CURRENT source code (hidden, own empty data folder, port 8791, no Notion accounts, the real app is never touched) to prove a code fix really works before it reaches the user. action=check (default): start, wait, collect startup errors and tracebacks, stop; verdict passed or failed. start/status/stop keep it running for manual HTTP tests on the returned port. RULE: every NotionTool code change must pass nt_test_app check (plus its pytest tests) before it is reported done; a failed verdict means the task is not done.', 'annotations': RW, 'inputSchema': _schema({'action': {'type': 'string', 'enum': ['check', 'start', 'status', 'stop']}, 'port': I, 'keep': B})},
@@ -272,4 +273,11 @@ def call(name, args):
         flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == 'nt' else 0
         subprocess.Popen(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', f"Start-Sleep 2; & '{script}'"], cwd=str(ROOT), creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
         return {'restarting': True, 'note': 'Reconnect in about 15 seconds.'}
+    if name == 'nt_find_symbol':
+        # Read-only: the per-worktree index lives in the git admin folder (or temp), never in data/.
+        from . import code_index
+        base = _path(args.get('path') or '.')
+        if base.is_file():
+            base = base.parent
+        return code_index.find_symbol(base, args['name'], limit=min(int(args.get('max_results') or 50), 500))
     raise ValueError('Unknown dev tool')

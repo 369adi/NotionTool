@@ -9,6 +9,8 @@ Markers in the task prompt (written by the Main):
   [[code: notiontool/step_guard.py]]           whole file if small, else a pointer
   [[test: python -m pytest tests/test_x.py -q]] the exact check to run at the end
 Small files in the task's 'files' list (<= AUTO_MAX_LINES) are added automatically.
+For larger .py files in that list the ranked repo map (code_index, PageRank over import
+and call edges) fills the rest of BUDGET_CHARS with their most connected symbols.
 """
 import os
 import re
@@ -18,6 +20,10 @@ RANGE = re.compile(r'^(.*?):(\d+)(?:-(\d+))?$')
 AUTO_MAX_LINES = 200
 WHOLE_MAX_LINES = 400
 BUDGET_CHARS = 40000
+MAP_SYMBOL_MAX_LINES = 120
+MAP_MIN_CHARS = 200
+MAP_HEADER = ('Repo map: the most connected symbols of the larger task files '
+              '(ranked by imports and calls across the repo).')
 NOTE = ('\n\nContext pack: the code shown above is the current file state at task start. '
         'Do not read or search it again; read only lines that are not shown. '
         'Batch several reads into one call where possible, and never poll in a loop.')
@@ -68,10 +74,51 @@ def _code(spec, root):
     return text, len(text), path
 
 
+def _map_blocks(root, large, budget, info):
+    """Blocks of the best ranked symbols of the large .py files, within the remaining budget."""
+    if not large or budget - info['chars'] < MAP_MIN_CHARS:
+        return []
+    base = os.path.realpath(root)
+    files = {}
+    for name, path, lines in large:
+        files[os.path.relpath(path, base).replace(os.sep, '/')] = (name, lines)
+    try:
+        from . import code_index
+        ranked = code_index.repo_map(base, focus=list(files), limit=0)
+    except Exception as error:  # the map is an extra; it must never break a task start
+        info['map_error'] = ('%s: %s' % (type(error).__name__, error))[:200]
+        return []
+    blocks, taken = [], {}
+    for symbol in ranked.get('symbols', ()):
+        if budget - info['chars'] < MAP_MIN_CHARS:
+            break
+        if symbol.get('path') not in files:
+            continue
+        name, lines = files[symbol['path']]
+        start = max(1, int(symbol.get('line') or 1))
+        end = min(len(lines), max(start, int(symbol.get('end_line') or start)))
+        if start > len(lines):
+            continue
+        ranges = taken.setdefault(symbol['path'], [])
+        if any(start <= done_end and done_start <= end for done_start, done_end in ranges):
+            continue  # already shown inside a class or method block
+        text = _block(name, lines, start, min(end, start + MAP_SYMBOL_MAX_LINES - 1))
+        if not blocks:
+            text = MAP_HEADER + '\n' + text
+        if info['chars'] + len(text) > budget:
+            continue  # a smaller symbol may still fit
+        ranges.append((start, end))
+        info['chars'] += len(text)
+        info['blocks'] += 1
+        info['symbols'] += 1
+        blocks.append(text)
+    return blocks
+
+
 def expand(prompt, files, root, budget=BUDGET_CHARS):
-    """Return (prompt, info). info: added (bool), chars, blocks, skipped."""
+    """Return (prompt, info). info: added (bool), chars, blocks, skipped, tests, symbols."""
     prompt = str(prompt or '')
-    info = dict(added=False, chars=0, blocks=0, skipped=0, tests=0)
+    info = dict(added=False, chars=0, blocks=0, skipped=0, tests=0, symbols=0)
     seen = set()
 
     def replace(match):
@@ -91,7 +138,7 @@ def expand(prompt, files, root, budget=BUDGET_CHARS):
         return text
 
     prompt = MARK.sub(replace, prompt)
-    extra = []
+    extra, large = [], []
     for name in files or ():
         if not isinstance(name, str):
             continue
@@ -103,7 +150,11 @@ def expand(prompt, files, root, budget=BUDGET_CHARS):
             lines = _lines(path)
         except OSError:
             continue
-        if not lines or len(lines) > AUTO_MAX_LINES:
+        if not lines:
+            continue
+        if len(lines) > AUTO_MAX_LINES:
+            if path.endswith('.py'):
+                large.append((name, path, lines))
             continue
         text = _block(name, lines, 1, len(lines))
         if info['chars'] + len(text) > budget:
@@ -112,6 +163,7 @@ def expand(prompt, files, root, budget=BUDGET_CHARS):
         info['chars'] += len(text)
         info['blocks'] += 1
         extra.append(text)
+    extra.extend(_map_blocks(root, large, budget, info))
     if extra:
         prompt += '\n\n' + '\n\n'.join(extra)
     if info['blocks']:
