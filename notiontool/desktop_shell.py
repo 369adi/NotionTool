@@ -160,6 +160,9 @@ _BUILD_RE = re.compile(r"var BUILD = '([0-9a-f]{16})';")
 # Asked on attach: which overlay build (if any) runs in the open page.
 PROBE_JS = ("(function () { return {installed: !!window.__ntDeskInstalled, "
             "build: String(window.__ntDeskBuild || '')}; })()")
+# Startup self-check of the pinned Notion runtime: overlay present + which Notion build runs.
+VERIFY_JS = ("(function () { return {installed: !!window.__ntDeskInstalled, "
+             "ua: String(navigator.userAgent || '')}; })()")
 # Removes an older overlay from the open page without reloading it. Also installed as
 # window.__ntDeskTeardown so a later build can call it. Notion's own nodes are never removed:
 # only nodes we created (data-nt-desk-own, nt-desk-* id, or only non-mark nt-desk-* classes and no
@@ -284,23 +287,17 @@ def source_build(source):
 
 
 # ---- environment ------------------------------------------------------------
-def find_exe(run=subprocess.run):
-    """Path of the installed Notion desktop Notion.exe (MSIX first, then the classic install)."""
+def find_exe(run=subprocess.run, root=None):
+    """Notion.exe for the NotionTool window: our PINNED copy (notion_runtime.py), never the live system
+    install, so a Notion Store update cannot change the NotionTool window. First start makes the copy.
+    Only if the copy cannot be made (disk full, access denied) the system Notion is used as fallback."""
+    from . import notion_runtime
     try:
-        out = run(['powershell.exe', '-NoProfile', '-Command',
-                   '(Get-AppxPackage com.notion.app.desktop.notion).InstallLocation'],
-                  capture_output=True, text=True, timeout=20)
-        location = (out.stdout or '').strip().splitlines()
-        if location and location[-1].strip():
-            exe = Path(location[-1].strip()) / 'Notion' / 'Notion.exe'
-            if exe.exists():
-                return str(exe)
-    except Exception:
-        pass
-    classic = Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Notion' / 'Notion.exe'
-    if classic.exists():
-        return str(classic)
-    raise FileNotFoundError('The Notion desktop app is not installed')
+        return notion_runtime.ensure(run=run, root=root)
+    except FileNotFoundError:
+        raise
+    except Exception:  # noqa: BLE001 - copy failed: still start, from the system install
+        return notion_runtime.system_exe(run)
 
 
 def default_profile():
@@ -981,7 +978,14 @@ class DesktopController:
     """Start, watch and stop the NotionTool desktop window for server.py."""
 
     def __init__(self, server, *, port=DEFAULT_PORT, profile_dir=None, exe_finder=find_exe, data_dir=None,
-                 app_factory=None, http_get=None, stopper=stop_processes, push_interval=1.0):
+                 app_factory=None, http_get=None, stopper=stop_processes, push_interval=1.0,
+                 runtime_check=None, runtime_root=None):
+        # Startup self-check of the pinned Notion runtime (notion_runtime.py). On by default only with the
+        # real finder; tests with fake finders/apps keep their old behaviour unless they turn it on.
+        self.runtime_check = (exe_finder is find_exe) if runtime_check is None else bool(runtime_check)
+        self.runtime_root = runtime_root
+        self.runtime = None
+        self._restart_after = False
         self.server = server
         self.port = int(port)
         self.profile_dir = profile_dir or default_profile()
@@ -1005,7 +1009,7 @@ class DesktopController:
         app = getattr(shell, 'app', None)
         return dict(state=self.state, error=self.error, port=self.port, profile=self.profile_dir,
                     pid=getattr(app, 'pid', None), target_id=getattr(shell, 'target_id', '') if shell else '',
-                    started_at=self.started_at,
+                    started_at=self.started_at, runtime=self.runtime,
                     push=self.pusher.stats.snapshot() if getattr(self, 'pusher', None) is not None else None)
 
     def autostart(self):
@@ -1115,6 +1119,58 @@ class DesktopController:
         except Exception:  # noqa: BLE001
             pass
 
+    def _verify_runtime(self, shell, tries=10, interval=1.0):
+        """Startup self-check of the pinned Notion runtime (notion_runtime.py).
+
+        The overlay must really be in the page. Loaded -> this Notion version becomes last_good. Missing on
+        the version that is on trial -> roll back to the last good version and restart the window (returns
+        False). Missing without an older good version -> state 'degraded' with a clear message (True)."""
+        from . import notion_runtime
+        value = None
+        for _ in range(max(1, tries)):
+            session = getattr(getattr(shell, 'app', None), 'session', None)
+            try:
+                result = session.send('Runtime.evaluate', {'expression': VERIFY_JS, 'returnByValue': True}, 10) or {}
+                value = (result.get('result') or {}).get('value') if isinstance(result, dict) else None
+            except Exception:  # noqa: BLE001
+                value = None
+            if isinstance(value, dict) and value.get('installed'):
+                break
+            if self.stop_event.wait(interval):
+                return True
+        ua = value.get('ua', '') if isinstance(value, dict) else ''
+        running = notion_runtime.ua_version(ua)
+        state = notion_runtime.load_state(self.runtime_root)
+        current = state.get('current') or ''
+        on_pinned = bool(current) and notion_runtime.matches(current, ua)
+        if isinstance(value, dict) and value.get('installed'):
+            if on_pinned:
+                notion_runtime.mark_good(current, self.runtime_root)
+            self.runtime = dict(ok=True, notion=running, pinned=current, last_good=state.get('last_good') or '')
+            return True
+        message = 'The NotionTool overlay did not load on Notion %s' % (running or '?')
+        self.runtime = dict(ok=False, notion=running, pinned=current, last_good=state.get('last_good') or '')
+        try:
+            self.server.store.event('desktop_overlay_missing', message=message[:200])
+        except Exception:
+            pass
+        if on_pinned and notion_runtime.rollback(self.runtime_root):
+            self._restart_after = True
+            self.error = message + '; going back to Notion ' + str(state.get('last_good'))
+            return False
+        self.state, self.error = 'degraded', message + ' (no older working Notion version to go back to)'
+        return True
+
+    def _restart_later(self):
+        runner = threading.current_thread()
+
+        def go():
+            runner.join(timeout=30)
+            if not self.stop_event.is_set():
+                self.start()
+
+        threading.Thread(target=go, daemon=True, name='desktop-app-rollback').start()
+
     def _make_app(self):
         secrets = notion_shell.shell_secrets(self.server)
         kwargs = dict(secrets=secrets)
@@ -1156,6 +1212,9 @@ class DesktopController:
             # The login assist keeps running: it idles on workspace pages and wakes up after a sign-out.
             self.state, self.error = 'running', ''
             self.server.store.event('desktop_app_started', message='NotionTool window attached on port %d' % self.port)
+            # Pinned runtime self-check: overlay really loaded? Else roll back to the last good Notion.
+            if self.runtime_check and not self._verify_runtime(shell):
+                return
             # After a restart Notion sometimes shows 'Oops! Something went wrong ... Refresh'. Reload that page
             # once or twice from here (backend, not desktop JS) so the window is ready without a manual click.
             threading.Thread(target=self._heal_error_page, args=(shell,), daemon=True,
@@ -1188,6 +1247,15 @@ class DesktopController:
                     shell.close(stop_app=False)
                 except Exception:
                     pass
+            if self._restart_after:
+                # Rollback: close the window that runs the failed Notion and start the last good one.
+                self._restart_after = False
+                self.state = 'restarting'
+                try:
+                    self.stopper(self.profile_dir)
+                except Exception:
+                    pass
+                self._restart_later()
 
     def stop(self, close_window=True):
         self.stop_event.set()
