@@ -1577,7 +1577,7 @@
       var node = newChatControl(ev.target);
       if (!node) return;
       block(ev);
-      createWelcome(node);
+      openCreate(node);  // name field + Main checkbox (owner 23.10.: the new chat UI's button opens the dialog)
     }
 
     function onKey(ev) {
@@ -1585,7 +1585,7 @@
       var node = newChatControl(ev.target);
       if (!node) return;
       block(ev);
-      createWelcome(node);
+      openCreate(node);  // name field + Main checkbox (owner 23.10.: the new chat UI's button opens the dialog)
     }
 
     // ---- jump to the newest message after switching chats ------------------------------------
