@@ -315,7 +315,7 @@ class EngineTests(unittest.TestCase):
         self.adapter.review_passed=False
         run=self.engine.submit('c','verify carefully')
         self.pump(lambda:self.store.get('runs',run['id'])['state']=='blocked')
-        self.assertEqual(self.store.get('runs',run['id'])['fixes'],2)
+        self.assertEqual(self.store.get('runs',run['id'])['fixes'],1)  # max_fix_rounds=1 default
         self.assertFalse(any(m['role']=='assistant' for m in self.store.all('messages')))
     def test_cancel_holds_ambiguous_thread(self):
         self.adapter.ambiguous=True;self.adapter.count=1

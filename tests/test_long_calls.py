@@ -142,8 +142,8 @@ class JobsTests(unittest.TestCase):
         self.assertEqual(long_calls.sync_limit({'mcp_sync_limit_s': 90}), 55.0)
         self.assertEqual(long_calls.sync_limit({'mcp_sync_limit_s': '30'}), 30.0)
         self.assertEqual(long_calls.sync_limit({'mcp_sync_limit_s': 'x'}), long_calls.SYNC_LIMIT)
-        self.assertEqual(long_calls.wait_seconds(None), 30.0)
-        self.assertEqual(long_calls.wait_seconds(500), 40.0)
+        self.assertEqual(long_calls.wait_seconds(None), long_calls.DEFAULT_WAIT)  # DEFAULT_WAIT=50.0
+        self.assertEqual(long_calls.wait_seconds(500), long_calls.MAX_WAIT)  # clamped to MAX_WAIT=50.0
         self.assertEqual(long_calls.wait_seconds(-1), 0.0)
 
 

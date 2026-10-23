@@ -228,7 +228,7 @@ class Store:
                        switch_retry_s=60, switch_remaining_tasks=3,
                        ui_mode='classic', dynamic_roles=False, role_definitions=[],
                        coworker_rotate_mode='new_welcome', main_context_policy='hint',
-                       coworker_delete_old_chat=True)
+                       coworker_delete_old_chat=True, idle_mode=True)
         return dict(defaults, **self.get('settings', 'app', {}))
 
     def remember(self, ident, text, source=''):

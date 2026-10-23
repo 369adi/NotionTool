@@ -106,7 +106,7 @@ class FileTests(unittest.TestCase):
         block = data[start:data.index(b"path=='/api/run/confirm'", start)]
         self.assertIn(b'problems.handle(app,self.read_body())', block)
         self.assertEqual(block.count(b'\n'), block.count(b'\r\n'))
-        self.assertEqual(data.count(b'problems.install_desk_actions()'), 2)
+        self.assertEqual(data.count(b'problems.install_desk_actions()'), 3)  # 3 call sites in server.py
         for line in data.split(b'\n'):
             if b'problems.install_desk_actions()' in line or b'from . import problems' in line:
                 self.assertTrue(line.endswith(b'\r'), line)
