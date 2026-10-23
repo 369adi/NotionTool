@@ -333,6 +333,31 @@ class MainWake:
             found.append((run, tasks))
         return found
 
+    def busy_threads(self):
+        """Main thread ids that still have open operator work (a run not finished or an open task).
+
+        Finished runs of such a Main are held back and sent together in one message once the very
+        last coworker of that Main is done (owner 2026-10-23: no wake after every single run).
+        """
+        open_runs = set()
+        for task in self.store.all("tasks"):
+            if task.get("state") in OPEN_TASK_STATES:
+                open_runs.add(task.get("run_id"))
+        busy = set()
+        for run in self.store.all("runs"):
+            if not run.get("operator") or run.get("confirmed_at"):
+                continue
+            state = run.get("state")
+            if state in TERMINAL_RUN and run.get("id") not in open_runs:
+                continue
+            if state not in TERMINAL_RUN and state not in ACTIVE and state != "queued" \
+                    and run.get("id") not in open_runs:
+                continue  # unknown or paused state without open tasks never blocks the wake
+            _, thread = self.thread_of(run)
+            if thread:
+                busy.add(thread)
+        return busy
+
     def baseline(self):
         """Old finished runs count as notified without a message (no spam after a restart)."""
         now = _num(self.clock())
@@ -386,8 +411,11 @@ class MainWake:
             if not thread:
                 continue
             groups.setdefault((account, thread), []).append((run, tasks))
+        busy = self.busy_threads()
         sent = []
         for (account, thread), items in groups.items():
+            if thread in busy:
+                continue  # owner 2026-10-23: one wake only when the very last coworker of this Main is done
             if now - self.last_sent.get(thread, -MIN_GAP_S) < MIN_GAP_S:
                 continue
             try:

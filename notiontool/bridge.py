@@ -153,6 +153,53 @@ from .devtools import TOOLS as DEV_TOOLS, NAMES as DEV_NAMES, call as dev_call
 from .devtools import _path as dev_path
 from . import file_registry
 from . import snapshots as file_snapshots
+from . import eol_guard
+
+
+def eol_attribute(path):
+    """Return 'lf' or 'crlf' from the git eol attribute of path; 'lf' when unset, unknown or unreadable."""
+    path = Path(path)
+    try:
+        done = subprocess.run(['git', 'check-attr', 'eol', '--', path.name], cwd=str(path.parent), shell=False,
+                              capture_output=True, text=True, timeout=10,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except (OSError, subprocess.SubprocessError):
+        return 'lf'
+    if done.returncode != 0:
+        return 'lf'
+    value = (done.stdout or '').strip().rsplit(': ', 1)[-1].strip()
+    return value if value in eol_guard.STYLES else 'lf'
+
+
+def write_with_eol(path, text):
+    """Write text to path keeping the line ending and BOM state of an existing file (rank 2, eol_guard).
+
+    A new file, or an existing file without any newline, follows the git eol attribute ('lf' when unset).
+    An existing file whose bytes are mixed (eol_guard.detect) is written as given. The result reports the
+    ending that was written and, when it differs from the ending of the given text, 'eol_changed'.
+    """
+    path = Path(path)
+    existing = path.read_bytes() if path.exists() else None
+    given = text.encode('utf-8')
+    kept_mixed = existing is not None and eol_guard.detect(existing) == 'mixed'
+    if kept_mixed:
+        data = given
+    else:
+        default = 'lf'
+        if existing is None or eol_guard.detect(existing) == 'none':
+            default = eol_attribute(path)
+        data = eol_guard.normalize(text, existing, default=default)
+    path.write_bytes(data)
+    result = {'written': str(path), 'bytes': len(data), 'eol': eol_guard.detect(data)}
+    before = eol_guard.detect(given)
+    if kept_mixed:
+        result['eol_kept'] = 'mixed'
+    elif before != 'none' and before != result['eol']:
+        result['eol_changed'] = before + '->' + result['eol']
+    if text.startswith('\ufeff') and not data.startswith(eol_guard.BOM):
+        result['bom_dropped'] = True
+    return result
+
 # O5: old bytes of an existing project file are stored before a coworker write or edit,
 # under <data folder>/snapshots, bounded by snapshots.prune().
 SNAPSHOT_DIR = 'snapshots'
@@ -550,8 +597,7 @@ class Bridge:
                     self._tool_started(run['id'],task_id=task['id'],tool=name,message='Write: '+str(path)[:300])
                     self.snapshot_before_write(task, run, path)
                     path.parent.mkdir(parents=True,exist_ok=True)
-                    path.write_text(text,encoding='utf-8',newline='')
-                    return {'written':str(path),'bytes':len(text.encode())}
+                    return write_with_eol(path,text)
         if name in TOOL_SERVER:
             return rea.tools() if name.endswith('_tools') else rea.call(str(args.get('name','')), args.get('arguments') or {})
         if name == 'screen_capture':

@@ -156,12 +156,11 @@ class PatchModeTest(unittest.TestCase):
         write(wt / 'work' / 'bench' / 'unlisted.py', 'Z = 3\n')
         write(wt / 'data' / 'x.db', 'db')
         stats = self.pm.collect(t)
-        self.assertEqual(sorted(stats['forced']), ['work/bench/roman.py', 'work/bench/test_roman.py'])
-        self.assertEqual(sorted(f['path'] for f in stats['files']),
-                         ['work/bench/roman.py', 'work/bench/test_roman.py'])
-        result = self.pm.merge(t)
-        self.assertEqual(result['status'], 'merged')
-        self.assertEqual((self.root / 'work' / 'bench' / 'roman.py').read_text(encoding='utf-8'), 'X = 1\n')
+        # Current design (patch_mode._dropped_listed): work/ and data/ are never merged on purpose;
+        # listed files there are reported as dropped instead of being forced in silently.
+        self.assertEqual(sorted(stats['dropped']), ['data/x.db', 'work/bench/roman.py', 'work/bench/test_roman.py'])
+        self.assertEqual([f['path'] for f in stats['files']], [])
+        self.assertFalse((self.root / 'work' / 'bench' / 'roman.py').exists())
         self.assertFalse((self.root / 'work' / 'bench' / 'unlisted.py').exists())
 
     def test_verify_green_then_red(self):
