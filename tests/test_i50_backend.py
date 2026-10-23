@@ -1,4 +1,4 @@
-"""I50 backend: GET /api/chat/ages, hard 23 h send block on /api/send, POST /api/chat/context_switch stub.
+"""I50 backend: GET /api/chat/ages, hard 23 h send block on /api/send, POST /api/chat/context_switch (real switch).
 
 No real app, port or Notion call: the HTTP handler is called directly (same pattern as test_auth_routes.py)
 with a fake store and a mocked engine.
@@ -31,10 +31,18 @@ class FakeHTTPServer:
 
 
 class FakeStore:
-    def __init__(self, chats=(), workers=()):
-        self.data = {'chats': {c['id']: dict(c) for c in chats}, 'workers': {w['id']: dict(w) for w in workers}}
+    def __init__(self, chats=(), workers=(), accounts=(), tasks=()):
+        self.data = {'chats': {c['id']: dict(c) for c in chats}, 'workers': {w['id']: dict(w) for w in workers},
+                     'accounts': {a['id']: dict(a) for a in accounts}, 'tasks': {t['id']: dict(t) for t in tasks}}
         self._settings = {}
         self.events = []
+        self.lock = threading.RLock()
+
+    def batch(self, puts, deletes=()):
+        for kind, value in puts:
+            self.put(kind, value)
+        for kind, ident in deletes:
+            self.data.get(kind, {}).pop(ident, None)
 
     def settings(self):
         return dict(self._settings)
@@ -54,6 +62,27 @@ class FakeStore:
 
     def event(self, kind, *args, **kwargs):
         self.events.append(kind)
+
+
+class FakeAdapter:
+    """Notion adapter for the real context switch: a new Welcome chat that Notion lists (or not)."""
+    NEW = '3fea1b13e54d805cbc4700a9af92c91f'
+
+    def __init__(self, listed=True):
+        self.listed = listed
+        self.renamed = []
+
+    def client(self, account_id):
+        return types.SimpleNamespace(info={'space_id': 'space1'}, account_id=account_id)
+
+    def new_id(self, space_id, prefix):
+        return self.NEW
+
+    def create_welcome(self, client, tid, model):
+        return self.listed, True
+
+    def rename_thread(self, client, tid, title):
+        self.renamed.append((tid, title))
 
 
 def make_app(store):
@@ -112,14 +141,17 @@ class ChatAgesTests(unittest.TestCase):
     def test_ages_for_every_known_chat(self):
         status, data = call(self.app, 'GET', '/api/chat/ages')
         self.assertEqual(status, 200)
-        self.assertEqual(set(data), {'c_young', 'c_old', 'c_plain', 'c_unknown'})
-        for entry in data.values():
-            self.assertEqual(set(entry), {'age_s', 'created_at'})
+        self.assertEqual((data['warn_h'], data['limit_h']), (20, 23))
+        rows = {row['id']: row for row in data['chats']}
+        self.assertEqual(set(rows), {'c_young', 'c_old', 'c_plain', 'c_unknown'})
+        for row in rows.values():
+            self.assertEqual(set(row), {'id', 'worker_id', 'thread_id', 'title', 'purpose', 'created_at', 'age_h', 'blocked'})
         # The Notion thread of the Main worker counts first, then the chat record.
-        self.assertAlmostEqual(data['c_young']['age_s'], HOUR, delta=5)
-        self.assertAlmostEqual(data['c_old']['age_s'], 24 * HOUR, delta=5)
-        self.assertAlmostEqual(data['c_plain']['age_s'], 2 * HOUR, delta=5)
-        self.assertEqual(data['c_unknown'], {'age_s': None, 'created_at': None})
+        self.assertAlmostEqual(rows['c_young']['age_h'], 1, delta=0.01)
+        self.assertAlmostEqual(rows['c_old']['age_h'], 24, delta=0.01)
+        self.assertAlmostEqual(rows['c_plain']['age_h'], 2, delta=0.01)
+        self.assertEqual((rows['c_old']['blocked'], rows['c_young']['blocked']), (True, False))
+        self.assertEqual((rows['c_unknown']['age_h'], rows['c_unknown']['blocked']), (None, False))
         json.dumps(data)  # plain JSON
 
     def test_age_is_seconds_since_created(self):
@@ -167,18 +199,73 @@ class SendBlockTests(unittest.TestCase):
             self.app.action('/api/send', {'chat_id': 'c_old', 'text': 'hello'})
 
 
-class ContextSwitchStubTests(unittest.TestCase):
-    def setUp(self):
-        self.app = make_app(FakeStore(chats=[dict(id='c1', main_worker='', created=time.time())]))
+OLD_THREAD = 'aaaabbbbccccddddeeeeffff00001111'
 
-    def test_stub_answers_ok(self):
-        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'chat_id': 'c1'})
-        self.assertEqual((status, data), (200, {'ok': True, 'chat_id': 'c1'}))
+
+def switch_store(tasks=()):
+    now = time.time()
+    return FakeStore(
+        chats=[dict(id='c1', main_worker='w1', title='Main chat', created=now - 30 * HOUR),
+               dict(id='c_plain', main_worker='', created=now)],
+        workers=[dict(id='w1', account_id='a1', thread_id=OLD_THREAD, purpose='main', label='Main chat',
+                      created_at=now - 30 * HOUR),
+                 dict(id='w2', account_id='a1', thread_id='2222333344445555', purpose='worker', label='Cw',
+                      created_at=now - 24 * HOUR)],
+        accounts=[dict(id='a1', model='m1')], tasks=tasks)
+
+
+class ContextSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self.store = switch_store()
+        self.app = make_app(self.store)
+        self.app.adapter = FakeAdapter()
+
+    def test_switch_by_worker_id_moves_the_chat_to_a_fresh_one(self):
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
+        self.assertEqual(status, 200, data)
+        self.assertEqual((data['worker_id'], data['thread_id'], data['old_thread_id']), ('w1', FakeAdapter.NEW, OLD_THREAD))
+        worker = self.store.get('workers', 'w1')
+        self.assertEqual(worker['thread_id'], FakeAdapter.NEW)
+        self.assertIn(OLD_THREAD, worker['retired_threads'])
+        self.assertEqual(worker['label'], 'Main chat')  # a Main keeps its name
+        self.assertIn('chat_context_switch', self.store.events)
+        row = [r for r in self.app.chat_ages()['chats'] if r['id'] == 'c1'][0]
+        self.assertEqual(row['thread_id'], FakeAdapter.NEW)
+        self.assertLess(row['age_h'], 0.01)  # the age restarts in the fresh chat
+        self.assertFalse(row['blocked'])
         self.app.engine.submit.assert_not_called()
 
-    def test_stub_needs_a_chat_id(self):
-        status, _ = call(self.app, 'POST', '/api/chat/context_switch', {})
+    def test_switch_by_chat_id_uses_the_main_worker(self):
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'chat_id': 'c1'})
+        self.assertEqual(status, 200, data)
+        self.assertEqual((data['worker_id'], data['chat_id'], data['thread_id']), ('w1', 'c1', FakeAdapter.NEW))
+
+    def test_switch_of_a_coworker(self):
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w2'})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.store.get('workers', 'w2')['thread_id'], FakeAdapter.NEW)
+
+    def test_bad_requests_are_400(self):
+        for body in ({}, {'chat_id': 'c_plain'}, {'chat_id': 'nope'}, {'worker_id': 'nope'}):
+            status, data = call(self.app, 'POST', '/api/chat/context_switch', body)
+            self.assertEqual(status, 400, body)
+        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], OLD_THREAD)
+
+    def test_not_listed_new_chat_keeps_the_old_one(self):
+        self.app.adapter = FakeAdapter(listed=False)
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
         self.assertEqual(status, 400)
+        self.assertIn('Context switch failed', data['error'])
+        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], OLD_THREAD)
+
+    def test_busy_chat_is_not_switched(self):
+        self.store = switch_store(tasks=[dict(id='t1', worker_id='w1', state='running')])
+        self.app = make_app(self.store)
+        self.app.adapter = FakeAdapter()
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
+        self.assertEqual(status, 400)
+        self.assertIn('working on a task', data['error'])
+        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], OLD_THREAD)
 
 
 if __name__ == '__main__':

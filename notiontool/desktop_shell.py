@@ -906,16 +906,22 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
 
     def chat_age_switch(args):
         # I50: Context Switch button -> POST /api/chat/context_switch {worker_id}.
-        worker_id = str((args or {}).get('worker_id') or '').strip()
-        if not worker_id:
+        # The backend does the real switch (fresh Notion chat) and answers worker_id + the new thread_id.
+        args = args or {}
+        worker_id = str(args.get('worker_id') or '').strip()
+        chat_id = str(args.get('chat_id') or '').strip()
+        if not worker_id and not chat_id:
             raise ValueError('Context switch needs a chat with a worker id')
+        body = {'worker_id': worker_id[:100]} if worker_id else {'chat_id': chat_id[:100]}
         try:
-            result = api('POST', CHAT_SWITCH_PATH, {'worker_id': worker_id[:100]})
+            result = api('POST', CHAT_SWITCH_PATH, body)
         except HostApiError as exc:
             if exc.status == 404:
                 raise ValueError('Context switch is not available yet: the backend route is missing')
             raise ValueError('Context switch failed: ' + str(exc))
         thread = re.sub(r'[^0-9a-f]', '', str(result.get('thread_id') or '').lower())
+        if not thread:
+            raise ValueError('Context switch failed: NotionTool did not return the new chat')
         return dict(worker_id=str(result.get('worker_id') or worker_id), thread_id=thread,
                     url=chat_url(thread) if thread else '')
 
@@ -938,6 +944,8 @@ class DesktopShell(NotionShell):
         super().__init__(None, account_id, {}, asset_dir=asset_dir or DESK_DIR, secrets=secrets, **kwargs)
         self.app = app
         self.handlers = {k: v for k, v in dict(handlers or {}).items() if k in DESK_ACTIONS}
+        ages = self.handlers.get('chat_ages')  # I50 send block (NotionShell._block_old_chat)
+        self.chat_ages_source = (lambda: ages({})) if callable(ages) else None
         self.build = ''
         self.page_refresh = ''
         self.teardown_result = None

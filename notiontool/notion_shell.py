@@ -37,6 +37,7 @@ Invariants:
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import re
 import threading
 import time
 
@@ -182,6 +183,40 @@ def pin_log(entry):
             handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except Exception:
         pass
+
+
+def request_thread_id(post):
+    """I50: Notion thread id (lowercase hex, no dashes) a runInferenceTranscript body writes to; '' if none."""
+    try:
+        data = json.loads(post) if isinstance(post, str) else None
+    except ValueError:
+        return ''
+    if not isinstance(data, dict):
+        return ''
+    return re.sub(r'[^0-9a-f]', '', str(data.get('threadId') or '').lower())
+
+
+def send_block_reason(ages, thread):
+    """I50 desktop send block: the reason when ``thread`` is a chat at or over the send limit in a
+    chat_ages payload ({limit_h, chats: [{thread_id, age_h, blocked}]}); '' otherwise. Unknown age or an
+    unknown thread is never blocked (same rule as server.Application.require_young_chat)."""
+    if not thread or not isinstance(ages, dict):
+        return ''
+    try:
+        limit = float(ages.get('limit_h') or 23)
+    except (TypeError, ValueError):
+        limit = 23.0
+    for chat in ages.get('chats') or []:
+        if not isinstance(chat, dict):
+            continue
+        if re.sub(r'[^0-9a-f]', '', str(chat.get('thread_id') or '').lower()) != thread:
+            continue
+        age = chat.get('age_h')
+        known = isinstance(age, (int, float)) and not isinstance(age, bool)
+        if chat.get('blocked') or (known and age >= limit):
+            return ('chat_too_old: this chat is %s h old (limit %g h); sending is blocked. '
+                    'Use Context Switch for a fresh chat.' % ('%.1f' % age if known else '%g+' % limit, limit))
+    return ''
 
 
 def request_shape(post):
@@ -530,6 +565,8 @@ class NotionShell:
         if not ident:
             return
         request = params.get('request') or {}
+        if str(request.get('method') or '').upper() == 'POST' and self._block_old_chat(ident, request):
+            return  # I50: refused before it reaches Notion
         patched = None
         try:
             if str(request.get('method') or '').upper() == 'POST':
@@ -557,6 +594,35 @@ class NotionShell:
                 self.session.send('Fetch.continueRequest', {'requestId': ident}, 10)
             except Exception:
                 pass
+
+    # I50 send block: the desktop message box is Notion's own composer; its sends arrive in _pin_request as
+    # paused runInferenceTranscript requests. chat_ages_source() returns a chat_ages payload (DesktopShell
+    # wires the chat_ages action); a chat 23 h or older is failed there and never reaches Notion.
+    chat_ages_source = None
+
+    def _block_old_chat(self, ident, request):
+        source = getattr(self, 'chat_ages_source', None)
+        if not callable(source):
+            return False
+        try:
+            thread = request_thread_id(request.get('postData'))
+            reason = send_block_reason(source() if thread else None, thread)
+        except Exception:
+            return False
+        if not reason:
+            return False
+        try:
+            self.session.send('Fetch.failRequest', {'requestId': ident, 'errorReason': 'BlockedByClient'}, 10)
+        except Exception:
+            pass  # never continue it: the request stays refused
+        pin_log(dict(event='send_blocked_too_old', account=str(getattr(self, 'account_id', ''))[:40],
+                     thread=thread[:40], reason=reason[:200]))
+        try:
+            self.session.send('Runtime.evaluate', {'expression': "(function(){try{var c=window.__ntDeskCtx;"
+                              "if(c&&c.toast)c.toast(" + _js(reason) + ",'error');}catch(e){}})()"}, 5)
+        except Exception:
+            pass
+        return True
 
     def _handle_event(self, method, params):
         try:

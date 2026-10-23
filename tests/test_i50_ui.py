@@ -220,5 +220,57 @@ class ChatAgeHandlerTests(unittest.TestCase):
         self.assertEqual(json.loads(seen[1].data.decode('utf-8')), {'worker_id': 'w1'})
 
 
+class BackendContractTests(unittest.TestCase):
+    """End to end: the real backend replies (Application.chat_ages and the real context switch through the
+    HTTP handler) run through the shell actions chat_ages and chat_age_switch."""
+
+    def setUp(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_i50_backend as backend
+        self.backend = backend
+        self.store = backend.switch_store()
+        self.app = backend.make_app(self.store)
+        self.app.adapter = backend.FakeAdapter()
+
+    def host(self, method, path, body=None):
+        status, payload = self.backend.call(self.app, method, path, body)
+        if status >= 400:
+            raise desktop_shell.HostApiError(status, str((payload or {}).get('error') or ''))
+        return payload
+
+    def handlers(self):
+        original = desktop_shell.notion_shell.default_handlers
+        desktop_shell.notion_shell.default_handlers = lambda s: {}
+        try:
+            return desktop_shell.desktop_handlers(FakeServer(), host_call=self.host)
+        finally:
+            desktop_shell.notion_shell.default_handlers = original
+
+    def test_real_ages_and_real_switch_through_the_shell(self):
+        h = self.handlers()
+        ages = h['chat_ages']({})
+        self.assertTrue(ages['api_ok'], ages)
+        self.assertEqual((ages['warn_h'], ages['limit_h']), (20.0, 23.0))
+        self.assertGreaterEqual(len(ages['chats']), 1)
+        main = [row for row in ages['chats'] if row['thread_id'] == self.backend.OLD_THREAD]
+        self.assertEqual(len(main), 1)
+        self.assertGreaterEqual(main[0]['age_h'], 23)
+        result = h['chat_age_switch']({'worker_id': main[0]['worker_id']})
+        self.assertEqual(result['worker_id'], 'w1')
+        self.assertTrue(result['thread_id'])
+        self.assertNotEqual(result['thread_id'], self.backend.OLD_THREAD)
+        self.assertTrue(result['url'])
+        after = {row['thread_id']: row for row in h['chat_ages']({})['chats']}
+        self.assertIn(result['thread_id'], after)
+        self.assertNotIn(self.backend.OLD_THREAD, after)
+        self.assertLess(after[result['thread_id']]['age_h'], 1)
+
+    def test_failed_backend_switch_is_an_error_in_the_shell(self):
+        self.app.adapter = self.backend.FakeAdapter(listed=False)
+        with self.assertRaisesRegex(ValueError, 'Context switch failed'):
+            self.handlers()['chat_age_switch']({'worker_id': 'w1'})
+
+
 if __name__ == '__main__':
     unittest.main()

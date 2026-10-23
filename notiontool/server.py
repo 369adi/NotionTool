@@ -225,7 +225,7 @@ class Application:
                         if method=='GET' and path=='/api/health':
                             return self.response(200,app.health())
                         if method=='GET' and path=='/api/chat/ages':
-                            return self.response(200,app.chat_ages())  # I50: chat_id -> {age_s, created_at}
+                            return self.response(200,app.chat_ages())  # I50: {warn_h, limit_h, chats: [...]}
                         if method=='GET' and path=='/api/chats':
                             return self.response(200,{'chats':app.chat_list()})
                         if method=='GET' and path=='/api/run':
@@ -1065,10 +1065,104 @@ class Application:
             return dict(age_s=None, created_at=None)
         return dict(age_s=int(max(0.0, now - created)), created_at=created)
 
+    CHAT_AGE_WARN_HOURS = 20
+    SWITCH_BUSY_STATES = ('running', 'sending', 'sent', 'uncertain', 'reviewing', 'cancelling', 'claimed',
+                          'tool_pending', 'executing', 'fixing', 'checkpoint', 'preparing')
+
     def chat_ages(self, now=None):
-        """GET /api/chat/ages: chat_id -> {age_s, created_at} for every known harness chat."""
+        """GET /api/chat/ages (I50): {warn_h: 20, limit_h: 23, chats: [...]} for the desktop sidebar.
+
+        One row per harness chat (its Main worker's Notion thread) plus one per Coworker chat that is no
+        chat's Main. Row: id, worker_id, thread_id, title, purpose, created_at, age_h (= age_s / 3600) and
+        blocked (age at or over coworker_age_guard.HARD_MAX_AGE_HOURS, the limit of the /api/send block).
+        Unknown age: age_h None, never blocked."""
+        from .coworker_age_guard import HARD_MAX_AGE_HOURS, HARD_MAX_AGE_S
+        from .team_rotation import epoch
         now = time.time() if now is None else now
-        return {c['id']: Application.chat_age(self, c, now) for c in self.store.all('chats') if c.get('id')}
+
+        def row(ident, worker_id, thread_id, title, purpose, age):
+            age_s = age.get('age_s')
+            return dict(id=str(ident), worker_id=str(worker_id or ''), thread_id=str(thread_id or ''),
+                        title=str(title or '')[:120], purpose=str(purpose or ''), created_at=age.get('created_at'),
+                        age_h=(age_s / 3600.0) if age_s is not None else None,
+                        blocked=bool(age_s is not None and age_s >= HARD_MAX_AGE_S))
+        rows, seen = [], set()
+        for chat in self.store.all('chats'):
+            if not chat.get('id'):
+                continue
+            wid = str(chat.get('main_worker') or '')
+            worker = (self.store.get('workers', wid) or {}) if wid else {}
+            rows.append(row(chat['id'], wid, worker.get('thread_id') or chat.get('thread_id'),
+                            chat.get('title') or worker.get('label'), worker.get('purpose') or 'main',
+                            Application.chat_age(self, chat, now)))
+            if wid:
+                seen.add(wid)
+        for worker in self.store.all('workers'):
+            if worker.get('id') in seen or worker.get('purpose') != 'worker' or not worker.get('thread_id'):
+                continue
+            created = 0.0
+            for value in (worker.get('created_at'), worker.get('thread_created_at')):
+                created = epoch(value)
+                if created:
+                    break
+            age = dict(age_s=int(max(0.0, now - created)), created_at=created) if created else dict(age_s=None, created_at=None)
+            rows.append(row(worker['id'], worker['id'], worker['thread_id'], worker.get('label') or 'Coworker', 'worker', age))
+        return dict(warn_h=Application.CHAT_AGE_WARN_HOURS, limit_h=HARD_MAX_AGE_HOURS, chats=rows)
+
+    def chat_context_switch(self, body, now=None):
+        """POST /api/chat/context_switch (I50): move one chat into a fresh Notion chat.
+
+        Takes worker_id, or chat_id (-> the chat's Main worker). Uses the Coworker rotation path
+        ChatContext.fresh_welcome: a new Welcome chat is created and verified, the worker and a short handoff
+        move there, the old thread goes to retired_threads (sidebar archive). The age restarts (created_at =
+        now). Returns worker_id, chat_id, the new thread_id and old_thread_id. Raises ValueError (nothing
+        moved, the old chat stays in use) when the chat is busy or Notion did not list the new chat."""
+        from .chat_context import ChatContext
+        body = body or {}
+        worker_id = str(body.get('worker_id') or '').strip()[:100]
+        chat_id = str(body.get('chat_id') or '').strip()[:100]
+        if not worker_id and chat_id:
+            chat = self.store.get('chats', chat_id)
+            if not chat:
+                raise ValueError('Chat not found')
+            worker_id = str(chat.get('main_worker') or '')
+            if not worker_id:
+                raise ValueError('This chat has no Notion chat to switch')
+        if not worker_id:
+            raise ValueError('Choose a chat (worker_id or chat_id) to switch')
+        worker = self.store.get('workers', worker_id)
+        if not worker or not worker.get('thread_id'):
+            raise ValueError('Worker not found or without a Notion chat')
+        if not worker.get('account_id'):
+            raise ValueError('This chat has no Notion account')
+        if any(t.get('worker_id') == worker_id and t.get('state') in Application.SWITCH_BUSY_STATES
+               for t in self.store.all('tasks')):
+            raise ValueError('This chat is working on a task; switch after it finishes')
+        old, label = worker['thread_id'], worker.get('label')
+        handoff = ('Context switch from the NotionTool desktop: this chat replaces the older chat %s '
+                   '(chats are limited to %d h). Continue the work of that chat; NotionTool keeps its state.'
+                   % (old, Application.chat_switch_limit()))
+        client = self.adapter.client(worker['account_id'])
+        task = dict(id='', run_id=str(body.get('run_id') or '')[:100])
+        moved = ChatContext(self.store).fresh_welcome(self.adapter, client, worker, task, dict(handoff=handoff),
+                                                      worker.get('context_usage') or {})
+        new = (moved or {}).get('thread_id') or ''
+        if not new or new == old:
+            raise ValueError('Context switch failed: Notion did not list the new chat; the old chat is still used')
+        now = time.time() if now is None else now
+        with self.store.lock:
+            fresh = self.store.get('workers', worker_id) or dict(moved)
+            fresh.update(created_at=now, thread_created_at=now)
+            if fresh.get('purpose') != 'worker' and label:
+                fresh['label'] = label  # a Main keeps its name
+            self.store.put('workers', fresh)
+        self.store.event('chat_context_switch', '', worker_id=worker_id, message=old + ' -> ' + new)
+        return dict(ok=True, worker_id=worker_id, chat_id=chat_id, thread_id=new, old_thread_id=old)
+
+    @staticmethod
+    def chat_switch_limit():
+        from .coworker_age_guard import HARD_MAX_AGE_HOURS
+        return HARD_MAX_AGE_HOURS
 
     def require_young_chat(self, chat_id, now=None):
         """I50 hard send block: a chat 23 h or older (coworker_age_guard.HARD_MAX_AGE_HOURS) is never written to.
@@ -1216,11 +1310,8 @@ class Application:
                     raise ValueError('Folder not found')
                 return self.store.put('chats',chat)
             if path=='/api/chat/context_switch':
-                # I50 stub for the Context switch button: answers ok, changes and sends nothing (real switch comes later).
-                chat_id = str(body.get('chat_id') or '').strip()[:100]
-                if not chat_id:
-                    raise ValueError('Choose a chat (chat_id) to switch')
-                return {'ok':True,'chat_id':chat_id}
+                # I50 Context switch button: real switch of one chat (worker_id or chat_id) into a fresh chat.
+                return Application.chat_context_switch(self, body)
             if path=='/api/send':
                 # I50 hard send block: a chat 23 h or older is refused (400) before the engine or Notion sees the text.
                 Application.require_young_chat(self, body['chat_id'])
