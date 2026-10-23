@@ -26,7 +26,7 @@ KEEP = 3 * 3600  # items stay 3 h: the snapshot at a Notion rate limit shows win
 # go on. step_hard_60m 1500 stays as a safety net below the 1,760 steps / 60 min that tripped Notion.
 DEFAULTS = dict(step_soft_15m=800, step_hard_15m=1000, step_hard_60m=1500, step_pause_s=900,
                 wsteps_soft_15m=112_000_000, wsteps_hard_15m=140_000_000, wsteps_hard_60m=210_000_000,
-                step_context_cap=200_000, max_parallel_turns=4, start_spacing_s=45, starts_5m=8,
+                step_context_cap=200_000, max_parallel_turns=4, start_spacing_s=15, starts_5m=12,
                 provider_cooldown_s=900, step_soft_48h=25000, step_hard_48h=30000,
                 inf_hard_60m=450, cw_streak_h=12, cw_active_steps_h=100, cw_rest_s=3600,
                 err_hard_60m=30, err_wait_s=300)
@@ -504,7 +504,9 @@ def start_wait(store, worker, now=None, task=None):
         return lim['err_wait_s'], '%d error steps in 60 min (max %d): no new coworker turns for now' % (
             int(st['errors_60m']), lim['err_hard_60m'])
     running = running_turns(store, account, str((worker or {}).get('id') or ''))
-    max_par = max(1, lim['max_parallel_turns'] // 2) if st.get('soft_48h') else lim['max_parallel_turns']
+    # Owner 2026-10-23: the soft 48 h mark no longer halves the parallel coworkers (it made them run one
+    # by one). It is only shown as a warning; the hard 48 h mark and the 15/60 min limits still stop.
+    max_par = lim['max_parallel_turns']
     if running >= max_par:
         return 30, '%d coworker turns already run on this account (max %d%s)' % (
             running, max_par, ', 48 h budget almost used' if st.get('soft_48h') else '')

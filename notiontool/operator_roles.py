@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 QUALITIES = ('fast', 'standard', 'high')
-MAX_FIX_ROUNDS = 2
+MAX_FIX_ROUNDS = 1  # owner 2026-10-23: one review + at most one fix round (was 2: too slow)
 LIVE = ('queued', 'retry', 'running', 'uncertain', 'cancelling')
 UI_WORDS = re.compile(r'(?i)\b(ui|ux|design|designer|layout|css|styles?|styling|visual|theme|sidebar|'
                       r'buttons?|colou?rs?|spacing|frontend|front-end|typography|icons?)\b')
