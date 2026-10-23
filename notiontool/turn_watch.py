@@ -811,6 +811,11 @@ class TurnWatch:
         if budget_used_up(self.store, now):
             return []
         watched = {w.get('thread_id') for w in self.workers()}
+        # Also exclude archived/retired Main threads so a just-switched old Main never
+        # receives an automatic restart-cut continue (it is no longer active).
+        archived_purposes = {'archived_main', 'archived_operator', 'operator_candidate'}
+        watched |= {w.get('thread_id') for w in self.store.all('workers')
+                    if w.get('purpose') in archived_purposes and w.get('thread_id')}
         state = self.store.get('turn_watch', 'restart_cuts') or {'id': 'restart_cuts', 'keys': []}
         sent = []
         for account in self.store.all('accounts'):

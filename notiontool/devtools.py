@@ -35,7 +35,22 @@ _CMD_C = re.compile(r'\bcmd(?:\.exe)?\b[^;\n]*?(?<![\w./\\])/[ck]\b', re.I)
 _PS_CMD = re.compile(r'\b(?:powershell|pwsh)(?:\.exe)?\b.*?(?<![\w-])-(?:c|command|e|ec|enc|encodedcommand)\b', re.I | re.S)
 
 
+# Opening an image/video in a desktop app pops up the Photos app on the owner PC (User 2026-10-23).
+IMAGE_OPEN_BLOCKED = ('Blocked: never open images/videos in a desktop app (Photos pops up on the owner PC). '
+                      'Check renders inside Blender (bpy.data.images pixel stats) or with nt_screen_capture '
+                      'of the Blender window instead.')
+_IMG_OPEN = re.compile(r'\b(?:Start-Process|saps|Invoke-Item|ii|start|explorer(?:\.exe)?|mspaint(?:\.exe)?)\b'
+                       r'[^;|\n]*\.(?:png|jpe?g|webp|bmp|gif|tiff?|exr|mp4)\b', re.I)
+
+
 def shell_guard(command):
+    """Block opening image files in desktop apps, then apply the antivirus guard."""
+    if _IMG_OPEN.search(str(command or '')):
+        return IMAGE_OPEN_BLOCKED
+    return _shell_guard_base(command)
+
+
+def _shell_guard_base(command):
     """Return SHELL_BLOCKED for command shapes antivirus flags as droppers, else None."""
     c = str(command or '')
     for m in _HERE_OPEN.finditer(c):
