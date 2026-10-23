@@ -1100,6 +1100,9 @@
     var agesBusy = false;
     var ageSwitching = {};
     var AGE_ROW_MARKS = ['chat-row', 'coworker', 'private-chat'];
+    // Rows that already carry their own switch button: no second (age) switch button there.
+    var OWN_SWITCH_MARKS = ['switch', 'main-switch'];
+    var lockBanner = null;
 
     // Loads GET /api/chat/ages (CHAT_AGES_ROUTE) through the desktop shell. Called on mount, from the
     // 5 s watchdog once CHAT_AGE_REFRESH_MS (60 s) have passed, and after a Context Switch.
@@ -1130,12 +1133,14 @@
     }
 
     function styleChatAge(row, entry, now) {
-      var chip = null, btn = null, old = [];
+      var chip = null, btn = null, own = null, old = [];
       for (var i = 0; i < row.children.length; i++) {
         var kid = row.children[i];
         var mark = kid.getAttribute('data-nt-desk');
         if (mark === 'chat-age') chip = kid;
         else if (mark === 'age-switch') btn = kid;
+        // Fix 2: a Coworker row ('switch') or Main row ('main-switch') already has its own switch button.
+        else if (OWN_SWITCH_MARKS.indexOf(mark) >= 0) own = kid;
         else if (mark === 'age' || (kid.classList && kid.classList.contains('nt-desk-age'))) old.push(kid);
       }
       var hours = entry ? chatAgeNow(entry, now, chatAges.at) : null;
@@ -1149,6 +1154,7 @@
       if (level === 'unknown') {
         if (chip) dropOwn(chip);
         if (btn) dropOwn(btn);
+        if (own && own.getAttribute('data-nt-switch-level')) own.removeAttribute('data-nt-switch-level');
         if (row.getAttribute('data-nt-age-level')) row.removeAttribute('data-nt-age-level');
         return;
       }
@@ -1159,6 +1165,12 @@
       var title = chatAgeTitle(level, label, chatAges.limit_h);
       if (chip.getAttribute('title') !== title) chip.setAttribute('title', title);
       if (row.getAttribute('data-nt-age-level') !== level) row.setAttribute('data-nt-age-level', level);
+      // Exactly ONE switch button per row: the row's own switch wins, it only takes the age colour.
+      if (own) {
+        if (btn) dropOwn(btn);
+        if (own.getAttribute('data-nt-switch-level') !== level) own.setAttribute('data-nt-switch-level', level);
+        return;
+      }
       if (!btn) { btn = ageSwitchButton(entry.thread); row.appendChild(btn); }
       var disabled = level === 'switching' || !entry.worker_id;
       if (btn.disabled !== disabled) btn.disabled = disabled;
@@ -1216,6 +1228,45 @@
       schedule();
       var key = chatAgeKey(result && result.thread_id);
       if (key && entry.purpose !== 'worker') openChat(key, (result && result.url) || '');
+    }
+
+    // Lock banner (Fix 2): when the open chat is send-locked (23 h), an own banner sits directly above
+    // Notion's message box (.nt-desk-composer, marked by chrome.js) with one Context Switch button.
+    function lockBannerNode() {
+      var text = el('span', { cls: 'nt-desk-lock-banner-text', 'data-nt-desk': 'lock-banner-text' });
+      var btn = el('button', { cls: 'nt-desk-lock-banner-switch', type: 'button', 'data-nt-desk': 'lock-banner-switch',
+        text: 'Context Switch', 'aria-label': 'Context Switch' });
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var thread = lockBanner && lockBanner.getAttribute('data-nt-desk-thread');
+        if (thread) ageContextSwitch(thread);
+      });
+      return el('div', { cls: 'nt-desk-lock-banner', role: 'alert', 'data-nt-desk': 'lock-banner' }, [text, btn]);
+    }
+
+    function applyLockBanner() {
+      var key = chatAgeKey(threadFromHref(location.href));
+      var entry = key ? (chatAges.chats[key] || null) : null;
+      var level = !entry ? 'unknown' : (ageSwitching[entry.thread] ? 'switching'
+        : chatAgeLevel(chatAgeNow(entry, Date.now(), chatAges.at), entry.blocked, chatAges.warn_h, chatAges.limit_h));
+      var composer = document.querySelector('.nt-desk-composer');
+      if ((level !== 'locked' && level !== 'switching') || !composer || !composer.parentNode) {
+        if (lockBanner) { dropOwn(lockBanner); lockBanner = null; }
+        return;
+      }
+      if (!lockBanner) lockBanner = lockBannerNode();
+      if (lockBanner.parentNode !== composer.parentNode || lockBanner.nextSibling !== composer) {
+        composer.parentNode.insertBefore(lockBanner, composer);
+      }
+      if (lockBanner.getAttribute('data-nt-desk-thread') !== entry.thread) lockBanner.setAttribute('data-nt-desk-thread', entry.thread);
+      var label = chatAgeText(chatAgeNow(entry, Date.now(), chatAges.at), chatAges.limit_h);
+      setText(lockBanner.children[0], LOCK_GLYPH + ' ' + (level === 'switching' ? 'Context Switch running ...'
+        : chatAgeTitle('locked', label, chatAges.limit_h)));
+      var btn = lockBanner.children[1];
+      var disabled = level === 'switching' || !entry.worker_id;
+      if (btn.disabled !== disabled) btn.disabled = disabled;
+      setText(btn, level === 'switching' ? 'Switching ...' : 'Context Switch');
     }
 
     // ---- Named chats: own New chat dialog, Chats section, gear menu ------------------------
@@ -2030,6 +2081,7 @@
         collapseEmpty(root);
       } catch (e) { /* branding is cosmetic; never break the filter or the New chat routing */ }
       try { applyChatAges(sidebarRoot()); } catch (e) { /* I50 age chips are cosmetic */ }
+      try { applyLockBanner(); } catch (e) { /* the lock banner is a hint; the backend still blocks */ }
       try { applyPendingOpen(); } catch (e) { pendingOpen = null; }
       try { applyChatScroll(); } catch (e) { pendingScroll = null; }
       try { applyRenderSkip(); } catch (e) { /* performance only */ }

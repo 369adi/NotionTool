@@ -14,6 +14,8 @@ from .agent_guard import GUARD_RULE, COWORKER_RULE
 from .context_archive import TOKEN_DIVISOR, canonical_json, estimate_tokens  # noqa: E402,F401
 
 CONTENT_KINDS = ('code', 'prose', 'json')
+# I50 Fix 2: a Main's old chat after a context switch is archived by rename, never deleted.
+MAIN_ARCHIVE_PREFIX = 'Main (archived '
 
 
 def _text_of(value):
@@ -495,7 +497,11 @@ class ChatContext:
         return worker
 
     def retire_old(self, adapter, client, worker, task, old):
-        """Delete the old Coworker chat only through a verified endpoint; otherwise rename it and keep it out of the pool."""
+        """Delete the old Coworker chat only through a verified endpoint; otherwise rename it and keep it out of the pool.
+
+        A Main (any purpose other than 'worker') is never deleted here: its old chat is archived by rename."""
+        if (worker.get('purpose') or 'worker') != 'worker':
+            return self.archive_main_chat(adapter, client, worker, task, old)
         deleter = getattr(adapter, 'delete_thread', None)
         keep = not self.store.settings().get('coworker_delete_old_chat', True)
         note = 'kept by the setting coworker_delete_old_chat' if keep else 'no verified delete endpoint yet'
@@ -513,6 +519,25 @@ class ChatContext:
         self.store.event('coworker_old_chat_kept', task.get('run_id', ''), worker_id=worker['id'],
                          message=old + ': ' + note + '; excluded from the pool')
         return 'retired'
+
+    def archive_main_chat(self, adapter, client, worker, task, old):
+        """I50 Fix 2: retire (never delete) a Main's old chat. It is renamed to an archive title, kept in
+        Notion and listed in the worker's archived_threads; delete_thread is never called for it."""
+        title = MAIN_ARCHIVE_PREFIX + time.strftime('%Y-%m-%d %H:%M') + ')'
+        note = 'renamed to ' + title
+        try:
+            adapter.rename_thread(client, old, title)
+        except Exception as exc:
+            note = 'rename failed: ' + str(exc)[:80]
+        with self.store.lock:
+            fresh = self.store.get('workers', worker['id']) or worker
+            archived = [t for t in (fresh.get('archived_threads') or []) if t != old][-19:]
+            fresh['archived_threads'] = archived + [old]
+            self.store.put('workers', fresh)
+        worker['archived_threads'] = fresh['archived_threads']
+        self.store.event('main_old_chat_archived', task.get('run_id', ''), worker_id=worker['id'],
+                         message=old + ': ' + note + '; kept, never deleted')
+        return 'archived'
 
 
 def cleanup_blocker(store, worker, current_task):

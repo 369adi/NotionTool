@@ -190,6 +190,26 @@ html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
 .nt-desk-chat-age-locked { background: var(--nt-age-lock-bg, #dc2626); color: var(--nt-age-lock-fg, #ffffff); }
 .nt-desk-chat-age-switching { background: var(--nt-age-ok-bg, rgba(255, 255, 255, .06)); color: var(--nt-age-ok-fg, #8a90a2); }
 .nt-desk-age-switch { margin: 0 4px 0 0; border: 0; cursor: pointer; background: rgba(124, 92, 255, .16); color: #d9d0ff; }
+/* Fix 2: every switch button (age, Coworker, Main, lock banner) is at least 24 x 24 px (click target). */
+.nt-desk-age-switch, .nt-desk-switch, .nt-desk-cw-switch, .nt-desk-main-switch, .nt-desk-lock-banner-switch {
+  box-sizing: border-box; height: 24px; min-height: 24px; min-width: 24px; line-height: 24px; }
+.nt-desk-switch, .nt-desk-cw-switch, .nt-desk-main-switch { display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto; align-self: center; padding: 0 8px; }
+/* A row's own switch button takes the age colour instead of a second age switch button. */
+[data-nt-switch-level="warn"] { background: var(--nt-age-warn-bg, rgba(249, 115, 22, .16)); color: var(--nt-age-warn-fg, #fb923c); }
+[data-nt-switch-level="locked"] { background: var(--nt-age-lock-soft, rgba(220, 38, 38, .12)); color: var(--nt-age-lock-text-strong, #fecaca);
+  box-shadow: inset 0 0 0 1px var(--nt-age-lock-line, rgba(248, 113, 113, .45)); }
+/* Lock banner above the message box while the open chat is send-locked (like .nt-desk-banner, 4 px grid). */
+.nt-desk-lock-banner { display: flex; align-items: center; gap: 8px; box-sizing: border-box; margin: 0 0 8px; padding: 8px 12px;
+  border-radius: 8px; border: 1px solid var(--nt-age-lock-line, rgba(248, 113, 113, .45));
+  background: var(--nt-age-lock-soft, rgba(220, 38, 38, .12)); color: var(--nt-age-lock-text-strong, #fecaca);
+  font: 500 12px/16px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif); }
+.nt-desk-lock-banner[hidden] { display: none; }
+.nt-desk-lock-banner-text { flex: 1 1 auto; min-width: 0; }
+.nt-desk-lock-banner-switch { flex: 0 0 auto; padding: 0 12px; border: 0; border-radius: 999px; cursor: pointer;
+  background: var(--nt-age-lock-bg, #dc2626); color: var(--nt-age-lock-fg, #ffffff); font: 600 12px/24px var(--nt-font, inherit); }
+.nt-desk-lock-banner-switch:disabled { cursor: default; opacity: .55; }
+.nt-desk-lock-banner-switch:focus-visible { outline: none; box-shadow: var(--nt-focus, 0 0 0 2px #12151d, 0 0 0 4px #7c5cff); }
 .nt-desk-age-switch:hover { background: rgba(124, 92, 255, .28); }
 .nt-desk-age-switch:focus-visible { outline: none; box-shadow: var(--nt-focus, 0 0 0 2px #12151d, 0 0 0 4px #7c5cff); }
 .nt-desk-age-switch:disabled { cursor: default; opacity: .55; }
