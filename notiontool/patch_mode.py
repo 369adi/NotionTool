@@ -26,6 +26,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from . import eol_guard
+
 SETTING = 'patch_mode'
 DEFAULT_ENABLED = False
 # Entry for desktop_settings.HARNESS_SETTINGS; the integration task adds it there.
@@ -73,6 +75,25 @@ MARKER = re.compile(r'^(<{7}|>{7})( |$)')
 REPO_CONFIG = (('rerere.enabled', 'true'), ('rerere.autoupdate', 'true'), ('merge.conflictStyle', 'zdiff3'),
                ('diff.algorithm', 'histogram'), ('core.longpaths', 'true'))
 _RERERE_LINE = re.compile(r"^(?:Resolved|Staged) '(.+)' using previous resolution", re.M)
+# Rank 7: mergiraf (GPL-3.0) is only ever run by git as an external merge driver process; NotionTool never
+# imports or bundles it. merge.mergiraf.driver is set only when mergiraf is on PATH and the project
+# .gitattributes routes a path to it ('*.py merge=mergiraf'); tools/merge_replay.py decides whether that
+# attribute is worth adding. git merge-tree --write-tree runs merge drivers too, but it reads .gitattributes
+# from the work tree it runs in, so the probe runs in the task worktree, like the real merge.
+MERGIRAF = 'mergiraf'
+MERGIRAF_ATTR = 'merge=mergiraf'
+MERGIRAF_DRIVER = 'mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L'
+EOL_COMMIT_MESSAGE = 'Keep the line endings of merged files (eol_guard)'
+
+
+def _routes_to_mergiraf(path):
+    """True when a .gitattributes file has a line with merge=mergiraf."""
+    try:
+        text = Path(path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return False
+    return any(MERGIRAF_ATTR in line.split()[1:] for line in text.splitlines()
+               if line.strip() and not line.lstrip().startswith('#'))
 # Lint gate: a fixed, small rule set (undefined names, redefinitions, unused imports, syntax errors).
 # Only findings that the same files on main do not have fail, so an old F401 (e.g. an __init__ re-export) stays green.
 LINT_NAME = 'lint'
@@ -239,6 +260,7 @@ class PatchMode:
         self._lint_baseline = {}  # (base commit, path) -> Counter of the ruff findings that file has there
         self.remove_backoff = REMOVE_BACKOFF_S
         self.repo_config = None  # {key: 'set'|'kept'|'error'} after the first prepare or merge
+        self.merge_driver = None  # mergiraf driver config: 'set'|'kept'|'missing'|'unused'|'error' (rank 7)
 
     # ---- git ---------------------------------------------------------------
     def _git(self, args, cwd=None, check=True, timeout=GIT_TIMEOUT_S, input=None):
@@ -301,6 +323,114 @@ class PatchMode:
         if 'error' not in done.values():
             self.repo_config = done
         return done
+
+    def _configure_driver(self):
+        """Set merge.mergiraf.name/driver in the repo config (rank 7) only when mergiraf is on PATH and the
+        project .gitattributes routes a path to it (merge=mergiraf). A value the owner set wins.
+
+        git runs mergiraf as its own process; nothing is imported. Returns 'set'|'kept'|'missing'|'unused'|'error'.
+        """
+        if self.merge_driver in ('set', 'kept'):
+            return self.merge_driver
+        if shutil.which(MERGIRAF) is None:
+            state = 'missing'
+        elif not _routes_to_mergiraf(self.root / '.gitattributes'):
+            state = 'unused'
+        else:
+            try:
+                found = self._git(['config', '--get', 'merge.mergiraf.driver'], check=False).returncode
+                if found == 0:
+                    state = 'kept'
+                elif found == 1:
+                    self._git(['config', '--local', 'merge.mergiraf.name', 'mergiraf structured merge'])
+                    self._git(['config', '--local', 'merge.mergiraf.driver', MERGIRAF_DRIVER])
+                    state = 'set'
+                else:
+                    state = 'error'
+            except (GitError, OSError):
+                state = 'error'
+        self.merge_driver = state
+        return state
+
+    def _merge_drivers(self, cwd=None):
+        """Names of the custom merge drivers git can run here (merge.<name>.driver in any config scope)."""
+        out = self._git(['config', '--get-regexp', r'^merge\..*\.driver$'], cwd=cwd, check=False).stdout
+        return sorted({line.split(None, 1)[0][len('merge.'):-len('.driver')]
+                       for line in out.splitlines() if line.strip()})
+
+    def _git_bytes(self, args, cwd=None):
+        """Raw stdout bytes of a git command, or None when it fails."""
+        cmd = ['git', '-c', 'core.autocrlf=false', '-c', 'core.quotepath=false'] + list(args)
+        try:
+            proc = subprocess.run(cmd, cwd=str(cwd or self.root), env=_git_env(), capture_output=True,
+                                  timeout=GIT_TIMEOUT_S, creationflags=_NO_WINDOW)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
+
+    def _attributes(self, names, keys, cwd=None):
+        """{path: {attr: value}} from `git check-attr` (values: set, unset, unspecified or a string)."""
+        proc = self._git(['check-attr', '-z', '--stdin'] + list(keys), cwd=cwd, check=False,
+                         input='\0'.join(names) + '\0')
+        found = {}
+        if proc.returncode != 0:
+            return found
+        parts = proc.stdout.split('\0')
+        for i in range(0, len(parts) - 2, 3):
+            found.setdefault(parts[i], {})[parts[i + 1]] = parts[i + 2]
+        return found
+
+    def _eol_guard(self, path, old_main):
+        """Rank 2, patch_mode half: keep the line endings of every file the merge brings to main.
+
+        Each text file that differs between old_main and the merged HEAD is normalized in the worktree with
+        eol_guard to the ending (and BOM state) main has for it as checked out (`git cat-file --filters`), or
+        to the git eol attribute for a new file. Files that are mixed on main, binary, -text, not UTF-8 or
+        without any newline are left alone. When the stored bytes change, that is one extra commit, so _undo
+        drops it together with the merge. Returns {path: 'lf->crlf', ...} for every file it rewrote.
+        """
+        listing = self._git(['diff', '--name-only', '-z', '--diff-filter=AMR', old_main, 'HEAD'], cwd=path,
+                            check=False)
+        names = [n for n in listing.stdout.split('\0') if n] if listing.returncode == 0 else []
+        if not names:
+            return {}
+        attrs = self._attributes(names, ('binary', 'text', 'eol'), cwd=path)
+        changed = {}
+        for rel in names:
+            attr = attrs.get(rel, {})
+            if attr.get('binary') == 'set' or attr.get('text') == 'unset':
+                continue
+            file = Path(path) / rel
+            try:
+                current = file.read_bytes()
+            except OSError:
+                continue
+            if b'\0' in current or eol_guard.detect(current) == 'none':
+                continue
+            try:
+                text = current.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+            existing = self._git_bytes(['cat-file', '--filters', '%s:%s' % (old_main, rel)], cwd=path)
+            if existing is not None and eol_guard.detect(existing) == 'mixed':
+                continue
+            if existing is None or eol_guard.detect(existing) == 'none':
+                style = attr.get('eol')
+                if style not in eol_guard.STYLES:
+                    continue  # a new file without an eol attribute keeps its bytes
+                data = eol_guard.normalize(text, None, default=style)
+                if current.startswith(eol_guard.BOM):
+                    data = eol_guard.BOM + data
+            else:
+                data = eol_guard.normalize(text, existing)
+            if data != current:
+                file.write_bytes(data)
+                changed[rel] = '%s->%s' % (eol_guard.detect(current), eol_guard.detect(data))
+        if changed:
+            self._git(['add', '--'] + sorted(changed), cwd=path, check=False)
+            if self._git(['diff', '--cached', '--quiet'], cwd=path, check=False).returncode == 1:
+                self._git(['commit', '-q', '--no-verify', '-m', EOL_COMMIT_MESSAGE], cwd=path, check=False)
+        return changed
 
     def _rerere_ready(self):
         """True when git rerere is not switched off and has recorded at least one resolution."""
@@ -763,17 +893,22 @@ class PatchMode:
             result['cleanup'] = self._remove(path, branch)
             return dict(result, status='nothing', message='The task changed no files; nothing to merge')
         self._configure_repo()
-        probe = self._git(['merge-tree', '--write-tree', '--name-only', self.base, branch], check=False)
+        result['merge_driver'] = self._configure_driver()
+        # merge-tree --write-tree runs merge drivers (e.g. mergiraf), but it reads .gitattributes from the work
+        # tree it runs in. Run it in the task worktree, where the real merge below runs, so both see the same
+        # attributes and the probe never reports a conflict that the real merge would solve.
+        probe = self._git(['merge-tree', '--write-tree', '--name-only', self.base, branch], cwd=path, check=False)
         if probe.returncode not in (0, 1):
             return dict(result, status='error', message=(probe.stderr or probe.stdout).strip()[-600:])
         before = self.rev('HEAD', cwd=path)
         if probe.returncode == 1:
-            # A real conflict. git rerere may know it already (a coworker solved the same hunks before); then
-            # the merge is committed here and still goes through the secret scan and the tests below.
+            # A real conflict. git rerere may know it already (a coworker solved the same hunks before), or a
+            # merge driver may solve it in the real merge; then the merge is committed here and still goes
+            # through the secret scan and the tests below (the gate runs after every driver merge).
             replay = self._rerere_merge(path, branch)
             if replay is None:
                 return self._conflict(task, result, probe.stdout, old_main)
-            result['rerere'] = replay
+            result['rerere' if replay['files'] else 'real_merge'] = replay
         else:
             joined = self._git(['merge', '-q', '--no-edit', '-m', 'Merge %s into %s' % (self.base, branch),
                                 self.base], cwd=path, check=False)
@@ -781,6 +916,9 @@ class PatchMode:
                 self._git(['merge', '--abort'], cwd=path, check=False)
                 return dict(result, status='error',
                             message='git merge failed: ' + (joined.stderr or joined.stdout).strip()[-600:])
+        eol = self._eol_guard(path, old_main)  # rank 2: merged files keep main's line endings
+        if eol:
+            result['eol'] = eol
         head = self.rev('HEAD', cwd=path)
         scan = self.secret_scan(old_main, head, cwd=path)
         result['scan'] = scan
@@ -871,14 +1009,19 @@ class PatchMode:
 
         Only when rerere solved every conflicted file the merge is committed; returns dict(resolved, files,
         note). Otherwise the merge is aborted and None is returned (the conflict goes to a coworker).
+        The real merge is also tried when a custom merge driver (merge.<name>.driver, e.g. mergiraf) is
+        configured, so a conflict the driver solves never becomes a follow-up task.
         """
-        if not self._rerere_ready():
+        drivers = self._merge_drivers(cwd=path)
+        if not self._rerere_ready() and not drivers:
             return None
         message = 'Merge %s into %s' % (self.base, branch)
         joined = self._git(['merge', '--no-edit', '-m', message, self.base], cwd=path, check=False)
         files = sorted(set(_RERERE_LINE.findall((joined.stdout or '') + '\n' + (joined.stderr or ''))))
         if joined.returncode == 0:
-            return dict(resolved=True, files=files, note='The real merge had no conflict left')
+            return dict(resolved=True, files=files, drivers=drivers,
+                        note='The real merge had no conflict left' + (
+                            ' (merge driver: %s)' % ', '.join(drivers) if drivers else ''))
         unmerged = [n for n in self._git(['diff', '--name-only', '--diff-filter=U'], cwd=path,
                                          check=False).stdout.splitlines() if n.strip()]
         remaining = [n for n in self._git(['rerere', 'remaining'], cwd=path, check=False).stdout.splitlines()

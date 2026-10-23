@@ -613,5 +613,113 @@ class PatchModeHardeningHelpersTest(unittest.TestCase):
         self.assertEqual(tasks[0]['state'], 'done')  # pure: the input is not changed
 
 
+def merge_tree_rc(cwd, branch):
+    """Exit code of the patch mode probe in cwd: 0 clean, 1 conflict."""
+    return subprocess.run(['git', '-c', 'core.autocrlf=false', 'merge-tree', '--write-tree', '--name-only', 'main',
+                           branch], cwd=str(cwd), capture_output=True, text=True).returncode
+
+
+def blob(cwd, spec):
+    return subprocess.run(['git', 'show', spec], cwd=str(cwd), capture_output=True).stdout
+
+
+@unittest.skipUnless(GIT, 'git is not installed; patch mode needs a real git')
+class PatchModeDriverTest(unittest.TestCase):
+    """Rank 7 (merge driver: probe and real merge agree; mergiraf only from PATH) and rank 2 (eol_guard on merges)."""
+    setUp = PatchModeTest.setUp
+    tearDown = PatchModeTest.tearDown
+    _create = PatchModeTest._create
+    task = PatchModeTest.task
+    main_sha = PatchModeTest.main_sha
+    edit = PatchModeTest.edit
+
+    def _driver(self, exit_code):
+        """A stand-in merge driver run by git as a process: exit 0 keeps %A (the task side), exit 1 fails."""
+        script = self.tmp / ('driver_%d.py' % exit_code)
+        write(script, 'import sys\nsys.exit(%d)\n' % exit_code)
+        git(self.root, 'config', 'merge.keepours.driver',
+            '"%s" "%s" %%O %%A %%B' % (Path(sys.executable).as_posix(), script.as_posix()))
+
+    def _two_add_tasks(self):
+        t1 = self.task('t1', 's1', 'Add accepts numbers as text')
+        t2 = self.task('t2', 's2', 'Add works with floats')
+        for t in (t1, t2):
+            self.pm.prepare(t)
+        self.edit(t1, 'demoapp/calc.py', 'return a + b', 'return int(a) + int(b)')
+        self.assertEqual(self.pm.merge(t1)['status'], 'merged')
+        self.edit(t2, 'demoapp/calc.py', 'return a + b', 'return float(a) + float(b)')
+        return t2, Path(self.pm.worktree_path(t2))
+
+    def test_probe_and_real_merge_agree_when_a_merge_driver_solves_the_conflict(self):
+        self._driver(0)
+        t2, wt2 = self._two_add_tasks()
+        write(wt2 / '.gitattributes', 'demoapp/calc.py merge=keepours\n')  # only the task routes calc.py
+        self.pm.collect(t2)
+        branch = self.pm.branch_name(t2)
+        # merge-tree runs the driver but reads .gitattributes from its own work tree: in the main checkout it
+        # would report a conflict that the real merge in the task worktree solves; in the worktree both agree.
+        self.assertEqual(merge_tree_rc(self.root, branch), 1)
+        self.assertEqual(merge_tree_rc(wt2, branch), 0)
+        result = self.pm.merge(t2)
+        self.assertEqual(result['status'], 'merged', result)
+        self.assertTrue(result['tests']['green'])  # the gate ran after the driver merge
+        self.assertEqual(self.created, [])
+        self.assertIn('float(a) + float(b)', (self.root / 'demoapp' / 'calc.py').read_text(encoding='utf-8'))
+
+    def test_probe_and_real_merge_agree_when_the_merge_driver_fails(self):
+        self._driver(1)
+        write(self.root / '.gitattributes', 'demoapp/calc.py merge=keepours\n')
+        git(self.root, 'add', '-A')
+        git(self.root, 'commit', '-q', '-m', 'route calc.py to the driver')
+        t2, wt2 = self._two_add_tasks()
+        self.pm.collect(t2)
+        branch = self.pm.branch_name(t2)
+        self.assertEqual((merge_tree_rc(self.root, branch), merge_tree_rc(wt2, branch)), (1, 1))
+        result = self.pm.merge(t2)
+        self.assertEqual(result['status'], 'conflict', result)
+        self.assertEqual(len(self.created), 1)
+        self.assertNotIn('<<<<<<<', (wt2 / 'demoapp' / 'calc.py').read_text(encoding='utf-8'))  # merge aborted
+
+    def test_mergiraf_driver_is_configured_only_when_on_path_and_routed(self):
+        from unittest import mock
+        real = shutil.which
+
+        def which(found):
+            return lambda name, *a, **k: (found if name == 'mergiraf' else real(name, *a, **k))
+
+        write(self.root / '.gitattributes', '*.py merge=mergiraf\n')
+        with mock.patch.object(patch_mode.shutil, 'which', which(None)):
+            self.assertEqual(self.pm._configure_driver(), 'missing')
+        self.assertIsNone(git_config(self.root, 'merge.mergiraf.driver'))
+        write(self.root / '.gitattributes', '# *.py merge=mergiraf\n* text=auto\n')
+        with mock.patch.object(patch_mode.shutil, 'which', which('C:/tools/mergiraf.exe')):
+            self.assertEqual(self.pm._configure_driver(), 'unused')
+            self.assertIsNone(git_config(self.root, 'merge.mergiraf.driver'))
+            write(self.root / '.gitattributes', '*.py merge=mergiraf\n')
+            self.assertEqual(self.pm._configure_driver(), 'set')
+        self.assertEqual(git_config(self.root, 'merge.mergiraf.driver'), patch_mode.MERGIRAF_DRIVER)
+        self.assertEqual(self.pm._merge_drivers(), ['mergiraf'])
+
+    def test_merged_files_keep_mains_line_endings(self):
+        write(self.root / 'demoapp' / 'win.py', 'A = 1\r\nB = 2\r\n')
+        write(self.root / 'demoapp' / 'mixed.py', 'M = 1\r\nN = 2\n')
+        git(self.root, 'add', '-A')
+        git(self.root, 'commit', '-q', '-m', 'crlf and mixed files')
+        t = self.task('t1', 's1', 'Change B and N')
+        self.pm.prepare(t)
+        wt = Path(self.pm.worktree_path(t))
+        write(wt / 'demoapp' / 'win.py', 'A = 1\nB = 3\n')  # the coworker wrote LF into a CRLF file
+        write(wt / 'demoapp' / 'mixed.py', 'M = 1\nN = 3\n')  # mixed on main: left as written
+        write(wt / 'demoapp' / 'new.py', 'X = 1\r\n')  # new file, no eol attribute: left as written
+        result = self.pm.merge(t)
+        self.assertEqual(result['status'], 'merged', result)
+        self.assertEqual(result['eol'], {'demoapp/win.py': 'lf->crlf'})
+        self.assertEqual(blob(self.root, 'main:demoapp/win.py'), b'A = 1\r\nB = 3\r\n')
+        self.assertEqual((self.root / 'demoapp' / 'win.py').read_bytes(), b'A = 1\r\nB = 3\r\n')
+        self.assertEqual(blob(self.root, 'main:demoapp/mixed.py'), b'M = 1\nN = 3\n')
+        self.assertEqual(blob(self.root, 'main:demoapp/new.py'), b'X = 1\r\n')
+        self.assertTrue(result['tests']['green'])
+
+
 if __name__ == '__main__':
     unittest.main()
