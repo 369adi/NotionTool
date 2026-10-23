@@ -1905,6 +1905,9 @@ class Engine:
                 task['patch_state'] = 'waiting'  # tick() starts collect -> verify -> merge
             self.store.event('task_finished', task['run_id'], task_id=task['id'], state=task['state'], message=task['title'],
                              complete_wait_s=info.get('complete_wait_s'))
+            if task['state'] == 'done':
+                from .parallel_plan import finish_task_part  # rank 10: real seconds onto the plan_part record (never raises)
+                finish_task_part(self.store, task)
         except ModelVerificationError as exc:
             failure=exc
             self._release(info['worker_id'],info['lease'])

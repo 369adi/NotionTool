@@ -285,7 +285,7 @@ def design_skip_reason(settings, plan_tasks, ui):
     return 'every task has files and acceptance and the work is not UI'
 
 
-def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality='', route=''):
+def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', quality='', route='', plan_id=''):
     """Queue the operator's own plan as executor tasks for the Coworkers; no Main turn is ever sent.
 
     tasks use the planner contract: id, title, prompt, acceptance, optional depends_on, files,
@@ -396,6 +396,9 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
             # Team graphs: stage_role / read_only become top-level keys inside this lock, before any dispatch.
             # A task matched only by position may be the wrong one: it gets summary and effort, never team keys.
             if str(spec['id']) not in by_position and apply_team_keys(spec, task):
+                changed = True
+            if plan_id:
+                task['plan_part'] = '%s:%s' % (plan_id, spec['id'])  # rank 10: finish_task_part stores the real seconds
                 changed = True
             if changed:
                 store.put('tasks', task)
