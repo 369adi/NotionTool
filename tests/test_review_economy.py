@@ -245,7 +245,7 @@ class ReviewEconomyTest(unittest.TestCase):
         self.assertIn('Fix 1: Part T1', text)
 
     def test_fix_rounds_limit_unchanged_and_main_decides(self):
-        self.assertEqual(MAX_FIX_ROUNDS, 2)
+        self.assertEqual(MAX_FIX_ROUNDS, 1)  # owner 2026-10-23: one fix round (was 2)
         out = delegate(self.engine, self.chat, 'Refactor', [spec()])
         for _ in range(MAX_FIX_ROUNDS + 1):
             (build,) = self.live(out)

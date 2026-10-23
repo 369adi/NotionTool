@@ -1148,6 +1148,17 @@ class NotionAdapter:
         self.refresh(account_id)
         chat = self.ensure_main_chat(account_id)
         if chat:
+            # Recovery path: if the ledger Main was pending (created but not yet renamed),
+            # rename it now so it becomes 'Main' instead of staying 'Welcome to Notion'.
+            account = self.store.get('accounts', account_id)
+            ledger = account.get('team_threads') or {}
+            item = ledger.get('main') or {}
+            if item.get('pending') and item.get('id'):
+                client = self.client(account_id)
+                self.rename_thread(client, item['id'], MAIN_TITLE)
+                account['team_threads']['main'] = {'id': item['id'], 'pending': False}
+                self.store.put('accounts', account)
+                self.store.event('team_setup', message='Pending Main renamed to Main (recovery)', slot=account.get('slot'))
             return {'account_id': account_id, 'chat_id': chat['id'], 'created': False}
         account = self.store.get('accounts', account_id)
         if account.get('state') == 'ai_disabled':
