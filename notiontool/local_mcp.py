@@ -39,6 +39,20 @@ def codebase_memory_path():
     return ''
 
 
+WEB_VERSION = '0.7.0'  # duckduckgo-mcp-server (github.com/nickclyde/duckduckgo-mcp-server); the pinned release
+RESEARCH_ROLES = ('researcher',)  # roles that are offered the web server (a server without 'roles' is for every role)
+
+
+def web_search_path():
+    """duckduckgo-mcp-server executable (PATH, then ~/.local/bin of uv tool install). Never installs anything."""
+    found = which('duckduckgo-mcp-server')
+    if found:
+        return found
+    exe = 'duckduckgo-mcp-server.exe' if os.name == 'nt' else 'duckduckgo-mcp-server'
+    fallback = Path.home() / '.local' / 'bin' / exe
+    return str(fallback) if fallback.is_file() else ''
+
+
 def _rea_command():
     from .rea import COMMAND
     return list(COMMAND)
@@ -64,6 +78,12 @@ SERVERS = [
          installed=lambda: bool(uvx_path()),
          ready='uv found. Start Blender and click "Connect to MCP server" in the BlenderMCP sidebar (N panel).',
          missing='Install uv (uvx) and the Blender MCP add-on.'),
+    dict(key='web', id='builtin_web', name='DuckDuckGo Search MCP', setting='web_enabled', label='Web',
+         url='Local stdio: duckduckgo-mcp-server ' + WEB_VERSION + ' (web search and page text; research roles only)',
+         command=lambda: [web_search_path() or 'duckduckgo-mcp-server'], installed=lambda: bool(web_search_path()),
+         roles=RESEARCH_ROLES,
+         ready='duckduckgo-mcp-server found; offered to research roles only. Search text is sent to DuckDuckGo.',
+         missing='Not installed. Install it yourself (uv tool install duckduckgo-mcp-server==' + WEB_VERSION + '); nothing is installed automatically.'),
     dict(key='codebase', id='builtin_codebase_memory', name='Codebase Memory MCP', setting='codebase_memory_enabled',
          label='Codebase Memory', url='Local stdio: codebase-memory-mcp (code knowledge graph)',
          command=lambda: [codebase_memory_path() or 'codebase-memory-mcp'], installed=lambda: bool(codebase_memory_path()),
@@ -93,6 +113,13 @@ for _server in SERVERS:
 
 def enabled(settings, server):
     return bool(settings.get(server['setting'], False))
+
+
+def role_allowed(server, role=None):
+    """True when a worker with this role may be offered the server. No role (owner/operator) or a server
+    without 'roles' is always allowed."""
+    roles = server.get('roles')
+    return not roles or role is None or role in roles
 
 
 def public(settings):

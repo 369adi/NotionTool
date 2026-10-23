@@ -53,7 +53,7 @@ REA_TOOLS = {
     'rea_tools': ('Discover REA (Reverse Engineer Anything) tools and their argument schemas', {}),
     'rea_call': ('Call a discovered REA tool', {'name':{'type':'string'},'arguments':{'type':'object'}}),
 }
-from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled
+from .local_mcp import SERVERS as LOCAL_SERVERS, BY_KEY as LOCAL_BY_KEY, TOOL_SERVER, tool_specs, enabled as local_enabled, role_allowed as local_role_allowed
 READ_ONLY_ROLES = ('architect','researcher','quality_planner','planner','reviewer')
 from . import long_calls
 from . import token_budget
@@ -251,7 +251,7 @@ class Bridge:
             self._screen = ScreenCapture(self.store)
         return self._screen
 
-    def tools(self):
+    def tools(self, role=None):
         tools = dict(TOOLS)
         if self.browser_access():
             tools.update(BROWSER_TOOLS)
@@ -259,7 +259,7 @@ class Bridge:
             tools.update(SCREEN_TOOLS)
         settings = self.store.settings()
         for server in LOCAL_SERVERS:
-            if local_enabled(settings, server):
+            if local_enabled(settings, server) and local_role_allowed(server, role):
                 tools.update(tool_specs(server))
         return tools
 
@@ -495,7 +495,9 @@ class Bridge:
             verifier(worker,pending)
         with self.engine.lock:
             task,run = self.assignment(token)
-            if name not in self.tools():
+            if name not in self.tools(task['role']):
+                if name in TOOL_SERVER and name in self.tools():
+                    raise ValueError('This tool is not offered to the ' + str(task['role']) + ' role')
                 raise ValueError('Unknown or disabled tool' + (' (enable browser access in Settings)' if name in BROWSER_TOOLS else ' (enable '+LOCAL_BY_KEY[TOOL_SERVER[name]]['label']+' in Settings)' if name in TOOL_SERVER else ''))
             if name in TOOL_SERVER:
                 rea = self.local_client(TOOL_SERVER[name])
