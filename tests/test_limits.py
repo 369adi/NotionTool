@@ -1,7 +1,12 @@
 """Eight realistic slots; each chat stays on its own account (B45)."""
 import unittest
 import time
-import test_engine as fixtures
+import os
+import sys
+# Module form (python -m unittest tests.test_limits, used by the merge check) only puts the
+# project root on the path; the sibling import below needs tests/ itself.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import test_engine as fixtures  # noqa: E402
 
 
 class MeteredAdapter(fixtures.FakeAdapter):
