@@ -229,7 +229,7 @@ class PusherTests(unittest.TestCase):
         self.assertEqual(snap['timeouts'], 1)
         self.assertGreaterEqual(snap['dropped'], 2)
         self.assertEqual(self.events[0][0], 'push_slow')
-        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(len(self.jobs), 2)          # one push + one background state build, never a push queue
         self.run_jobs()                               # the slow push finally ends: newest state goes next
         self.assertTrue(self.pusher.tick())
         self.run_jobs()

@@ -266,6 +266,8 @@ class StatePusher:
         self.slow_ms = slow_ms
         self.spawn = spawn or self._thread
         self.lock = threading.Lock()
+        self._latest = None
+        self._building = False
         self._sent_key = None
         self._last_sent = None
         self._inflight = None      # (kind, started) of the running push
@@ -279,19 +281,46 @@ class StatePusher:
         return thread
 
     def tick(self):
-        start = time.perf_counter()
-        state, _rebuilt = self.cache.get()
-        build_ms = _ms(start)
-        if build_ms > self.slow_ms:
-            self._slow('build', build_ms)
+        # The state build can take many seconds while the store is busy (seen: 52 s). It runs on its own
+        # thread so the 3 s heartbeat keeps flowing; before, the window showed 'lost connection' after 20 s.
+        self._start_build()
+        with self.lock:
+            state = self._latest
         self._check_inflight()
-        key = _state_key(state)
         now = self.clock()
-        if key != self._sent_key:
-            return self._send('state', state, key)
+        if state is not None:
+            key = _state_key(state)
+            if key != self._sent_key:
+                return self._send('state', state, key)
         if self._last_sent is None or now - self._last_sent >= self.heartbeat_s:
             return self._send('heartbeat', {'type': 'heartbeat', 'ts': round(self.wall(), 3)}, None)
         return None
+
+    def _start_build(self):
+        with self.lock:
+            if self._building:
+                return
+            self._building = True
+            first = self._latest is None
+        if first:
+            self._build()   # very first state inline, so the window gets content on the first tick
+        else:
+            self.spawn(self._build)
+
+    def _build(self):
+        start = time.perf_counter()
+        state = None
+        try:
+            state, _rebuilt = self.cache.get()
+        except Exception as exc:  # noqa: BLE001 - a failed build must never stop the heartbeat
+            self.stats.last_error = ('build: ' + (str(exc) or type(exc).__name__))[:200]
+        build_ms = _ms(start)
+        with self.lock:
+            if state is not None:
+                self._latest = state
+            self._building = False
+        if build_ms > self.slow_ms:
+            self._slow('build', build_ms)
 
     def _check_inflight(self):
         with self.lock:
