@@ -1078,6 +1078,13 @@ class NotionAdapter:
                 self.store.put('workers', worker)
                 if event:
                     self.store.event(event, message=worker.get('label', '') + ' ' + worker['thread_id'], slot=account.get('slot'))
+                if event == 'coworker_joined':
+                    try:
+                        cb = getattr(self, 'on_coworker_joined', None)
+                        if callable(cb):
+                            cb()
+                    except Exception:
+                        pass
             usable += bool(worker.get('enabled') and worker.get('join_state') == 'joined')
         return {'main': main['id'] if main else '', 'coworkers': usable}
 

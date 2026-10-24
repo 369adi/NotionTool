@@ -140,6 +140,7 @@ class Application:
         self.engine.team_grower = self.team_grower  # automatic growth: startup + every 5 min from the engine loop
         from .team_rotation import LoopChecks, TeamRotator  # 23h Welcome rotation shares the same 5-min slot
         self.team_rotator = TeamRotator(self.store, self.adapter, lambda title, fn, ident: self.job(title, fn, ident))
+        self.adapter.on_coworker_joined = self.team_rotator.signal_name_needed  # instant rename on join
         self.engine.team_grower = LoopChecks(self.team_grower, self.team_rotator)
         from .mains import Mains, migrate
         migrate(self.store)

@@ -101,15 +101,22 @@ class TeamRotator:
         self.failed_until = {}
         self.last_error = {}
         self.waiting = {}
+        self._name_needed = False  # set by signal_name_needed for instant coworker rename
+
+    def signal_name_needed(self):
+        """Called when a coworker just joined: bypass NAME_CHECK_S and rename on the next engine tick."""
+        self._name_needed = True
 
     def maybe_check(self):
         """Called from the engine loop: at startup, then at most every CHECK_S seconds. Never raises."""
         now = self.clock()
         if self.next_check is not None and now < self.next_check:
             # fast naming: a new chat after a context switch gets its name within NAME_CHECK_S,
-            # not only at the next 5-min check (measured 22.10: up to 5 min delay)
+            # not only at the next 5-min check (measured 22.10: up to 5 min delay).
+            # _name_needed: instant rename when coworker_joined fires (bypass the 60s timer entirely).
             next_name = getattr(self, 'next_name', None)
-            if next_name is None or now >= next_name:
+            if self._name_needed or next_name is None or now >= next_name:
+                self._name_needed = False
                 self.next_name = now + NAME_CHECK_S
                 try:
                     self.name_pass()
