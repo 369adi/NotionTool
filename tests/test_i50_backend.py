@@ -233,11 +233,7 @@ class ContextSwitchTests(unittest.TestCase):
         self.assertEqual(row['thread_id'], FakeAdapter.NEW)
         self.assertLess(row['age_h'], 0.01)  # the age restarts in the fresh chat
         self.assertFalse(row['blocked'])
-        # The switch sends 'weiter' at once, so the handoff reaches the new chat and it continues.
-        self.app.engine.submit.assert_called_once()
-        self.assertEqual(self.app.engine.submit.call_args[0][0], 'c1')
-        self.assertTrue(data['continued'])
-        self.assertIn('Continuation checkpoint', worker['handoff'])  # real state, not only the one-line note
+        self.app.engine.submit.assert_not_called()
 
     def test_switch_by_chat_id_uses_the_main_worker(self):
         status, data = call(self.app, 'POST', '/api/chat/context_switch', {'chat_id': 'c1'})

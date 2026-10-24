@@ -1145,28 +1145,6 @@ class Application:
                    % (old, Application.chat_switch_limit()))
         client = self.adapter.client(worker['account_id'])
         task = dict(id='', run_id=str(body.get('run_id') or '')[:100])
-        # A context switch must carry the real state. Before, the new chat got only the fixed note above and
-        # did not know the last point of the old chat. Now: the old chat's own handoff (brief_text) first, then
-        # the checkpoint from the durable records (goal, user requests, tasks, recent chat history).
-        if not chat_id:
-            chat_id = next((str(c.get('id') or '') for c in self.store.all('chats')
-                            if c.get('main_worker') == worker_id), '')
-        if not task['run_id'] and chat_id:
-            task['run_id'] = str((self.store.get('chats', chat_id) or {}).get('active_run') or '')
-        parts = [handoff]
-        brief = str(body.get('brief_text') or '').strip()
-        # Only a Main carries its context into the new chat. A Coworker switch is just a fresh Welcome chat
-        # (too many tokens -> old one goes, new one starts); Coworkers get their next task anyway.
-        is_main = worker.get('purpose') != 'worker'
-        if is_main and brief:
-            parts.append('Handoff from the old chat (its last point; continue exactly there):\n' + brief[:20000])
-        try:
-            if is_main:
-                parts.append(ChatContext(self.store).handoff(worker, task))
-        except Exception as exc:  # noqa: BLE001 - the note and the brief still move
-            self.store.event('chat_context_switch_checkpoint_failed', '', worker_id=worker_id,
-                             message=(type(exc).__name__ + ': ' + str(exc))[:200])
-        handoff = '\n\n'.join(parts)
         main = worker.get('purpose') != 'worker'
         # Manual switch: the old chat is never deleted (it stays in the sidebar archive), only renamed;
         # a Main's old chat becomes '<label> (archived)', a Coworker's keeps the retire_old title.
@@ -1195,21 +1173,8 @@ class Application:
                 self.store.event('chat_context_switch_rename_failed', '', worker_id=worker_id,
                                  message=(new + ': ' + type(exc).__name__ + ': ' + str(exc))[:250])
         self.store.event('chat_context_switch', '', worker_id=worker_id, message=old + ' -> ' + new)
-        continued = None
-        if main and chat_id and body.get('continue', True):
-            # The handoff only rides along with the next message (notion.py handoff_included). Without one the
-            # new chat sat idle and never continued. So the switch itself sends 'weiter' right away; the
-            # handoff above goes with it and the new chat picks up at the last point of the old chat.
-            try:
-                self.engine.submit(chat_id, 'weiter: Kontextwechsel abgeschlossen. Lies die Uebergabe und mach '
-                                   'genau am letzten Punkt des alten Chats weiter.', 'switch-' + new)
-                continued = True
-            except Exception as exc:  # noqa: BLE001 - the switch stays; the failure is reported, not hidden
-                continued = False
-                self.store.event('chat_context_switch_continue_failed', '', worker_id=worker_id,
-                                 message=(type(exc).__name__ + ': ' + str(exc))[:250])
         return dict(ok=True, worker_id=worker_id, chat_id=chat_id, thread_id=new, old_thread_id=old,
-                    renamed=renamed, continued=continued)
+                    renamed=renamed)
 
     @staticmethod
     def chat_switch_limit():
