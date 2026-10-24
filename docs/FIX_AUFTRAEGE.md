@@ -314,7 +314,7 @@ Abnahme: python -m pytest im Projektordner ist grün, keine Abhängigkeiten auß
 
 | Datum | Run-ID | Wanduhr bis done | max. gleichzeitig | Arbeit ÷ Wanduhr | worker_budget | Runden pro Teil | Review Runde 1 bestanden | Modelle | pytest | Bemerkung |
 |---|---|---|---|---|---|---|---|---|---|---|
-| vorher | | | | | | | | | | |
+| vorher 24.10. 02:16 | r4bc1015e51cc4674ba90ef5926e151d6 | ca. 420 s (02:16:18 bis 02:23) | 4 | ca. 1,9 (818 s Arbeit) | 4 | 1 | 4 von 4 | Executor Sonnet/medium; Review 2x Sonnet/high, 2x Opus/high (Sonnet war vorgegeben) | 45 passed, aber erst nach Handkopie | Falsch-fertig: bei durations und ratelimit patch_state=failed, Dateien nur im Worktree, Run trotzdem done mit 4 accepted. Ursache: work/ ist gitignored, der Worktree-Diff ist leer. Messordner künftig außerhalb von work/ |
 | nachher | | | | | | | | | | |
 
 Werte aus `/api/run?id=<run>&compact=1` und `work\_review_parallel_ro.py` (nur lesen).
