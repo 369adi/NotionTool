@@ -17,8 +17,9 @@ window (test_desktop_no_lag allowlists only this module):
 # workspace (sidebar + frame + real text) counts as 'loading'; login/onboarding pages are left alone.
 PROBE = ("(function(){var t=(document.body&&document.body.innerText)||'';"
          "if(/\\/login|\\/signup|onboarding/.test(location.pathname))return '';"
-         "if(/Something went wrong/i.test(t)&&t.length<2000)return 'error';"
-         "var ok=document.querySelector('.notion-sidebar')&&document.querySelector('.notion-frame')&&t.length>200;"
+         "if(/Something went wrong/.test(t)&&/Refresh/.test(t)&&t.length<600)return 'error';"
+         # no .notion-frame here: the AI chat page has none (live 2026-10-24 20:14, healthy chat reloaded)
+         "var ok=document.querySelector('.notion-sidebar')&&t.length>200;"
          "return ok?'':'loading';})()")
 
 # Clear service workers and CacheStorage (program files only; user data stays).
@@ -36,7 +37,8 @@ _CLEAR_JS = (
     "})()"
 )
 
-STUCK_CHECKS = 8  # 8 x 2.5 s = 20 s of nothing but grey placeholders
+STUCK_CHECKS = 8  # 8 x 2.5 s = 20 s without a finished workspace
+ERROR_CHECKS = 2  # 2 x 2.5 s = 5 s of the crash page
 
 
 def page_state(session):
@@ -66,6 +68,7 @@ def heal(get_session, stop_event, store, checks=48, wait_s=2.5, max_reloads=4): 
     """
     reloads = 0
     loading = 0
+    errors = 0
     cache_cleared = False
     for _ in range(checks):
         if stop_event.wait(wait_s):
@@ -78,7 +81,9 @@ def heal(get_session, stop_event, store, checks=48, wait_s=2.5, max_reloads=4): 
         except Exception:  # noqa: BLE001
             continue
         loading = loading + 1 if state == 'loading' else 0
-        if state != 'error' and loading < STUCK_CHECKS:
+        errors = errors + 1 if state == 'error' else 0
+        # The crash page must stay 2 checks (5 s): Notion shows it briefly while it loads on its own.
+        if errors < ERROR_CHECKS and loading < STUCK_CHECKS:
             continue
         if reloads >= max_reloads:
             store.event('desktop_error_page_stuck',
@@ -94,6 +99,7 @@ def heal(get_session, stop_event, store, checks=48, wait_s=2.5, max_reloads=4): 
             return reloads
         reloads += 1
         loading = 0
+        errors = 0
         what = 'showed "Something went wrong"' if state == 'error' else 'hung on the loading page'
         store.event('desktop_error_page_reloaded',
                     message='Notion %s; reloaded (%d)' % (what, reloads))
