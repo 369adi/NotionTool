@@ -116,6 +116,9 @@ class DesktopChromeTest(unittest.TestCase):
         quota = block(self.js, 'var QUOTA = [')
         self.assertIn("'verbraucht dein ki-kontingent'", quota)
         self.assertIn("'uses your ai credits faster'", quota)
+        # "Opus 5.5 consumes your AI allowance faster than other models" (user 2026-10-24)
+        self.assertIn("'consumes your ai allowance faster'", quota)
+        self.assertIn("'ai allowance faster than other models'", quota)
         for phrase in re.findall(r"'([^']*)'", quota):
             self.assertEqual(phrase, phrase.lower(), phrase)
         self.assertIn('function bannerFor(node)', self.js)

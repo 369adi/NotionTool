@@ -66,7 +66,9 @@
   // Quota / upsell banner texts (lower case substrings, English and German).
   var QUOTA = [
     'verbraucht dein ki-kontingent', 'verbraucht ihr ki-kontingent', 'verbraucht dein ki-guthaben',
-    'uses your ai credits faster', 'use your ai credits faster', 'uses more of your ai credits'
+    'uses your ai credits faster', 'use your ai credits faster', 'uses more of your ai credits',
+    'consumes your ai allowance faster', 'consume your ai allowance faster', 'uses your ai allowance faster',
+    'ai allowance faster than other models'
   ];
   var BANNER_MAX_TEXT = 400;
   var BANNER_DEPTH = 6;
