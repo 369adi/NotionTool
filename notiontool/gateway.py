@@ -18,9 +18,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = 1
+VERSION = 2
 DEFAULT_PORT = 8792
-HOLD_SECONDS = 120
+HOLD_SECONDS = 25  # Notion's MCP client gives up before 120 s -> 'Failed to connect'; answer fast instead
 SAFE_METHODS = {'initialize', 'notifications/initialized', 'tools/list', 'ping', 'resources/list', 'prompts/list'}
 CACHED_METHODS = ('initialize', 'tools/list')
 FORWARD_HEADERS = ('authorization', 'content-type', 'accept', 'mcp-session-id', 'mcp-protocol-version', 'last-event-id')
@@ -152,8 +152,8 @@ class Gateway:
         # A cached schema is not proof that the disconnected server can execute it.
         if name == 'tools/list':
             return self.reply(ident, {'tools': []})
-        if name == 'initialize':
-            return self.reply(ident, error={'code': -32000, 'message': 'NotionTool is offline; no tools are connected.'})
+        # initialize is NOT refused any more: the cached answer below keeps the connection alive
+        # while the app restarts (a refused initialize is what Notion shows as 'Failed to connect').
         if name in self.cache:
             kept, data = self.cache[name]
             try:
