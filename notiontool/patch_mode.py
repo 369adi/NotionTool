@@ -611,7 +611,7 @@ class PatchMode:
 
     def _run_tests(self, name, argv, cwd):
         env = dict(os.environ)
-        env.update(PYTHONPATH=str(cwd), PYTHONDONTWRITEBYTECODE='1', PYTHONIOENCODING='utf-8',
+        env.update(PYTHONPATH=os.pathsep.join([str(cwd), str(Path(cwd)/'tests')]), PYTHONDONTWRITEBYTECODE='1', PYTHONIOENCODING='utf-8',
                    NOTIONTOOL_PATCH_VERIFY='1')
         started = time.monotonic()
         try:
