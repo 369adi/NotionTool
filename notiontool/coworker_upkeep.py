@@ -16,6 +16,7 @@ PRUNE_BATCH = 10
 PRUNE_PAUSE = 0.05
 DEFAULT_KEEP_HOURS = 6
 VACUUM_MB = 50  # VACUUM only after more than this many MB were deleted
+SLIM_MIN_BYTES = 1048576  # records above 1 MB get their stored tool outputs shortened once
 VACUUM_INTERVAL = 86400
 MISSING_GRACE = 300
 MAX_NEW_PER_CYCLE = 2
@@ -218,6 +219,29 @@ class CoworkerUpkeep:
         self.last_vacuum, self.pending_mb = now, 0.0
         return True
 
+    def slim_contexts(self, sizes, doomed):
+        """Shorten stored tool outputs in big records no chat observes any more (observe does the active ones).
+
+        Bug 2026-10-24: old records kept up to 75 MB of tool output; every read of them blocked the store.
+        """
+        from .chat_context import slim_entity
+        freed = 0
+        for ident, size in sizes.items():
+            if ident in doomed or size < SLIM_MIN_BYTES:
+                continue
+            record = self.store.get('thread_context', ident)
+            if not record or record.get('tool_slimmed'):
+                continue
+            entities = record.get('entities') or {}
+            for key in list(entities):
+                entities[key] = slim_entity(entities[key])
+            record['tool_slimmed'] = True
+            self.store.put('thread_context', record)
+            freed += max(0, size - len(json.dumps(record, ensure_ascii=False).encode('utf-8')))
+            if self.engine.stop_event.wait(PRUNE_PAUSE):
+                break
+        return freed
+
     def prune_contexts(self):
         """Delete thread_context records nobody needs (context_archive.prune_ids); at most once per hour."""
         now = self.clock()
@@ -242,6 +266,7 @@ class CoworkerUpkeep:
                 self.store.delete('thread_context', ident)
                 deleted += 1
                 freed += sizes.get(ident, 0)
+        freed += self.slim_contexts(sizes, set(doomed))
         mb = freed / 1048576
         self.pending_mb += mb
         try:

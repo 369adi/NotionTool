@@ -103,6 +103,13 @@ class FakeStore:
     def delete(self, kind, ident):
         self.data[kind].pop(ident, None)
 
+    def get(self, kind, ident, default=None):
+        value = self.data[kind].get(ident)
+        return json.loads(json.dumps(value)) if value is not None else default
+
+    def put(self, kind, doc):
+        self.data[kind][doc['id']] = doc
+
     def event(self, kind, **kw):
         self.events.append((kind, kw))
 
@@ -155,6 +162,20 @@ class PruneContextsTests(unittest.TestCase):
         self.assertEqual(up.prune_contexts()['count'], 1)
         self.assertNotIn('acc:b', store.data['thread_context'])
         self.assertEqual([k for k, _ in store.events], ['thread_context_pruned'] * 2)
+
+    def test_big_old_tool_outputs_are_shortened_once(self):
+        big = dict(id='acc:t1', updated=FRESH, estimated_tokens=999999,
+                   entities={'a': dict(kind='tool', text='x' * (2 * 1024 * 1024)),
+                             'b': dict(kind='user_message', text='hello')})
+        store = FakeStore([big], workers=[worker('w1', 't1')])
+        result = self.make(store, [NOW]).prune_contexts()
+        slim = store.data['thread_context']['acc:t1']
+        self.assertTrue(slim['tool_slimmed'])
+        self.assertLess(len(slim['entities']['a']['text']), 5000)
+        self.assertEqual(slim['entities']['b']['text'], 'hello')
+        self.assertEqual(slim['estimated_tokens'], 999999)
+        self.assertGreater(result['mb'], 1.5)
+        self.assertEqual(result['count'], 0)
 
     def test_nothing_to_delete_writes_no_event(self):
         store = FakeStore([blob('acc:t1')], workers=[worker('w1', 't1')])
