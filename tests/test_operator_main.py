@@ -90,7 +90,10 @@ class OperatorMainTest(unittest.TestCase):
         chat_id = self.register()['chat_id']
         result = delegate(self.engine, chat_id, 'Fix two things', tasks('a', 'b', 'c', deps={'c': ['a', 'b']}))
         run = self.store.get('runs', result['run_id'])
+        # T1 rule: 3 parts, width 2 (c waits for a and b), 2 young coworkers -> min(2, max(2, 2)) = 2.
         self.assertEqual((run['state'], run['operator'], run['main_worker'], run['worker_budget']), ('executing', True, OP, 2))
+        self.assertEqual((run['parallel_width'], run['parts'], run['live_budget']), (2, 3, True))
+        self.assertTrue(any('c depends on a' in w and 'share no file' in w for w in result['warnings']), result['warnings'])
         queued = self.engine.tasks(run['id'])
         self.assertEqual(sorted(t['role'] for t in queued), ['executor'] * 3)
         self.assertFalse(any(t['use_main'] for t in queued))
@@ -104,6 +107,22 @@ class OperatorMainTest(unittest.TestCase):
         self.assertEqual(run['state'], 'done')  # every answer passed the machine check, so no Main stage
         self.assertIn('3 delegated task(s) finished', run['summary'])
         self.assertEqual([t['role'] for t in self.engine.tasks(run['id'])], ['executor'] * 3)  # no reviewer, no integrator
+
+    def test_four_independent_parts_get_worker_budget_four(self):
+        for ident in (ACC + ':co3', ACC + ':co4'):
+            self.store.put('workers', dict(id=ident, account_id=ACC, thread_id=ident.split(':')[1], purpose='worker',
+                                           enabled=True, state='ready', lease='', label='Welcome to Notion', join_state='joined'))
+        chat_id = self.register()['chat_id']
+        parts = tasks('a', 'b', 'c', 'd')
+        for n, part in enumerate(parts):
+            part['files'] = ['part%d.py' % n]
+        result = delegate(self.engine, chat_id, 'Four parts', parts)
+        run = self.store.get('runs', result['run_id'])
+        self.assertEqual((run['parts'], run['parallel_width'], run['worker_budget']), (4, 4, 4))
+        self.assertFalse(any('share no file' in w for w in result['warnings']), result['warnings'])
+        self.assertEqual(self.engine._run_budget(run, self.store.settings()), 4)  # the live dispatch budget agrees
+        one = delegate(self.engine, chat_id, 'One part', tasks('z'))
+        self.assertEqual(self.store.get('runs', one['run_id'])['worker_budget'], 1)  # only a real one-part request
 
     def test_delegate_is_idempotent_and_defaults_to_the_operator_chat(self):
         self.register()
