@@ -229,6 +229,7 @@ class TransientInference(Exception):
 
 CANCELLED_BEFORE_SUBMISSION = 'Assignment cancelled before submission'
 HEAL_BASE, HEAL_CAP = 60, 600  # seconds: 60, 120, 240, 480, 600, 600, ...
+TICK_SLOW_S = 5.0  # a coordinator tick holding the lock longer than this is logged as tick_slow
 # Owner rule: at the hard token limit (burst level 'pause' or the 6 h budget used up) every RUNNING
 # coworker turn stops at once, not only new ones. The stop is local (Notion has no verified stop
 # endpoint): the stream is closed, a sent turn is reconciled (I5, never resent), an unsent one waits.
@@ -1518,7 +1519,24 @@ class Engine:
         task['limit_reply_charged'] = True
 
     def tick(self):
+        # Live 2026-10-24 20:21-20:23: after a restart the desktop state build and the idle 'Weiter' both
+        # waited ~2 min, released together. Both wait on this lock; tick_slow names the step that holds it.
+        marks = [('start', time.perf_counter())]
+        try:
+            return self._tick_locked(marks)
+        finally:
+            took = time.perf_counter() - marks[0][1]
+            if took > TICK_SLOW_S:
+                steps = ', '.join('%s %.1fs' % (name, at - marks[i][1]) for i, (name, at) in enumerate(marks[1:]))
+                try:
+                    self.store.event('tick_slow', took_s=round(took, 1),
+                                     message=('Coordinator tick held the lock %.1f s: %s' % (took, steps))[:300])
+                except Exception:
+                    pass
+
+    def _tick_locked(self, marks):
         with self.lock:
+            marks.append(('lock', time.perf_counter()))
             for future, info in list(self.inflight.items()):
                 if future.done():
                     del self.inflight[future]
@@ -1526,16 +1544,21 @@ class Engine:
                         # Seconds from the finished remote call to its completion here (lock wait + tick start).
                         info['complete_wait_s'] = round(max(0.0, time.time() - info['done_at']), 3)
                     self._complete(future, info)
+            marks.append(('complete', time.perf_counter()))
             # Owner rule: at the hard token limit every running coworker turn stops at once (Main untouched).
             limit_latch = self._limit_check()
+            marks.append(('limit', time.perf_counter()))
             self._start_merges()
+            marks.append(('merges', time.perf_counter()))
             self._reconcile()
             self._heal_workers()
+            marks.append(('reconcile', time.perf_counter()))
             try:
                 from .account_failover import rehome_runs
                 rehome_runs(self.store)  # B41: runs of dead/AI-disabled accounts move to a working Main
             except Exception as exc:  # never let failover stop dispatch
                 self.store.event('run_rehome_failed', '', error=str(exc)[:300])
+            marks.append(('rehome', time.perf_counter()))
             runs = self.store.all('runs')
             if getattr(self.adapter, 'single_account_harness', False):
                 from .harness_account import runnable_accounts
