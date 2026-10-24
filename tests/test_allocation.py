@@ -23,6 +23,34 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(parallel_width(tasks),1)
         self.assertEqual(parallel_width([dict(id=str(n),depends_on=[]) for n in range(40)]),40)
 
+    def test_parallel_width_compares_ids_as_text_and_ignores_unknown(self):
+        tasks=[dict(id=1,depends_on=[]),dict(id='2',depends_on=['1']),dict(id=3,depends_on=['zz'])]
+        self.assertEqual(parallel_width(tasks),2)  # 1 and 3 start together; 2 waits for 1
+
+    def test_t1_budget_one_coworker_per_independent_part(self):
+        from notiontool.allocation import parts_budget
+        self.assertEqual(parts_budget(4,4,5),4)   # 4 independent parts -> worker_budget 4
+        self.assertEqual(parts_budget(4,4,3),3)   # at most the free slots
+        self.assertEqual(parts_budget(3,1,5),2)   # serial plan with 2+ parts: review of A overlaps B
+        self.assertEqual(parts_budget(1,1,5),1)   # only a real one-part request gets 1
+        self.assertEqual(parts_budget(4,4,0),1)
+
+    def test_normalize_deps_aliases_numbers_duplicates_and_self(self):
+        from notiontool.allocation import normalize_deps
+        tasks=[dict(id=1),dict(id='T1',deps='1'),dict(id=3,after=1,depends_on=['T1','T1']),dict(id='x',depends_on=['x','1'])]
+        warnings=normalize_deps(tasks)
+        self.assertEqual([t['id'] for t in tasks],['1','T1','3','x'])
+        self.assertEqual([t['depends_on'] for t in tasks],[[],['1'],['T1','1'],['1']])
+        self.assertFalse(any(k in t for t in tasks for k in ('deps','after')))
+        self.assertTrue(any('3' in w and 'merged' in w for w in warnings),warnings)
+        self.assertTrue(any('x' in w and 'itself' in w for w in warnings),warnings)
+        from notiontool.protocol import validate_plan
+        plan={'tasks':[dict(t,title='t',prompt='p',acceptance='a') for t in tasks]}
+        validate_plan(plan)  # the cleaned plan passes; unknown ids/cycles are still validate_plan's job
+        bad=[dict(id='a',deps='missing',title='t',prompt='p',acceptance='a')]
+        normalize_deps(bad)
+        with self.assertRaisesRegex(ContractError,'Unknown dependency'):validate_plan({'tasks':bad})
+
     def test_explicit_parallel_request_rejects_serial_plan_and_extra_review_task(self):
         policy=allocation('Use exactly 15 independent calculations',15)
         serial=[dict(id=str(n),depends_on=[str(n-1)] if n else []) for n in range(15)]

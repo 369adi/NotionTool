@@ -14,7 +14,7 @@ from . import plain_protocol
 from . import prompt_once
 from . import file_registry
 from . import coworker_age_guard
-from .allocation import allocation, parallel_width, validate_allocation
+from .allocation import allocation, normalize_deps, parallel_width, parts_budget, validate_allocation
 from .team_size import coworker_capacity
 from .model_routing import DEFAULT_MODEL, MODELS, validate_models, with_reason
 from .model_verification import ModelVerificationError
@@ -494,6 +494,11 @@ class Engine:
             if not run['harness']:
                 run['allocation'] = dict(mode='direct', budget=1, advisers=0, reason='Harness off: Architect answers directly')
             run['worker_budget'] = run['allocation']['budget']
+            run['live_budget'] = True  # T1: the dispatch budget is recomputed every pass (_run_budget)
+            if run['allocation'].get('mode') == 'direct':
+                run['budget_cap'] = 1  # F8: a real limit, unlike the frozen worker_budget
+            elif run['allocation'].get('requested_parts'):
+                run['budget_cap'] = max(1, int(run['allocation']['requested_parts']))
             self.store.put('runs', run)
             self.store.message(chat_id, 'user', goal.strip(), run_id)
             self.store.event('run_created', run_id, message='Request queued' if existing else 'Approach planning started')
@@ -1551,20 +1556,32 @@ class Engine:
             active = active[offset:] + active[:offset]
             self.round_robin += 1
             settings = self.store.settings()
+            # F10: each run's budget once per pass (live capacity), before the round-robin loop.
+            pass_workers = self.store.all('workers')
+            pass_accounts = {a['id']: a for a in self.store.all('accounts')}
+            coworker_ids = {w['id'] for w in pass_workers if w.get('purpose') == 'worker'}
+            budgets = {run['id']: self._run_budget(run, settings, pass_workers, pass_accounts) for run in active}
             # Round-robin one assignment per run per pass, across all accounts.
             while len(self.inflight) < min(40, settings['max_workers']):
                 assigned = False
                 for run in active:
                     if len(self.inflight) >= min(40, settings['max_workers']):
                         break
-                    if sum(info['run_id']==run['id'] for info in self.inflight.values()) >= run.get('worker_budget', max(1,run['capacity'])):
+                    used = sum(info['run_id'] == run['id'] and (not run.get('live_budget') or info.get('worker_id') in coworker_ids)
+                               for info in self.inflight.values())  # live runs: a Main turn uses no coworker slot
+                    if used >= budgets[run['id']]:
                         continue
                     for task in self.tasks(run['id']):
                         if task['state'] not in ('queued', 'retry') or task['next_at'] > self.clock():
                             continue
                         deps = [self.store.get('tasks', d) for d in task['deps']]
-                        if any(not d or d['state'] in ('failed', 'blocked', 'cancelled') for d in deps):
-                            set_state(self.store, task, 'blocked', 'dependency failed', error='A dependency failed')
+                        bad = [d for d in deps if not d or d['state'] in ('failed', 'blocked', 'cancelled', 'skipped')]
+                        if bad:
+                            # F11: a skipped dependency never becomes done, so it blocks like a failed one.
+                            if all(d and d['state'] == 'skipped' for d in bad):
+                                set_state(self.store, task, 'blocked', 'dependency skipped', error='A dependency was skipped')
+                            else:
+                                set_state(self.store, task, 'blocked', 'dependency failed', error='A dependency failed')
                             self.store.put('tasks', task)
                             continue
                         if any(d['state'] != 'done' for d in deps) or self._conflicts(task, run):
@@ -1590,6 +1607,38 @@ class Engine:
                             self.store.put('tasks', task)
                 if not assigned:
                     break
+
+    def live_capacity(self, account_id, settings, workers=None, accounts=None, now=None):
+        """Coworker slots of one Main's account right now (F9), shared by delegate and the dispatch budget:
+        enabled coworkers on that account, account ready, younger than the age guard (I32), at most
+        per_account and max_workers. 0 when none qualify."""
+        workers = self.store.all('workers') if workers is None else workers
+        accounts = {a['id']: a for a in self.store.all('accounts')} if accounts is None else accounts
+        if accounts.get(account_id, {}).get('state') != 'ready':
+            return 0
+        now = time.time() if now is None else now
+        pool = [w for w in workers if w.get('purpose') == 'worker' and w.get('enabled')
+                and w.get('account_id') == account_id and not coworker_age_guard.too_old(w, now)]
+        return coworker_capacity(settings, pool)
+
+    def _run_budget(self, run, settings, workers=None, accounts=None):
+        """Parallel coworker tasks of one run in this dispatch pass.
+
+        T1 rule for live runs: before a plan exists the live capacity; with a plan
+        parts_budget(parts, parallel_width, live capacity); budget_cap (direct runs, explicit part count) on top.
+        Runs stored before T1 (no live_budget) keep their frozen worker_budget."""
+        if not run.get('live_budget'):
+            return run.get('worker_budget', max(1, run.get('capacity') or 0))
+        by_id = {w['id']: w for w in (self.store.all('workers') if workers is None else workers)}
+        account = (by_id.get(run.get('main_worker')) or {}).get('account_id') or run.get('account_id', '')
+        live = self.live_capacity(account, settings, list(by_id.values()), accounts)
+        if 'parallel_width' in run:
+            budget = parts_budget(run.get('parts', 0), run['parallel_width'], live)
+        else:
+            budget = live
+        if run.get('budget_cap'):
+            budget = min(budget, int(run['budget_cap']))
+        return max(1, budget)
 
     def _choose_worker(self, task, run, settings):
         workers = self.store.all('workers')
@@ -2226,14 +2275,18 @@ class Engine:
             self._watch(future, self.inflight[future])
 
     def _import_plan(self, run, plan, prefix=''):
+        if isinstance(plan, dict) and isinstance(plan.get('tasks'), list):
+            # F6: planner plans and review fixes both land here, so aliases and numeric ids are cleaned once.
+            for note in normalize_deps(plan['tasks']):
+                self.store.event('plan_deps_normalized', run['id'], message=note)
         tasks = validate_plan(plan)
-        ids = {t['id']:uid('t') for t in tasks}
+        ids = {str(t['id']):uid('t') for t in tasks}  # F2: validate_plan checks ids as text
         for task in tasks:
             self._resource_keys(run, task.get('files',[]))
         for task in tasks:
             self.add_task(run, 'executor', task['prompt'], prefix+task['title'],
-                          deps=[ids[d] for d in task.get('depends_on',[])], files=task.get('files',[]),
-                          acceptance=task['acceptance'], ident=ids[task['id']],specialty=str(task.get('role','executor'))[:60],
+                          deps=[ids[str(d)] for d in task.get('depends_on',[])], files=task.get('files',[]),
+                          acceptance=task['acceptance'], ident=ids[str(task['id'])],specialty=str(task.get('role','executor'))[:60],
                           model=task['model'] if 'model' in task else _UNSET_MODEL, model_reason=task.get('model_reason', ''),
                           use_main=task.get('use_main', False), task_class=task.get('task_class', ''), risk=task.get('risk', ''))
 
@@ -2273,7 +2326,9 @@ class Engine:
                 planner = next(t for t in reversed(tasks) if t['role'] == 'planner')
                 plan = json.loads(planner['result'])
                 self._import_plan(run, plan)
-                run['worker_budget'] = max(1,min(run.get('worker_budget',max(1,run['capacity'])),parallel_width(plan['tasks'])))
+                # F8: no width cap any more; the width is the T1 input of _run_budget and information for the UI.
+                run['parallel_width'] = parallel_width(plan['tasks'])
+                run['parts'] = len(plan['tasks'])
                 run.update(state='executing', summary=plan.get('summary',''))
                 run['solo'] = len(plan['tasks']) == 1 and plan['tasks'][0].get('use_main', False)
             elif state in ('executing', 'fixing'):

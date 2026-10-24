@@ -13,8 +13,7 @@ import os
 import re
 import time
 
-from .allocation import parallel_width
-from .team_size import team_size
+from .allocation import normalize_deps, parallel_width, parts_budget
 from .protocol import validate_plan
 from .store import uid
 
@@ -71,6 +70,20 @@ def task_effort(task):
     value = (task or {}).get('effort') if isinstance(task, dict) else None
     value = value.strip().lower() if isinstance(value, str) else ''
     return value if value in EFFORTS else ''
+
+
+def _dep_file_warnings(tasks):
+    """A dependency should mean a shared file or a needed result: warn when the files lists do not overlap."""
+    files = {str(t.get('id')): set(t.get('files') or []) for t in tasks if isinstance(t.get('files') or [], list)}
+    warnings = []
+    for t in tasks:
+        ident = str(t.get('id', '?'))
+        for dep in t.get('depends_on') or [] if isinstance(t.get('depends_on'), list) else []:
+            dep = str(dep)
+            if dep in files and ident in files and not files[ident] & files[dep]:
+                warnings.append('Task %s depends on %s but their files lists share no file: keep depends_on only if '
+                                '%s needs the result of %s, otherwise drop it so both run in parallel' % (ident, dep, ident, dep))
+    return warnings
 
 
 def _warnings(store, chat, tasks):
@@ -309,12 +322,9 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
     quality = quality or next((t['quality'] for t in tasks if t.get('quality')), '')
     route, notes = _request_route(route, tasks)  # notes: warnings for bad task-level route values
     tasks = [{k: v for k, v in t.items() if k not in ('quality', 'route')} for t in tasks]
-    for item in tasks:
-        # 'deps' / 'after' are common names for depends_on; silently dropping them ran dependent tasks in parallel.
-        # Converted before the route decision so decide, team_graph.expand and validate_plan see the real deps.
-        for alias in ('deps', 'after'):
-            if alias in item and not item.get('depends_on'):
-                item['depends_on'] = list(item.pop(alias) or [])
+    # 'deps' / 'after' are common names for depends_on; silently dropping them ran dependent tasks in parallel.
+    # Normalized before the route decision so decide, team_graph.expand and validate_plan see the real deps.
+    notes = notes + normalize_deps(tasks) + _dep_file_warnings(tasks)
     quality, quality_reason = choose_quality(goal, tasks, quality)
     settings = store.settings()
     user_tasks = tasks
@@ -357,7 +367,8 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         # I32: chats 23 h or older count for no capacity; with none young the tasks wait queued for the rotation.
         from .coworker_age_guard import young
         coworkers = young(store, coworkers, stamp) or coworkers[:1]
-        capacity = max(1, min(int(store.settings().get('max_workers') or 1), team_size(store.settings()), len(coworkers)))
+        # F9: the same helper as the engine's dispatch budget (enabled, young coworkers on the Main's account).
+        capacity = max(1, engine.live_capacity(operator.get('account_id', ''), store.settings(), now=stamp))
         run = dict(id=uid('r'), chat_id=chat['id'], main_worker=operator['id'], goal=goal, state='executing',
                    stage='', context='', project_path=chat.get('project_path', ''), folder_id=chat.get('folder_id', ''),
                    created=stamp, updated=stamp, capacity=capacity, account_id=operator.get('account_id', ''),
@@ -373,7 +384,13 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         free = len([w for w in coworkers if w.get('state') not in BUSY])
         run['capacity_hint'] = dict(free=free, startable=startable,
                                     hint=capacity_hint(free, startable, user_tasks, **capacity_settings(settings)))
-        run['worker_budget'] = max(1, min(capacity, startable))
+        # T1 budget rule (allocation.parts_budget): one coworker per independent part, at least 2 for a plan
+        # with 2+ parts, at most the free coworker slots; 1 only for a real one-part request. The engine
+        # recomputes it every dispatch pass with the live capacity (live_budget); parallel_width is information.
+        run['parallel_width'] = startable
+        run['parts'] = len(plan['tasks'])
+        run['live_budget'] = True
+        run['worker_budget'] = parts_budget(run['parts'], startable, capacity)
         engine._import_plan(run, plan)  # checks every planned file path before any task is queued
         created = [t for t in engine.tasks(run['id']) if t.get('role') == 'executor']
         # plan id -> engine task: explicit first, then by position; by_position = the ids only the fallback matched

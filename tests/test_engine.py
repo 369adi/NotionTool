@@ -121,6 +121,29 @@ class EngineTests(unittest.TestCase):
             if predicate():return
             time.sleep(.015)
         self.fail('Coordinator did not reach expected state: '+str([(r['state'],r['error']) for r in self.store.all('runs')]))
+    def test_skipped_dependency_blocks_like_a_failed_one(self):
+        now=time.time()
+        run=dict(id='rs',chat_id='c',state='executing',stage='',capacity=2,main_worker='main',account_id='a',goal='g',
+                 project_path=self.temp.name,harness=True,live_budget=True,fixes=0,summary='',error='',context='',created=now,updated=now)
+        self.store.put('runs',run)
+        first=self.engine.add_task(run,'executor','p','A')
+        first=self.store.get('tasks',first['id']);first['state']='skipped';self.store.put('tasks',first)
+        second=self.engine.add_task(run,'executor','p','B',deps=[first['id']])
+        self.pump(lambda:self.store.get('tasks',second['id'])['state']=='blocked')
+        self.assertEqual(self.store.get('tasks',second['id'])['error'],'A dependency was skipped')
+    def test_two_runs_on_one_account_both_get_coworkers(self):
+        # F12: without the width cap one run must not take the whole account team.
+        for n in range(4,40):
+            w=self.store.get('workers',f'w{n}');w['enabled']=False;self.store.put('workers',w)
+        self.worker('main2','main')
+        self.store.put('chats',dict(id='c2',title='Main 2',main_worker='main2',folder_id='f2',project_path=self.temp.name))
+        self.adapter.hold=True
+        runs=[self.engine.submit('c','Build and verify'),self.engine.submit('c2','Build and verify')]
+        coworkers={f'w{n}' for n in range(4)}
+        def both():
+            busy=[{t['worker_id'] for t in self.engine.tasks(r['id']) if t['role']=='executor' and t['state']=='running'} for r in runs]
+            return all(b & coworkers for b in busy)
+        self.pump(both)
     def test_full_harness_runs_plan_execute_review_integrate(self):
         run=self.engine.submit('c','Build and verify')
         self.pump(lambda:self.store.get('runs',run['id'])['state']=='done')

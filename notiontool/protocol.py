@@ -92,6 +92,7 @@ def prompt_for(task, run, context, token, tools_available=False):
     if task['role'] == 'planner':
         return header + f'''Please combine the approach suggestions into an execution plan. There are {run.get('capacity', 0)} contributors available.
 Use independent tasks where useful, with dependencies for work that must happen in order.
+Set depends_on only when two tasks list the same file in files or one task needs the other's result; otherwise leave it empty so the tasks run at the same time.
 Avoid simultaneous edits of the same files, and include ways to check the results.
 For this planning step, provide the plan rather than executing it. Please format the response as JSON:
 {{"summary":"approach", "tasks":[{{"id":"T1","title":"...","role":"executor",

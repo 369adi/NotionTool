@@ -78,9 +78,73 @@ def validate_allocation(plan, policy):
         raise ContractError('The requested contributions must be independent: use no dependencies and make each calculation/check self-contained, without relying on another contribution.')
 
 
+def _text(value):
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def normalize_deps(tasks):
+    """Clean the dependency fields of planner/delegate tasks in place and return warnings.
+
+    Alias keys (team_route.DEP_KEYS) are always removed and merged into depends_on; a single text or
+    number becomes a one-item list; ids and dependencies become text; duplicates and self-dependencies
+    are dropped. Unknown ids and cycles stay with validate_plan (one error path, ContractError).
+    """
+    from .team_route import DEP_KEYS
+    warnings = []
+    for task in tasks if isinstance(tasks, list) else []:
+        if not isinstance(task, dict):
+            continue
+        if _text(task.get('id')):
+            task['id'] = str(task['id'])
+        ident = task.get('id', '?')
+        found, merged, odd = [], [], None
+        for key in DEP_KEYS:
+            if key not in task:
+                continue
+            value = task.pop(key)
+            if value is None:
+                value = []
+            elif _text(value):
+                value = [value]
+            if not isinstance(value, (list, tuple)):
+                odd = value  # not a list: validate_plan rejects it with its own message
+                continue
+            if value:
+                found.append(key)
+            merged.extend(value)
+        if odd is not None:
+            task['depends_on'] = odd
+            continue
+        if 'depends_on' in found and len(found) > 1:
+            warnings.append('Task %s: depends_on and %s were both set; merged them'
+                            % (ident, ', '.join(k for k in found if k != 'depends_on')))
+        deps = []
+        for dep in merged:
+            dep = str(dep) if _text(dep) else dep
+            if dep == ident:
+                warnings.append('Task %s: dropped its dependency on itself' % ident)
+                continue
+            if dep not in deps:
+                deps.append(dep)
+        task['depends_on'] = deps
+    return warnings
+
+
+def parts_budget(parts, width, capacity):
+    """T1 budget rule: one coworker per independent part (the plan's widest wave), at least 2 for any
+    plan with 2 or more parts (so the review of part A can start while part B is still built), at most
+    the free coworker slots (capacity). Only a real one-part request gets 1."""
+    if int(parts or 0) <= 1:
+        return 1
+    return max(1, min(int(capacity or 0), max(2, int(width or 0))))
+
+
 def parallel_width(tasks):
-    """Maximum runnable wave in the validated dependency graph."""
-    remaining = {t['id']: set(t.get('depends_on', [])) for t in tasks}
+    """Maximum runnable wave in the validated dependency graph (ids compared as text, known ids only)."""
+    ids = [str(t.get('id', i)) for i, t in enumerate(tasks)]
+    known = set(ids)
+    remaining = {i: {str(d) for d in (t.get('depends_on') or []) if str(d) in known and str(d) != i}
+                 for i, t in zip(ids, tasks)}
     done, width = set(), 1
     while remaining:
         wave = {ident for ident, deps in remaining.items() if deps <= done}
