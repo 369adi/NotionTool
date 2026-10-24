@@ -22,7 +22,9 @@ class MeteredAdapter(fixtures.FakeAdapter):
                 self.execution_peak = max(self.execution_peak, self.executing)
                 self.execution.append((task['run_id'], worker['id'], account, prompt))
             if self.wait_execution:
-                self.gate.wait(12)
+                # 30 s like the older fake (test_engine.py): a self-release near the 12 s pump timeout
+                # lets executors finish early and breaks the expected inflight peak under load.
+                self.gate.wait(30)
         try:
             return super().run(worker, task, prompt, cancel, update)
         finally:
@@ -43,13 +45,20 @@ class EightSlotTests(unittest.TestCase):
     def setUp(self):
         # Base setup: 1 account 'a', workers w0-w39, chat 'c', main worker.
         fixtures.EngineTests.setUp(self)
+        # Measured: ticks in the final 'all runs done' wait spent most of their time in sqlite commits
+        # (synchronous=FULL, ~5 ms disk sync per store write). The throwaway test db needs no fsync.
+        with self.store.lock:
+            self.store.db.execute('PRAGMA synchronous=OFF')
         # count=5: planner returns 5 executor tasks (one account's worker quota).
         self.adapter = MeteredAdapter(count=5)
         self.engine.adapter = self.adapter
         # Create 8 accounts, assign workers, create one main+chat per account.
         for slot in range(8):
             ident = 'a' if slot == 0 else 'a%d' % slot
-            self.store.put('accounts', dict(id=ident, slot=slot + 1, state='ready', cooldown_until=0))
+            # Keep the base record of account 'a' (e.g. its email); only set slot, state and cooldown.
+            account = self.store.get('accounts', ident) or dict(id=ident)
+            account.update(slot=slot + 1, state='ready', cooldown_until=0)
+            self.store.put('accounts', account)
             for n in range(slot * 5, slot * 5 + 5):
                 w = self.store.get('workers', 'w%d' % n)
                 w['account_id'] = ident
