@@ -1840,7 +1840,7 @@ class Application:
                 account=self.store.get('accounts',account['id'])
             if account['state']!='ready' or account.get('bridge_blocked') or account.get('bridge_next_at',0)>time.time():continue
             if account.get('bridge_connected') and account.get('bridge_url')==result['url']:
-                if time.time()-account.get('bridge_checked_at',0)<300:
+                if time.time()-account.get('bridge_checked_at',0)<60:  # I51: check every 60 s (was 300 s) for fast reconnect
                     connected+=1;continue
                 try:alive=self.adapter.bridge_alive(account['id'],result['url'])
                 except Exception:alive=True  # a failed check never tears down a working bridge
@@ -1850,16 +1850,13 @@ class Application:
                     if fresh.get('bridge_misses'):
                         fresh.update(bridge_misses=0,bridge_missing_since=0);self.store.put('accounts',fresh)
                     connected+=1;continue
-                # Reconnect only when the module is confirmed missing twice, and not while Coworkers of this
-                # account are working (max. 10 minutes) - a confirmed-missing MCP is broken for them anyway.
+                # I51: reconnect on first confirmed miss (was: two misses). Only wait while Coworkers are actively busy (max 10 min).
                 misses=fresh.get('bridge_misses',0)+1
                 fresh.update(bridge_misses=misses,bridge_missing_since=fresh.get('bridge_missing_since') or time.time())
-                if misses<2:fresh['bridge_checked_at']=time.time()-240  # confirm in about a minute
                 self.store.put('accounts',fresh)
                 busy=any(w['account_id']==account['id'] and w.get('state') in ('busy','recovering') for w in self.store.all('workers'))
-                if misses<2 or (busy and time.time()-fresh['bridge_missing_since']<600):
-                    if misses>=2:
-                        self.store.event('mcp_reconnect_deferred',message='NotionTool MCP missing; reconnect waits until the Coworkers are idle',slot=account.get('slot'))
+                if busy and time.time()-fresh['bridge_missing_since']<600:
+                    self.store.event('mcp_reconnect_deferred',message='NotionTool MCP missing; reconnect waits until the Coworkers are idle',slot=account.get('slot'))
                     connected+=1;continue
                 self.store.event('mcp_missing',message='NotionTool MCP is no longer active in the account; reconnecting',slot=account.get('slot'))
             try:
