@@ -177,6 +177,18 @@ class TeamGrower:
             started.append(ident)
         return started
 
+    def _retire_pending(self, ident, tid):
+        """Retire every pending worker whose thread_id is tid (chat was deleted or gone)."""
+        for w in self.store.all('workers'):
+            if w.get('account_id') != ident or w.get('thread_id') != tid:
+                continue
+            if w.get('join_state') != 'pending' or w.get('state') in RETIRED_STATES:
+                continue
+            w.update(state='retired', enabled=False, lease='', retired_reason='regreet: chat not in Notion chat list')
+            self.store.put('workers', w)
+            self.store.event('coworker_retired', worker_id=w['id'], thread_id=tid,
+                             message='Pending Coworker chat gone from Notion (regreet failed); retired')
+
     def _regreet(self, ident, due):
         sent = 0
         try:
@@ -186,7 +198,11 @@ class TeamGrower:
                 try:
                     sent += bool(self.adapter.regreet_welcome(ident, tid))
                 except Exception as exc:
-                    self.store.event('welcome_resend_failed', message=(tid + ': ' + str(exc))[:200], account_id=ident)
+                    msg = str(exc)
+                    self.store.event('welcome_resend_failed', message=(tid + ': ' + msg)[:200], account_id=ident)
+                    if 'not in the chat list' in msg or 'chat list' in msg.lower():
+                        self._retire_pending(ident, tid)
+                        continue
                 self._restore_name(ident, tid)
             try:
                 self.adapter.refresh(ident)  # picks up the joins
