@@ -121,6 +121,15 @@ class AppChatRouteTests(unittest.TestCase):
         self.assertEqual(rows[0]['settings']['promote']['route'], '/api/app/chat/promote')
         self.assertEqual(rows[0]['settings']['promote']['body'], dict(thread_id=out['thread_id'], main=True))
 
+    def test_new_chat_gets_user_name_directly_without_main_n_step(self):
+        # Owner 2026-10-24: the sidebar showed 'Main 27' first, then the typed name.
+        for name, main, rid in (('Holiday plans', False, 'r-direct-p'), ('Tax return', True, 'r-direct-m')):
+            out = self.create(name, main, rid)
+            self.assertEqual(out['state'], 'done')
+            titles = [t for tid, t in self.adapter.renames if tid == out['thread_id']]
+            self.assertEqual(titles, [name])
+            self.assertEqual(self.adapter.threads[out['thread_id']], name)
+
     def test_same_request_id_never_creates_twice(self):
         first = self.create('Notes', False, 'r-same')
         second = self.create('Notes', False, 'r-same')

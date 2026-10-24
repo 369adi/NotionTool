@@ -274,7 +274,9 @@ def _reserve(server, ledger):
     """Create (or find) the durable create_main operation for this ledger entry; idempotent."""
     store = server.store
     purpose = MAIN_PURPOSE if ledger.get('main') else PRIVATE_PURPOSE
-    op, _new = _mains(server).request_create(ledger['account_id'], ledger['id'], purpose=purpose)
+    # The chat gets the user's name right away (no 'Main N' step in the Notion sidebar).
+    op, _new = _mains(server).request_create(ledger['account_id'], ledger['id'], purpose=purpose,
+                                             title=ledger.get('name', ''))
     ledger.update(op_id=op['id'], state='reserved' if op.get('state') == 'reserved' else ledger.get('state', 'reserved'),
                   thread_id=op.get('thread_id') or ledger.get('thread_id', ''), updated=time.time())
     store.put(APP_LEDGER, ledger)
@@ -346,6 +348,8 @@ def finish_create(server, ident):
             records.append(('chats', chat))
         store.batch(records)
         ledger['worker_id'] = worker['id']
+    if op.get('title') == name:
+        ledger['renamed'] = True  # run_create already gave the chat this name in Notion
     if not ledger.get('renamed'):
         try:
             adapter.rename_thread(adapter.client(ledger['account_id']), ledger['thread_id'], name)

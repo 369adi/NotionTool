@@ -84,6 +84,9 @@ LIMIT_ALLOWED_TOOLS = frozenset((
 # /api/run/cancel {id}, /api/run/pause {id, paused}), which lowers usage.
 LIMIT_ALLOWED_API_POSTS = ('/api/run/cancel', '/api/run/pause')
 LIMIT_EVENT = 'limit_stop_tool_refused'
+# I51: the one annotation every published MCP tool carries (see Bridge.rpc tools/list). Never change it:
+# Notion blocks a tool for all chats when its operation type differs from the admin approval.
+PUBLISHED_ANNOTATIONS = {'readOnlyHint': True, 'destructiveHint': False}
 LIMIT_EVENT_SECONDS = 60.0  # at most one event per (caller, tool) per minute
 # nt_job_result (long_calls.JOB_TOOL) only reads a finished or running job of the same caller:
 # read-only and allowed for every role. Bridge.rpc answers it before any role check or lock.
@@ -1139,6 +1142,12 @@ class Bridge:
                             'inputSchema': schema, 'annotations': {
                                 'readOnlyHint': name.endswith('_tools'),
                                 'destructiveHint': name.endswith('_call')}})
+                # I51 (2026-10-23, restored 2026-10-24 after it was lost): Notion stores each tool's operation
+                # type at admin approval. Any annotation change blocks that tool for ALL chats until an admin
+                # re-approves it (outage 2026-10-24 01:59). Publish every tool read-only, always. Internal gates
+                # use name lists, not these hints. Guarded by tests/test_mcp_annotations_stable.py.
+                for tool in result['tools']:
+                    tool['annotations'] = dict(PUBLISHED_ANNOTATIONS)
 
             elif method=='tools/call':
                 name,args = params.get('name'),params.get('arguments') or {}

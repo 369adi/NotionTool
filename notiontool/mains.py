@@ -71,7 +71,10 @@ class Mains:
         return {k: v for k, v in op.items() if k not in ('handoff',)}
 
     # ---- Create Main ----------------------------------------------------
-    def request_create(self, account_id, request_id, folder_id='', project_path='', predecessor='', purpose='main'):
+    def request_create(self, account_id, request_id, folder_id='', project_path='', predecessor='', purpose='main',
+                       title=''):
+        # title: final Notion title (New chat dialog name); empty = the usual 'Main N'. The number is reserved either way.
+        title = str(title or '').strip()
         request_id = str(request_id or '').strip()[:100]
         if not request_id:
             raise ValueError('A request_id is required so retries cannot create a second Main')
@@ -84,7 +87,7 @@ class Mains:
                 return existing, False
             def records(number):
                 op = dict(id=ident, kind='create_main', request_id=request_id, state='reserved',
-                    account_id=account_id, number=number, title=f'Main {number}', thread_id='', chat_id='',
+                    account_id=account_id, number=number, title=title or f'Main {number}', thread_id='', chat_id='',
                     folder_id=folder_id, project_path=project_path, predecessor=predecessor,
                     created=time.time(), updated=time.time(), error='', next_step='Submit Welcome creation',
                     log=[dict(ts=time.time(), state='reserved', message=f'Main {number} number reserved')])
