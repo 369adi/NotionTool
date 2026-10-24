@@ -158,6 +158,40 @@ def switch_message(reason, d):
                d['min_tokens'], d['token_limit']))
 
 
+# Bug 2026-10-24: tool entities kept the full tool output (up to 16 MB per entity, 75 MB per chat).
+# Every observe re-read and re-wrote that record under the store lock, so the desktop build took
+# up to 4 minutes and the MCP connection stopped answering ("Failed to connect to MCP server").
+# Tool outputs are now stored shortened; the cut part still counts as omitted_tokens.
+TOOL_FIELD_CAP = 4000
+TOOL_FIELDS = ('text', 'result', 'content', 'input', 'output')
+
+
+def slim_entity(entity):
+    if not isinstance(entity, dict) or entity.get('kind') != 'tool':
+        return entity
+    out, omitted = None, 0
+    for field in TOOL_FIELDS:
+        value = entity.get(field)
+        if isinstance(value, str):
+            text = value
+        elif isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            continue
+        if len(text) > TOOL_FIELD_CAP + 64:
+            out = out if out is not None else dict(entity)
+            out[field] = text[:TOOL_FIELD_CAP] + ' ...[shortened]'
+            omitted += estimate_tokens(text) - estimate_tokens(out[field])
+    if out is None:
+        return entity
+    out['omitted_tokens'] = int(entity.get('omitted_tokens') or 0) + omitted
+    return out
+
+
+def omitted_tokens(entities):
+    return sum(int(e.get('omitted_tokens') or 0) for e in entities if isinstance(e, dict))
+
+
 class ChatContext:
     def __init__(self, store):
         self.store = store
@@ -168,11 +202,17 @@ class ChatContext:
         entities = record['entities']
         # 'latest' duplicated the whole transcript (up to ~28 MB per chat) and was never read.
         changed = record.pop('latest', None) is not None or 'estimated_tokens' not in record
+        if not record.get('tool_slimmed'):
+            # One-time shrink of records written before tool outputs were shortened.
+            for key in list(entities):
+                entities[key] = slim_entity(entities[key])
+            record['tool_slimmed'] = changed = True
         for patch in transcript.get('patches', []):
             entity = patch.get('entity') or {}
             if patch.get('op') == 'put' and entity:
                 key = entity.get('id') or str(entity.get('sequence', '')) or hashlib.sha256(
                     json.dumps(entity, sort_keys=True).encode()).hexdigest()
+                entity = slim_entity(entity)
                 if entities.get(key) != entity:
                     entities[key] = entity
                     changed = True
@@ -182,7 +222,8 @@ class ChatContext:
             return record
         record['updated'] = time.time()
         # Deduplicate snapshots but keep every observed entity and its latest version.
-        record['estimated_tokens'] = max(estimate_tokens(entities), estimate_tokens(transcript))
+        record['estimated_tokens'] = max(estimate_tokens(entities) + omitted_tokens(entities.values()),
+                                         estimate_tokens(transcript))
         self.store.put('thread_context', record)
         return record
 
@@ -199,7 +240,8 @@ class ChatContext:
                             for t in tasks if t.get('sent_at', 0) > archived_at)
         native = record.get('native_tokens', 0) if archived_at > base_at else 0
         if base_seq:
-            observed = estimate_tokens({k: e for k, e in record['entities'].items() if e.get('sequence', 0) > base_seq})
+            later = {k: e for k, e in record['entities'].items() if e.get('sequence', 0) > base_seq}
+            observed = estimate_tokens(later) + omitted_tokens(later.values())
         elif base_at and not self.new_chat(worker, base_at):
             observed = 0
         else:
