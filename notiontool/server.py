@@ -1139,6 +1139,16 @@ class Application:
         if any(t.get('worker_id') == worker_id and t.get('state') in Application.SWITCH_BUSY_STATES
                for t in self.store.all('tasks')):
             raise ValueError('This chat is working on a task; switch after it finishes')
+        if worker.get('purpose') != 'worker':
+            # One way only: a Main always switches through the file handoff (main_switch.py).
+            from . import main_switch
+            from .operator_main import delegate
+            chat_id = chat_id or next((str(c.get('id') or '') for c in self.store.all('chats')
+                                       if c.get('main_worker') == worker_id), '')
+            request_id = str(body.get('request_id') or ('main-switch-' + time.strftime('%Y%m%d-%H%M%S')))
+            return main_switch.start(self.store, chat_id,
+                lambda b: delegate(self.engine, b['chat_id'], b['goal'], b['tasks'], b['request_id']), request_id,
+                brief_text=body.get('brief_text'), trigger='user')
         old, label = worker['thread_id'], worker.get('label')
         handoff = ('Context switch from the NotionTool desktop: this chat replaces the older chat %s '
                    '(chats are limited to %d h). Continue the work of that chat; NotionTool keeps its state.'

@@ -220,63 +220,32 @@ class ContextSwitchTests(unittest.TestCase):
         self.app = make_app(self.store)
         self.app.adapter = FakeAdapter()
 
-    def test_switch_by_worker_id_moves_the_chat_to_a_fresh_one(self):
-        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
-        self.assertEqual(status, 200, data)
-        self.assertEqual((data['worker_id'], data['thread_id'], data['old_thread_id']), ('w1', FakeAdapter.NEW, OLD_THREAD))
-        worker = self.store.get('workers', 'w1')
-        self.assertEqual(worker['thread_id'], FakeAdapter.NEW)
-        self.assertIn(OLD_THREAD, worker['retired_threads'])
-        self.assertEqual(worker['label'], 'Main chat')  # a Main keeps its name
-        self.assertIn('chat_context_switch', self.store.events)
-        row = [r for r in self.app.chat_ages()['chats'] if r['id'] == 'c1'][0]
-        self.assertEqual(row['thread_id'], FakeAdapter.NEW)
-        self.assertLess(row['age_h'], 0.01)  # the age restarts in the fresh chat
-        self.assertFalse(row['blocked'])
+    def test_main_switch_uses_the_file_handoff_switch(self):
+        # One way only: a Main never gets the inline fresh-chat switch, it goes to main_switch (file handoff).
+        for body in ({'worker_id': 'w1'}, {'chat_id': 'c1'}):
+            with mock.patch('notiontool.main_switch.start', return_value=dict(ok=True, state='brief_ready')) as start:
+                status, data = call(self.app, 'POST', '/api/chat/context_switch', body)
+            self.assertEqual(status, 200, data)
+            self.assertEqual(start.call_args[0][1], 'c1')
+            self.assertEqual(start.call_args[1]['trigger'], 'user')
+        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], OLD_THREAD)
         self.app.engine.submit.assert_not_called()
-
-    def test_switch_by_chat_id_uses_the_main_worker(self):
-        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'chat_id': 'c1'})
-        self.assertEqual(status, 200, data)
-        self.assertEqual((data['worker_id'], data['chat_id'], data['thread_id']), ('w1', 'c1', FakeAdapter.NEW))
 
     def test_switch_of_a_coworker(self):
         status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w2'})
         self.assertEqual(status, 200, data)
         self.assertEqual(self.store.get('workers', 'w2')['thread_id'], FakeAdapter.NEW)
 
-    def test_main_switch_renames_old_and_new_chat(self):
-        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
-        self.assertEqual(status, 200, data)
-        self.assertTrue(data['renamed'])
-        self.assertIn((OLD_THREAD, 'Main chat (archived)'), self.app.adapter.renamed)
-        self.assertIn((FakeAdapter.NEW, 'Main chat'), self.app.adapter.renamed)
-
     def test_manual_switch_never_deletes_the_old_chat(self):
         deleted = []
         self.app.adapter.delete_thread = lambda client, tid: deleted.append(tid)
-        for worker_id in ('w1', 'w2'):
+        for worker_id in ('w2',):
             status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': worker_id})
             self.assertEqual(status, 200, data)
         self.assertEqual(deleted, [])  # rename instead of delete: the old chats stay in the sidebar archive
         titles = [title for tid, title in self.app.adapter.renamed]
-        self.assertIn('Main chat (archived)', titles)
         self.assertIn('Cowork (retired)', titles)  # a Coworker keeps the normal retire title
         self.assertIsNone(data['renamed'])  # a Coworker's new chat is named by the pool, not here
-
-    def test_failed_rename_of_the_new_chat_keeps_the_switch(self):
-        adapter = FakeAdapter()
-        def rename(client, tid, title):
-            if tid == FakeAdapter.NEW:
-                raise RuntimeError('rename endpoint down')
-            adapter.renamed.append((tid, title))
-        adapter.rename_thread = rename
-        self.app.adapter = adapter
-        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
-        self.assertEqual(status, 200, data)
-        self.assertFalse(data['renamed'])
-        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], FakeAdapter.NEW)
-        self.assertIn('chat_context_switch_rename_failed', self.store.events)
 
     def test_manual_switch_adapter_hides_delete_only(self):
         adapter = FakeAdapter()
@@ -296,10 +265,10 @@ class ContextSwitchTests(unittest.TestCase):
 
     def test_not_listed_new_chat_keeps_the_old_one(self):
         self.app.adapter = FakeAdapter(listed=False)
-        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w1'})
+        status, data = call(self.app, 'POST', '/api/chat/context_switch', {'worker_id': 'w2'})
         self.assertEqual(status, 400)
         self.assertIn('Context switch failed', data['error'])
-        self.assertEqual(self.store.get('workers', 'w1')['thread_id'], OLD_THREAD)
+        self.assertEqual(self.store.get('workers', 'w2')['thread_id'], '2222333344445555')
 
     def test_busy_chat_is_not_switched(self):
         self.store = switch_store(tasks=[dict(id='t1', worker_id='w1', state='running')])

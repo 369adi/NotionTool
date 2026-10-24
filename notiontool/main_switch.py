@@ -524,7 +524,7 @@ def start(store, operator_chat_id, delegate_fn, request_id, now=None, brief_text
     if str(trigger or '') in NO_SWITCH_TRIGGERS:
         return dict(ok=False, state='skipped', reason='A Main switch never starts from team setup')
     needed, measured = needs_switch(worker, _settings(store))
-    if measured and not needed:
+    if measured and not needed and trigger != 'user':
         return dict(ok=False, state='skipped', reason='The Main does not need a switch (context and lag below the limits)')
     path = brief_path(store, rid)
     seeded = False
