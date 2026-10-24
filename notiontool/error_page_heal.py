@@ -12,11 +12,14 @@ window (test_desktop_no_lag allowlists only this module):
 - clear JS cache once after the first failed plain reload, then reload again (max max_reloads total).
 """
 
+# Positive check (user report 2026-10-24 20:06): a half-loaded window with some text, a shifted layout or a
+# few placeholders slipped through the old 'looks broken' rules. Now anything that is not a finished
+# workspace (sidebar + frame + real text) counts as 'loading'; login/onboarding pages are left alone.
 PROBE = ("(function(){var t=(document.body&&document.body.innerText)||'';"
-         "if(/Something went wrong/.test(t)&&/Refresh/.test(t)&&t.length<600)return 'error';"
-         "if(t.length<200&&!document.querySelector('.notion-sidebar')&&"
-         "document.querySelectorAll('[class*=skeleton],[class*=Skeleton],[class*=shimmer]').length>10)return 'loading';"
-         "return '';})()")
+         "if(/\\/login|\\/signup|onboarding/.test(location.pathname))return '';"
+         "if(/Something went wrong/i.test(t)&&t.length<2000)return 'error';"
+         "var ok=document.querySelector('.notion-sidebar')&&document.querySelector('.notion-frame')&&t.length>200;"
+         "return ok?'':'loading';})()")
 
 # Clear service workers and CacheStorage (program files only; user data stays).
 _CLEAR_JS = (
@@ -56,7 +59,7 @@ def _clear_cache(session):
         pass
 
 
-def heal(get_session, stop_event, store, checks=24, wait_s=2.5, max_reloads=4):
+def heal(get_session, stop_event, store, checks=48, wait_s=2.5, max_reloads=4):  # 48 x 2.5 s = 2 min
     """Check every wait_s seconds; reload a crash or stuck loading page at most max_reloads times.
 
     After the first failed plain reload the JS cache is cleared before the next reload attempt.
