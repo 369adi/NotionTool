@@ -114,13 +114,8 @@ def account_handlers(server):
         with server.engine.lock, adapter.lock:
             target = session()
             target.send('Network.clearBrowserCookies', {})
-            # Drop Notion's cached workspace/session too, otherwise the SPA keeps showing the old
-            # account's chats after sign-out. Then force the window back to the login page.
-            try:
-                for origin in ('https://app.notion.com', 'https://www.notion.so'):
-                    target.send('Storage.clearDataForOrigin', {'origin': origin, 'storageTypes': 'all'})
-            except Exception:
-                pass
+            # Force the window back to the login page. We deliberately do NOT wipe Notion's full site
+            # data: that would strip the NotionTool shell state and leave a plain Notion page.
             try:
                 target.send('Page.navigate', {'url': 'https://app.notion.com/login'})
             except Exception:
