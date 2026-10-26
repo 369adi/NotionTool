@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from notiontool.account_settings import account_handlers, open_main
 from notiontool.store import Store
@@ -94,6 +94,25 @@ class AccountControlsTests(unittest.TestCase):
             self.actions['account_sign_out']({'account_id': 'a'})
         self.cdp.send.assert_not_called()
         self.adapter.sessions.delete.assert_not_called()
+
+    def test_sign_out_cancels_held_runs_instead_of_blocking(self):
+        self.store.put('runs', {'id': 'r1', 'account_id': 'a', 'state': 'planning'})
+        self.store.put('runs', {'id': 'r2', 'account_id': 'a', 'state': 'queued'})
+        self.store.put('runs', {'id': 'r3', 'account_id': 'other', 'state': 'planning'})
+        cancelled = []
+        def fake_cancel(run_id):
+            run = self.store.get('runs', run_id)
+            if run:
+                run['state'] = 'cancelled'
+                self.store.put('runs', run)
+            cancelled.append(run_id)
+        cancel = Mock(side_effect=fake_cancel)
+        self.server.engine.cancel = cancel
+        result = self.actions['account_sign_out']({'account_id': 'a'})
+        self.assertEqual(cancelled, ['r1', 'r2'])
+        self.assertEqual(cancel.call_args_list, [call('r1'), call('r2')])
+        self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
+        self.assertEqual(result['navigate'], 'https://app.notion.com/login')
 
     def test_switch_rejects_missing_login_without_touching_the_active_session(self):
         self.store.put('accounts', {'id': 'b', 'state': 'signin'})

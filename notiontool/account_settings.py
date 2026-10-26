@@ -106,6 +106,15 @@ def account_handlers(server):
         ident = str(args.get('account_id') or '')
         if not ident or ident != selected_account(store):
             raise ValueError('Choose the active account to sign out.')
+        # Held runs (planned/queued, not executing) must never block sign-out forever: cancel them
+        # first so the user can always leave an account. Truly active runs still block (idle below).
+        held = ('queued', 'approach', 'planning', 'paused')
+        for r in list(store.all('runs')):
+            if r.get('account_id') == ident and r.get('state') in held:
+                try:
+                    server.engine.cancel(r['id'])
+                except Exception:
+                    pass
         with server.engine.lock, adapter.lock:
             idle(ident)
             session().send('Network.clearBrowserCookies', {})
