@@ -85,32 +85,23 @@ class AccountControlsTests(unittest.TestCase):
         self.assertIsNotNone(self.store.get('projects', 'keep-project'))
         self.assertEqual(result['navigate'], 'https://app.notion.com/login')
 
-    def test_sign_out_rejects_wrong_account_and_active_work_before_changing_login(self):
+    def test_sign_out_rejects_wrong_account_but_allows_active_work(self):
         with self.assertRaisesRegex(ValueError, 'active account'):
             self.actions['account_sign_out']({'account_id': 'other'})
         self.store.put('workers', {'id': 'w', 'account_id': 'a'})
         self.store.put('tasks', {'id': 't', 'worker_id': 'w', 'state': 'running'})
-        with self.assertRaisesRegex(ValueError, 'active tasks'):
-            self.actions['account_sign_out']({'account_id': 'a'})
-        self.cdp.send.assert_not_called()
-        self.adapter.sessions.delete.assert_not_called()
+        result = self.actions['account_sign_out']({'account_id': 'a'})
+        self.cdp.send.assert_called_once_with('Network.clearBrowserCookies', {})
+        self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
+        self.assertEqual(result['navigate'], 'https://app.notion.com/login')
 
-    def test_sign_out_cancels_held_runs_instead_of_blocking(self):
+    def test_sign_out_proceeds_even_with_runs_present(self):
         self.store.put('runs', {'id': 'r1', 'account_id': 'a', 'state': 'planning'})
-        self.store.put('runs', {'id': 'r2', 'account_id': 'a', 'state': 'queued'})
-        self.store.put('runs', {'id': 'r3', 'account_id': 'other', 'state': 'planning'})
-        cancelled = []
-        def fake_cancel(run_id):
-            run = self.store.get('runs', run_id)
-            if run:
-                run['state'] = 'cancelled'
-                self.store.put('runs', run)
-            cancelled.append(run_id)
-        cancel = Mock(side_effect=fake_cancel)
+        self.store.put('runs', {'id': 'r2', 'account_id': 'a', 'state': 'executing'})
+        cancel = Mock()
         self.server.engine.cancel = cancel
         result = self.actions['account_sign_out']({'account_id': 'a'})
-        self.assertEqual(cancelled, ['r1', 'r2'])
-        self.assertEqual(cancel.call_args_list, [call('r1'), call('r2')])
+        cancel.assert_not_called()
         self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
         self.assertEqual(result['navigate'], 'https://app.notion.com/login')
 
