@@ -254,16 +254,87 @@ class Browser:
         return True
 
     def hide_window(self, tab):
-        """Move the window of tab off screen (not minimized: the tab keeps running). Never raises."""
+        """Hide the transport window: off screen and, when it is the hidden transport browser,
+        fully removed from the Windows taskbar (SW_HIDE). Never raises."""
         try:
-            return self._window_bounds(tab, {'left': -32000, 'top': -32000, 'width': 1200, 'height': 800})
+            moved = self._window_bounds(tab, {'left': -32000, 'top': -32000, 'width': 1200, 'height': 800})
+            if self.hidden():
+                self.hide_native()
+            return moved
         except Exception:
             return False
 
     def show_window(self, tab):
         """Bring the window of tab back on screen (the user opened Notion in Edge). Never raises."""
         try:
-            return self._window_bounds(tab, {'left': 80, 'top': 80, 'width': 1280, 'height': 860})
+            shown = self._window_bounds(tab, {'left': 80, 'top': 80, 'width': 1280, 'height': 860})
+            self.show_native()
+            return shown
+        except Exception:
+            return False
+
+    def _owned_pids(self):
+        """PIDs of browser processes that use exactly this owned profile (transport included)."""
+        profile = str(getattr(self, 'profile', '') or '')
+        if os.name != 'nt' or not profile:
+            return []
+        pids = []
+        for item in self.list_processes():
+            cmd = str(item.get('cmd') or '')
+            if profile.lower() in cmd.lower():
+                try:
+                    pids.append(int(item.get('pid') or 0))
+                except (TypeError, ValueError):
+                    pass
+        return pids
+
+    def _native_windows(self):
+        """Top-level visible HWNDs of this owned browser's processes."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        pids = set(self._owned_pids())
+        if not pids:
+            return []
+        found = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @WNDENUMPROC
+        def cb(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value in pids:
+                    found.append(hwnd)
+            return True
+
+        user32.EnumWindows(cb, 0)
+        return found
+
+    def hide_native(self):
+        """SW_HIDE this owned browser's windows so no taskbar button exists. Never raises."""
+        self._set_native_visible(False)
+
+    def show_native(self):
+        """SW_SHOW this owned browser's windows (undo a hide_native). Never raises."""
+        self._set_native_visible(True)
+
+    def _set_native_visible(self, visible):
+        if os.name != 'nt':
+            return False
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            show = 5 if visible else 0  # SW_SHOW / SW_HIDE
+            # The browser window may appear a moment after the process starts: retry briefly.
+            for _ in range(8):
+                wins = self._native_windows()
+                if wins or not visible:
+                    break
+                time.sleep(0.25)
+            for hwnd in self._native_windows():
+                user32.ShowWindow(hwnd, show)
+            return True
         except Exception:
             return False
 
