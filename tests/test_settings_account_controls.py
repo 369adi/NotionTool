@@ -78,7 +78,8 @@ class AccountControlsTests(unittest.TestCase):
 
     def test_sign_out_clears_only_local_sign_in_and_keeps_user_data(self):
         result = self.actions['account_sign_out']({'account_id': 'a'})
-        self.cdp.send.assert_called_once_with('Network.clearBrowserCookies', {})
+        self.cdp.send.assert_any_call('Network.clearBrowserCookies', {})
+        self.cdp.send.assert_any_call('Page.navigate', {'url': 'https://app.notion.com/login'})
         self.assertEqual(self.adapter.sessions.delete.call_count, 2)
         self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
         self.assertIsNotNone(self.store.get('chats', 'keep'))
@@ -91,7 +92,7 @@ class AccountControlsTests(unittest.TestCase):
         self.store.put('workers', {'id': 'w', 'account_id': 'a'})
         self.store.put('tasks', {'id': 't', 'worker_id': 'w', 'state': 'running'})
         result = self.actions['account_sign_out']({'account_id': 'a'})
-        self.cdp.send.assert_called_once_with('Network.clearBrowserCookies', {})
+        self.cdp.send.assert_any_call('Network.clearBrowserCookies', {})
         self.assertEqual(self.store.get('accounts', 'a')['state'], 'signin')
         self.assertEqual(result['navigate'], 'https://app.notion.com/login')
 

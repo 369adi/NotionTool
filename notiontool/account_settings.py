@@ -109,7 +109,19 @@ def account_handlers(server):
         # Sign-out only clears the local session. Notion-side chats and runs continue over the API,
         # so nothing must ever block signing out (user rule).
         with server.engine.lock, adapter.lock:
-            session().send('Network.clearBrowserCookies', {})
+            target = session()
+            target.send('Network.clearBrowserCookies', {})
+            # Drop Notion's cached workspace/session too, otherwise the SPA keeps showing the old
+            # account's chats after sign-out. Then force the window back to the login page.
+            try:
+                for origin in ('https://app.notion.com', 'https://www.notion.so'):
+                    target.send('Storage.clearDataForOrigin', {'origin': origin, 'storageTypes': 'all'})
+            except Exception:
+                pass
+            try:
+                target.send('Page.navigate', {'url': 'https://app.notion.com/login'})
+            except Exception:
+                pass
             for key in (ident, 'login_' + ident):
                 adapter.sessions.delete(key)
             account = dict(store.get('accounts', ident))
