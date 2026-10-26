@@ -1834,10 +1834,10 @@ class Application:
         return self.mcp_http.server_port
 
     @staticmethod
-    def gateway_health(port):
+    def gateway_health(port,timeout=2):
         import urllib.request
         try:
-            with urllib.request.urlopen(f'http://127.0.0.1:{port}/__gateway',timeout=2) as response:
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/__gateway',timeout=timeout) as response:
                 data=json.loads(response.read())
             return data if data.get('service')=='notiontool-gateway' else None
         except Exception:
@@ -1850,6 +1850,25 @@ class Application:
             probe.settimeout(1)
             return probe.connect_ex(('127.0.0.1',port))==0
 
+    @staticmethod
+    def pid_alive(pid):
+        """True while the process runs. Never os.kill(pid,0) on Windows: that terminates the process."""
+        try:pid=int(pid or 0)
+        except (TypeError,ValueError):return False
+        if pid<=0:return False
+        if os.name!='nt':
+            try:os.kill(pid,0)
+            except OSError:return False
+            return True
+        import ctypes
+        kernel=ctypes.windll.kernel32
+        handle=kernel.OpenProcess(0x1000,False,pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:return False
+        try:
+            code=ctypes.c_ulong()
+            return bool(kernel.GetExitCodeProcess(handle,ctypes.byref(code))) and code.value==259  # STILL_ACTIVE
+        finally:kernel.CloseHandle(handle)
+
     def ensure_gateway(self):
         """Process 2: the stable MCP gateway Tailscale points to. It survives every restart of this app,
         holds MCP requests while the app is down and answers as backup MCP if the restart takes longer."""
@@ -1859,6 +1878,13 @@ class Application:
         if settings.get('mcp_gateway') is False:return 0
         port=int(settings.get('mcp_gateway_port') or gw.DEFAULT_PORT)
         health=self.gateway_health(port)
+        if not health and self.port_busy(port):
+            # 26.10.2026: under heavy load (RAM full) our own gateway answered slower than 2 s, was taken for a
+            # foreign program and Tailscale was pointed at the core directly -> the MCP broke together with the app.
+            for _ in range(3):
+                health=self.gateway_health(port,timeout=5)
+                if health:break
+                time.sleep(1)
         if health and health.get('version')==gw.VERSION:return port
         if health:  # an older gateway version: replace it once
             import urllib.request
@@ -1869,6 +1895,11 @@ class Application:
                 if not self.gateway_health(port):break
                 time.sleep(0.5)
         elif self.port_busy(port):
+            info=gw.read_json(gw.runtime_dir(self.data_dir)/'gateway.json')
+            if int(info.get('port') or 0)==port and self.pid_alive(info.get('pid')):
+                # our own gateway, only too busy to answer the health check: Tailscale stays on the gateway, never on the core
+                self.store.event('mcp_gateway_slow',message=f'MCP gateway on port {port} is slow to answer; Tailscale stays on the gateway')
+                return port
             self.store.event('mcp_gateway_port_busy',message=f'Port {port} belongs to another program; the MCP runs without gateway')
             return 0
         breakaway=0x01000000  # CREATE_BREAKAWAY_FROM_JOB

@@ -99,13 +99,18 @@ class GatewayV3(unittest.TestCase):
         status, body = call(g2, 'initialize', 5)
         self.assertEqual((status, body['id']), (200, 5))
 
-    def test_down_core_does_not_advertise_cached_tools(self):
+    def test_down_core_keeps_cached_tools(self):
+        # v4 (user 26.10.2026): NotionTool down or hanging must not break the MCP - the tools stay listed,
+        # a call gets a clear 'NOT executed' result instead of a dead endpoint.
         core = Core()
         g = self.gateway(core)
         call(g, 'tools/list')
         core.close()
-        status, body = call(g, 'tools/list')
-        self.assertEqual(body['result']['tools'], [])
+        status, body = call(g, 'tools/list', 9)
+        self.assertEqual((status, body['id'], body['result']['tools'][0]['name']), (200, 9, 'nt_api'))
+        status, body = call(g, 'tools/call')
+        self.assertTrue(body['result']['isError'])
+        self.assertIn('NOT executed', body['result']['content'][0]['text'])
 
     def test_every_request_logged_without_secrets(self):
         core = Core()

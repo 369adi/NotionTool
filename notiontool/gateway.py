@@ -11,6 +11,11 @@ blocked (a long action holding the engine lock). v2 then waited up to 900 s and 
 up first. Now safe methods answer from the gateway after SAFE_SECONDS, tool calls get a 'busy, not
 retried' result after CALL_SECONDS, the cache and accepted logins survive a gateway restart
 (runtime/gateway_cache.json) and every request is logged to runtime/gateway.log.
+
+v4 (user 26.10.2026: 'when NotionTool fails, the NotionTool MCP must not break with it'): a DOWN core
+no longer empties tools/list. NotionTool's own cached tools (nt_*) stay advertised so Notion keeps the
+MCP and its tools; proxied tools (roblox_*, blender_*, mcp_* ...) stay hidden while down so their own MCP
+servers take over. Every call still gets a clear 'NOT executed' result until the app is back.
 """
 import hashlib
 import http.client
@@ -24,7 +29,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = 3
+VERSION = 4
 DEFAULT_PORT = 8792
 HOLD_SECONDS = 25  # Notion's MCP client gives up before 120 s -> 'Failed to connect'; answer fast instead
 SAFE_SECONDS = 8  # initialize/ping/tools/list: answer from the gateway when the core is slower than this
@@ -33,6 +38,7 @@ CONNECT_SECONDS = 5
 LOG_MAX_BYTES = 5 * 1024 * 1024
 SAFE_METHODS = {'initialize', 'notifications/initialized', 'ping', 'tools/list', 'resources/list', 'prompts/list'}
 CACHED_METHODS = ('initialize', 'tools/list')
+OWN_TOOL_PREFIX = 'nt_'  # v4: NotionTool's own tools stay listed from the cache while the core is down
 FORWARD_HEADERS = ('authorization', 'content-type', 'accept', 'mcp-session-id', 'mcp-protocol-version', 'last-event-id')
 RETURN_HEADERS = ('content-type', 'mcp-session-id', 'cache-control')
 
@@ -245,10 +251,16 @@ class Gateway:
         name, ident = parsed.get('method'), parsed.get('id')
         if 'id' not in parsed:
             return 202, [('Content-Type', 'application/json')], b'{}'
-        # A cached schema is not proof that a DISCONNECTED server can execute it. A busy core is alive:
-        # its cached tool list stays valid, so the tools do not vanish from Notion while it works.
+        # v4: a DOWN core keeps NotionTool's own cached tools (nt_*) listed. An empty list made them vanish
+        # from Notion whenever the app hung, so the MCP broke together with the app. Proxied tools (roblox_*,
+        # blender_*, mcp_* ...) stay hidden while down so Notion uses their own MCP servers (e.g. the Roblox
+        # MCP) instead. Calls stay safe: a down core gets the 'NOT executed' result below, never a resend.
         if name == 'tools/list' and not busy:
-            return self.reply(ident, {'tools': []})
+            try:
+                tools = json.loads(self.cache[name][1])['result']['tools']
+                return self.reply(ident, {'tools': [t for t in tools if str(t.get('name') or '').startswith(OWN_TOOL_PREFIX)]})
+            except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+                return self.reply(ident, {'tools': []})
         # initialize is NOT refused any more: the cached answer below keeps the connection alive
         # while the app restarts (a refused initialize is what Notion shows as 'Failed to connect').
         if name in self.cache:
@@ -263,7 +275,8 @@ class Gateway:
             return self.reply(ident, {})
         if name == 'tools/list':
             return self.reply(ident, {'tools': []})
-        text = 'NotionTool is restarting; this tool call was not executed. Try again in about a minute.'
+        text = ('NotionTool is not reachable right now (restarting or hanging); this tool call was NOT executed. '
+                'The MCP itself stays connected - try again in about a minute.')
         if name == 'tools/call':
             return self.reply(ident, {'content': [{'type': 'text', 'text': text}], 'isError': True})
         return self.reply(ident, error={'code': -32000, 'message': text})
