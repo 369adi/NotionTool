@@ -41,8 +41,10 @@ POLICIES = ('ask', 'auto')
 ASK_TOKENS = 1300000  # ask early: the user sees lag from about 1.5M
 ASK_TURNS = 1000
 LAG_MS = 20000  # measured Main reply lag that counts as a real need for a switch
+AGE_TEXT = ('The Main chat is %.1f h old (limit %d h). Write the switch brief and switch to a fresh '
+            'chat now; do not ask the user.')
 NO_SWITCH_TRIGGERS = ('team_setup', 'ensure_team', 'team_grow')
-OLD_TITLE = 'Main (old, Archive %s)'
+OLD_TITLE = 'Main (expired, %s)'
 BRIEF_MAX_CHARS = 8000
 ASK_TEXT = 'The Main chat is getting long. Ask the user whether to switch to a fresh Main chat.'
 ACTIVE = ('brief_requested', 'brief_ready', 'prompt_sent')
@@ -112,10 +114,24 @@ def need_reasons(usage, settings):
     return reasons
 
 
+def age_over(worker, settings, now=None):
+    """(over, age_h, limit_h): a Main chat at or above coworker_max_age_hours (default 22) must switch."""
+    from .team_rotation import age_seconds, max_age_hours
+    limit = max_age_hours(settings)
+    worker = worker or {}
+    probe = dict(created_at=worker.get('created_at') or worker.get('thread_created_at'))
+    age = age_seconds(probe, _now(now))
+    if age is None:
+        return False, None, limit
+    return age >= limit * 3600, age / 3600.0, limit
+
+
 def needs_switch(worker, settings):
     """(needed, measured) for an operator worker: a stored context_ask or measured usage over a limit."""
     ask = (worker or {}).get('context_ask') or {}
     if ask.get('ask'):
+        return True, True
+    if age_over(worker, settings)[0]:
         return True, True
     usage = (worker or {}).get('context_usage')
     if not usage:
@@ -125,18 +141,23 @@ def needs_switch(worker, settings):
 
 def check(store, worker, usage, settings, now=None):
     """Notice dict for a long operator chat, else None. worker['context_ask'] is written only on change."""
-    if not worker or worker.get('purpose') != OPERATOR:
+    if not worker or worker.get('purpose') not in (OPERATOR, 'main'):
         return None
     settings, usage = dict(settings or {}), dict(usage or {})
     tokens, turns = _int(usage.get('estimated_tokens')), _int(usage.get('turns'))
-    reasons = need_reasons(usage, settings)
+    # Pool Mains (named chats like 'Roblox') only get the age reason; the operator gets every reason.
+    reasons = need_reasons(usage, settings) if worker.get('purpose') == OPERATOR else []
+    over, age_h, limit_h = age_over(worker, settings, now)
+    if over:
+        reasons.append('age')
     previous = worker.get('context_ask')
     if not reasons:
         if previous:
             worker['context_ask'] = None
             store.put('workers', worker)
         return None
-    notice = dict(ask=True, usage=dict(estimated_tokens=tokens, turns=turns), text=ASK_TEXT,
+    text = (AGE_TEXT % (age_h, limit_h)) if over else ASK_TEXT
+    notice = dict(ask=True, usage=dict(estimated_tokens=tokens, turns=turns), text=text,
                   reasons=reasons)
     if not previous or not previous.get('ask') or previous.get('reasons') != reasons:
         worker['context_ask'] = dict(notice, at=_now(now))

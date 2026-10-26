@@ -27,6 +27,7 @@ from pathlib import Path
 from . import notion_shell
 from .notion_shell import BINDING, NotionShell, _js, chat_url
 from .desktop_app import DesktopApp
+from . import tabbar_skin
 
 DESK_DIR = Path(__file__).parent / 'web' / 'desktop'
 # In the frozen build __file__ lives in a temporary _MEI folder; the harness data stays next to dist\.
@@ -35,12 +36,23 @@ DATA_DIR = (Path(sys.executable).resolve().parent.parent if getattr(sys, 'frozen
 APP_FILE = 'desktop_app.json'
 DEFAULT_PORT = 9333
 # File stems in load order; overlay.js registers the 'sidebar' part. 'theme' (design system) is first.
-PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'settings', 'extras', 'studio', 'stepcap', 'donesound')
-MOUNT_ORDER = ('theme', 'chrome', 'declutter', 'sidebar', 'shell', 'live', 'settings', 'extras', 'studio')
+PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'projects', 'settings', 'extras', 'studio', 'v6', 'stepcap', 'donesound')
+# 'v6' (Chat v6 layout 1:1 to the mockup: sidebar panel + chat header) mounts after the parts it reads.
+MOUNT_ORDER = ('theme', 'chrome', 'declutter', 'sidebar', 'shell', 'live', 'projects', 'settings', 'extras', 'studio', 'v6')
+# Projects page (projects.js): each action is one /api/ui/projects route, called through the host API.
+PROJECT_ACTIONS = ('projects_list', 'projects_detail', 'projects_create', 'projects_update', 'projects_open',
+                   'projects_archive', 'projects_unarchive')
+PROJECTS_PATH = '/api/ui/projects'
 DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_schema', 'app_settings_get',
                                               'app_settings_set', 'main_switch_start', 'app_chat_create',
                                               'app_chat_rename', 'app_chat_promote', 'main_refresh',
-                                              'chat_context_switch', 'chat_ages', 'chat_age_switch')
+                                              'chat_context_switch', 'chat_ages', 'chat_age_switch',
+                                              'chat_thread_age', 'live_answer', 'account_status', 'account_sign_in',
+                                              'account_sign_out', 'account_select', 'account_setup', 'backup_status', 'backup_now',
+                                              'usage_report', 'patch_status', 'app_restart', 'app_restart_status',
+                                              'app_health', 'notion_connections', 'notion_connection_permissions') + PROJECT_ACTIONS
+# RBX fix: one age check (Notion thread created_time) for ANY chat, also chats NotionTool did not create.
+CHAT_SEND_CHECK_PATH = '/api/chat/send_check'
 CREATE_WAIT = 150.0
 # I50 chat age (sidebar): the overlay asks through ctx.call('chat_ages' / 'chat_age_switch'); desktop JS
 # never opens network connections itself (test_desktop_no_lag), so the shell calls these routes.
@@ -550,7 +562,10 @@ def desktop_state(server, app_settings=None, now=None):
     except Exception:
         account = ''
     try:
-        coordination = server.engine.coordination()
+        try:  # light task view of this build (desktop_state_cache.LightStore), not a full task parse
+            coordination = server.engine.coordination(store=store)
+        except TypeError:
+            coordination = server.engine.coordination()
     except Exception:
         coordination = {}
     stalled = getattr(server, 'stalled_tasks', None)
@@ -805,6 +820,15 @@ def chat_age_rows(payload):
 def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monotonic, wait=CREATE_WAIT,
                      host_call=None):
     handlers = notion_shell.default_handlers(server)
+    from .account_settings import account_handlers
+    handlers.update(account_handlers(server))
+    from .backup import desk_handlers as backup_handlers
+    from .restart_guard import desk_handlers as restart_handlers
+    handlers.update(backup_handlers(server))
+    handlers.update(restart_handlers(server))
+    from .notion_connections import desk_handlers as connection_handlers
+    handlers.update(connection_handlers(server))
+    handlers['patch_status'] = lambda args: server.engine.patch_status()
     store = server.store
     api = host_call or host_api(server)
 
@@ -875,8 +899,10 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
                              {k: args.get(k) for k in ('main', 'thread_id', 'chat_id') if k in args})
 
     def chat_context_switch(args):
-        # Context switch button (sidebar): a Coworker gets a fresh chat before its next task
-        # (/api/chat/compress, nothing sent now); a Main starts the ask-first Main switch.
+        # Context switch button (sidebar / v6 header): a Coworker gets a fresh chat before its next task
+        # (/api/chat/compress, nothing sent now). A Main gets a switch request into its own chat and does the
+        # switch itself (owner 2026-10-25 23:06): handoff + brief by the Main, /api/main/switch/start with
+        # brief_text, advance until switched (switch_request.py). No coworker brief task any more.
         args = args or {}
         worker_id = str(args.get('worker_id') or '')
         if worker_id:
@@ -887,10 +913,31 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
         for record in store.all('main_switches'):
             if record.get('state') in SWITCH_ACTIVE:
                 return dict(record, duplicate=True, kind='main')
-        body = {'request_id': 'desk-switch-' + time.strftime('%Y%m%d-%H%M%S')}
-        if args.get('chat_id'):
-            body['chat_id'] = str(args['chat_id'])
-        return dict(server.action('/api/main/switch/start', body) or {}, kind='main')
+        body = {k: str(args[k])[:100] for k in ('chat_id', 'worker_id', 'thread_id') if args.get(k)}
+        return dict(server.action('/api/main/switch/request', body) or {}, kind='main')
+
+    def live_answer(args):
+        # Live page Answer box: the typed reply goes out through the route the Main chat uses (POST /api/send).
+        # No route writes into a coworker's own Notion thread, so the reply goes to the chat that owns the
+        # coworker's request (task -> run -> chat_id) and names the coworker. Never a Notion UI click.
+        args = args or {}
+        worker_id = str(args.get('worker_id') or '').strip()
+        text = str(args.get('text') or '').strip()
+        if not text:
+            raise ValueError('Type a reply first')
+        worker = store.get('workers', worker_id) or {}
+        if worker.get('purpose') != 'worker':
+            raise ValueError('Choose a coworker first')
+        task = store.get('tasks', str(worker.get('task_id') or '')) or {}
+        run = store.get('runs', str(task.get('run_id') or '')) or {}
+        chat_id = str(run.get('chat_id') or '')
+        if not chat_id:
+            raise ValueError('This coworker has no open request to answer')
+        label = str(worker.get('label') or 'Coworker')[:40]
+        body = dict(chat_id=chat_id, text='Reply for ' + label + ': ' + text[:4000],
+                    request_id=str(args.get('request_id') or 'live-' + uuid.uuid4().hex[:16])[:100])
+        result = server.action('/api/send', body) or {}
+        return dict(result, sent=True, chat_id=chat_id, worker_id=worker_id)
 
     def chat_ages(args):
         # I50: GET /api/chat/ages for the sidebar age chips (on load and every 60 s). A missing route
@@ -925,9 +972,78 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
         return dict(worker_id=str(result.get('worker_id') or worker_id), thread_id=thread,
                     url=chat_url(thread) if thread else '')
 
+    def chat_thread_age(args):
+        # RBX fix: age of ANY open chat (also own chats NotionTool did not create) from the Notion thread
+        # created_time, via POST /api/chat/send_check. send=true is the composer send check (>= 23 h refused,
+        # the own chat's context switch starts). The badge asks with send=false.
+        args = args or {}
+        thread = re.sub(r'[^0-9a-f]', '', str(args.get('thread_id') or '').lower())
+        if len(thread) != 32:
+            raise ValueError('Choose a chat to check its age')
+        try:
+            from .harness_account import selected_account
+            account = str(selected_account(store) or '')[:100]
+        except Exception:
+            account = ''
+        body = {'thread_id': thread, 'send': bool(args.get('send')), 'account_id': account}
+        try:
+            return api('POST', CHAT_SEND_CHECK_PATH, body)
+        except HostApiError as exc:
+            if exc.status == 400 and 'chat_too_old' in str(exc):
+                # 400 = refused send (>= 23 h): the composer must not pass the text to Notion.
+                return dict(allowed=False, level='locked', thread_id=thread,
+                            message='This chat is older than 23 h. A fresh chat with the context was started.')
+            # Review RBX: fail closed. A missing route (404) or any other failed check blocks the send.
+            return dict(allowed=False, level='unknown', thread_id=thread, age_h=None, warning='',
+                        message='Chat age unknown: sending is blocked. Click to retry.', error=str(exc)[:200])
+        except Exception as exc:  # noqa: BLE001 - the host API itself failed: blocked, never allowed
+            return dict(allowed=False, level='unknown', thread_id=thread, age_h=None, warning='',
+                        message='Chat age unknown: sending is blocked. Click to retry.', error=str(exc)[:200])
+
+    def projects_call(method, path, body=None):
+        try:
+            return api(method, path, body)
+        except HostApiError as exc:
+            raise ValueError(str(exc))
+
+    def project_id(args):
+        ident = str((args or {}).get('id') or '').strip()
+        if not ident:
+            raise ValueError('Choose a project first')
+        return ident[:100]
+
+    def project_fields(args):
+        args = args or {}
+        body = {k: args[k] for k in ('name', 'goal', 'repo_path', 'main_chat_id') if k in args}
+        if isinstance(args.get('chat_ids'), (list, tuple)):
+            body['chat_ids'] = [str(c)[:100] for c in args['chat_ids']][:200]
+        return body
+
+    def projects_list(args):
+        suffix = '?archived=1' if (args or {}).get('archived') else ''
+        return projects_call('GET', PROJECTS_PATH + suffix)
+
+    def projects_detail(args):
+        from urllib.parse import quote
+        ident = quote(project_id(args), safe='')
+        return projects_call('GET', PROJECTS_PATH + '/' + ident + '?n=' + str(int((args or {}).get('n') or 10)))
+
+    def projects_create(args):
+        return projects_call('POST', PROJECTS_PATH, project_fields(args))
+
+    def projects_update(args):
+        return projects_call('POST', PROJECTS_PATH + '/update', dict(project_fields(args), id=project_id(args)))
+
+    def projects_post(route):
+        return lambda args: projects_call('POST', PROJECTS_PATH + '/' + route, {'id': project_id(args)})
+
+    handlers.update(projects_list=projects_list, projects_detail=projects_detail, projects_create=projects_create,
+                    projects_update=projects_update, projects_open=projects_post('open'),
+                    projects_archive=projects_post('archive'), projects_unarchive=projects_post('unarchive'))
     handlers.update(app_chat_create=app_chat_create, app_chat_rename=app_chat_rename,
                     app_chat_promote=app_chat_promote, chat_context_switch=chat_context_switch,
-                    chat_ages=chat_ages, chat_age_switch=chat_age_switch)
+                    chat_ages=chat_ages, chat_age_switch=chat_age_switch, chat_thread_age=chat_thread_age,
+                    live_answer=live_answer)
     handlers.update(state=state, runs=lambda args: state(args)['runs'], new_welcome_chat=new_welcome_chat,
                     settings_schema=settings_schema, app_settings_get=app_settings_get,
                     app_settings_set=app_settings_set, main_switch_start=main_switch_start,
@@ -946,6 +1062,8 @@ class DesktopShell(NotionShell):
         self.handlers = {k: v for k, v in dict(handlers or {}).items() if k in DESK_ACTIONS}
         ages = self.handlers.get('chat_ages')  # I50 send block (NotionShell._block_old_chat)
         self.chat_ages_source = (lambda: ages({})) if callable(ages) else None
+        check = self.handlers.get('chat_thread_age')  # RBX fix: any chat, age from the Notion thread created_time
+        self.thread_age_source = (lambda thread: check({'thread_id': thread, 'send': True})) if callable(check) else None
         self.build = ''
         self.page_refresh = ''
         self.teardown_result = None
@@ -1017,6 +1135,7 @@ class DesktopShell(NotionShell):
             self.app.inject(source)
             self.script_id = self.app.script_id
             self.enable_model_pin(self.session)  # the composer never sends 'Auto' (notion_shell.pin_config_body)
+            self.tabbar = tabbar_skin.start(self.app)  # v6: Notion's tab bar in the app background (tabbar_skin.py)
             self._started = True
             return self.info()
 
@@ -1324,6 +1443,16 @@ class DesktopController:
             # Pinned runtime self-check: overlay really loaded? Else roll back to the last good Notion.
             if self.runtime_check and not self._verify_runtime(shell):
                 return
+            # Startup preference: always open this account's persisted Main, even when Notion restores a page.
+            # This runs once per start/reattach, never from state pushes or while switching views.
+            from .account_settings import open_main
+            open_main(self.server, selected_account(self.server.store) or '')
+            account = selected_account(self.server.store) or ''
+            if (account and self.server.store.get('accounts', account, {}).get('state') == 'ready'
+                    and hasattr(self.server, 'job_once')):
+                from .notion_connections import ensure_notiontool
+                self.server.job_once('Verify NotionTool MCP permissions',
+                                     lambda: ensure_notiontool(self.server, account), 'startup-mcp:' + account)
             # After a restart Notion sometimes shows 'Oops! Something went wrong ... Refresh'. Reload that page
             # once or twice from here (backend, not desktop JS) so the window is ready without a manual click.
             threading.Thread(target=self._heal_error_page, args=(shell,), daemon=True,

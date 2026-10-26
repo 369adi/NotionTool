@@ -13,12 +13,12 @@
 
 /* ---- Top bar: slim dark bar with blur ---------------------------------------------- */
 .nt-desk-chrome-on .nt-desk-topbar {
-  background: var(--nt-topbar-bg, rgba(11, 13, 18, 0.72)) !important;
-  -webkit-backdrop-filter: blur(var(--nt-blur, 16px)) saturate(140%);
-  backdrop-filter: blur(var(--nt-blur, 16px)) saturate(140%);
+  background: var(--nt-topbar-bg, rgba(9, 9, 11, 0.72)) !important;
+  -webkit-backdrop-filter: blur(var(--nt-blur, 12px)) saturate(140%);
+  backdrop-filter: blur(var(--nt-blur, 12px)) saturate(140%);
   border-bottom: 1px solid var(--nt-border, rgba(255, 255, 255, 0.06)) !important;
   box-shadow: none !important;
-  color: var(--nt-text, #e6e8ef) !important;
+  color: var(--nt-text, #f4f4f5) !important;
   font-size: 13px;
   letter-spacing: 0.01em;
 }
@@ -26,20 +26,27 @@
 /* ---- Chat composer: floating rounded card with gradient focus ring ------------------- */
 .nt-desk-chrome-on .nt-desk-composer {
   position: relative;
+  box-sizing: border-box;
+  max-width: var(--nt-chat-w, 860px);
+  margin-left: auto;
+  margin-right: auto;
+  /* Fixed width: never shrink-to-fit with the typed text (bug 2026-10-25). */
+  width: 100%;
+  min-width: 0;
   border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.08)) !important;
   border-radius: calc(var(--nt-radius, 12px) + 4px) !important;
-  background: var(--nt-raised, #181c26) !important;
+  background: var(--nt-raised, #16161d) !important;
   box-shadow: var(--nt-shadow-float, 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3)) !important;
-  color: var(--nt-text, #e6e8ef) !important;
+  color: var(--nt-text, #f4f4f5) !important;
   transition: box-shadow 0.18s ease, border-color 0.18s ease;
 }
 .nt-desk-chrome-on .nt-desk-composer:focus-within {
   border-color: transparent !important;
   background:
-    linear-gradient(var(--nt-raised, #181c26), var(--nt-raised, #181c26)) padding-box,
-    linear-gradient(135deg, var(--nt-accent-1, #7c5cff), var(--nt-accent-2, #22d3ee)) border-box !important;
+    linear-gradient(var(--nt-raised, #16161d), var(--nt-raised, #16161d)) padding-box,
+    linear-gradient(135deg, var(--nt-accent-1, #8b5cf6), var(--nt-accent-2, #22d3ee)) border-box !important;
   box-shadow:
-    0 0 0 3px var(--nt-accent-glow, rgba(124, 92, 255, 0.18)),
+    0 0 0 3px var(--nt-accent-glow, rgba(139, 92, 246, 0.18)),
     var(--nt-shadow-float, 0 14px 40px rgba(0, 0, 0, 0.45)) !important;
 }
 /* Small branding label on the top-left border of the empty composer. It sits on the border line,
@@ -59,7 +66,7 @@
   letter-spacing: 0.12em;
   text-transform: uppercase;
   white-space: nowrap;
-  background: var(--nt-raised, #181c26);
+  background: var(--nt-raised, #16161d);
   color: var(--nt-accent-2, #22d3ee);
   opacity: 0.8;
   pointer-events: none;
@@ -71,14 +78,14 @@
 
 /* ---- Chat messages: readable width and rhythm ---------------------------------------- */
 .nt-desk-chrome-on .nt-desk-message {
-  max-width: var(--nt-message-width, 760px);
+  max-width: var(--nt-chat-w, 860px);
   line-height: 1.6 !important;
-  font-size: 15px;
-  color: var(--nt-text, #e6e8ef);
+  font-size: var(--nt-chat-font, 17px);
+  color: var(--nt-text, #f4f4f5);
 }
 .nt-desk-chrome-on .nt-desk-message .nt-desk-code {
-  background: var(--nt-raised, #181c26) !important;
-  color: var(--nt-code-text, #e6e8ef) !important;
+  background: var(--nt-raised, #16161d) !important;
+  color: var(--nt-code-text, #f4f4f5) !important;
   border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.07)) !important;
   border-radius: var(--nt-radius-sm, 10px) !important;
   padding: 12px 14px !important;

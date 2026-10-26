@@ -132,7 +132,19 @@ class TeamRotator:
             started = []
         self.name_pass()
         self.cleanup_pass()
+        self.expired_pass()
         return started
+
+    def expired_pass(self):
+        """Periodically expire old Mains and user-named chats (>= 22 h, not the current Main). Never raises."""
+        if self.budget_reason():
+            return 0
+        try:
+            from .main_handoff_ops import sweep_expired
+            return sweep_expired(self.store, self.adapter, now=self.clock()).get('renamed', 0)
+        except Exception as exc:
+            self.store.event('chat_expired_sweep_failed', message='Expired-chat sweep failed: ' + type(exc).__name__)
+            return 0
 
     def cleanup_pass(self):
         """Periodically delete retired Coworker chats (setting coworker_delete_old_chat, default on). Never raises."""

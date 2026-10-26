@@ -1,0 +1,697 @@
+/* NotionTool desktop part 'v6': Chat v6 layout 1:1 to the mockup (AI Bilder/Screenshot 2026-10-25 010922.png).
+ * Values = target spec v2 (work/HANDOFF_MAIN_V6.md section 6): app px = (mockup px - (30,13)) * 1.115, viewport 1313x804.
+ * Only active while html has .nt-v6-on (set by v6.js). Notion's sidebar box width is never forced here.
+ */
+html.nt-v6-on {
+  --nt-rail-w: 66px !important;
+  --v6-bg: #04060c;
+  --v6-panel: #050b16;
+  --v6-panel-2: #0b1435;
+  --v6-line: #111825;
+  --v6-line-2: #18223a;
+  --v6-text: #eaeff7;
+  --v6-text-2: #9cb0d5;
+  --v6-text-3: #7888ac;
+  --v6-violet: #8152ee;
+  --v6-blue: #3b86f1;
+  --v6-cyan: #1db2f5;
+  --v6-green: #18f5ba;
+  --v6-amber: #eeb663;
+  --v6-red: #f94168;
+  --v6-grad: linear-gradient(90deg, #7747ed 0%, #6247fd 17%, #4f60fc 31%, #4371f0 41%, #2e94f9 60%, #15a3fe 73%, #0aadfd 79%, #06bafd 87%, #01c7fc 94%, #14d2fd 100%);
+  --v6-font: Inter, "Segoe UI Variable", "Segoe UI", sans-serif;
+}
+
+/* Notion's app box is 100vw wide; our rail pushed its right edge out of the window. */
+html.nt-v6-on.nt-shell-on .notion-cursor-listener { width: 100% !important; }
+/* Notion sets the chat column to window width minus sidebar (inline px); let it fill its own parent instead. */
+html.nt-v6-on.nt-shell-on .layout-chat { width: 100% !important; max-width: 100% !important; }
+html.nt-v6-on body, html.nt-v6-on .notion-app-inner { background: var(--v6-bg) !important; }
+html.nt-v6-on.nt-shell-on .layout-chat {
+  background: radial-gradient(420px 150px at 0 40px, rgba(0, 32, 70, 0.5), transparent 70%), var(--v6-bg) !important;
+}
+
+/* ---- Rail: 66 px, violet top glow, logo 28x31, tabs 48x55 at pitch 60.2 ------------------------ */
+html.nt-v6-on .nt-rail {
+  background: linear-gradient(180deg, #1e0c5e 0, #07102a 58px, #040a13 130px, #040a13 100%) !important;
+  border-right: 1px solid #0a101e !important;
+  box-shadow: none !important;
+}
+html.nt-v6-on .nt-rail-logo {
+  width: 28px !important; height: 31px !important; margin: 24px auto 0 !important; flex: none !important;
+  font-size: 0 !important; color: transparent !important; border: 0 !important; box-shadow: none !important; border-radius: 0 !important;
+  background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 28'><defs><linearGradient id='a' x1='0' y1='0' x2='1' y2='0'><stop offset='0' stop-color='%237b4cff'/><stop offset='.45' stop-color='%236a58f8'/><stop offset='1' stop-color='%233e7cf4'/></linearGradient><linearGradient id='b' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='%23744ff7'/><stop offset='.35' stop-color='%234f6af0'/><stop offset='.7' stop-color='%233b86f1'/><stop offset='1' stop-color='%231fc2f5'/></linearGradient><linearGradient id='c' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='%232f86ee'/><stop offset='.5' stop-color='%2312b6f9'/><stop offset='1' stop-color='%2336d0f4'/></linearGradient></defs><path d='M10 0H23L16 9H0.6Z' fill='url(%23a)'/><path d='M0 8.6H8.6V21L0 26.6Z' fill='url(%23b)'/><path d='M22 9V19L13 27.5V17Z' fill='url(%23c)'/></svg>") center / contain no-repeat !important;
+  filter: drop-shadow(0 0 5px rgba(100, 80, 255, 0.55));
+}
+html.nt-v6-on .nt-rail-logo * { display: none !important; }
+html.nt-v6-on .nt-shell-tabs { gap: 5.2px !important; padding-top: 14.5px !important; }
+html.nt-v6-on .nt-shell-tab {
+  width: 48px !important; height: 55px !important; margin: 0 auto !important; box-sizing: border-box !important;
+  padding: 10.5px 0 0 !important; gap: 2px !important; justify-content: flex-start !important;
+  border-radius: 11px !important; border: 1.5px solid transparent !important; background: transparent !important;
+  color: #b9c4d8 !important; font: 500 10.7px/13px var(--v6-font) !important; position: relative !important;
+}
+html.nt-v6-on .nt-shell-tab:hover { background: rgba(120, 140, 200, 0.08) !important; color: #d8e6fa !important; }
+html.nt-v6-on .nt-shell-tab.nt-shell-tab-active,
+html.nt-v6-on .nt-shell-tab.nt-shell-tab-active:hover {
+  color: #d8e6fa !important;
+  background:
+    linear-gradient(90deg, #3c19b4 0%, #3818ad 30%, #1f2a86 40%, #122362 50%, #122a68 70%, #0a4a93 88%, #0059a3 100%) padding-box,
+    linear-gradient(90deg, #8253f7, #6a5cf5 25%, #4e8bf3 50%, #3b9ef5 75%, #1bbdfe) border-box !important;
+  border: 1.5px solid transparent !important;
+  box-shadow: inset 3px 0 0 rgba(130, 83, 247, 0.55), inset 0 0 6px rgba(60, 110, 240, 0.35),
+    -3px 0 10px rgba(110, 60, 230, 0.35), 3px 0 10px rgba(0, 90, 180, 0.35) !important;
+}
+html.nt-v6-on .nt-shell-tab.nt-shell-tab-active::before { display: none !important; }
+html.nt-v6-on .nt-shell-tab-icon { color: #d5e0f6 !important; }
+html.nt-v6-on .nt-shell-tab-icon svg {
+  width: 21px !important; height: 21px !important; stroke-width: 1.7 !important;
+  fill: none !important; stroke: currentColor !important; stroke-linecap: round; stroke-linejoin: round;
+}
+html.nt-v6-on .nt-rail-status { display: none !important; }
+html.nt-v6-on .nt-shell-tab-badge, html.nt-v6-on .nt-v6-badge {
+  position: absolute !important; top: 4px !important; right: 4px !important; min-width: 14.5px !important; height: 14.5px !important;
+  padding: 0 3px !important; box-sizing: border-box !important; border-radius: 999px !important; background: #fa093e !important;
+  color: #fff !important; font: 700 9.5px/14.5px var(--v6-font) !important; text-align: center !important;
+  box-shadow: 0 0 6px rgba(250, 9, 62, 0.6) !important; pointer-events: none;
+}
+html.nt-v6-on [data-nt-shell-tab="live"] .nt-shell-tab-badge { display: none !important; }
+
+/* ---- Notion parts that the mockup does not have -------------------------------------------- */
+html.nt-v6-on .nt-desk-strip { display: none !important; }
+html.nt-v6-on .nt-v6-toprow { min-height: 68px !important; height: 68px !important; }
+html.nt-v6-on .nt-v6-toprow > * { visibility: hidden !important; pointer-events: none !important; }
+
+/* ---- Sidebar panel: Notion box 66-336, panel 75-325 x 13.4-793 r13 -------------------------- */
+.nt-v6-sb {
+  position: fixed; top: 0; z-index: 120; box-sizing: border-box; display: none;
+  padding: 13.4px 11px 11px 9px;
+  background: #040816; /* user 02:06: no blue strip above the project card */
+  font-family: var(--v6-font); color: var(--v6-text); font-size: 12px;
+}
+html.nt-v6-on .nt-v6-sb.nt-v6-show { display: block; }
+html.nt-v6-on.nt-shell-view-open .nt-v6-sb { display: block; }
+.nt-v6-sb-in {
+  height: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: 0; overflow: hidden;
+  padding: 0 7.5px; border-radius: 13px; border: 1px solid var(--v6-line); 
+  background: linear-gradient(180deg, #0a0f1c 0, #070c18 120px, #050b16 260px, #050b16 100%);
+}
+.nt-v6-sb svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.nt-v6-btn { cursor: pointer; user-select: none; }
+.nt-v6-col { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.nt-v6-t1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nt-v6-t2 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* project picker */
+.nt-v6-proj {
+  position: relative; display: flex; align-items: center; gap: 8.5px; height: 56px; flex: none;
+  padding: 0 11px 0 3.5px; margin-top: 7px; border: 0; background: transparent; border-radius: 10px;
+}
+.nt-v6-proj::after { content: ""; position: absolute; left: 15px; right: 15px; bottom: -4px; height: 1px; background: #0c1a2c; }
+.nt-v6-ico { display: flex; align-items: center; justify-content: center; flex: none; }
+.nt-v6-proj .nt-v6-ico {
+  width: 41.5px; height: 42px; box-sizing: border-box; border-radius: 10px; color: #e3e7fc;
+  background: linear-gradient(180deg, #0b1435, #08102e); border: 1px solid #101a3c;
+}
+.nt-v6-proj .nt-v6-ico svg { width: 24px; height: 24px; stroke-width: 1.7; }
+.nt-v6-proj .nt-v6-t1 { font-size: 13.2px; font-weight: 700; line-height: 16px; color: #f5fbfc; }
+.nt-v6-proj .nt-v6-t2 { font-size: 10px; line-height: 13px; color: #869aba; margin-top: 3px; }
+.nt-v6-proj:hover .nt-v6-ico { border-color: #1d2c5c; }
+.nt-v6-chev { color: #a5b8d1; display: flex; }
+.nt-v6-chev svg { width: 16px; height: 16px; }
+
+/* active chat card 233x78 */
+.nt-v6-main {
+  position: relative; flex: none; height: 78px; box-sizing: border-box; margin: 12.3px 1px 0 -1px; padding: 9.3px 7.5px 0 12px;
+  border-radius: 10px; border: 1px solid transparent; border-left-width: 2.5px;
+  background:
+    radial-gradient(130px 60px at 100% 0, rgba(4, 34, 92, 0.55), transparent 70%) padding-box,
+    linear-gradient(180deg, #182350 0%, #141f42 35%, #101a31 70%, #0f1a2d 100%) padding-box,
+    linear-gradient(90deg, #6b40d6, #2a3270 30%, #1d3554 60%, #17263d) border-box;
+  box-shadow: -2px 0 10px rgba(110, 60, 230, 0.35);
+}
+.nt-v6-main-top { display: flex; gap: 14.8px; align-items: flex-start; }
+.nt-v6-main .nt-v6-ico { width: 22px; height: 22px; margin-top: 3.7px; background: none; border: 0; color: #dae6f5; }
+.nt-v6-main .nt-v6-ico svg { width: 22px; height: 22px; stroke-width: 1.7; }
+.nt-v6-main .nt-v6-t1 { font-size: 12.2px; font-weight: 700; line-height: 15px; color: #fafeff; }
+.nt-v6-chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 19px; box-sizing: border-box; margin-top: 1.2px; padding: 0 8px 0 5px;
+  border-radius: 999px; font-size: 9.7px; color: #b4c7ee; background: #1b284e; border: 1px solid #252f5c; width: max-content;
+}
+.nt-v6-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--v6-violet); flex: none; display: block; }
+.nt-v6-dot.g { background: #39f3c6; box-shadow: 0 0 8px rgba(24, 245, 186, 0.75); }
+.nt-v6-dot.v { background: #8257e2; box-shadow: 0 0 8px rgba(130, 87, 226, 0.8); }
+.nt-v6-dot.a { background: var(--v6-amber); box-shadow: 0 0 8px rgba(238, 182, 99, 0.75); }
+.nt-v6-dot.r { background: var(--v6-red); box-shadow: 0 0 8px rgba(249, 65, 104, 0.75); }
+.nt-v6-dot.n { background: #3a4660; box-shadow: none; }
+.nt-v6-age { display: flex; align-items: center; gap: 5.5px; margin-top: 9.9px; color: #8293bd; font-size: 10px; flex: none; }
+.nt-v6-ring { width: 21px; height: 21px; flex: none; }
+.nt-v6-ring circle { fill: none; stroke-width: 3; }
+.nt-v6-ring .bg { stroke: #313a65; }
+.nt-v6-ring .fg { stroke: url(#ntv6g); stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; }
+.nt-v6-live {
+  position: absolute; left: 50.6px; top: 52.2px; right: 10px; display: flex; align-items: center; gap: 9.3px; margin: 0;
+  font-size: 8.7px; line-height: 11px; color: #8c9fc4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.nt-v6-live .nt-v6-dot { width: 6.7px; height: 6.7px; }
+.nt-v6-live .nt-v6-dot.g { background: #864ce5; box-shadow: 0 0 7px rgba(134, 76, 229, 0.9); }
+.nt-v6-live b { color: #90a1c8; font-weight: 700; letter-spacing: 0.04em; margin-right: 4.1px; }
+
+/* chats */
+.nt-v6-h { margin: 18.4px 5.5px 5px; font-size: 11.7px; font-weight: 600; line-height: 14px; color: #aab8e0; display: flex; align-items: center; gap: 6px; flex: none; }
+.nt-v6-h i { font-style: normal; color: #7888a6; font-weight: 500; }
+.nt-v6-list { display: flex; flex-direction: column; gap: 0; min-height: 0; overflow: hidden; }
+.nt-v6-row {
+  display: flex; align-items: center; gap: 17.3px; height: 36.2px; box-sizing: border-box; padding: 0 11px 0 10.8px;
+  border-radius: 8px; color: var(--v6-text); flex: none;
+}
+.nt-v6-row:hover { background: rgba(120, 140, 200, 0.07); }
+.nt-v6-row.cur { background: rgba(129, 82, 238, 0.14); }
+.nt-v6-rico { display: flex; align-items: center; justify-content: center; width: 20px; flex: none; color: #e3ecfe; }
+.nt-v6-rico svg, .nt-v6-row svg { width: 20px; height: 20px; stroke-width: 1.6; }
+.nt-v6-row .nt-v6-t1 { font-size: 11.8px; font-weight: 500; color: #eaeff7; flex: 1; }
+.nt-v6-when { font-size: 11.2px; color: #7888ac; flex: none; margin-left: auto; }
+.nt-v6-more { display: flex; align-items: center; gap: 4px; margin: 7.8px 9px 0; font-size: 10.7px; color: #9cb0d5; width: max-content; flex: none; }
+.nt-v6-more:hover { color: var(--v6-text); }
+.nt-v6-more svg { width: 12px; height: 12px; }
+.nt-v6-sep { height: 1px; background: #0d1625; margin: 13.8px 4.5px 0 3.5px; flex: none; }
+
+/* coworkers: pitch 79 */
+.nt-v6-sep + .nt-v6-h { margin-top: 16.6px; margin-left: 6.5px; font-size: 12px; color: #a1b3dc; }
+.nt-v6-cw {
+  position: relative; display: flex; min-height: 79px; box-sizing: border-box; padding: 7px 8px 13.3px 0; border-radius: 10px; flex: none;
+}
+.nt-v6-cw:hover { background: rgba(120, 140, 200, 0.06); }
+.nt-v6-cw > .nt-v6-dot { position: absolute; left: 14.1px; top: 18.5px; width: 7.8px; height: 7.8px; }
+.nt-v6-cw > .nt-v6-dot::after {
+  content: ""; position: absolute; left: 25.6px; top: 0.6px; width: 6.7px; height: 6.7px; border-radius: 50%; background: inherit;
+}
+.nt-v6-cw > .nt-v6-col { margin-left: 55.9px; }
+.nt-v6-cw-top { display: flex; align-items: center; gap: 6px; height: 15px; }
+.nt-v6-cw-top .nt-v6-t1 { font-size: 11.3px; font-weight: 700; color: #dae2ee; flex: 1; }
+.nt-v6-cw-top .nt-v6-when { font-size: 10.3px; color: #7683a4; }
+.nt-v6-cw-sub { font-size: 8.7px; line-height: 12px; color: #828fad; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nt-v6-cw-tool { font: 9.5px/13px "Cascadia Code", Consolas, monospace; color: #8c9bbf; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nt-v6-prog { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+.nt-v6-bar { flex: none; width: 114.7px; height: 5.6px; border-radius: 4px; background: #192745; overflow: hidden; }
+.nt-v6-bar > span { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #5663c3, #6ca8e1); }
+.nt-v6-prog em { font-style: normal; font-size: 10.3px; color: #7f8da6; flex: none; }
+.nt-v6-cw-ask { display: flex; align-items: center; gap: 8px; color: var(--v6-amber); }
+.nt-v6-answer {
+  margin-left: auto; display: flex; align-items: center; justify-content: center; width: 52.4px; height: 23.4px; box-sizing: border-box;
+  border-radius: 6px; font-size: 9.5px; color: #d7e3ec; border: 1px solid #18223a; background: #0b152b;
+}
+.nt-v6-answer:hover { border-color: rgba(238, 182, 99, 0.6); }
+.nt-v6-cw.idle .nt-v6-cw-sub { color: #6b7896; }
+.nt-v6-cw.idle .nt-v6-cw-top .nt-v6-t1 { color: #b9c3d6; }
+.nt-v6-cw.idle .nt-v6-bar > span { background: linear-gradient(90deg, #3a4660, #4c5a78); }
+.nt-v6-empty { font-size: 10.7px; color: #6b7896; padding: 4px 9px; }
+
+/* project card + New chat 224x35 */
+.nt-v6-pcard { display: flex; gap: 17px; align-items: flex-start; padding: 16.1px 8px 0 12px; flex: none; }
+.nt-v6-pcard .nt-v6-ico { width: 14px; height: 14px; background: none; border: 0; color: #cfd6ee; margin-top: 1px; }
+.nt-v6-pcard .nt-v6-ico svg { width: 14px; height: 14px; }
+.nt-v6-pcard .nt-v6-t1 { font-size: 11.5px; font-weight: 600; line-height: 14px; color: #dfe6f6; }
+.nt-v6-pcard .nt-v6-t2 { font-size: 9.7px; line-height: 13.4px; color: #7281a2; }
+.nt-v6-spacer { flex: 1; min-height: 8px; }
+.nt-v6-new {
+  display: flex; align-items: center; justify-content: center; gap: 12.5px; width: 224px; max-width: 100%; height: 35px; box-sizing: border-box;
+  margin: 0 auto 47px; border-radius: 9px; flex: none; background: var(--v6-grad); color: #dbfcff; font-size: 12.6px; font-weight: 600;
+  box-shadow: 0 6px 18px rgba(9, 59, 135, 0.55), 0 2px 10px rgba(37, 17, 116, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+.nt-v6-new:hover { filter: brightness(1.08); }
+.nt-v6-new svg { width: 14px; height: 14px; stroke-width: 2.2; }
+
+/* sidebar scroll area: chats + coworkers scroll, project card and New chat stay pinned */
+html.nt-v6-on .nt-v6-scroll { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; scrollbar-width: none; display: flex; flex-direction: column; }
+html.nt-v6-on .nt-v6-scroll::-webkit-scrollbar { display: none; }
+html.nt-v6-on .nt-v6-scroll > * { flex: none; }
+html.nt-v6-on .nt-v6-list { overflow: visible; flex: none; min-height: auto; }
+
+/* live: chats that are thinking or answering right now (Notion's row canvas) */
+.nt-v6-row.live { background: linear-gradient(90deg, rgba(129, 82, 238, 0.18), rgba(29, 178, 245, 0.04)); box-shadow: inset 2px 0 0 #8152ee; }
+.nt-v6-row.live .nt-v6-rico { color: #c4b5fd; }
+.nt-v6-row.live .nt-v6-t1 { color: #f5f3ff; }
+.nt-v6-livetag { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 10.3px; color: #b8a6fb; flex: none; }
+.nt-v6-spin {
+  width: 11px; height: 11px; box-sizing: border-box; border-radius: 50%; flex: none; display: block;
+  border: 2px solid rgba(129, 82, 238, 0.25); border-top-color: #8d53f6; border-right-color: #3f8aec;
+  animation: ntv6spin 0.9s linear infinite;
+}
+@keyframes ntv6spin { to { transform: rotate(360deg); } }
+.nt-v6-dot.p { animation: ntv6pulse 1.3s ease-in-out infinite; }
+@keyframes ntv6pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.75); } }
+.nt-v6-cw.live { background: rgba(24, 245, 186, 0.05); box-shadow: inset 2px 0 0 rgba(24, 245, 186, 0.7); }
+.nt-v6-cw.live .nt-v6-cw-tool { color: #8fe9cf; }
+
+/* ---- Header: height 76, pill bar 655.5x44.6 ------------------------------------------------ */
+.nt-v6-hd {
+  position: fixed; z-index: 110; box-sizing: border-box; display: none; align-items: center; gap: 15.3px;
+  padding: 0 38.5px 0 5px; font-family: var(--v6-font); color: var(--v6-text);
+  background: linear-gradient(180deg, var(--v6-bg) 72%, rgba(4, 6, 12, 0));
+}
+html.nt-v6-on .nt-v6-hd.nt-v6-show { display: flex; }
+html.nt-shell-view-open .nt-v6-hd { display: none !important; }
+.nt-v6-hd svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.nt-v6-back { width: 26px; height: 26px; border-radius: 7px; display: flex; align-items: center; justify-content: center; color: #f9fdff; flex: none; }
+.nt-v6-back:hover { background: rgba(120, 140, 200, 0.1); }
+.nt-v6-back svg { width: 18.5px; height: 18.5px; stroke-width: 2; }
+.nt-v6-ttl { display: flex; flex-direction: column; min-width: 0; flex: 0 1 auto; }
+.nt-v6-ttl b { font-size: 17.3px; font-weight: 700; line-height: 22px; color: #fcffff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -0.01em; }
+.nt-v6-ttl span { display: flex; align-items: center; gap: 10.6px; font-size: 10.3px; line-height: 13px; color: #97a8ce; margin-top: 4.2px; white-space: nowrap; }
+.nt-v6-ttl span svg { width: 13px; height: 13px; color: #bdc6e3; }
+.nt-v6-stat {
+  margin-left: auto; display: flex; align-items: center; width: 655.5px; max-width: calc(100% - 140px); height: 44.6px; box-sizing: border-box;
+  padding: 0 3.5px 0 9.7px; border-radius: 11px; flex: none; overflow: hidden;
+  background: linear-gradient(180deg, #081020, #060d19); border: 1px solid #111827; box-shadow: none;
+}
+.nt-v6-si {
+  position: relative; display: flex; align-items: center; gap: 9.9px; height: 100%; padding: 0; flex: none;
+  font-size: 11.7px; font-weight: 500; color: #bcc7df; white-space: nowrap; border: 0;
+}
+.nt-v6-si.nt-v6-btn:hover { color: #fff; }
+.nt-v6-si svg { color: #d5e5fe; }
+.nt-v6-si:nth-child(1) svg:first-child { width: 17px; height: 17px; }
+.nt-v6-si .nt-v6-lock { width: 11px; height: 11px; color: #b0c0ee; margin-left: -2.7px; }
+.nt-v6-si:nth-child(2) { margin-left: 22.7px; gap: 10.8px; font-size: 11.3px; color: #909ebc; }
+.nt-v6-si:nth-child(2) svg { width: 13px; height: 13px; color: #c8d1ed; }
+.nt-v6-si:nth-child(3) { margin-left: 22.3px; gap: 9px; font-size: 11.4px; color: #e8ecef; padding-right: 17.9px; }
+.nt-v6-si:nth-child(3) .nt-v6-ring { width: 24.5px; height: 24.5px; }
+.nt-v6-si:nth-child(3)::after, .nt-v6-si:nth-child(5)::after {
+  content: ""; position: absolute; right: 0; top: 50%; width: 1px; height: 25.6px; margin-top: -12.8px; background: #142038;
+}
+.nt-v6-si:nth-child(4) { margin-left: 15.6px; }
+.nt-v6-si:nth-child(5) { margin-left: 25.5px; gap: 10px; padding-right: 14.5px; }
+.nt-v6-si:nth-child(5) .nt-v6-ring { width: 23.6px; height: 23.6px; }
+.nt-v6-si:nth-child(6) { margin-left: 13.1px; gap: 8.7px; }
+.nt-v6-si:nth-child(6) svg { width: 14px; height: 14px; color: #bec9ee; }
+.nt-v6-si .nt-v6-ring .bg { stroke: #19243d; }
+.nt-v6-ctx { display: flex; flex-direction: column; gap: 0; min-width: 0; }
+.nt-v6-ctx small { font-size: 10.1px; line-height: 12px; color: #adbbd8; font-weight: 400; }
+.nt-v6-ctx b { font-size: 11.6px; font-weight: 600; line-height: 14px; color: #f2f4f6; }
+.nt-v6-ctx .nt-v6-bar { width: 74.7px; height: 3.5px; margin-top: 2px; background: #1c2b4c; }
+.nt-v6-ctx .nt-v6-bar > span { background: linear-gradient(90deg, #2d7bec, #41adf1); }
+.nt-v6-si:nth-child(5) .nt-v6-ctx small { font-size: 10px; color: #969fb9; }
+.nt-v6-si:nth-child(5) .nt-v6-ctx b { font-size: 11.7px; color: #eaf2f5; }
+.nt-v6-sw { font-size: 8.8px; color: #a0aac8; }
+.nt-v6-sw.ask { color: var(--v6-amber); font-size: 9.5px; }
+.nt-v6-stop { margin-left: 14.3px; }
+.nt-v6-stop > span {
+  display: flex; align-items: center; gap: 7.2px; width: 48px; height: 25.7px; box-sizing: border-box; padding: 0 8px; border-radius: 6px;
+  font-size: 9.5px; font-weight: 600; color: #d48091; background: linear-gradient(180deg, #33192b, #371628); border: 0;
+}
+.nt-v6-stop > span i { width: 9.5px; height: 10px; border-radius: 2px; background: #f94168; display: block; flex: none; }
+.nt-v6-stop.off > span { opacity: 0.45; }
+
+/* ---- messages: tool timeline, steps, user bubble, assistant, code ----------------------------- */
+html.nt-v6-on [data-nt-v6="tool"] {
+  position: relative; box-sizing: border-box; min-height: 43.5px; margin-left: 0 !important; padding: 0 28px 0 63.4px !important;
+  border: 0 !important; border-radius: 0 !important; color: #e2e4ea;
+  background:
+    radial-gradient(circle at 6.6px 50%, #18f5ba 0, #18f5ba 3.6px, #33d2aa 3.7px, #33d2aa 4.4px, transparent 4.6px) no-repeat,
+    linear-gradient(#2f584c, #2f584c) 6.1px 0 / 1px 100% no-repeat,
+    linear-gradient(#0d121e, #0d121e) 27.8px 100% / calc(100% - 27.8px) 1px no-repeat !important;
+}
+html.nt-v6-on [data-nt-v6="tool"]:hover { background-color: rgba(120, 140, 200, 0.04) !important; }
+html.nt-v6-on [data-nt-v6="tool"]::before {
+  content: ""; position: absolute; left: 32.8px; top: 50%; width: 17.8px; height: 17.8px; margin-top: -8.9px; border-radius: 50%;
+  background: #1fefbf url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23064d38' stroke-width='3.6' stroke-linecap='round' stroke-linejoin='round'><path d='M20 6 9 17l-5-5'/></svg>") center / 11px no-repeat;
+}
+html.nt-v6-on [data-nt-v6="tool"]::after {
+  content: attr(data-nt-v6-dur); position: absolute; right: 28px; top: 50%; transform: translateY(-50%);
+  font: 10.7px var(--v6-font); color: #a0abc5;
+}
+html.nt-v6-on [data-nt-v6="tool"] [role="img"] { display: none !important; }
+html.nt-v6-on [data-nt-v6="tool"] * { font-size: 11.8px; font-weight: 500; color: #e2e4ea; }
+html.nt-v6-on [data-nt-v6="steps"] { background: transparent !important; border: 0 !important; }
+html.nt-v6-on [data-nt-v6="steps"] .nt-desk-steps {
+  box-sizing: border-box; min-height: 43.5px; display: flex; align-items: center; padding: 0 28px 0 63.4px !important;
+  border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+  font-size: 11.8px !important; color: #7e89a7 !important;
+  background:
+    linear-gradient(#2f584c, #2f584c) 6.1px 0 / 1px 100% no-repeat,
+    linear-gradient(#0d121e, #0d121e) 27.8px 100% / calc(100% - 27.8px) 1px no-repeat !important;
+}
+/* specificity must beat theme.css (5) user bubble rule (0,4,5) */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] div[data-nt-v6="ububble"][data-nt-v6="ububble"],
+html.nt-v6-on [data-nt-v6="ububble"] {
+  background: linear-gradient(90deg, #6236f0 0%, #5f40fd 6%, #3855fd 25%, #2a66f5 38%, #2084fb 54%, #198afa 65%, #0aa9f1 90%, #02b2fe 95%, #03c0fb 100%) !important;
+  color: #effcff !important; border-radius: 11px 11px 3px 11px !important; border: 0 !important;
+  padding: 8.4px 21px 8.4px 17.8px !important; font-size: 13.5px !important; line-height: 18.6px !important;
+  box-shadow: 0 6px 18px rgba(46, 102, 245, 0.22) !important; max-width: 70%; width: fit-content; margin-left: auto !important;
+}
+html.nt-v6-on [data-nt-v6="ububble"] * { color: inherit !important; font-size: inherit !important; line-height: inherit !important; }
+/* assistant answer: no panel behind it (theme.css draws one) */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) [data-active-edit-reference-id][data-active-edit-reference-id] {
+  background: transparent !important; border: 0 !important; box-shadow: none !important;
+}
+/* code blocks in the chat */
+html.nt-v6-on .layout-chat .notion-code-block {
+  border-radius: 9px !important; border: 1px solid #111825 !important; background: #060b16 !important; overflow: hidden;
+}
+html.nt-v6-on .layout-chat .notion-code-block,
+html.nt-v6-on .layout-chat .notion-code-block [contenteditable],
+html.nt-v6-on .layout-chat .notion-code-block .line-numbers {
+  font-family: Consolas, "Cascadia Code", monospace !important; font-size: 10.7px !important; line-height: 14.3px !important;
+}
+html.nt-v6-on .layout-chat .notion-code-block .line-numbers { color: #66728c !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.keyword { color: #b779d9 !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.string { color: #52d0ab !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.function { color: #e0c49b !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.punctuation,
+html.nt-v6-on .layout-chat .notion-code-block .token.operator { color: #8292a7 !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.property { color: #9eb5c8 !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.number,
+html.nt-v6-on .layout-chat .notion-code-block .token.boolean { color: #e09f6b !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.comment { color: #5d6b85 !important; }
+html.nt-v6-on .layout-chat .notion-code-block .token.builtin,
+html.nt-v6-on .layout-chat .notion-code-block .token.class-name { color: #7fb1e6 !important; }
+
+/* ---- composer: #070e1b card, border #111a2b, no glow; Attach / Commands / Delegate; send 58x29 -- */
+html.nt-v6-on .nt-desk-composer {
+  background: #070e1b !important; border: 1px solid #111a2b !important; border-radius: 11px !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; outline: 0 !important;
+}
+html.nt-v6-on .nt-desk-composer:focus-within { border-color: #16223a !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; }
+html.nt-v6-on .nt-desk-composer [aria-label*="ictat" i],
+html.nt-v6-on .nt-desk-composer [aria-label*="voice" i],
+html.nt-v6-on .nt-desk-composer [aria-label*="microphone" i] { display: none !important; }
+html.nt-v6-on [data-nt-v6="attach"], html.nt-v6-on [data-nt-v6="cmd"] {
+  width: auto !important; padding: 0 9px 0 6px !important; gap: 8px !important; border-radius: 7px !important;
+}
+html.nt-v6-on [data-nt-v6="attach"] { color: #aeb8dc !important; }
+html.nt-v6-on [data-nt-v6="cmd"] { color: #9cabc7 !important; }
+html.nt-v6-on [data-nt-v6="attach"] svg, html.nt-v6-on [data-nt-v6="cmd"] svg { display: none !important; }
+html.nt-v6-on [data-nt-v6="attach"]::before, html.nt-v6-on [data-nt-v6="cmd"]::before {
+  content: ""; width: 16px; height: 16px; flex: none; background: center / 16px no-repeat;
+}
+html.nt-v6-on [data-nt-v6="attach"]::before {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23aeb8dc' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'><path d='m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48'/></svg>");
+}
+html.nt-v6-on [data-nt-v6="cmd"]::before {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239cabc7' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 15l6-6'/></svg>");
+}
+html.nt-v6-on [data-nt-v6="attach"]::after { content: "Attach"; font: 500 9.7px var(--v6-font); }
+html.nt-v6-on [data-nt-v6="cmd"]::after { content: "Commands"; font: 500 9.7px var(--v6-font); }
+html.nt-v6-on [data-nt-v6="attach"]:hover, html.nt-v6-on [data-nt-v6="cmd"]:hover { background: rgba(120, 140, 200, 0.1) !important; color: var(--v6-text) !important; }
+/* model + effort stay in place (header pills press them, popups anchor here) but are not drawn twice */
+html.nt-v6-on [data-nt-v6="quiet"] { opacity: 0 !important; pointer-events: none !important; }
+html.nt-v6-on [data-nt-v6="send"] {
+  width: 58px !important; height: 29px !important; border-radius: 8px !important; color: #fff !important; opacity: 1 !important;
+  background: var(--v6-grad) !important; box-shadow: 0 4px 12px rgba(46, 120, 255, 0.35) !important;
+}
+html.nt-v6-on [data-nt-v6="send"] svg { fill: #fff !important; color: #fff !important; width: 14px !important; height: 14px !important; }
+.nt-v6-dg {
+  position: fixed; z-index: 115; display: none; align-items: center; gap: 8px; padding: 0 9px 0 6px; box-sizing: border-box;
+  border-radius: 7px; color: #b9c6e7; font: 500 9.7px var(--v6-font); cursor: pointer; user-select: none;
+}
+html.nt-v6-on .nt-v6-dg.nt-v6-show { display: flex; }
+html.nt-shell-view-open .nt-v6-dg { display: none !important; }
+.nt-v6-dg:hover { background: rgba(120, 140, 200, 0.1); color: var(--v6-text); }
+.nt-v6-dg svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---- live-measured corrections (work/out_v6m1.txt + out_v6m2.txt vs target spec v2) --------------- */
+/* theme.css:76 glow ring is not in the mockup */
+html.nt-v6-on { --nt-shadow-glow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; }
+/* rail has 16 px top padding + 16 px gap: logo y 24.5 x 21, first tab y 70 */
+html.nt-v6-on .nt-rail-logo { margin: 8.5px auto 0 !important; position: relative !important; left: 2.5px !important; }
+html.nt-v6-on .nt-shell-tabs { padding-top: 0 !important; margin-top: -1.5px !important; }
+/* picker box y 21.4, Main card y 82.5 */
+.nt-v6-proj { margin-top: 0; }
+/* header: back icon x 347.9, title cap y 22.3, pill bar right edge 1274.5, centre y 37.9; Stop never clipped */
+.nt-v6-hd { padding: 0 26.5px 0 0; gap: 12px; }
+.nt-v6-back { margin-left: -3.8px; }
+.nt-v6-ttl { position: relative; top: -4.5px; }
+.nt-v6-stat { width: auto; min-width: 655.5px; max-width: calc(100% - 120px); position: relative; top: -4.1px; }
+/* composer: wrapper 872 (Notion inline max-width 742) -> card 824 wide; height 68 = editor 31 + bar 37 */
+html.nt-v6-on div:has(> div > .nt-desk-composer) { max-width: 872px !important; }
+html.nt-v6-on .nt-desk-composer .autolayout-row.autolayout-fill-width { padding-top: 0 !important; }
+html.nt-v6-on .nt-desk-composer [contenteditable][role="textbox"] {
+  padding: 14px 18px 0 19px !important; min-height: 60px !important; font-size: 13px !important; line-height: 20px !important; /* user 02:06: chat box was too small */
+}
+html.nt-v6-on .nt-desk-composer .autolayout-col > div.autolayout-fill-width:not(.autolayout-row):not(.autolayout-col) {
+  padding: 0 14.5px 12.3px 17.5px !important; margin-top: -4px !important; align-items: flex-end !important;
+}
+/* composer card must beat chrome.css:27/43 (0,3,0 focus ring) and theme.css:247 (0,4,1 glow) */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer,
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer:focus-within,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within {
+  background: #070e1b !important; border: 1px solid #111a2b !important; border-radius: 11px !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; max-width: none !important;
+}
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer:focus-within,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within { border-color: #16223a !important; }
+/* the mockup has no "NotionTool" label on the composer border */
+html.nt-v6-on .nt-desk-composer-empty::after { content: none !important; display: none !important; }
+html.nt-v6-on.nt-theme:not(.nt-desk-off) div:has(> div > .nt-desk-composer),
+html.nt-v6-on body div:has(> div > .nt-desk-composer) { max-width: 872px !important; transition: none !important; }
+/* ---- user review 22:43 (screenshot vs mockup 010922) ---------------------------------------------- */
+/* Stop is never clipped: the pill bar does not clip, the Stop chip sizes to its content */
+.nt-v6-stat { overflow: visible; }
+html.nt-v6-on .nt-v6-stop { width: auto; min-width: 48px; flex: none; }
+html.nt-v6-on .nt-v6-stop > span {
+  box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 48px; height: 25.7px; padding: 0 7px 0 6.7px; gap: 5.6px; font-size: 9.7px; line-height: 1; white-space: nowrap;
+}
+html.nt-v6-on .nt-v6-stop > span > i { flex: none; width: 7.8px; height: 7.8px; }
+/* composer is ONE card: Notion's inner card (rgb 15,15,19 + 1px ring) and the editor focus ring are removed */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer .autolayout-col,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer .autolayout-col,
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"],
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"]:focus,
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"]:focus-visible,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"],
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"]:focus,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"]:focus-visible {
+  background: transparent !important; box-shadow: none !important; border-color: transparent !important; outline: none !important;
+}
+/* the orange age note is not in the mockup; the header pill shows the age. switching/locked stay visible */
+html.nt-v6-on .nt-desk-age-badge[data-nt-age-level="warn"] { display: none !important; }
+/* chat text 12.4/1.57 #f4f6f9 (Notion default 16/24) */
+html.nt-v6-on [data-active-edit-reference-id] [data-content-editable-root] { font-size: 12.4px !important; line-height: 1.57 !important; color: #f4f6f9 !important; }
+html.nt-v6-on [data-active-edit-reference-id] .notion-text-block [data-content-editable-leaf],
+html.nt-v6-on [data-active-edit-reference-id] .notion-bulleted_list-block [data-content-editable-leaf],
+html.nt-v6-on [data-active-edit-reference-id] .notion-numbered_list-block [data-content-editable-leaf] {
+  font-size: 12.4px !important; line-height: 19.5px !important;
+}
+/* tool and step rows 11.8 px (Notion inline 14 px) */
+html.nt-v6-on [data-nt-v6="tool"], html.nt-v6-on [data-nt-v6="tool"] *,
+html.nt-v6-on [data-nt-v6="steps"], html.nt-v6-on [data-nt-v6="steps"] *, html.nt-v6-on .nt-desk-steps {
+  font-size: 11.8px !important; line-height: 16px !important;
+}
+
+/* ---- user review 26.10. 01:19 (mockup 010922): clean motion, aligned timeline, cleaner composer ---------- */
+/* motion: 120 ms hover/focus, 200 ms values and panels, one easing (critique). The panels are now patched in
+   place (v6.js morph), so these transitions really run instead of being reset on every update. */
+html.nt-v6-on { --v6-ease: cubic-bezier(0.2, 0, 0, 1); --v6-fast: 120ms; --v6-slow: 200ms; }
+.nt-v6-btn, .nt-v6-row, .nt-v6-cw, .nt-v6-si, .nt-v6-back, .nt-v6-answer, .nt-v6-more, .nt-v6-new,
+.nt-v6-proj .nt-v6-ico, .nt-v6-stop > span, html.nt-v6-on [data-nt-v6="attach"], html.nt-v6-on [data-nt-v6="cmd"] {
+  transition: background-color var(--v6-fast) var(--v6-ease), color var(--v6-fast) var(--v6-ease),
+    border-color var(--v6-fast) var(--v6-ease), box-shadow var(--v6-fast) var(--v6-ease),
+    filter var(--v6-fast) var(--v6-ease), opacity var(--v6-fast) var(--v6-ease) !important;
+}
+.nt-v6-bar > span { transition: width var(--v6-slow) var(--v6-ease); }
+.nt-v6-ring .fg { transition: stroke-dasharray var(--v6-slow) var(--v6-ease); }
+.nt-v6-dot { transition: background-color var(--v6-slow) var(--v6-ease), box-shadow var(--v6-slow) var(--v6-ease); }
+html.nt-v6-on .nt-v6-sb.nt-v6-show, html.nt-v6-on .nt-v6-hd.nt-v6-show { animation: ntv6in var(--v6-slow) var(--v6-ease) both; }
+@keyframes ntv6in { from { opacity: 0; } to { opacity: 1; } }
+/* live dot breathes with opacity only: scale() also moved the twin dot of the coworker rows */
+.nt-v6-dot.p { animation: ntv6pulse 1.6s ease-in-out infinite; }
+@keyframes ntv6pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) {
+  html.nt-v6-on .nt-v6-sb, html.nt-v6-on .nt-v6-hd, .nt-v6-dot.p { animation: none !important; }
+  .nt-v6-bar > span, .nt-v6-ring .fg { transition: none !important; }
+}
+
+/* coworker rows: the bar shrinks so "232k / 600k" always fits (it was cut off at the panel edge) */
+.nt-v6-cw .nt-v6-prog { gap: 10px; min-width: 0; padding-right: 2px; }
+.nt-v6-cw .nt-v6-bar { flex: 1 1 auto; width: auto; min-width: 40px; max-width: 114.7px; }
+.nt-v6-cw .nt-v6-prog em { white-space: nowrap; }
+
+/* "N steps" groups sit on the same timeline as the tool rows: full-width row, line at the same x, hollow dot
+   (collapsed group), label aligned with the tool names. Live before: label box 4 px off and only 133 px wide. */
+html.nt-v6-on [data-nt-v6="steps"][data-nt-v6="steps"] {
+  position: relative; box-sizing: border-box; min-height: 43.5px; align-items: center;
+  margin-left: 0 !important; padding: 0 28px 0 63.4px !important; border: 0 !important; border-radius: 0 !important;
+  background:
+    radial-gradient(circle at 6.6px 50%, #04060c 0, #04060c 2.4px, #50618a 2.6px, #50618a 4.1px, transparent 4.4px) no-repeat,
+    linear-gradient(#2f584c, #2f584c) 6.1px 0 / 1px 100% no-repeat,
+    linear-gradient(#0d121e, #0d121e) 27.8px 100% / calc(100% - 27.8px) 1px no-repeat !important;
+}
+html.nt-v6-on [data-nt-v6="steps"][data-nt-v6="steps"]:hover { background-color: rgba(120, 140, 200, 0.04) !important; }
+html.nt-v6-on [data-nt-v6="steps"][data-nt-v6="steps"] .nt-desk-steps.nt-desk-steps,
+html.nt-v6-on [data-nt-v6="steps"][data-nt-v6="steps"]:hover .nt-desk-steps.nt-desk-steps {
+  min-height: 0 !important; padding: 0 !important; margin: 0 !important; border: 0 !important;
+  box-shadow: none !important; background: none !important;
+}
+
+/* composer: Delegate draws the outline people icon of the mockup; same 8 px radius on Attach / Commands / Delegate */
+html.nt-v6-on .nt-v6-dg.nt-v6-dg svg { fill: none !important; stroke: currentColor !important; stroke-width: 1.8 !important; }
+html.nt-v6-on [data-nt-v6="attach"], html.nt-v6-on [data-nt-v6="cmd"], html.nt-v6-on .nt-v6-dg { border-radius: 8px !important; }
+
+/* user review 26.10. 01:51: project dropdown (instead of jumping to the Projects tab) */
+.nt-v6-pmenu {
+  position: fixed; z-index: 2147483000; box-sizing: border-box; padding: 4px; border-radius: 12px;
+  background: var(--v6-panel); border: 1px solid var(--v6-line-2); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  font-family: var(--v6-font); font-size: 12px; color: var(--v6-text); animation: nt-v6-pm-in 120ms ease-out;
+}
+@keyframes nt-v6-pm-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.nt-v6-pmenu svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.nt-v6-pm-item { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px; border-radius: 8px; color: var(--v6-text-2); }
+.nt-v6-pm-item:hover { background: var(--v6-panel-2); color: var(--v6-text); }
+.nt-v6-pm-item.on { color: var(--v6-text); background: rgba(124, 77, 235, 0.18); }
+.nt-v6-pm-item.on svg { color: #7c4deb; }
+.nt-v6-pm-sep { height: 1px; margin: 4px 8px; background: var(--v6-line-2); }
+.nt-v6-pm-empty { padding: 8px; color: var(--v6-text-3); }
+
+/* user review 26.10. 01:51: Notion's scroll-to-bottom button no longer covers message text */
+html.nt-v6-on [data-nt-v6="scroll-btn"] { z-index: 60; transition: none !important; }
+
+/* ---- polish 2026-10-26: coworker badge instead of a second dot, active count, neutral idle Stop,
+   context warn/over, sidebar scroll fades, calm message tables, message column as wide as the composer ---- */
+.nt-v6-cw > .nt-v6-dot::after { content: none; }
+.nt-v6-av {
+  position: absolute; left: 27px; top: 11.4px; width: 22px; height: 22px; box-sizing: border-box; border-radius: 7px; pointer-events: none;
+  display: flex; align-items: center; justify-content: center; font-size: 9.6px; font-weight: 700; letter-spacing: -0.02em;
+  color: #c9d3ee; background: #0e1730; border: 1px solid #1a2643;
+}
+.nt-v6-cw.idle .nt-v6-av { color: #7f8db0; background: #0a1224; border-color: #141e36; }
+.nt-v6-cw.live .nt-v6-av { color: #b9f7e5; border-color: rgba(24, 245, 186, 0.45); }
+.nt-v6-h .nt-v6-hn { margin-left: auto; margin-right: 8px; font-size: 10.3px; font-weight: 500; color: #66738f; }
+.nt-v6-h .nt-v6-hn.on { color: #8fe9cf; }
+.nt-v6-stop.off { cursor: default; }
+.nt-v6-stop.off > span { opacity: 1; color: #5c6782; background: #0a1222; }
+.nt-v6-stop.off > span i { background: #364260; }
+.nt-v6-si.warn .nt-v6-ctx b { color: #f3c27a; }
+.nt-v6-si.warn .nt-v6-ctx .nt-v6-bar > span { background: #e9a948; }
+.nt-v6-si.over .nt-v6-ctx b { color: #ff8da1; }
+.nt-v6-si.over .nt-v6-ctx .nt-v6-bar > span { background: #f2536f; }
+.nt-v6-si.hint, .nt-v6-si.hint svg, .nt-v6-si.hint .nt-v6-sw { color: #f3c27a; }
+html.nt-v6-on .nt-v6-scroll.fb { -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 30px), transparent); mask-image: linear-gradient(180deg, #000 calc(100% - 30px), transparent); }
+html.nt-v6-on .nt-v6-scroll.ft { -webkit-mask-image: linear-gradient(180deg, transparent, #000 22px); mask-image: linear-gradient(180deg, transparent, #000 22px); }
+html.nt-v6-on .nt-v6-scroll.ft.fb {
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 22px, #000 calc(100% - 30px), transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 22px, #000 calc(100% - 30px), transparent);
+}
+html.nt-v6-on .layout-chat .notion-table-block th,
+html.nt-v6-on .layout-chat .notion-table-block td { border-color: #18223a !important; }
+html.nt-v6-on .layout-chat .notion-table-block th { background: rgba(124, 77, 235, 0.09) !important; color: #e6e9f5 !important; }
+html.nt-v6-on .layout-chat .notion-table-block td { background: rgba(8, 14, 28, 0.5) !important; }
+/* Notion caps the message column at 798px with 52px padding (694px of text); the composer is 822px wide */
+html.nt-v6-on .layout-chat div[style*="max-width: 798px"][style*="padding-inline: 52px"] { max-width: 878px !important; padding-inline: 33px 23px !important; }
+
+/* ---- user review 26.10. 03:21 ------------------------------------------------------------------ */
+/* colours closer to the mockup: navy instead of near black */
+html.nt-v6-on { --v6-bg: #050a18; --v6-sbbg: #060c1d; }
+html.nt-v6-on.nt-shell-on body, html.nt-v6-on.nt-shell-on .notion-app-inner { background: var(--v6-bg) !important; }
+html.nt-v6-on.nt-shell-on .layout-chat {
+  background: radial-gradient(520px 200px at 0 30px, rgba(20, 50, 120, 0.35), transparent 70%),
+    radial-gradient(700px 260px at 100% 100%, rgba(29, 120, 245, 0.06), transparent 70%), var(--v6-bg) !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail {
+  background: linear-gradient(180deg, #2a1288 0, #141a5a 64px, #0b1440 150px, #081030 320px, #070d26 100%) !important;
+  border-right: 1px solid #15204a !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab:not(.nt-shell-tab-active) { color: #c9d6f0 !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab:not(.nt-shell-tab-active) svg { color: #9fb6ff !important; }
+html.nt-v6-on .nt-v6-sb-in {
+  background: linear-gradient(180deg, #0e1734 0, #0b1430 140px, #09112a 320px, #080f25 100%) !important;
+  border-color: #1a2650 !important;
+}
+html.nt-v6-on .notion-sidebar { background: var(--v6-sbbg) !important; }
+/* a chat that thinks in the background no longer looks selected */
+.nt-v6-row.live { background: none; box-shadow: none; }
+.nt-v6-row.live:hover { background: rgba(120, 140, 200, 0.07); }
+.nt-v6-row.live .nt-v6-t1 { color: #eaeff7; }
+.nt-v6-row.live .nt-v6-rico { color: inherit; }
+/* the open chat thinking: clear on the Main card */
+.nt-v6-main.run {
+  box-shadow: 0 0 0 1px rgba(150, 110, 255, 0.85), 0 0 22px rgba(129, 82, 238, 0.45), inset 0 0 16px rgba(129, 82, 238, 0.14);
+}
+.nt-v6-main.run .nt-v6-live { color: #e4dcff; }
+.nt-v6-main.run .nt-v6-live b { color: #c9b8ff; margin-right: 5px; }
+.nt-v6-main .nt-v6-live .nt-v6-spin { margin-right: 6px; flex: none; }
+/* coworker bars in the mockup gradient, dimmer when idle */
+.nt-v6-cw.idle .nt-v6-bar > span { background: linear-gradient(90deg, #4a4fb0, #4f86cc); opacity: 0.7; }
+/* scroll-to-bottom: centred above the composer, dark glass instead of white */
+html.nt-v6-on [data-nt-v6="scroll-btn"] {
+  background: rgba(14, 22, 46, 0.95) !important; color: #cfe0ff !important; border: 1px solid #27366a !important;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), 0 0 12px rgba(129, 82, 238, 0.22) !important;
+}
+html.nt-v6-on [data-nt-v6="scroll-btn"]:hover { background: #18275a !important; color: #fff !important; }
+html.nt-v6-on [data-nt-v6="scroll-btn"] svg { fill: currentColor !important; color: inherit !important; }
+/* hidden at once, not after the throttled scan: artifacts side panel, premium model notice */
+html.nt-v6-on .nt-v6-gone { display: none !important; }
+html.nt-v6-on .nt-desk-composer > div:has([aria-label="Dismiss premium model notice"]),
+html.nt-v6-on .nt-desk-composer > div:has([aria-label*="premium model" i]) { display: none !important; }
+
+/* ---- own frame (user 26.10. 03:31): NotionTool is the app, Notion's sidebar never shows -------- */
+html.nt-v6-on .nt-v6-sb { background: var(--v6-sbbg) !important; }
+html.nt-v6-on .notion-sidebar-container {
+  width: var(--nt-v6-sbw, 270px) !important; min-width: var(--nt-v6-sbw, 270px) !important; max-width: var(--nt-v6-sbw, 270px) !important;
+  background: var(--v6-sbbg) !important; transition: none !important;
+}
+html.nt-v6-on .notion-sidebar-container > * { visibility: hidden !important; pointer-events: none !important; }
+html.nt-v6-on .notion-sidebar [role="separator"] { display: none !important; }
+.nt-v6-rz { position: fixed; top: 0; bottom: 0; width: 9px; z-index: 125; cursor: col-resize; display: none; touch-action: none; }
+html.nt-v6-on .nt-v6-rz.nt-v6-show { display: block; }
+html.nt-v6-on.nt-shell-view-open .nt-v6-rz { display: block; }
+.nt-v6-rz::after { content: ""; position: absolute; left: 4px; top: 13px; bottom: 11px; width: 1px; background: transparent; }
+.nt-v6-rz:hover::after, .nt-v6-rz.drag::after { background: rgba(140, 100, 255, 0.85); box-shadow: 0 0 8px rgba(129, 82, 238, 0.6); }
+html.nt-v6-rz-drag, html.nt-v6-rz-drag * { cursor: col-resize !important; user-select: none !important; }
+
+/* ---- colours 1:1 from the mockup pixels (work/sample_mock.py), replaces the navy try of 03:21 --- */
+html.nt-v6-on { --v6-bg: #04050c; --v6-sbbg: #050a14; }
+html.nt-v6-on.nt-shell-on .layout-chat {
+  background: radial-gradient(420px 150px at 0 40px, rgba(0, 32, 70, 0.5), transparent 70%), #04050c !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail {
+  background: linear-gradient(180deg, #0b0a2e 0, #090a22 40px, #05070c 170px, #050a13 100%) !important;
+  border-right: 1px solid #090f20 !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab:not(.nt-shell-tab-active) { color: #b9c4d8 !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab:not(.nt-shell-tab-active) svg { color: inherit !important; }
+html.nt-v6-on .nt-v6-sb-in {
+  background: linear-gradient(180deg, #050c1a 0, #060b17 300px, #060b15 100%) !important;
+  border-color: #111825 !important;
+}
+.nt-v6-bar { background: #101a32; }
+.nt-v6-bar > span, .nt-v6-cw.idle .nt-v6-bar > span { background: linear-gradient(90deg, #3a52b0, #3f6fc4 60%, #4a8ad6); opacity: 1; }
+/* Model is working (mockup: ring + text under the last tool step) */
+.nt-v6-work {
+  position: fixed; z-index: 58; display: none; align-items: center; gap: 12px; height: 26px; padding: 0 12px 0 6px;
+  border-radius: 13px; background: #04050c; font: 500 11.8px var(--v6-font); color: #e2e4ea; pointer-events: none;
+}
+html.nt-v6-on .nt-v6-work.nt-v6-show { display: flex; }
+.nt-v6-wring {
+  width: 14px; height: 14px; border-radius: 50%; box-sizing: border-box; flex: none;
+  border: 2px solid #101c44; border-top-color: #3b86f1; border-right-color: #3b86f1; animation: ntv6spin 0.9s linear infinite;
+}
+@keyframes ntv6spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .nt-v6-wring { animation: none; } }
+
+
+/* ---- round 11 (user 26.10. 03:42): own chat feed, durations next to the step, no working row in the composer ---- */
+html.nt-v6-on .nt-v6-work, html.nt-v6-on .nt-v6-work.nt-v6-show { display: none !important; }
+html.nt-v6-on [data-nt-v6="tool"]::after {
+  position: static !important; right: auto !important; top: auto !important; transform: none !important;
+  margin-left: 10px; align-self: center; flex: none;
+}
+.nt-v6-feed { position: fixed; z-index: 30; background: #04050c; display: flex; flex-direction: column; }
+.nt-v6-feed-sc { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 6px 0 18px; scrollbar-width: thin; scrollbar-color: #1b2540 transparent; }
+.nt-v6-feed-in { max-width: 880px; margin: 0 auto; padding: 0 28px; display: flex; flex-direction: column; }
+.nt-v6-older { display: block; margin: 6px auto 14px; padding: 5px 14px; border-radius: 999px; border: 1px solid #1a2238; background: #0b1120; color: #a0abc5; font: 500 11.5px/1.3 inherit; cursor: pointer; }
+.nt-v6-older:hover { background: #111a2e; color: #e2e4ea; }
+.nt-v6-down { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); width: 30px; height: 30px; border-radius: 50%; border: 1px solid #1a2238; background: #0b1120; color: #c9d2e6; display: none; align-items: center; justify-content: center; cursor: pointer; }
+.nt-v6-feed.nt-v6-away .nt-v6-down { display: flex; }
+html.nt-v6-feed-on [data-nt-v6-src] { visibility: hidden !important; }
+html.nt-v6-feed-on [data-testid="agent-chat-scroll-to-bottom-button"] { display: none !important; }
+.nt-v6-fwork { display: flex; align-items: center; gap: 9px; margin: 10px 0 4px 48px; color: #c9d2e6; font: 500 12px/1.3 inherit; }
+.nt-v6-fwork i { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #101c44; border-top-color: #7c6cff; animation: ntv6fspin .8s linear infinite; }
+@keyframes ntv6fspin { to { transform: rotate(360deg); } }
+.nt-v6-code { position: relative; display: flex; background: #060b17; border: 1px solid #0d1526; border-radius: 10px; margin: 8px 0; overflow: hidden; }
+.nt-v6-code .nt-v6-ln { padding: 10px 8px 10px 12px; text-align: right; color: #3e4761; font: 12px/1.55 ui-monospace, Consolas, monospace; white-space: pre; user-select: none; border-right: 1px solid #0d1526; }
+.nt-v6-code pre { margin: 0 !important; padding: 10px 12px !important; background: transparent !important; flex: 1; min-width: 0; overflow-x: auto; font: 12px/1.55 ui-monospace, Consolas, monospace !important; }
+.nt-v6-copy { position: absolute; top: 6px; right: 8px; padding: 3px 9px; border-radius: 6px; border: 1px solid #1a2238; background: #0b1120; color: #a0abc5; font: 500 11px/1.3 inherit; cursor: pointer; z-index: 1; }
+.nt-v6-copy:hover { color: #e2e4ea; background: #111a2e; }

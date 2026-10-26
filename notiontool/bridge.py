@@ -101,6 +101,33 @@ from .screen_capture import SCREEN_TOOLS, SCREEN_OPERATOR_TOOLS, SCREEN_OPERATOR
 from .agent_guard import GUARD_RULE, PLAN_RULE
 
 
+LOCK_WAIT_S = 30.0  # a tool call waits at most this long for engine.lock (below the 45 s sync limit)
+
+
+class bounded_lock:
+    """with-block over engine.lock that waits at most LOCK_WAIT_S, then a clear error (nothing changed).
+
+    Writes run inline (never jobs), so a write that waited on a held engine.lock without a limit stayed
+    'tool running, no result yet' in Notion (live 25.10., nt_write_file)."""
+    def __init__(self, lock, seconds=None):
+        self.lock, self.seconds = lock, LOCK_WAIT_S if seconds is None else seconds
+        self.plain = not callable(getattr(lock, 'acquire', None))
+
+    def __enter__(self):
+        if self.plain:
+            return self.lock.__enter__()
+        if not self.lock.acquire(timeout=self.seconds):
+            raise ValueError('NotionTool is busy (internal lock held for over %d s); nothing was changed. '
+                             'Try this call once more in a minute.' % self.seconds)
+        return self.lock
+
+    def __exit__(self, *exc):
+        if self.plain:
+            return self.lock.__exit__(*exc)
+        self.lock.release()
+        return False
+
+
 def shell_command(command):
     """PowerShell on Windows; pwsh or sh elsewhere (development/tests)."""
     if os.name=='nt':
@@ -498,11 +525,11 @@ class Bridge:
             # A wrongly routed model must not touch project tools before its
             # final response is rejected. Do network reads outside the engine
             # lock, then recheck the capability below before any side effect.
-            with self.engine.lock:
+            with bounded_lock(self.engine.lock):
                 pending,_=self.assignment(token)
                 worker=self.store.get('workers',pending['worker_id'])
             verifier(worker,pending)
-        with self.engine.lock:
+        with bounded_lock(self.engine.lock):
             task,run = self.assignment(token)
             if name not in self.tools(task['role']):
                 if name in TOOL_SERVER and name in self.tools():
@@ -715,16 +742,24 @@ class Bridge:
             else:
                 process = subprocess.Popen(shell_command(command),
                     cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=creationflags)
+            # Bounded: process.communicate() after the kill waited without a limit for pipes a grandchild
+            # kept open, so the job never ended (nt_job_result 'still running' for 20+ min, live 25.10.).
+            # RAM limit for the whole command and no leftover processes (live 26.10.: a coworker's python
+            # grew to 17 GB after its command, the PC froze for 30 min).
+            job = long_calls.contain(process)
             try:
-                output,_ = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                if os.name=='nt':
-                    subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,creationflags=creationflags)
-                else:
-                    process.kill()
-                process.communicate()
-                raise ValueError('Command timed out; its process tree was stopped') from None
-            return dict(exit_code=process.returncode,output=output.decode('utf-8',errors='replace')[-30000:])
+                output,_,timed_out = long_calls.communicate(process, timeout, creationflags, long_calls.output_sink())
+            finally:
+                peak = long_calls.release(job)
+            text = output.decode('utf-8',errors='replace')
+            limit_mb = long_calls.job_mem_mb()
+            if peak is not None and peak >= limit_mb - 64:
+                text += ('\n[NotionTool] This command reached the RAM limit of %d MB (all its processes '
+                         'together) and was cut off. Run fewer or smaller tests at once.' % limit_mb)
+            if timed_out:
+                raise ValueError('Command timed out; its process tree was stopped. Last output: '
+                                 + (text.strip()[-2000:] or '(none)'))
+            return dict(exit_code=process.returncode,output=text[-30000:])
         finally:
             self.shell_gate.release()
 
@@ -899,7 +934,7 @@ class Bridge:
 
     def _task_dev_path(self, token, path):
         """Resolve a coworker write path: inside the task's worktree when it has one, else as before."""
-        with self.engine.lock:
+        with bounded_lock(self.engine.lock):  # a held engine.lock must never stall nt_write_file/nt_edit_file
             task, run = self.assignment(token)
             if self.worktree(task) is not None:
                 return self.path(run, str(path or ''), task=task)
@@ -907,7 +942,7 @@ class Bridge:
 
     def _claim_for_task(self, token, path):
         """Claim path for the task behind token (same rules as the write_file tool)."""
-        with self.engine.lock:
+        with bounded_lock(self.engine.lock):  # bounded: a write never waits forever (live 25.10.)
             task, run = self.assignment(token)
             if self.role_is_read_only(task['role']):
                 raise ValueError(READ_ONLY_REFUSAL)
@@ -1017,6 +1052,9 @@ class Bridge:
             if not re.fullmatch(r'[A-Za-z]{3,64}',method): raise ValueError('Invalid Notion method name')
             # Validate save_to before calling Notion, so a rejected path has no side effects.
             target=self.save_target(args.get('save_to'))
+            if method=='runInferenceTranscript':  # RBX review: raw sends pass the same age check
+                from . import foreign_chat_guard
+                foreign_chat_guard.guard_body(app.store,app.adapter,args.get('body') or {},str(getattr(client,'account_id','') or ''))
             result=client.call(method,args.get('body') or {})
             return result if target is None else self.save_response(target,result)
         if name=='nt_inference_body':
@@ -1027,6 +1065,8 @@ class Bridge:
         if name=='nt_notion_stream':
             body=args.get('body')
             if not isinstance(body,dict): raise ValueError('body must be an object')
+            from . import foreign_chat_guard  # RBX review: a raw send into a >= 23 h chat is refused
+            foreign_chat_guard.guard_body(app.store,app.adapter,body,str(getattr(client,'account_id','') or ''))
             limit=min(int(args.get('max_lines') or 400),3000); lines=[]
             for line in client.transport.stream('runInferenceTranscript',body,client.headers(),timeout=float(args.get('timeout') or 180)):
                 if isinstance(line,bytes): line=line.decode('utf-8','replace')
@@ -1079,6 +1119,8 @@ class Bridge:
             raise ValueError('Calling local MCP tools from your own chat requires the Bearer token shown in Settings > Remote MCP access, or a valid worker assignment through mcp_call.')
         if name=='mcp_servers':
             value = [{'id':'NotionTool','tools':list(TOOLS),'full_pc_access':self.full_access()}]
+            if operator is not None:
+                value[0]['tools'] += sorted(OPERATOR_NAMES)
             if self.browser_access():
                 value.append({'id':'Browser','tools':list(BROWSER_TOOLS)})
             if self.screen_access():
@@ -1091,12 +1133,24 @@ class Bridge:
         if name=='mcp_list_tools':
             value = [dict(name=n,description=d,inputSchema={'type':'object','properties':p}) for n,(d,p) in tools.items()
                      if not args.get('tool_name') or n==args['tool_name']]
+            if operator is not None:
+                value += [dict(spec) for spec in OPERATOR_TOOLS
+                          if not args.get('tool_name') or spec['name'] == args['tool_name']]
             if not args.get('tool_name') or args['tool_name']==long_calls.JOB_TOOL:
                 spec = long_calls.JOB_TOOL_SPEC
                 value.append(dict(name=spec['name'],description=spec['description'],inputSchema=json.loads(json.dumps(spec['inputSchema']))))
             return value
         if name=='mcp_call':
             inner,inner_args,token = args.get('tool_name'),args.get('arguments') or {},args.get('assignment_token','')
+            owner_files = {'run_shell':'nt_shell', 'read_file':'nt_read_file',
+                           'list_files':'nt_list_dir', 'write_file':'nt_write_file'}
+            if operator is not None and not token:
+                if inner in OPERATOR_NAMES:
+                    return self.operator_call(operator, inner, inner_args)
+                if inner in owner_files:
+                    if inner == 'write_file':
+                        inner_args = dict(path=inner_args.get('path'), content=inner_args.get('text',''))
+                    return self.operator_call(operator, owner_files[inner], inner_args)
             # Owner connection (operator scope already has shell access): local MCP tools need no assignment token.
             discover = inner in TOOL_SERVER and inner.endswith('_tools') and not token
             return self.local_call(inner,inner_args) if inner in TOOL_SERVER and (discover or (operator is not None and not self.has_assignment(token))) else self.call(inner,inner_args,token)
@@ -1152,7 +1206,8 @@ class Bridge:
             elif method=='tools/call':
                 name,args = params.get('name'),params.get('arguments') or {}
                 if self.is_job_call(name, args):
-                    # nt_job_result itself is never wrapped; it waits at most 40 s.
+                    # nt_job_result itself is never wrapped; it waits at most MAX_WAIT (50 s) and never past
+                    # the job's hard limit (then a JobLost error with the last output).
                     value = self.job_result(name, args, operator)
                 elif self.runs_inline(name, args):
                     value = self.tool_value(name, args, operator)
@@ -1160,7 +1215,8 @@ class Bridge:
                     # Answer before Notion's MCP request timeout (-32001): a slower call goes on as a
                     # job on one thread (call() logs tool_finished there when it really ends).
                     value = self.long_jobs().run(self.caller_key(args, operator), name, args,
-                        lambda: self.tool_value(name, args, operator), long_calls.sync_limit(self.store.settings()))
+                        lambda: self.tool_value(name, args, operator), long_calls.sync_limit(self.store.settings()),
+                        long_calls.job_deadline(args))
                 if isinstance(value, dict):
                     value = dict(value)  # a stored job result keeps its image for the next nt_job_result
                 image = value.pop('_image', None) if isinstance(value, dict) else None

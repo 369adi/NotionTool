@@ -4,6 +4,9 @@
 .nt-desk-hidden { display: none !important; }
 /* Sidebar footer icons next to 'New chat' (New page, Hot and fresh features). */
 html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
+/* Redesign sidebar strip (declutter.js): Search, Home, Customize sidebar, workspace switcher,
+ * help/news icons, 'Welcome to Notion' and '(expired)' chats. */
+html:not(.nt-desk-off) .nt-desk-sb-hidden { display: none !important; }
 
 /* Branded header at the top of the sidebar. */
 .nt-desk-brand {
@@ -124,19 +127,24 @@ html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
   background: var(--nt-raised, #181c26); }
 .nt-desk-card { flex: 1 0 100%; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 3px 8px 0;
   font-size: 11px; line-height: 14px; color: #b8c0d9; }
-.nt-desk-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
-.nt-desk-dot-running { background: #22d3ee; animation: nt-desk-pulse 1.4s ease-out infinite; }
-.nt-desk-dot-waiting { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, .85); }
-.nt-desk-dot-idle { background: #6b7280; }
+.nt-desk-dot { flex: none; width: 8px; height: 8px; border-radius: 999px; background: var(--nt-text-3, gray); margin-left: auto; }
+.nt-desk-dot-running { background: var(--nt-accent-2, cyan); animation: nt-desk-pulse 1.4s ease-out infinite; }
+.nt-desk-dot-waiting { background: var(--nt-warning, orange); }
+.nt-desk-dot-unread { background: var(--nt-unread, dodgerblue); }
+.nt-desk-dot-idle { display: none; }
 @keyframes nt-desk-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(124, 92, 255, .9); }
-  70% { box-shadow: 0 0 0 6px rgba(34, 211, 238, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0); }
+  0% { box-shadow: 0 0 0 0 var(--nt-accent-2, cyan); }
+  70% { box-shadow: 0 0 0 8px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }
-@media (prefers-reduced-motion: reduce) { .nt-desk-dot-running { animation: none; box-shadow: 0 0 6px #22d3ee; } }
+@media (prefers-reduced-motion: reduce) { .nt-desk-dot-running { animation: none; } }
+/* Chat rows: icon, name, one dot. The plain age text (ok level) is not shown; warn and locked stay visible. */
+[data-nt-desk="chat-row"] > .nt-desk-chat-age-ok, [data-nt-desk="chat-row"] > .nt-desk-chat-age-switching,
+[data-nt-desk="chat-row"] > .nt-desk-row-age.nt-desk-age-ok { display: none; }
+[data-nt-desk="chat-row"][data-nt-age-level="ok"] > .nt-desk-age-switch { display: none; }
 .nt-desk-card-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nt-desk-progress { flex: none; width: 44px; height: 4px; border-radius: 4px; background: rgba(255, 255, 255, .14); overflow: hidden; }
-.nt-desk-progress-fill { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #7c5cff, #22d3ee); }
+.nt-desk-progress-fill { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--nt-accent, blueviolet), var(--nt-accent-2, cyan)); }
 .nt-desk-progress-count { flex: none; font-variant-numeric: tabular-nums; color: #f1f4ff; }
 .nt-desk-card.nt-desk-no-run .nt-desk-progress, .nt-desk-card.nt-desk-no-run .nt-desk-progress-count { display: none; }
 .nt-desk-coworkers { margin: 6px 4px 12px; }
@@ -205,6 +213,13 @@ html:not(.nt-desk-off) .nt-desk-footer-hidden { display: none !important; }
   background: var(--nt-age-lock-soft, rgba(220, 38, 38, .12)); color: var(--nt-age-lock-text-strong, #fecaca);
   font: 500 12px/16px var(--nt-font, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif); }
 .nt-desk-lock-banner[hidden] { display: none; }
+/* RBX fix: composer age badge (any chat, age from the Notion thread created_time). */
+.nt-desk-age-badge { box-sizing: border-box; margin: 0 0 8px; padding: 6px 12px; border-radius: 8px; border: 1px solid #7C3F16;
+  background: #2A1D12; color: #FED7AA; font: 600 12px/16px "Segoe UI", Inter, -apple-system, sans-serif; font-variant-numeric: tabular-nums; }
+.nt-desk-age-badge[data-nt-age-level="warn"] { border-color: #FB923C; color: #FB923C; }
+.nt-desk-age-badge[data-nt-age-level="switching"] { background: #1A1730; border-color: #5B4BB5; color: #DDD6FE; }
+.nt-desk-age-badge[data-nt-age-level="locked"] { background: #2A1215; border-color: #DC2626; color: #FECACA; }
+.nt-desk-composer[data-nt-age-locked] { opacity: .45; pointer-events: none; filter: grayscale(1); }
 .nt-desk-lock-banner-text { flex: 1 1 auto; min-width: 0; }
 .nt-desk-lock-banner-switch { flex: 0 0 auto; padding: 0 12px; border: 0; border-radius: 999px; cursor: pointer;
   background: var(--nt-age-lock-bg, #dc2626); color: var(--nt-age-lock-fg, #ffffff); font: 600 12px/24px var(--nt-font, inherit); }

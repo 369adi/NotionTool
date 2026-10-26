@@ -123,9 +123,13 @@ class Store:
         return json.loads(row[0]) if row else default
 
     def all(self, kind):
+        # Lag fix 2026-10-25: no ORDER BY in SQL. With the (kind) index SQLite copied every doc through a temp
+        # B-tree to sort by rowid (35 MB of task docs: 0.25-1 s per call, under the lock every engine, desktop
+        # and UI thread needs). The rows are sorted by rowid in Python after the lock is released: same order.
         with self.lock:
-            rows = self.db.execute('SELECT doc FROM objects WHERE kind=? ORDER BY rowid', (kind,)).fetchall()
-        return [json.loads(row[0]) for row in rows]
+            rows = self.db.execute('SELECT rowid, doc FROM objects WHERE kind=?', (kind,)).fetchall()
+        rows.sort(key=lambda row: row[0])
+        return [json.loads(row[1]) for row in rows]
 
     def put(self, kind, doc):
         with self.lock:

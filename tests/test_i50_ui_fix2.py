@@ -71,7 +71,7 @@ class MainArchiveTests(unittest.TestCase):
             tid, title = adapter.renamed[0]
             self.assertEqual(tid, 'old1')
             self.assertTrue(title.startswith(chat_context.MAIN_ARCHIVE_PREFIX), title)
-            self.assertIn('archived', title)
+            self.assertIn('expired', title)
             self.assertEqual(store.data['workers']['w1']['archived_threads'], ['old1'])
             self.assertEqual(store.events[-1][0], 'main_old_chat_archived')
             self.assertIn('never deleted', store.events[-1][1]['message'])

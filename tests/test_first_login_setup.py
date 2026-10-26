@@ -1,5 +1,6 @@
 import threading
 import unittest
+from unittest.mock import patch
 
 from notiontool import window_login as wl
 from notiontool.server import Application
@@ -10,6 +11,7 @@ class Store:
         self.accounts = {account['id']: dict(account)}
         self._settings = {'public_mcp_url': 'https://mcp.example/mcp'} if settings is None else settings
         self.events = []
+        self.workers = []
 
     def get(self, table, ident, default=None):
         return self.accounts.get(ident, default) if table == 'accounts' else default
@@ -24,6 +26,9 @@ class Store:
     def event(self, kind, *args, **kwargs):
         self.events.append(kind)
 
+    def all(self, table):
+        return self.workers if table == 'workers' else list(self.accounts.values()) if table == 'accounts' else []
+
 
 class Adapter:
     def __init__(self, store):
@@ -34,13 +39,27 @@ class Adapter:
         account = self.store.accounts[account_id]
         account['bridge_connected'] = True
 
-    def ensure_team(self, account_id, create_main=False):
+    def ensure_team(self, account_id, create_main=False, count=None):
         self.calls.append(('team', create_main))
-        return {'main_chats': 1, 'welcome_chats': 11}
+        assert count == 5
+        self.store.workers = [dict(id=str(i), account_id=account_id, enabled=True, welcome=True,
+                                  purpose='main' if i == 0 else 'worker') for i in range(6)]
+        return {'main_chats': 1, 'welcome_chats': 6, 'verified': True}
 
 
 class Fake:
-    first_login_setup = Application.first_login_setup
+    def first_login_setup(self, account_id):
+        # Connection protocol has its own tests; this fixture isolates login/team orchestration.
+        def ensure(server, ident):
+            url=server.store.settings().get('public_mcp_url')
+            if not url:
+                server.start_tunnel()
+                raise ValueError('No public MCP URL for NotionTool yet')
+            if not server.store.accounts[ident].get('bridge_connected'):
+                server.adapter.connect_bridge(ident,url,server.bridge_token,read_auto=True,write_auto=True)
+            return {'connected':True,'read_auto':True,'write_auto':True}
+        with patch('notiontool.notion_connections.ensure_notiontool',side_effect=ensure):
+            return Application.first_login_setup(self,account_id)
 
     def __init__(self, account, settings=None):
         self.store = Store(account, settings)
@@ -56,7 +75,7 @@ class FirstLoginSetupTest(unittest.TestCase):
     def test_connects_mcp_automatically_and_creates_main_and_coworkers_once(self):
         app = Fake({'id': 'a', 'state': 'ready'})
         result = app.first_login_setup('a')
-        self.assertEqual(result['mcp'], 'connected')
+        self.assertTrue(result['mcp']['connected'])
         self.assertEqual(app.adapter.calls, [('connect', 'https://mcp.example/mcp', True, True), ('team', True)])
         self.assertTrue(app.store.accounts['a']['first_setup_done'])
         self.assertEqual(app.first_login_setup('a')['skipped'], 'already set up')
@@ -71,6 +90,11 @@ class FirstLoginSetupTest(unittest.TestCase):
         app = Fake({'id': 'a', 'state': 'ai_disabled'})
         self.assertIn('skipped', app.first_login_setup('a'))
         self.assertEqual(app.adapter.calls, [])
+
+    def test_old_done_flag_cannot_skip_an_incomplete_team(self):
+        app = Fake({'id': 'a', 'state': 'ready', 'bridge_connected': True, 'first_setup_done': True})
+        app.first_login_setup('a')
+        self.assertEqual(app.adapter.calls, [('team', True)])
 
     def test_missing_url_keeps_setup_open_for_next_sign_in(self):
         app = Fake({'id': 'a', 'state': 'ready'}, settings={})

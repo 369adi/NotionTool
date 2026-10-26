@@ -139,6 +139,30 @@ def pending_tool_state(entity):
     return TOOL_NOT_STARTED_TEXT
 
 
+CUT_PENDING_TOOL = True  # False restores the old rule (idle + open tool stays 'running'); only for work/sim_tool_hang.py
+
+
+def cut_tool(transcript, own_turn):
+    """The own-turn tool step a finished session left without a result (a cut turn), else None.
+
+    Live 25.10.: status idle, no session_pending, newest step nt_read_file 'pending' without result. Notion
+    ended that turn; the tool is not running. Same rule as turn_watch._pending_tool plus the explicit
+    'pending' status; an approval wait or a stale session sequence never counts as cut."""
+    if not CUT_PENDING_TOOL or session_state(transcript) != 'finished':
+        return None
+    from .turn_watch import _pending_tool, _role  # local import: turn_watch imports this module
+    steps = sorted(own_turn, key=lambda e: e.get('sequence') or 0)
+    relevant = [e for e in steps if _role(e)]
+    if not relevant:
+        return None
+    last, seq = relevant[-1], (transcript.get('session') or {}).get('sequence')
+    if isinstance(seq, (int, float)) and not isinstance(seq, bool) and seq < (steps[-1].get('sequence') or 0):
+        return None
+    if _role(last) != 'tool' or approval_evidence(last) or not tool_waiting(last) or not _pending_tool(last, steps):
+        return None
+    return last
+
+
 def turn_state(transcript, task, resumes=()):
     """State of the task's own turn from ONE transcript read.
 
@@ -865,7 +889,8 @@ class NotionAdapter:
                 worker = worker or dict(id=account_id+':'+tid,account_id=account_id,thread_id=tid,
                     purpose=created.get(tid) or ('main' if managed.get(tid) == 'main' else 'worker'),
                     enabled=False,state='ready',lease='',last_used=0)
-                worker['label'] = thread.get('title') or (worker.get('label') if thread.get('guessed') else '') or 'Untitled chat'
+                worker['label'] = (thread.get('title') or (worker.get('label') if thread.get('guessed') else '')
+                    or ('Main' if managed.get(tid) == 'main' else 'Welcome to Notion' if tid in managed else 'Untitled chat'))
                 if worker['state'] in ('missing','error') and not worker.get('lease'):
                     worker['state'] = 'ready'
                 self.store.put('workers',worker)
@@ -1363,7 +1388,7 @@ class NotionAdapter:
                     return worker
         return None
 
-    def ensure_team(self,account_id,create_main=False):
+    def ensure_team(self,account_id,create_main=False,count=None):
         """Idempotent desired team: one Main and N Welcome Coworkers (team_size.py, from the settings).
 
         A reachable operator Main counts as the Main: no Main is created and the ledger 'main' points at
@@ -1392,7 +1417,9 @@ class NotionAdapter:
         model=client.model()
         account=self.store.get('accounts',account_id)
         ledger=account.get('team_threads') or {}
-        roles=team_roles(self.store.settings())
+        if count is not None and not 1 <= int(count) <= 40:
+            raise ValueError('Choose between 1 and 40 Coworkers')
+        roles=team_roles(self.store.settings()) if count is None else ['worker%d' % i for i in range(1, int(count)+1)]
         # Existing pool chats fill empty slots first; nothing is created twice.
         taken={(item or {}).get('id') for item in ledger.values()}
         spare=[w for w in self.store.all('workers') if w['account_id']==account_id and w.get('purpose','worker')=='worker'
@@ -1410,6 +1437,10 @@ class NotionAdapter:
                     raise ValueError('A previous Welcome creation is unconfirmed. Refresh the account before creating again.')
                 raise ValueError('A managed Welcome chat is missing; existing chats were preserved')
             if item:
+                if item.get('pending'):
+                    item['pending']=False  # read-back confirmed a creation interrupted by a restart
+                    account['team_threads']=ledger
+                    self.store.put('accounts',account)
                 continue
             if new_ids:
                 time.sleep(float(getattr(self,'welcome_gap_s',3.0)))  # paced: rapid creations lose greetings
@@ -1429,13 +1460,21 @@ class NotionAdapter:
             new_ids.append(str(uuid.UUID(tid)))
             self.store.event('team_setup',message=role+' Welcome chat created; waiting for its join',slot=account['slot'])
         self.refresh(account_id)
+        # Recover admission for every managed slot, including chats persisted before an interrupted setup.
+        # User-owned Welcome chats outside this ledger are never admitted.
+        managed={ledger[r]['id'] for r in roles}
+        from .cowork_names import is_pool_title
         for worker in self.store.all('workers'):
-            if worker['account_id']==account_id and worker['thread_id'] in new_ids:
+            if (worker['account_id']==account_id and worker['thread_id'] in managed
+                    and is_pool_title(worker.get('label','')) and not worker.get('user_set_title')
+                    and not worker.get('enabled') and worker.get('join_state') != 'released'):
                 worker.update(join_state='pending',enabled=False,welcome=True,purpose='worker',pool_admitted=True,
                               welcome_at=time.time())
                 self.store.put('workers',worker)
         self.apply_chat_pool(account_id,client)
-        managed={ledger[r]['id'] for r in roles}
+        if count is not None:
+            from .chat_pool import name_coworkers
+            name_coworkers(self, client, account_id)
         team=[w for w in self.store.all('workers') if w['account_id']==account_id and w['thread_id'] in managed]
         if len(team)<len(managed):
             raise ValueError('Created Welcome chat is absent from the Notion chat list')
@@ -1634,6 +1673,9 @@ class NotionAdapter:
         run_id = task.get('run_id', '')
         _phase['body'] = time.monotonic() - _t0
         self.store.event('presend_timing', run_id, commit=False, **trace, **{k: round(v, 2) for k, v in _phase.items()})
+        from . import foreign_chat_guard  # RBX review: one age check on every send path; >= 23 h is never sent
+        foreign_chat_guard.require_young(self.store, self, worker.get('thread_id'), None,
+                                         str(worker.get('account_id') or ''))
         self.store.event('remote_sent', run_id, prompt_chars=len(prompt), **trace)
         charge_send(self.store, worker, prompt)  # counted even if the chat is deleted later
         from . import step_guard
@@ -1896,7 +1938,12 @@ class NotionAdapter:
         if completed and not text:
             # Notion may have ended this turn with an error step and no reply (confirmed retry).
             self.confirm_turn_error(worker,task)
+        cut = None if text else cut_tool(transcript, own_turn)
         self.note_pending_interaction(task, own_turn)
+        if cut is not None:
+            self.note_cut_turn(task, cut)
+            raise PendingRemote(state='tool_cut', reason='tool_cut')
+        self.note_cut_resumed(task, transcript)
         # B46: liveness from the same read. A turn Notion still runs and that keeps adding steps is working, not hung.
         live = self.note_remote_progress(task, own_turn, session, transcript)
         # A timeout is not evidence that the server didn't accept the POST.
@@ -1928,6 +1975,27 @@ class NotionAdapter:
             except Exception:
                 pass
             return None
+
+    def note_cut_turn(self, task, step):
+        """Idle session + open tool = a cut turn (live 25.10. deadlock): set remote_done_at once, so the Main
+        can accept or abandon and the turn watch continues the chat. Nothing is resent."""
+        key = str(step.get('id') or step.get('tool_use_id') or step.get('sequence') or '')
+        stored = self.store.get('tasks', task.get('id', ''), {}) or {}
+        if stored.get('cut_pending_tool') and stored.get('cut_tool_key') == key and stored.get('remote_done_at'):
+            return
+        self.mark_task(task['id'], remote_done_at=time.time(), cut_pending_tool=True, cut_tool_key=key)
+        self.store.event('turn_cut_pending_tool', task.get('run_id', ''), task_id=task['id'],
+                         tool=str(stored.get('pending_tool') or step.get('kind') or '')[:120],
+                         message='Notion ended the turn while a tool call had no result; the turn counts as finished '
+                                 '(cut). The Main can accept or abandon it; nothing is resent')
+
+    def note_cut_resumed(self, task, transcript):
+        """The turn runs again after a cut (turn watch continue): the cut's remote_done_at no longer holds."""
+        stored = self.store.get('tasks', task.get('id', ''), {}) or {}
+        if stored.get('cut_pending_tool') and session_state(transcript) == 'running':
+            self.mark_task(task['id'], remote_done_at=0, cut_pending_tool=False, cut_tool_key='')
+            self.store.event('turn_cut_resumed', task.get('run_id', ''), task_id=task['id'],
+                             message='The cut turn runs again; waiting for its reply')
 
     def note_remote_progress(self, task, own_turn, session, transcript):
         """B46: record the newest step of our own turn. True while Notion still runs the turn and a new
@@ -2068,6 +2136,9 @@ class NotionAdapter:
             body['isPartialTranscript'] = True
             body['createThread'] = False
             body['generateTitle'] = False
+        from . import foreign_chat_guard  # RBX review: Continue/resume into a >= 23 h chat is never sent
+        foreign_chat_guard.require_young(self.store, self, worker['thread_id'], None,
+                                         str(worker.get('account_id') or ''))
         timeout = float(self.store.settings().get('task_timeout') or 1800)
         try:
             for _ in client.transport.stream('runInferenceTranscript', body, client.headers(), timeout=timeout):
@@ -2289,7 +2360,7 @@ class NotionAdapter:
                              message='Backup MCP tools now run automatically (no approval pause)')
         return changed
 
-    def connect_bridge(self, account_id, url, token, name='NotionTool', read_auto=True, write_auto=True, registry_id=''):
+    def connect_bridge(self, account_id, url, token, name='NotionTool', read_auto=True, write_auto=True, registry_id='', refresh_auth=False):
         if not url.startswith('https://'):
             raise ValueError('Notion requires a reachable public HTTPS MCP URL')
         client = self.client(account_id)
@@ -2312,14 +2383,17 @@ class NotionAdapter:
             authHeaders=auth,initiationContext='connect'),timeout=90)
         if not validation.get('success'):
             raise ValueError('Notion cannot reach this MCP server')
-        if not integration:
-            integration=self.new_id(client.info['space_id'],'00b6')
+        if not integration or refresh_auth:
+            new_integration = not integration
+            if new_integration:
+                integration=self.new_id(client.info['space_id'],'00b6')
             result = client.call('postWorkflowsMcpServerConnect',dict(integrationId=integration,spaceId=client.info['space_id'],
                 authHeaders=auth,moduleDefinition={'name':name,'serverUrl':url,
                 'runReadToolsAutomatically':read_auto,'runWriteToolsAutomatically':write_auto},initiationContext='connect'),timeout=90)
             if not result.get('success'):
                 raise ValueError('Notion refused the MCP connection')
-            modules.append({'pointer':{'table':'workflow_module','id':integration,'spaceId':client.info['space_id']},'defaultEnabled':True})
+            if new_integration:
+                modules.append({'pointer':{'table':'workflow_module','id':integration,'spaceId':client.info['space_id']},'defaultEnabled':True})
         # Idempotent: an existing, enabled module with the right permissions is left untouched, so a
         # reconnect never rewrites the account's chat modules while Coworkers are working.
         changed = integration not in records

@@ -15,7 +15,7 @@ from .context_archive import TOKEN_DIVISOR, canonical_json, estimate_tokens  # n
 
 CONTENT_KINDS = ('code', 'prose', 'json')
 # I50 Fix 2: a Main's old chat after a context switch is archived by rename, never deleted.
-MAIN_ARCHIVE_PREFIX = 'Main (archived '
+MAIN_ARCHIVE_PREFIX = 'Main (expired '
 
 
 def _text_of(value):
@@ -188,8 +188,13 @@ def slim_entity(entity):
     return out
 
 
+# One tool result never fills more than this much of the model context: Notion cuts or offloads
+# bigger results. Live 26.10.: one transcript read counted 9.25M tokens, so the Main showed 10.7M.
+OMITTED_CAP_TOKENS = 25000
+
+
 def omitted_tokens(entities):
-    return sum(int(e.get('omitted_tokens') or 0) for e in entities if isinstance(e, dict))
+    return sum(min(OMITTED_CAP_TOKENS, int(e.get('omitted_tokens') or 0)) for e in entities if isinstance(e, dict))
 
 
 class ChatContext:
@@ -222,8 +227,13 @@ class ChatContext:
             return record
         record['updated'] = time.time()
         # Deduplicate snapshots but keep every observed entity and its latest version.
+        # The raw transcript still carries full tool results (one transcript read was 9 MB), so it is
+        # measured with the same slimmed entities; otherwise max() brings the huge raw count back.
+        slim_transcript = dict(transcript, patches=[
+            dict(p, entity=slim_entity(p['entity'])) if isinstance(p, dict) and isinstance(p.get('entity'), dict) and p['entity'] else p
+            for p in transcript.get('patches', [])])
         record['estimated_tokens'] = max(estimate_tokens(entities) + omitted_tokens(entities.values()),
-                                         estimate_tokens(transcript))
+                                         estimate_tokens(slim_transcript))
         self.store.put('thread_context', record)
         return record
 

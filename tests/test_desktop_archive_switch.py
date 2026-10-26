@@ -69,12 +69,18 @@ class SwitchButtonTests(unittest.TestCase):
         self.assertEqual(result['kind'], 'coworker')
         self.assertEqual(server.calls, [('/api/chat/compress', {'worker_id': 'w1', 'reason': 'Context switch button'})])
 
-    def test_main_starts_main_switch_with_chat_id(self):
+    def test_main_sends_switch_request_with_chat_id(self):
+        # Owner 2026-10-25 23:06: the button asks the Main itself to switch (no coworker brief task).
         server, h = self.handlers(FakeStore([]))
         result = h['chat_context_switch']({'chat_id': 'c1'})
         self.assertEqual(result['kind'], 'main')
-        self.assertEqual(server.calls[0][0], '/api/main/switch/start')
-        self.assertEqual(server.calls[0][1]['chat_id'], 'c1')
+        self.assertEqual(server.calls, [('/api/main/switch/request', {'chat_id': 'c1'})])
+
+    def test_main_worker_id_goes_to_switch_request(self):
+        server, h = self.handlers(FakeStore([dict(id='acc:t1', purpose='operator')]))
+        result = h['chat_context_switch']({'worker_id': 'acc:t1'})
+        self.assertEqual(result['kind'], 'main')
+        self.assertEqual(server.calls, [('/api/main/switch/request', {'worker_id': 'acc:t1'})])
 
     def test_running_main_switch_is_not_started_twice(self):
         server, h = self.handlers(FakeStore([], [dict(id='s1', state='brief_requested')]))

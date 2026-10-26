@@ -219,6 +219,108 @@
     });
   }
 
+  // Live map (reference v6 Roles / v7 Direct): Main on top, TEAM_MAX coworkers per row; more coworkers wrap to the next row.
+  // Mode comes from the newest open run (allocation.mode or mode); without it, analyse/review roles mean Roles.
+  var TEAM_MAX = 4;
+  var ROLE_LABEL = { researcher: 'Researcher', architect: 'Architect', executor: 'Worker', quality_planner: 'Quality planner',
+    reviewer: 'Quality planner' };
+  var ROLE_STAGE = { researcher: 'analyse', architect: 'analyse', executor: 'build', quality_planner: 'review', reviewer: 'review' };
+  var STAGES = [['analyse', 'Analyse'], ['build', 'Build'], ['review', 'Review']];
+  // Roles mode: three labelled stage rows. Coworkers without a role step wait in Build; an empty Review shows an idle Quality planner.
+  function liveStages(cards) {
+    return STAGES.map(function (st) {
+      var own = list(cards).filter(function (c) { return c.stage === st[0]; });
+      if (!own.length && st[0] === 'review') own = [{ id: '', slot: true, label: 'Quality planner', kind: 'idle', text: 'Idle', role: 'Quality planner', stage: 'review' }];
+      return { id: st[0], label: st[1], cards: own };
+    });
+  }
+  function newestRun(s) { var runs = openRuns(s); return runs.length ? obj(runs[runs.length - 1]) : null; }
+  function liveMode(s) {
+    var run = newestRun(s);
+    if (!run) return 'direct';
+    var m = token(obj(run.allocation).mode || run.mode);
+    if (m === 'direct' || m === 'roles') return m;
+    return runTasks(s, run).some(function (t) { var r = token(obj(t).role); return !!ROLE_LABEL[r] && r !== 'executor'; }) ? 'roles' : 'direct';
+  }
+  function findTask(s, id) { return id ? list(obj(s).tasks).filter(function (t) { return obj(t).id === id; })[0] || null : null; }
+  function findRun(s, id) { return id ? list(obj(s).runs).filter(function (r) { return obj(r).id === id; })[0] || null : null; }
+  // The coworker's current step: its task_id, else its newest open step (working steps first).
+  function workerTask(s, w) {
+    w = obj(w);
+    var own = findTask(s, w.task_id);
+    if (own) return obj(own);
+    var open = list(obj(s).tasks).filter(function (t) {
+      t = obj(t);
+      var st = taskStatus(t);
+      return !!t.worker_id && t.worker_id === w.id && (st === 'Working' || st === 'Waiting' || st === 'Problem');
+    }).sort(byCreated);
+    var pick = open.filter(function (t) { return taskStatus(t) === 'Working'; });
+    if (!pick.length) pick = open;
+    return pick.length ? obj(pick[pick.length - 1]) : null;
+  }
+  // 'waits for Cowork 2': the coworker of the first unfinished step this step depends on.
+  function waitsFor(s, t, labels) {
+    t = obj(t); labels = obj(labels);
+    var deps = list(t.deps).concat(list(t.depends_on));
+    for (var i = 0; i < deps.length; i++) {
+      var d = findTask(s, deps[i]);
+      if (!d) continue;
+      var st = taskStatus(d);
+      if (st !== 'Done' && st !== 'Checked') return labels[obj(d).worker_id] || quote(taskSummary(d));
+    }
+    return '';
+  }
+  // Answer = what the coworker waits for from the user, through the existing endpoints:
+  // lost answer -> task_reconcile accept, request waits for the OK -> run_confirm, failed steps -> run_retry.
+  function answerDef(s, t) {
+    t = obj(t);
+    if (!t.id) return null;
+    if ((t.remote_unknown || token(t.state) === 'uncertain') && !t.remote_working) return acceptDef(t);
+    var run = obj(findRun(s, t.run_id)), st = token(run.state);
+    if (run.id && st === 'awaiting_main') return confirmDef(run);
+    if (run.id && st === 'blocked') return retryDef(run);
+    return null;
+  }
+  // Stop = run_cancel of the coworker's request (POST /api/run/cancel).
+  function stopDef(s, t) {
+    return runControls(findRun(s, obj(t).run_id)).filter(function (d) { return d.key === 'cancel'; })[0] || null;
+  }
+  function liveCards(s, now) {
+    s = obj(s);
+    var mode = liveMode(s), labels = {}, rows = teamRows(s, now);
+    var workers = list(s.workers).filter(function (w) { return obj(w).purpose === 'worker'; });
+    workers.forEach(function (w) { labels[w.id] = clip(w.label, 40) || 'Coworker'; });
+    return workers.map(function (w, i) {
+      var t = workerTask(s, w), status = t ? taskStatus(t) : '', row = obj(rows[i]), r = t ? token(t.role) : '';
+      var wait = status === 'Waiting' ? waitsFor(s, t, labels) : '';
+      var answer = t ? answerDef(s, t) : null;
+      var kind = answer ? 'ask' : wait ? 'wait' : row.cls;
+      var text = answer ? 'Needs your answer' : wait ? 'waits for ' + wait : row.cls === 'busy' ? 'Working' : row.state;
+      return { id: w.id, label: labels[w.id], kind: kind, text: text, task: t ? taskSummary(t) : '', taskId: t ? str(t.id) : '',
+        role: mode === 'roles' && t ? ROLE_LABEL[r] || '' : '', stage: mode === 'roles' ? ROLE_STAGE[r] || 'build' : '',
+        elapsed: t ? elapsedFor(t, now) : '',
+        answer: answer, stop: t ? stopDef(s, t) : null };
+    });
+  }
+  function mainInfo(s) {
+    var main = obj(list(obj(s).workers).filter(function (w) { return obj(w).purpose === 'main'; })[0]);
+    var run = newestRun(s);
+    return { label: clip(main.label, 40) || 'Main', busy: BUSY.indexOf(token(main.state)) >= 0,
+      goal: run ? runSummary(run) : '', step: run ? progressOf(run, runTasks(s, run)).text : '' };
+  }
+  function cardEvents(s, card) {
+    var evs = list(obj(s).events);
+    if (card) {
+      evs = evs.filter(function (e) {
+        e = obj(e);
+        return (!!e.worker_id && e.worker_id === card.id) || (!!card.taskId && e.task_id === card.taskId) || (!!e.worker && e.worker === card.label);
+      });
+    }
+    return evs.slice(-EVENT_LIMIT).reverse();
+  }
+  // Rail badge: coworkers that really run right now (it counted every attention item before).
+  function runningCount(s) { return teamRows(s, Date.now()).filter(function (m) { return m.cls === 'busy'; }).length; }
+
   function connection(raw, now, lastPush) {
     if (!raw) return { cls: 'off', text: 'Waiting for the harness' };
     if (lastPush && now - lastPush > STALE_MS) return { cls: 'warn', text: 'No update for ' + span((now - lastPush) / 1000) };
@@ -378,7 +480,9 @@
     taskStatus: taskStatus, taskSummary: taskSummary, runSummary: runSummary, firstSentence: firstSentence,
     elapsedFor: elapsedFor, stepText: stepText, progressOf: progressOf, openRuns: openRuns, historyRows: historyRows,
     outcomeText: outcomeText, needsYou: needsYou, runControls: runControls, teamRows: teamRows, initials: initials,
-    connection: connection, span: span, ago: ago, humanKind: humanKind, problems: problems
+    connection: connection, span: span, ago: ago, humanKind: humanKind, problems: problems,
+    TEAM_MAX: TEAM_MAX, ROLE_LABEL: ROLE_LABEL, liveMode: liveMode, liveCards: liveCards, liveStages: liveStages, waitsFor: waitsFor,
+    answerDef: answerDef, stopDef: stopDef, mainInfo: mainInfo, runningCount: runningCount
   };
 
   window.__ntDesk.live = function (ctx) {
@@ -412,22 +516,26 @@
     function sig(value) { try { return JSON.stringify(value); } catch (e) { return String(Math.random()); } }
 
     var root = el('div', { cls: 'nt-desk-lv', 'data-nt-desk': 'live-view' });
-    ['budget', 'needs', 'working', 'team', 'history', 'details'].forEach(function (name) {
-      slots[name] = root.appendChild(el('div', { cls: 'nt-desk-lv-slot nt-desk-lv-slot-' + name }));
+    // Reference layout: the team map (mode badge, Main, one coworker row) and a 340 px side panel.
+    slots.map = root.appendChild(el('div', { cls: 'nt-desk-lv-slot nt-desk-lv-slot-map' }));
+    var side = root.appendChild(el('div', { cls: 'nt-desk-lv-side' }));
+    slots.focus = side.appendChild(el('div', { cls: 'nt-desk-lv-slot nt-desk-lv-slot-focus' }));
+    ['reply', 'budget', 'needs', 'working', 'team', 'history', 'details'].forEach(function (name) {
+      slots[name] = side.appendChild(el('div', { cls: 'nt-desk-lv-slot nt-desk-lv-slot-' + name }));
     });
     var confirmBox = el('div', { cls: 'nt-desk-lv-confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-label': 'Please confirm' });
     confirmBox.hidden = true;
-    root.appendChild(confirmBox);
+    side.appendChild(confirmBox);
 
     // ---- New request: a template fills a draft into the Notion chat box. The user checks and sends it (never sent here).
     var requestBox = el('div', { cls: 'nt-desk-lv-request', role: 'dialog', 'aria-label': 'New request' });
     requestBox.hidden = true;
-    root.appendChild(requestBox);
+    side.appendChild(requestBox);
     var newRequestButton = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-btn-main nt-desk-lv-new-request', type: 'button',
       text: 'New request', title: 'Start a request from a template' });
     newRequestButton.addEventListener('click', function () { showRequest(''); });
     var requestBar = el('div', { cls: 'nt-desk-lv-toolbar' }, [newRequestButton]);
-    if (typeof root.insertBefore === 'function' && root.firstChild) root.insertBefore(requestBar, root.firstChild); else root.appendChild(requestBar);
+    if (typeof side.insertBefore === 'function' && side.firstChild) side.insertBefore(requestBar, side.firstChild); else side.appendChild(requestBar);
     function clearOwn(node) { clear(node); }
     var requestInputs = {}, requestText = null, requestId = '';
     function hideRequest() { requestBox.hidden = true; clearOwn(requestBox); requestInputs = {}; requestText = null; requestId = ''; }
@@ -785,6 +893,155 @@
         team.length ? busyCount + ' of ' + team.length + ' busy' : 0);
     }
 
+    // ---- Live map + 340 px side panel (reference v6 Roles / v7 Direct). selected = coworker shown in the panel.
+    var selected = '';
+    var SVG_NS = 'http://www.w3.org/2000/svg';
+    // Lucide icons: reply (Answer), square (Stop), bot (Main).
+    var ICON_PATHS = { reply: ['M20 18v-2a4 4 0 0 0-4-4H4', 'M9 17l-5-5 5-5'], stop: ['M5 5h14v14H5z'],
+      bot: ['M12 8V4H8', 'M6 8h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z', 'M2 14h2', 'M20 14h2', 'M15 13v2', 'M9 13v2'] };
+    function icon(name) {
+      if (typeof document.createElementNS !== 'function') return null;
+      var svg = document.createElementNS(SVG_NS, 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('aria-hidden', 'true');
+      ICON_PATHS[name].forEach(function (d) {
+        var p = document.createElementNS(SVG_NS, 'path');
+        p.setAttribute('d', d);
+        svg.appendChild(p);
+      });
+      return svg;
+    }
+    function pickCard(cards) {
+      return cards.filter(function (c) { return c.id === selected; })[0] || cards.filter(function (c) { return c.kind === 'ask'; })[0] ||
+        cards.filter(function (c) { return c.kind === 'busy'; })[0] || cards[0] || null;
+    }
+    // Answer box (right panel): the typed reply goes through the host action live_answer -> POST /api/send.
+    // Drafts and send states are kept per coworker, so a repaint never wipes what the user typed.
+    var replyDrafts = {}, replyStates = {};
+    function replyStateOf(c) { return c ? obj(replyStates[c.id]) : {}; }
+    function isReplyBox(node) { return !!(node && /(^|\s)nt-desk-lv-reply(\s|$)/.test(String(node.className || ''))); }
+    function replyLabel(st) {
+      if (st.state === 'sending') return 'Sending\u2026';
+      if (st.state === 'sent') return 'Sent to the chat';
+      if (st.state === 'error') return 'Could not send: ' + clip(st.error, 120);
+      return '';
+    }
+    function sendReply(c, box, button, status) {
+      if (!c || busyReply(c)) return;
+      var text = str(box.value).trim();
+      if (!text) { replyStates[c.id] = { state: 'error', error: 'Type a reply first' }; status.textContent = replyLabel(replyStates[c.id]); status.className = 'nt-desk-lv-reply-state nt-desk-lv-reply-error'; return; }
+      if (typeof ctx.call !== 'function') return;
+      var id = c.id;
+      replyStates[id] = { state: 'sending' };
+      button.disabled = true;
+      box.disabled = true;
+      status.textContent = replyLabel(replyStates[id]);
+      status.className = 'nt-desk-lv-reply-state nt-desk-lv-reply-sending';
+      var done = function (ok, error) {
+        if (ok) { replyStates[id] = { state: 'sent' }; delete replyDrafts[id]; }
+        else replyStates[id] = { state: 'error', error: error && error.message ? error.message : String(error || 'unknown error') };
+        sigs.reply = null;
+        toast(ok ? 'Reply sent.' : 'Reply not sent: ' + clip(replyStates[id].error, 120), !ok);
+        renderNow();
+      };
+      try {
+        Promise.resolve(ctx.call('live_answer', { worker_id: id, text: text.slice(0, 4000), request_id: 'live-' + Date.now().toString(36) }))
+          .then(function () { done(true); }, function (e) { done(false, e); });
+      } catch (e) { done(false, e); }
+    }
+    function busyReply(c) { return replyStateOf(c).state === 'sending'; }
+    function replySection(s, now) {
+      var c = pickCard(liveCards(s, now)), st = replyStateOf(c);
+      var asked = c && c.answer ? c.answer.title + ': ' + c.answer.text : c ? c.text + (c.task ? ': ' + c.task : '') : 'No coworker selected.';
+      var box = el('textarea', { cls: 'nt-desk-lv-reply', rows: '3', maxlength: '4000', 'aria-label': 'Reply to ' + (c ? c.label : 'coworker'),
+        placeholder: c ? 'Type your answer for ' + c.label : 'Select a coworker to answer', disabled: c && st.state !== 'sending' ? null : 'disabled' });
+      box.value = c ? str(replyDrafts[c.id]) : '';
+      var send = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-btn-main nt-desk-lv-send', type: 'button', disabled: c && st.state !== 'sending' && box.value.trim() ? null : 'disabled' },
+        [icon('reply'), el('span', { text: 'Answer' })]);
+      var status = el('p', { cls: 'nt-desk-lv-reply-state' + (st.state ? ' nt-desk-lv-reply-' + st.state : ''), role: 'status', 'aria-live': 'polite', text: replyLabel(st) });
+      box.addEventListener('input', function () {
+        if (!c) return;
+        replyDrafts[c.id] = box.value;
+        send.disabled = !(box.value.trim() && st.state !== 'sending');
+      });
+      box.addEventListener('keydown', function (event) {
+        if (!event || event.key === 'Escape') return;
+        if (event.stopPropagation) event.stopPropagation();
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { if (event.preventDefault) event.preventDefault(); replyDrafts[c.id] = box.value; sendReply(c, box, send, status); }
+      });
+      send.addEventListener('click', function () { if (c) { replyDrafts[c.id] = box.value; sendReply(c, box, send, status); } });
+      return el('section', { cls: 'nt-desk-lv-question', 'aria-label': 'Question and answer' }, [
+        el('h4', { cls: 'nt-desk-lv-title', text: 'Question' }),
+        el('p', { cls: 'nt-desk-lv-question-text', text: asked }),
+        box,
+        el('div', { cls: 'nt-desk-lv-reply-actions' }, [status, send])]);
+    }
+    function mapSection(s, now) {
+      var mode = liveMode(s), cards = liveCards(s, now), pick = pickCard(cards), main = mainInfo(s);
+      function cardButton(c) {
+        if (c.slot) {
+          return el('div', { cls: 'nt-desk-lv-cw nt-desk-lv-cw-idle nt-desk-lv-cw-slot', title: c.label + ': ' + c.text }, [
+            el('span', { cls: 'nt-desk-lv-cw-top' }, [
+              el('span', { cls: 'nt-desk-lv-cw-dot', 'aria-hidden': 'true' }),
+              el('span', { cls: 'nt-desk-lv-cw-name', text: c.label })]),
+            el('span', { cls: 'nt-desk-lv-cw-state', text: c.text })]);
+        }
+        var on = !!pick && c.id === pick.id;
+        var b = el('button', { cls: 'nt-desk-lv-cw nt-desk-lv-cw-' + c.kind + (on ? ' nt-desk-lv-cw-on' : ''), type: 'button',
+          'aria-pressed': on ? 'true' : 'false', title: c.label + ': ' + c.text }, [
+          el('span', { cls: 'nt-desk-lv-cw-top' }, [
+            el('span', { cls: 'nt-desk-lv-cw-dot', 'aria-hidden': 'true' }),
+            el('span', { cls: 'nt-desk-lv-cw-name', text: c.label }),
+            c.role ? el('span', { cls: 'nt-desk-lv-role', text: c.role }) : null]),
+          el('span', { cls: 'nt-desk-lv-cw-state', text: c.text + (c.kind === 'busy' && c.elapsed ? ' \u00b7 ' + c.elapsed : '') }),
+          c.task ? el('span', { cls: 'nt-desk-lv-cw-task', text: c.task }) : null]);
+        b.addEventListener('click', function () { selected = c.id; sigs.map = null; sigs.focus = null; renderNow(); });
+        return b;
+      }
+      var body = !cards.length ? empty('No coworkers yet.') : mode !== 'roles' ? el('div', { cls: 'nt-desk-lv-row' }, cards.map(cardButton)) :
+        el('div', { cls: 'nt-desk-lv-stages' }, liveStages(cards).map(function (st) {
+          return el('div', { cls: 'nt-desk-lv-stage nt-desk-lv-stage-' + st.id, role: 'group', 'aria-label': st.label }, [
+            el('h3', { cls: 'nt-desk-lv-stage-label', text: st.label }),
+            st.cards.length ? el('div', { cls: 'nt-desk-lv-row' }, st.cards.map(cardButton))
+              : el('p', { cls: 'nt-desk-lv-stage-empty', text: 'No coworker in this stage.' })]);
+        }));
+      return el('section', { cls: 'nt-desk-lv-map', 'aria-label': 'Delegation' }, [
+        el('div', { cls: 'nt-desk-lv-map-head' }, [
+          el('h2', { cls: 'nt-desk-lv-map-title', text: 'Delegation' }),
+          el('span', { cls: 'nt-desk-lv-mode nt-desk-lv-mode-' + mode, text: mode === 'roles' ? 'Mode: Roles' : 'Mode: Direct' })]),
+        el('div', { cls: 'nt-desk-lv-main' + (main.busy ? ' nt-desk-lv-main-busy' : '') }, [
+          el('span', { cls: 'nt-desk-lv-main-icon', 'aria-hidden': 'true' }, [icon('bot')]),
+          el('span', { cls: 'nt-desk-lv-main-text' }, [
+            el('span', { cls: 'nt-desk-lv-main-name', text: main.label }),
+            el('span', { cls: 'nt-desk-lv-main-goal', text: main.goal ? main.goal + (main.step ? ' \u00b7 ' + main.step : '') : 'Waiting for a request' })])]),
+        cards.length ? el('div', { cls: 'nt-desk-lv-link', 'aria-hidden': 'true' }) : null,
+        body]);
+    }
+    function focusSection(s, now) {
+      var c = pickCard(liveCards(s, now));
+      var answer = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-answer', type: 'button', disabled: c && c.answer ? null : 'disabled',
+        title: c && c.answer ? c.answer.title : 'Nothing to resolve right now' }, [icon('reply'), el('span', { text: 'Resolve' })]);
+      var stopButton = el('button', { cls: 'nt-desk-lv-btn nt-desk-lv-stop', type: 'button', disabled: c && c.stop ? null : 'disabled',
+        title: c && c.stop ? c.stop.title : 'Nothing to stop' }, [icon('stop'), el('span', { text: 'Stop' })]);
+      answer.addEventListener('click', function () { if (c && c.answer) ask(c.answer); });
+      stopButton.addEventListener('click', function () { if (c && c.stop) ask(c.stop); });
+      var events = cardEvents(s, c).map(function (e) {
+        e = obj(e);
+        return el('li', { cls: 'nt-desk-lv-event' }, [
+          el('span', { cls: 'nt-desk-lv-event-kind', text: humanKind(e.kind) }),
+          el('span', { cls: 'nt-desk-lv-event-text', text: clip(e.message, 120) }),
+          el('span', { cls: 'nt-desk-lv-time', text: ago(e.ts, now) })]);
+      });
+      return el('section', { cls: 'nt-desk-lv-focus', 'aria-label': 'Selected coworker' }, [
+        el('div', { cls: 'nt-desk-lv-focus-head' }, [
+          el('h3', { cls: 'nt-desk-lv-focus-name', text: c ? c.label : 'No coworker' }),
+          c && c.role ? el('span', { cls: 'nt-desk-lv-role', text: c.role }) : null]),
+        el('p', { cls: 'nt-desk-lv-focus-text', text: c ? c.text + (c.task ? ': ' + c.task : '') : 'No coworkers yet.' }),
+        el('div', { cls: 'nt-desk-lv-focus-actions' }, [answer, stopButton]),
+        el('h4', { cls: 'nt-desk-lv-title', text: 'Live events' }),
+        el('ul', { cls: 'nt-desk-lv-events' }, events.length ? events : [el('li', { cls: 'nt-desk-lv-empty', text: 'No events yet.' })])]);
+    }
+
     function historySection(s, now) {
       var rows = historyRows(s);
       return fold('history', 'History', rows.length, function () {
@@ -850,7 +1107,7 @@
       pillBadge.textContent = count ? String(count) : '';
       pill.className = 'nt-desk-live-pill' + (count ? ' nt-desk-live-pill-alert' : '') + (isOpen || shellShown ? ' nt-desk-live-pill-on' : '');
       pill.setAttribute('aria-label', count ? 'Open Live, ' + count + (count === 1 ? ' problem' : ' problems') : 'Open Live');
-      tabBadge(count);
+      tabBadge(runningCount(state()));
     }
     // Badge count on the Live tab of the v3 shell; every shell API is optional.
     var lastTabBadge = null;
@@ -902,6 +1159,10 @@
       var raw = state(), s = obj(raw), now = Date.now(), tick = Math.floor(now / REFRESH_MS);
       updateConnection(raw, now);
       try {
+        paint('map', sig([s.runs, s.tasks, s.workers, selected, tick]), function () { return mapSection(s, now); });
+        paint('focus', sig([s.runs, s.tasks, s.workers, selected, list(s.events).slice(-EVENT_LIMIT), tick]), function () { return focusSection(s, now); });
+        var rc = pickCard(liveCards(s, now)), rs = replyStateOf(rc);
+        paint('reply', sig([rc && rc.id, rc && rc.label, rc && rc.text, rc && rc.task, rc && rc.answer && rc.answer.title, rs.state, rs.error]), function () { return replySection(s, now); });
         paint('budget', sig([s.token_budget && [s.token_budget.used, s.token_budget.limit, s.token_budget.blocked, s.token_budget.window_start, s.token_budget.burst && [s.token_budget.burst.level, s.token_budget.burst.tokens_15m, s.token_budget.burst.coworker_turns_5m]], s.ai_disable, Math.floor(now / 60000)]),
           function () { return budgetSection(s, now); });
         paint('needs', sig([s.runs, s.tasks, s.stalled, s.stale_context_tasks, list(s.events).slice(-EVENT_LIMIT), connection(raw, now, lastPush).cls, Object.keys(dismissed).length, tick]),
@@ -1016,6 +1277,7 @@
       if (stopped || !node || typeof node.appendChild !== 'function') return null;
       if (isOpen) close();
       attach(node);
+      root.classList.add('nt-desk-lv-page');
       shellShown = true;
       sigs = {};
       renderNow();
@@ -1027,6 +1289,7 @@
       if (!shellShown) return;
       shellShown = false;
       hideConfirm();
+      root.classList.remove('nt-desk-lv-page');
       if (root.parentNode !== panelBody) attach(panelBody);
       if (!isOpen) stopRefresh();
       updatePill();
@@ -1040,7 +1303,9 @@
       if (!fn) return false;
       try {
         var liveView = { id: 'live', label: 'Live', title: 'Live', order: 20,
-          mount: shellMount, unmount: shellUnmount, show: shellMount, hide: shellUnmount };
+          mount: shellMount, unmount: shellUnmount, show: shellMount, hide: shellUnmount,
+          // Rail badge = coworkers running now (shell.js liveBadge counted every attention item: '6').
+          badge: function () { return runningCount(state()); } };
         // shell.js register(tab, view) takes the tab id first; an object-only call registered nothing
         // (the Live tab then showed the 'still loading' placeholder with a dead Open button).
         shellHandle = fn === sh.register ? fn.call(sh, 'live', liveView) : fn.call(sh, liveView);
@@ -1076,9 +1341,24 @@
         return;
       }
       if (event.key === 'Escape') {
-        if (pending) { hideConfirm(); return; }
-        if (isOpen) close();
+        if (pending) { hideConfirm(); if (event.preventDefault) event.preventDefault(); return; }
+        if (isOpen) { close(); return; }
+        if (shellShown && !event.defaultPrevented && (!typingIn(event.target) || isReplyBox(event.target))) {
+          if (!requestBox.hidden) { hideRequest(); if (event.preventDefault) event.preventDefault(); return; }
+          backToChat(event);
+        }
       }
+    }
+    function typingIn(node) {
+      var tag = String(node && node.tagName || '').toUpperCase();
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!(node && node.isContentEditable);
+    }
+    // Esc on the Live page goes back to Chat (the shell's back() did nothing with an empty trail).
+    function backToChat(event) {
+      var sh = window.__ntShell;
+      if (!sh || typeof sh.open !== 'function') return;
+      if (event.preventDefault) event.preventDefault();
+      try { sh.open('chat'); } catch (e) { /* shell is gone */ }
     }
     function onHash() { if (location.hash === HASH) open(); }
     function onVisibility() {

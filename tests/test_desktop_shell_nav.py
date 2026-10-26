@@ -1,4 +1,4 @@
-"""Studio v3 shell: tab bar, router (window.__ntShell), Ctrl+1..4, idempotent mount/stop.
+"""Desktop shell: nav rail, router (window.__ntShell), Ctrl+1..4, Esc goes back, idempotent mount/stop.
 
 Runs notiontool/web/desktop/shell.js (and overlay.js for the Mains heading) in node with a small
 fake DOM shaped like the live Notion sidebar (top row of [role="tab"] items + search button).
@@ -78,6 +78,9 @@ doc.createElement = t => new El(t);
 doc.createTextNode = t => { const n = new El('#text'); n._text = String(t); return n; };
 doc.addEventListener = () => {}; doc.removeEventListener = () => {};
 function mk(tag, attrs, text) { const n = new El(tag); Object.keys(attrs || {}).forEach(k => n.setAttribute(k, attrs[k])); if (text) n._text = text; return n; }
+// An element node as the browser reports it (nodeType 1), optionally with a visible box.
+function node(tag, attrs) { const n = mk(tag, attrs); n.nodeType = 1; return n; }
+function visible(n) { n.getBoundingClientRect = () => ({ left: 0, top: 0, right: 300, bottom: 200, width: 300, height: 200 }); return n; }
 function topRow() {
   const row = mk('div', { class: 'x78zum5' }); const tabs = mk('div');
   ['Home', 'Chat', 'Meetings', 'Posteingang'].forEach(l => tabs.appendChild(mk('div', { role: 'tab', 'aria-label': l,
@@ -115,8 +118,21 @@ function tabInfo() { const bar = q('[data-nt-desk="tabbar"]')[0]; if (!bar) retu
   const U = win.__ntDesk.shellUtil;
   out.keyTab = [U.keyTab({ ctrlKey: true, key: '1' }), U.keyTab({ ctrlKey: true, key: '4' }), U.keyTab({ ctrlKey: true, shiftKey: true, key: '2' }),
     U.keyTab({ key: '2' }), U.keyTab({ ctrlKey: true, code: 'Digit3', key: '#' })];
+  out.keyTabAll = ['1', '2', '3', '4', '5'].map(k => U.keyTab({ ctrlKey: true, key: k }));
   out.liveBadge = [U.liveBadge(state), U.liveBadge(null), U.liveBadge({ connected: false, attention: [1] }), U.liveBadge({ attention: [] })];
   out.badgeText = [U.badgeText(0), U.badgeText(3), U.badgeText(150)];
+  out.tabStep = [U.tabStep('chat', 'ArrowDown'), U.tabStep('settings', 'ArrowRight'), U.tabStep('chat', 'ArrowUp'), U.tabStep('live', 'End')];
+
+  // isBackKey: a plain Escape only
+  out.isBackKey = [U.isBackKey({ key: 'Escape' }), U.isBackKey({ key: 'Escape', ctrlKey: true }), U.isBackKey({ key: 'Escape', shiftKey: true }),
+    U.isBackKey({ key: 'Escape', altKey: true }), U.isBackKey({ key: 'Escape', metaKey: true }), U.isBackKey({ key: 'Escape', defaultPrevented: true }),
+    U.isBackKey({ key: 'Escape', isComposing: true }), U.isBackKey({ key: 'a' }), U.isBackKey({}), U.isBackKey(null)];
+
+  // isTyping: text fields only
+  out.isTyping = [U.isTyping(node('input')), U.isTyping(node('textarea')), U.isTyping(node('select')),
+    U.isTyping(node('div', { contenteditable: 'true' })), U.isTyping(node('div', { contenteditable: '' })),
+    U.isTyping(node('div', { role: 'textbox' })), U.isTyping(node('div', { contenteditable: 'false' })),
+    U.isTyping(node('div')), U.isTyping(node('button')), U.isTyping(null), U.isTyping(mk('input'))];
 
   // pure router
   const log = [];
@@ -130,11 +146,33 @@ function tabInfo() { const bar = q('[data-nt-desk="tabbar"]')[0]; if (!bar) retu
   r.open('notes'); r.open('chat'); out.rBad = r.open('nope'); un(); out.rAfterUnregister = r.badge('live', state);
   out.rLog = log; out.rCurrent = r.current;
 
+  // router history: router.back()
+  const quiet = Object.assign({}, host, { clearView() {}, showView() {}, hideView() {}, showChat() {}, placeholder() {} });
+  const r2 = U.createRouter(quiet);
+  out.back = { empty: [r2.back(), r2.depth, r2.current] };
+  r2.open('live'); r2.open('live'); r2.open('settings');
+  out.back.depth = r2.depth;
+  out.back.unknown = [r2.open('nope'), r2.depth, r2.current];
+  out.back.steps = [r2.back(), r2.current, r2.depth, r2.back(), r2.current, r2.depth, r2.back(), r2.current, r2.depth];
+  r2.open('notes'); r2.open('projects');
+  out.back.notes = [r2.depth, r2.back(), r2.current, r2.back(), r2.current];
+  r2.destroy();
+  out.back.dead = r2.back();
+  const r3 = U.createRouter(quiet);
+  for (let i = 0; i < 30; i++) r3.open(i % 2 ? 'projects' : 'live');
+  out.back.max = r3.depth;
+  let n = 0; while (r3.back() && n < 100) n++;
+  out.back.maxBacks = n;
+
   // mount
   const h = win.__ntDesk.shell(ctx);
-  out.m1 = { bars: q('[data-nt-desk="tabbar"]').length, barBeforeRow: q('[data-nt-desk="tabbar"]')[0].nextSibling === row,
+  const rail1 = q('[data-nt-desk="rail"]');
+  out.m1 = { rails: rail1.length, railOnBody: rail1[0].parentNode === doc.body, railClass: rail1[0].classList.contains('nt-rail'),
+    bars: q('[data-nt-desk="tabbar"]').length, barInRail: q('[data-nt-desk="tabbar"]')[0].parentNode === rail1[0],
+    logo: q('.nt-rail-logo').map(d => d.textContent),
     rowHidden: row.classList.contains('nt-shell-hide'), rowMark: row.getAttribute('data-nt-shell'), tabs: tabInfo(),
-    conn: q('[data-nt-desk="conn"]').map(d => [d.getAttribute('data-level'), d.textContent, d.parentNode === brand]),
+    conn: q('[data-nt-desk="conn"]').map(d => [d.getAttribute('data-level'), d.textContent, d.parentNode === rail1[0], d.getAttribute('aria-label')]),
+    brandDots: q('[data-nt-desk="brand"] [data-nt-desk="conn"]').length,
     brandCls: brand.classList.contains('nt-shell-brand'), on: doc.documentElement.classList.contains('nt-shell-on'),
     api: !!win.__ntShell && win.__ntShell.current, rowKept: row.isConnected };
 
@@ -151,7 +189,10 @@ function tabInfo() { const bar = q('[data-nt-desk="tabbar"]')[0]; if (!bar) retu
   await sleep(200);
   out.live2.tabs = tabInfo();
   out.key3 = key({ ctrlKey: true, key: '3' });
-  out.notes = { current: win.__ntShell.current, calls: Object.assign({}, calls), text: layer().textContent };
+  out.key3State = { current: win.__ntShell.current, calls: Object.assign({}, calls) };
+  win.__ntShell.open('notes');
+  out.notes = { current: win.__ntShell.current, calls: Object.assign({}, calls), text: layer().textContent,
+    active: tabInfo().filter(t => t[3]).map(t => t[0]) };
   out.keyShift = key({ ctrlKey: true, shiftKey: true, key: '2' });
   key({ ctrlKey: true, key: '1' });
   const chatTab = row.querySelector('[aria-label="Chat"]');
@@ -160,14 +201,16 @@ function tabInfo() { const bar = q('[data-nt-desk="tabbar"]')[0]; if (!bar) retu
   q('[data-nt-desk="tabbar"]')[0].children[0].click();
   out.chat2 = { clicks: chatTab.clicks };
   key({ ctrlKey: true, key: '2' });
+  out.projects = { current: win.__ntShell.current, text: layer().textContent };
+  key({ ctrlKey: true, key: '3' });
   out.live3 = { current: win.__ntShell.current, calls: Object.assign({}, calls) };
 
   // idempotent: mount again without stop, and Notion re-renders its row
   const h2 = win.__ntDesk.shell(ctx);
   const row2 = topRow(); wrap.replaceChild(row2, row);
   win.__ntShell.refresh(); await sleep(200);
-  out.m2 = { bars: q('[data-nt-desk="tabbar"]').length, layers: q('[data-nt-desk="shell-layer"]').length, conns: q('[data-nt-desk="conn"]').length,
-    barBeforeRow2: q('[data-nt-desk="tabbar"]')[0].nextSibling === row2, row2Hidden: row2.classList.contains('nt-shell-hide'),
+  out.m2 = { rails: q('[data-nt-desk="rail"]').length, bars: q('[data-nt-desk="tabbar"]').length, layers: q('[data-nt-desk="shell-layer"]').length,
+    conns: q('[data-nt-desk="conn"]').length, row2Hidden: row2.classList.contains('nt-shell-hide'),
     oldRowDetached: !row.isConnected, keyListeners: (winListeners.keydown || []).length,
     carried: tabInfo().filter(t => t[0] === 'live')[0][2], calls: Object.assign({}, calls), current: win.__ntShell.current };
   h.stop();
@@ -176,7 +219,8 @@ function tabInfo() { const bar = q('[data-nt-desk="tabbar"]')[0]; if (!bar) retu
   // stop
   win.__ntShell.open('live');
   h2.stop(); h2.stop();
-  out.stop = { bars: q('[data-nt-desk="tabbar"]').length, layers: q('[data-nt-desk="shell-layer"]').length, conns: q('[data-nt-desk="conn"]').length,
+  out.stop = { rails: q('[data-nt-desk="rail"]').length, bars: q('[data-nt-desk="tabbar"]').length, layers: q('[data-nt-desk="shell-layer"]').length,
+    conns: q('[data-nt-desk="conn"]').length,
     marked: q('[data-nt-shell]').length, hidden: q('.nt-shell-hide').length, api: typeof win.__ntShell,
     html: doc.documentElement.className, brandCls: brand.classList.contains('nt-shell-brand'), keyListeners: (winListeners.keydown || []).length,
     subs: subs.length, calls: Object.assign({}, calls), brandKept: brand.isConnected, rowKept: row2.isConnected,
@@ -185,8 +229,74 @@ function tabInfo() { const bar = q('[data-nt-desk="tabbar"]')[0]; if (!bar) retu
   // offline connection text
   state = null;
   const h3 = win.__ntDesk.shell(ctx);
-  out.offline = q('[data-nt-desk="conn"]').map(d => [d.getAttribute('data-level'), d.textContent]);
+  out.offline = q('[data-nt-desk="conn"]').map(d => [d.getAttribute('data-level'), d.textContent, d.getAttribute('aria-label')]);
   h3.stop();
+
+  // Esc goes straight back to Chat
+  state = { connected: true, attention: [] };
+  const h4 = win.__ntDesk.shell(ctx);
+  const sh = win.__ntShell;
+  const esc = o => key(Object.assign({ key: 'Escape' }, o || {}));
+  const settle = () => { sh.open('live'); sh.open('settings'); };
+  const e = {};
+  settle();
+  e.chain = [esc(), sh.current, esc(), sh.current, esc(), sh.current];
+  // typing keeps Esc
+  settle();
+  const inp = node('input'); doc.body.appendChild(inp);
+  doc.activeElement = inp; e.input = [esc(), sh.current];
+  doc.activeElement = null; e.inputTarget = [esc({ target: inp }), sh.current];
+  doc.activeElement = node('textarea'); e.textarea = [esc(), sh.current];
+  doc.activeElement = node('div', { contenteditable: 'true' }); e.editable = [esc(), sh.current];
+  doc.activeElement = node('div', { role: 'textbox' }); e.textbox = [esc(), sh.current];
+  doc.activeElement = node('button'); e.button = [esc(), sh.current];
+  doc.activeElement = null;
+  settle();
+  // modifiers and already handled keys
+  e.mods = [esc({ ctrlKey: true }), esc({ shiftKey: true }), esc({ altKey: true }), esc({ defaultPrevented: true }), esc({ isComposing: true }), sh.current];
+  // popups: a visible dialog / menu inside Notion's overlay container, or aria-modal anywhere
+  const ov = mk('div', { class: 'notion-overlay-container' }); doc.body.appendChild(ov);
+  const dlg = visible(node('div', { role: 'dialog' })); ov.appendChild(dlg);
+  e.popupDialog = [U.popupOpen(doc), esc(), sh.current];
+  ov.removeChild(dlg);
+  const menu = visible(node('div', { role: 'menu' })); ov.appendChild(menu);
+  e.popupMenu = [U.popupOpen(doc), esc(), sh.current];
+  ov.removeChild(menu);
+  const lb = visible(node('div', { role: 'listbox' })); ov.appendChild(lb);
+  e.popupListbox = [U.popupOpen(doc), esc(), sh.current];
+  ov.removeChild(lb);
+  const hid = visible(node('div', { role: 'dialog', 'aria-hidden': 'true' })); ov.appendChild(hid);
+  e.popupHidden = U.popupOpen(doc);
+  ov.removeChild(hid);
+  const flat = node('div', { role: 'dialog' }); ov.appendChild(flat);
+  e.popupZeroBox = U.popupOpen(doc);
+  ov.removeChild(flat);
+  e.noPopup = [U.popupOpen(doc), esc(), sh.current];
+  settle();
+  const modal = visible(node('div', { 'aria-modal': 'true' })); doc.body.appendChild(modal);
+  e.popupModal = [U.popupOpen(doc), esc(), sh.current];
+  doc.body.removeChild(modal);
+  // menus outside the overlay container, in our rail or in Notion's sidebar never block Esc
+  settle();
+  const loose = visible(node('div', { role: 'menu' })); doc.body.appendChild(loose);
+  e.looseMenu = U.popupOpen(doc);
+  doc.body.removeChild(loose);
+  const railEl = q('[data-nt-desk="rail"]')[0];
+  const inRail = visible(node('div', { role: 'menu' })); railEl.appendChild(inRail);
+  const inRailModal = visible(node('div', { role: 'dialog', 'aria-modal': 'true' })); railEl.appendChild(inRailModal);
+  e.railMenu = [U.popupOpen(doc), esc(), sh.current];
+  railEl.removeChild(inRail); railEl.removeChild(inRailModal);
+  settle();
+  const inSb = visible(node('div', { role: 'listbox' })); sb.appendChild(inSb);
+  e.sidebarMenu = [U.popupOpen(doc), esc(), sh.current];
+  sb.removeChild(inSb);
+  e.noDoc = [U.popupOpen(null), U.popupOpen({})];
+  // api.back and stop
+  settle();
+  e.apiBack = [sh.back(), sh.current];
+  h4.stop();
+  e.afterStop = [esc(), typeof win.__ntShell];
+  out.esc = e;
 
   // Mains heading stays single (overlay.js sidebarUtil)
   const S = win.__ntDesk.sidebarUtil || {};
@@ -227,9 +337,18 @@ class ShellNavTest(unittest.TestCase):
             raise AssertionError(cls.out['error'])
 
     def test_helpers(self):
-        self.assertEqual(self.out['keyTab'], ['chat', 'settings', None, None, 'notes'])
+        # Ctrl+1..4 are the four rail pages; Notes is routable but has no key and no rail item.
+        self.assertEqual(self.out['keyTab'], ['chat', 'settings', None, None, 'live'])
+        self.assertEqual(self.out['keyTabAll'], ['chat', 'projects', 'live', 'settings', None])
         self.assertEqual(self.out['liveBadge'], [3, 0, 0, 0])
         self.assertEqual(self.out['badgeText'], ['', '3', '99+'])
+        self.assertEqual(self.out['tabStep'], ['projects', 'chat', 'settings', 'settings'])
+
+    def test_is_back_key(self):
+        self.assertEqual(self.out['isBackKey'], [True, False, False, False, False, False, False, False, False, False])
+
+    def test_is_typing(self):
+        self.assertEqual(self.out['isTyping'], [True, True, True, True, True, True, False, False, False, False, False])
 
     def test_router(self):
         out = self.out
@@ -241,20 +360,43 @@ class ShellNavTest(unittest.TestCase):
         self.assertEqual(out['rLog'], ['show:live', 'ph:live', 'clear:live', 'mount:live', 'unmount', 'cleanup',
                                        'clear:live', 'show:notes', 'ph:notes', 'clear:notes', 'hide', 'chat'])
 
-    def test_mount_builds_tab_bar_in_place_of_notion_row(self):
+    def test_router_back_and_history(self):
+        back = self.out['back']
+        self.assertEqual(back['empty'], [False, 0, 'chat'])
+        # chat -> live (re-open of live adds nothing) -> settings
+        self.assertEqual(back['depth'], 2)
+        # an unknown page changes nothing
+        self.assertEqual(back['unknown'], [False, 2, 'settings'])
+        self.assertEqual(back['steps'], [True, 'live', 1, True, 'chat', 0, False, 'chat', 0])
+        # Notes is routable and takes part in the history
+        self.assertEqual(back['notes'], [2, True, 'notes', True, 'chat'])
+        self.assertFalse(back['dead'])
+        # the history is capped (20) and back never adds to it
+        self.assertEqual(back['max'], 20)
+        self.assertEqual(back['maxBacks'], 20)
+
+    def test_mount_builds_the_rail(self):
         m1 = self.out['m1']
+        self.assertEqual(m1['rails'], 1)
+        self.assertTrue(m1['railOnBody'])
+        self.assertTrue(m1['railClass'])
         self.assertEqual(m1['bars'], 1)
-        self.assertTrue(m1['barBeforeRow'])
+        self.assertTrue(m1['barInRail'])
+        self.assertEqual(m1['logo'], ['N'])
+        # Notion's own top row stays in the DOM, only hidden
         self.assertTrue(m1['rowHidden'])
         self.assertTrue(m1['rowKept'])
         self.assertEqual(m1['rowMark'], 'toprow')
-        self.assertEqual(m1['tabs'], [['chat', 'Chat', '4', True, True], ['live', 'Live', '3', False, True],
-                                      ['notes', 'Notes', '', False, True], ['settings', 'Settings', '', False, True]])
-        self.assertEqual(m1['conn'], [['on', 'Connected. NotionTool is running.', True]])
+        # rail tabs: chat / projects / live / settings. Notes has no rail item.
+        self.assertEqual(m1['tabs'], [['chat', 'Chats', '4', True, True], ['projects', 'Projects', '', False, True],
+                                      ['live', 'Live', '3', False, True], ['settings', 'Settings', '', False, True]])
+        # the rail footer is the one connection status; nothing in the brand header
+        self.assertEqual(m1['conn'], [['on', 'Online', True, 'Connected. NotionTool is running.']])
+        self.assertEqual(m1['brandDots'], 0)
         self.assertTrue(m1['brandCls'])
         self.assertTrue(m1['on'])
         self.assertEqual(m1['api'], 'chat')
-        self.assertEqual(self.out['offline'], [['wait', 'Connecting to NotionTool...']])
+        self.assertEqual(self.out['offline'], [['wait', 'Connecting', 'Connecting to NotionTool...']])
 
     def test_views_and_tab_switch(self):
         out = self.out
@@ -267,30 +409,36 @@ class ShellNavTest(unittest.TestCase):
         self.assertEqual(out['live2']['text'], 'Live view')
         live_tab = [t for t in out['live2']['tabs'] if t[0] == 'live'][0]
         self.assertEqual(live_tab[2:4], ['5', True])
+        # Ctrl+3 is Live: already open, so it is handled but nothing is mounted again
         self.assertTrue(out['key3'])
+        self.assertEqual(out['key3State'], {'current': 'live', 'calls': {'mount': 1, 'unmount': 0}})
+        # Notes is still routable, but no rail tab is highlighted for it
         self.assertEqual(out['notes']['current'], 'notes')
         self.assertEqual(out['notes']['calls'], {'mount': 1, 'unmount': 1})
         self.assertNotIn('Live view', out['notes']['text'])
+        self.assertEqual(out['notes']['active'], [])
         self.assertFalse(out['keyShift'])
         self.assertEqual(out['chat1'], {'current': 'chat', 'open': False, 'clicks': 0})
         self.assertEqual(out['chat2'], {'clicks': 1})
+        self.assertEqual(out['projects']['current'], 'projects')
+        self.assertIn('projects', out['projects']['text'].lower())
         self.assertEqual(out['live3'], {'current': 'live', 'calls': {'mount': 2, 'unmount': 1}})
 
     def test_idempotent_mount(self):
         m2 = self.out['m2']
-        self.assertEqual((m2['bars'], m2['layers'], m2['conns']), (1, 1, 1))
-        self.assertTrue(m2['barBeforeRow2'])
+        self.assertEqual((m2['rails'], m2['bars'], m2['layers'], m2['conns']), (1, 1, 1, 1))
         self.assertTrue(m2['row2Hidden'])
         self.assertTrue(m2['oldRowDetached'])
         self.assertEqual(m2['keyListeners'], 1)
         self.assertEqual(m2['carried'], '5')
+        # live: mounted, left for Notes, mounted again; the re-mount carries the open Live view over
         self.assertEqual(m2['calls'], {'mount': 3, 'unmount': 2})
         self.assertEqual(m2['current'], 'live')
         self.assertEqual(m2['afterOldStop'], 1)
 
     def test_stop_restores_everything(self):
         s = self.out['stop']
-        self.assertEqual((s['bars'], s['layers'], s['conns'], s['marked'], s['hidden']), (0, 0, 0, 0, 0))
+        self.assertEqual((s['rails'], s['bars'], s['layers'], s['conns'], s['marked'], s['hidden']), (0, 0, 0, 0, 0, 0))
         self.assertEqual(s['api'], 'undefined')
         self.assertNotIn('nt-shell', s['html'])
         self.assertFalse(s['brandCls'])
@@ -299,6 +447,39 @@ class ShellNavTest(unittest.TestCase):
         self.assertTrue(s['brandKept'])
         self.assertTrue(s['rowKept'])
         self.assertFalse(s['keyAfter'])
+
+    def test_esc_goes_back(self):
+        e = self.out['esc']
+        # settings -> straight to chat; on chat Esc stays with Notion
+        self.assertEqual(e['chain'], [True, 'chat', False, 'chat', False, 'chat'])
+        self.assertEqual(e['apiBack'], [True, 'live'])
+        self.assertEqual(e['afterStop'], [False, 'undefined'])
+
+    def test_esc_ignored_while_typing(self):
+        e = self.out['esc']
+        for name in ('input', 'inputTarget', 'textarea', 'editable', 'textbox'):
+            self.assertEqual(e[name], [False, 'settings'], name)
+        # a focused button is not typing
+        self.assertEqual(e['button'], [True, 'chat'])
+
+    def test_esc_needs_a_plain_key(self):
+        self.assertEqual(self.out['esc']['mods'], [False, False, False, False, False, 'settings'])
+
+    def test_esc_closes_popups_first(self):
+        e = self.out['esc']
+        for name in ('popupDialog', 'popupMenu', 'popupListbox', 'popupModal'):
+            self.assertEqual(e[name], [True, False, 'settings'], name)
+        # hidden or zero-size popups do not count
+        self.assertFalse(e['popupHidden'])
+        self.assertFalse(e['popupZeroBox'])
+        self.assertEqual(e['noPopup'], [False, True, 'chat'])
+
+    def test_permanent_menus_do_not_count_as_popups(self):
+        e = self.out['esc']
+        self.assertFalse(e['looseMenu'])
+        self.assertEqual(e['railMenu'], [False, True, 'chat'])
+        self.assertEqual(e['sidebarMenu'], [False, True, 'chat'])
+        self.assertEqual(e['noDoc'], [False, False])
 
     def test_single_mains_heading(self):
         self.assertEqual(self.out['hasEnsure'], 'function')
@@ -328,11 +509,30 @@ class ShellWiringTest(unittest.TestCase):
         self.assertNotIn('.remove()', self.js)
         self.assertNotIn('location.reload', self.js)
 
+    def test_popup_check_is_narrow(self):
+        self.assertIn("OVERLAY_SELECTOR = '.notion-overlay-container'", self.js)
+        self.assertIn("POPUP_IGNORE_SELECTOR = '.nt-rail,.notion-sidebar'", self.js)
+
     def test_css(self):
         self.assertIn('.nt-shell-hide { display: none !important; }', self.css)
         self.assertIn('html.nt-shell-on .nt-desk-composer-empty::after', self.css)
         self.assertIn('html.nt-shell-view-open .nt-shell-layer { display: block; }', self.css)
-        self.assertIn('#7c5cff', self.css)
+        self.assertIn('#8b5cf6', self.css)
+        self.assertNotIn('#7c5cff', self.css)
+        self.assertNotIn('#0b0d12', self.css)
+
+    def test_css_rail(self):
+        self.assertIn('.nt-rail {', self.css)
+        self.assertIn('width: var(--nt-rail-w, 84px);', self.css)
+        self.assertIn('z-index: 95;', self.css)
+        self.assertIn('html.nt-shell-on .notion-app-inner {', self.css)
+        self.assertIn('margin-left: var(--nt-rail-w, 84px);', self.css)
+        self.assertIn('width: calc(100% - var(--nt-rail-w, 84px));', self.css)
+
+    def test_second_status_dot_hidden(self):
+        # The rail footer is the only connection status; the dot extras.js puts in the brand header is hidden.
+        self.assertIn('html.nt-shell-on .nt-shell-brand .nt-desk-brand-dot { display: none !important; }', self.css)
+        self.assertNotIn('.nt-shell-conn', self.css)
 
     def test_line_endings(self):
         for name in ('shell.js', 'shell.css'):

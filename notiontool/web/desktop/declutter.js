@@ -19,6 +19,12 @@
   var CARD_MAX_TEXT = 280;
   var CARD_DEPTH = 5;
   var BUTTON_MAX_TEXT = 60;
+  // Redesign sidebar strip: only 'New chat' and the chat list stay. Own class, because chrome.js
+  // manages nt-desk-hidden inside the sidebar and would put these rows back.
+  var SB_HIDDEN = 'nt-desk-sb-hidden';
+  var SIDEBAR_STRIP_LABELS = ['search or ask', 'suchen oder fragen', 'home', 'startseite', 'customize sidebar',
+    'seitenleiste anpassen', 'hot and fresh features', 'help, contact, more', 'hilfe, kontakt, mehr'];
+  var SIDEBAR_STRIP_CHATS = ['welcome to notion', 'willkommen bei notion'];
 
   // Exact aria-labels (lower case), English and German. Hides the element itself.
   var LABELS = {
@@ -185,7 +191,11 @@
       timer = 0;
       if (stopped) return;
       scan.lastRun = Date.now();
-      if (!enabled()) { release(marked); marked = []; reasons = {}; return; }
+      if (!enabled()) {
+        release(marked); marked = []; reasons = {};
+        all(document, '.' + SB_HIDDEN).forEach(function (n) { n.classList.remove(SB_HIDDEN); });
+        return;
+      }
       reasons = {};
       var keep = [];
       all(document, CLICK_SEL + ',[aria-label]').forEach(function (node) {
@@ -233,6 +243,25 @@
           }
         }
       });
+      // Redesign sidebar strip: Search, Home, Customize sidebar, workspace switcher, help/news icons,
+      // 'Welcome to Notion' and '(expired)' chats. 'New chat' and the live chat list stay.
+      var sbKeep = [];
+      var sb = document.querySelector('.notion-sidebar');
+      if (sb) {
+        all(sb, '[aria-label]').forEach(function (n) {
+          var lab = String(n.getAttribute('aria-label') || '').toLowerCase().replace(/[\u2026.\s]+$/, '');
+          if (SIDEBAR_STRIP_LABELS.indexOf(lab) >= 0) sbKeep.push(n);
+        });
+        all(sb, '.notion-sidebar-switcher').forEach(function (n) { sbKeep.push(n); });
+        all(sb, '[role="treeitem"]').forEach(function (n) {
+          var t = String(n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          if (/\((expired|abgelaufen)\)$/.test(t) || SIDEBAR_STRIP_CHATS.indexOf(t) >= 0) sbKeep.push(n);
+        });
+      }
+      sbKeep = sbKeep.filter(function (n) { return !inside(n, '[data-nt-desk-own]'); });
+      all(document, '.' + SB_HIDDEN).forEach(function (n) { if (sbKeep.indexOf(n) < 0) n.classList.remove(SB_HIDDEN); });
+      sbKeep.forEach(function (n) { if (!n.classList.contains(SB_HIDDEN)) n.classList.add(SB_HIDDEN); });
+      if (sbKeep.length) reasons.sidebar = sbKeep.length;
       // Nodes that no longer match (or left the page) get their class back off.
       var gone = marked.filter(function (node) { return keep.indexOf(node) < 0; });
       if (gone.length) { release(gone); marked = marked.filter(function (node) { return keep.indexOf(node) >= 0; }); }

@@ -107,14 +107,17 @@ class DesktopJsIsolationTest(unittest.TestCase):
         found = hits(LOADERS)
         self.assertEqual(found, [], 'Desktop JS must not open windows, frames or reload/load pages:\n' + '\n'.join(found))
 
-    def test_page_changes_only_open_a_new_welcome_chat(self):
+    def test_page_changes_only_follow_explicit_chat_or_account_actions(self):
         found = []
         for path in desk_files():
             code = code_of(path)
             for match in NAVIGATE.finditer(code):
-                if 'new_welcome_chat' not in code[max(0, match.start() - 400):match.start()]:
+                before = code[max(0, match.start() - 400):match.start()]
+                account_action = (os.path.basename(path) == 'settings.js' and
+                                  re.search(r"call\('account_(?:select|sign_in|sign_out)'", before))
+                if 'new_welcome_chat' not in before and not account_action:
                     found.append('%s:%d' % (os.path.basename(path), line_of(code, match.start())))
-        self.assertEqual(found, [], 'Only the new Welcome chat (a user action) may change the page URL:\n'
+        self.assertEqual(found, [], 'Only explicit chat creation or account actions may change the page URL:\n'
                          + '\n'.join(found))
 
     def test_coworker_chats_open_only_on_a_user_click(self):
@@ -146,7 +149,9 @@ class DesktopJsIsolationTest(unittest.TestCase):
         # robots.txt transport tab and the Notion shell's own tab (once at start). Never the app window.
         # window_login.py: only the signed-out login page, once, right after the sign-in cookies were set.
         # error_page_heal.py: only Notion's own crash page ('Something went wrong ... Refresh'), max 2x after start.
-        own_tabs = {'browser.py', 'edge_transport.py', 'notion_shell.py', 'window_login.py', 'error_page_heal.py'}
+        # Account controls navigate once after the user completes sign-in, never on state updates.
+        own_tabs = {'browser.py', 'edge_transport.py', 'notion_shell.py', 'window_login.py', 'error_page_heal.py',
+                    'account_settings.py'}
         found = []
         for path in sorted(glob.glob(os.path.join(PKG, '*.py'))):
             if os.path.basename(path) in own_tabs:

@@ -159,16 +159,20 @@ def call(name, args):
             flags = subprocess.CREATE_NO_WINDOW
         else:
             cmd, flags = ['sh', '-c', str(args['command'])], 0
-        try:
-            env = {k: v for k, v in os.environ.items() if not k.startswith('_PYI') and k != '_MEIPASS2'}
-            env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'  # started programs get their own, fresh bundle state
-            r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, timeout=timeout, creationflags=flags, env=env)
-        except subprocess.TimeoutExpired as e:
-            out, _ = _cap((e.stdout or b'').decode('utf-8', 'replace'))
-            return {'exit_code': None, 'timed_out': True, 'stdout': out, 'stderr': ''}
-        out, t1 = _cap(r.stdout.decode('utf-8', 'replace'))
-        err, t2 = _cap(r.stderr.decode('utf-8', 'replace'), 20000)
-        return {'exit_code': r.returncode, 'stdout': out, 'stderr': err, 'truncated': t1 or t2, 'cwd': str(cwd)}
+        env = {k: v for k, v in os.environ.items() if not k.startswith('_PYI') and k != '_MEIPASS2'}
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'  # started programs get their own, fresh bundle state
+        p = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags, env=env)
+        # subprocess.run(timeout) waited without a limit for pipes a grandchild kept open after the kill and
+        # dropped the output ({exit_code: null, timed_out: true}, empty). Bounded, output kept (long_calls).
+        from . import long_calls
+        raw_out, raw_err, timed_out = long_calls.communicate(p, timeout, flags, long_calls.output_sink())
+        out, t1 = _cap(raw_out.decode('utf-8', 'replace'))
+        err, t2 = _cap(raw_err.decode('utf-8', 'replace'), 20000)
+        if timed_out:
+            return {'exit_code': None, 'timed_out': True, 'stdout': out, 'stderr': err, 'truncated': t1 or t2,
+                    'cwd': str(cwd), 'error': 'Command timed out after %d s; its process tree was stopped. '
+                                              'stdout/stderr hold the output written until then.' % timeout}
+        return {'exit_code': p.returncode, 'stdout': out, 'stderr': err, 'truncated': t1 or t2, 'cwd': str(cwd)}
     if name == 'nt_read_file':
         p = _path(args['path'])
         data = p.read_bytes()

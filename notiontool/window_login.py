@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 LOGIN_URL = 'https://www.' + 'notion.so/login'
-HOME_URL = 'https://app.' + 'notion.com/'  # Notion moved the app to app.notion.com; token_v2 lives there
+HOME_URL = 'https://app.' + 'notion.com/chat'  # Open chat while automatic Welcome setup prepares the Main.
 NOTION_COOKIE_DOMAINS = ('notion.so', 'notion.com')
 LOGIN_PATHS = ('/login', '/signup', '/desktopwithbrowserlogin', '/logout')
 FLAG = '__ntLoginRequested'

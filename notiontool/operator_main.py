@@ -451,3 +451,34 @@ def delegate(engine, chat_id, goal, tasks, request_id='', now=None, summary='', 
         if hint and settings.get('capacity_hint_warn', False):
             warnings.append(hint)  # off by default: log-only keeps today's warnings; the hint is in 'capacity'
         return _summary(engine, run, warnings=warnings)
+
+
+def switch_chat_id(store, body):
+    """Chat id for POST /api/main/switch/start.
+
+    Order: chat_id, else the Main chat of worker_id / thread_id (the caller's own Notion chat id), else the
+    operator chat, else the only active pool Main. Bug 2026-10-25: without chat_id only the operator chat
+    was tried; with pool Mains only that gave '' and the switch was refused ('Not an active operator Main chat').
+    """
+    body = body if isinstance(body, dict) else {}
+    chat_id = str(body.get('chat_id') or '').strip()
+    if chat_id:
+        return chat_id
+    chats = [c for c in store.all('chats') if c.get('main_worker') and c.get('state') != 'released']
+    worker_id = str(body.get('worker_id') or '').strip()
+    thread_id = str(body.get('thread_id') or '').strip()
+    if worker_id or thread_id:
+        for chat in chats:
+            worker = store.get('workers', chat['main_worker']) or {}
+            if (worker_id and chat['main_worker'] == worker_id) or (thread_id and worker.get('thread_id') == thread_id):
+                return str(chat.get('id') or '')
+        raise ValueError('No active Main chat for %s' % (worker_id or thread_id))
+    chat = operator_chat(store)
+    if chat:
+        return str(chat.get('id') or '')
+    mains = [c for c in chats if (store.get('workers', c['main_worker']) or {}).get('purpose') == 'main']
+    if len(mains) == 1:
+        return str(mains[0].get('id') or '')
+    raise ValueError('Several Main chats are active; pass thread_id (your own Notion chat id) or chat_id: ' + '; '.join(
+        '%s = thread %s (%s)' % (c.get('id'), (store.get('workers', c['main_worker']) or {}).get('thread_id', ''),
+                                 c.get('title') or '') for c in mains))

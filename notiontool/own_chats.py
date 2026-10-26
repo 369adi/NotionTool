@@ -480,6 +480,8 @@ def handle_app_route(server, path, body):
 def private_chats(store, account_id=''):
     """Rows for the desktop 'Chats' section; each carries the settings-button data for promote."""
     rows = []
+    recent={entry.get('thread_id'):entry.get('created',0) for entry in store.all(APP_LEDGER)
+            if entry.get('thread_id') and not entry.get('main')}
     for worker in store.all('workers'):
         if worker.get('purpose') != PRIVATE_PURPOSE or worker.get('state') == 'missing':
             continue
@@ -487,9 +489,21 @@ def private_chats(store, account_id=''):
             continue
         thread = worker.get('thread_id') or ''
         rows.append(dict(worker_id=worker['id'], thread_id=thread, role=PRIVATE_PURPOSE,
+                         created_at=recent.get(thread,0),
                          title=str(worker.get('label') or 'Chat')[:120],
                          settings=dict(promote=dict(route=PROMOTE_ROUTE, body=dict(thread_id=thread, main=True),
                                                     label='Make this a Main'),
                                        rename=dict(route=RENAME_ROUTE, body=dict(thread_id=thread)))))
     rows.sort(key=lambda r: (r['title'].casefold(), r['worker_id']))
+    known={r['thread_id'] for r in rows}
+    for ledger in store.all(APP_LEDGER):
+        if (ledger.get('main') or ledger.get('state') in ('done','failed') or
+                (account_id and ledger.get('account_id') != account_id)):
+            continue
+        if ledger.get('thread_id') in known and ledger.get('thread_id'):
+            continue
+        rows.append(dict(worker_id='', thread_id=ledger.get('thread_id',''), role=PRIVATE_PURPOSE,
+                         title=ledger.get('name') or 'New chat', pending=True, state=ledger.get('state','pending'),
+                         created_at=ledger.get('created',0)))
+    rows.sort(key=lambda r:(not r.get('pending'),-float(r.get('created_at') or 0),r['title'].casefold()))
     return rows

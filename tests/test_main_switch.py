@@ -224,7 +224,7 @@ class AdvanceTests(Base):
         self.assertEqual(ops.acks[0]['new_chat_id'], 'thread-new')
         self.assertEqual(ops.renamed[0], ('thread-new', 'Main'))
         self.assertEqual(ops.renamed[1][0], 'thread-old')
-        self.assertRegex(ops.renamed[1][1], r'^Main \(old, Archive \d{4}-\d{2}-\d{2} \d{2}:\d{2}\)$')
+        self.assertRegex(ops.renamed[1][1], r'^Main \(expired, \d{4}-\d{2}-\d{2} \d{2}:\d{2}\)$')
         self.assertEqual(ops.deleted, [])
         self.assertEqual(ms.advance(self.store, out, ops, now=T0)['state'], 'switched')
         self.assertEqual(len(ops.created), 1)

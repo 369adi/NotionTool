@@ -1,7 +1,9 @@
 """Settings tab view (Studio v3): the save round trip of settings.js with a fake ctx.call."""
 import json
+import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -127,6 +129,94 @@ class SettingsTabRoundTrip(unittest.TestCase):
         self.assertTrue(res['ok'])
 
 
+# Reload persistence: set every control of Models & Roles, Account and Limits through settings.js saveMany,
+# then re-read the schema. Only the fake ctx.call is used, so Sign out and Switch account can never run.
+HARNESS_MANY = HARNESS.split('var reports = [];')[0] + r"""
+L.saveMany(fakeCall, schema(), input.values, function () {}).then(function (res) {
+  var reloaded = {};
+  schema().harness.forEach(function (e) { reloaded[e.key] = e.value; });
+  process.stdout.write(JSON.stringify({ ok: res.ok, error: res.error || null, calls: calls, reloaded: reloaded,
+    accounts: L.accountRows({ accounts: [{ id: 'a1', email: 'main@example.com' }, { id: 'b2', email: 'backup@example.com' }],
+      harness_account_id: 'b2' }) }));
+});
+"""
+
+NEW_VALUES = {
+    'app_default_model': 'sonnet-5.5', 'app_never_use_auto': False, 'app_effort_override': 'high',
+    'app_role_researcher': 'haiku-5.5', 'app_role_architect': 'sonnet-5.5', 'app_role_worker': 'opus-5.5',
+    'app_role_quality_planner': 'haiku-5.5', 'app_direct_model': 'opus-5.5',
+    'coworker_max_age_hours': 18, 'app_send_block_hours': 12, 'app_steps_per_turn': 300, 'per_account': 4,
+    'max_workers': 30, 'app_auto_switch_context': False, 'app_auto_switch_percent': 65,
+    'app_load_last_messages': 9, 'app_restart_safety': False, 'main_context_policy': 'ask',
+}
+
+
+@unittest.skipUnless(NODE, 'node is not installed')
+class SettingsReloadPersistence(unittest.TestCase):
+    def run_many(self, values):
+        entries = ds.settings_schema({})['harness']
+        payload = dict(values=values, state={}, entries=entries, server_keys=list(notion_shell.page_settings_keys()))
+        harness = ROOT / 'tests' / '_settings_many_harness.js'
+        harness.write_text(HARNESS_MANY, encoding='utf-8')
+        try:
+            out = subprocess.run([NODE, str(harness), str(JS), json.dumps(payload)], capture_output=True, text=True,
+                                 timeout=60, check=True)
+        finally:
+            harness.unlink()
+        return json.loads(out.stdout)
+
+    def test_every_new_control_persists_after_a_reload(self):
+        res = self.run_many(NEW_VALUES)
+        self.assertTrue(res['ok'], res['error'])
+        for key, value in NEW_VALUES.items():
+            self.assertEqual(res['reloaded'][key], value, key)
+        names = [call[0] for call in res['calls']]
+        self.assertIn('settings_schema', names)  # the schema was re-read after saving
+        self.assertNotIn('account_sign_out', names)
+        self.assertNotIn('account_select', names)
+
+    def test_app_local_keys_survive_the_real_store(self):
+        from notiontool import desktop_shell
+        res = self.run_many(NEW_VALUES)
+        app_values = {}
+        for action, args in res['calls']:
+            if action == 'app_settings_set':
+                app_values.update(args['values'])
+        self.assertEqual(set(app_values), {k for k in NEW_VALUES if k.startswith('app_')})
+        with tempfile.TemporaryDirectory() as tmp:
+            desktop_shell.save_app_settings(app_values, tmp)
+            loaded = desktop_shell.load_app_settings(tmp)  # a fresh read, like a reload
+            schema = {e['key']: e for e in ds.settings_schema(loaded)['harness']}
+        for key in app_values:
+            self.assertEqual(schema[key]['value'], NEW_VALUES[key], key)
+
+    def test_server_keys_use_the_settings_route(self):
+        res = self.run_many(NEW_VALUES)
+        server = {}
+        for action, args in res['calls']:
+            if action == 'settings_set':
+                server.update(args['values'])
+        for key in ('per_account', 'max_workers', 'coworker_max_age_hours', 'main_context_policy'):
+            self.assertEqual(server.get(key), NEW_VALUES[key], key)
+
+    def test_account_rows_mark_the_active_account(self):
+        res = self.run_many({'app_compact': True})
+        rows = res['accounts']
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([bool(r.get('active')) for r in rows], [False, True])
+
+    def test_menu_order_signout_and_no_mode_badge(self):
+        js = JS.read_text(encoding='utf-8')
+        block = js.split('var TAB_SECTIONS', 1)[1].split('];', 1)[0]
+        labels = re.findall(r"label: '([^']+)'", block)
+        self.assertEqual(labels, ['Account', 'Models & Roles', 'Limits', 'Projects', 'Tools & MCP', 'Appearance', 'Shortcuts'])
+        self.assertIn('Sign out', js)
+        self.assertIn('account_sign_out', js)
+        self.assertIn('account_select', js)
+        self.assertNotIn('Mode: Roles', js)
+        self.assertNotIn('auto', ds.MODEL_OPTIONS)
+
+
 class SettingsTabKeys(unittest.TestCase):
     def test_default_coworker_count_is_five_everywhere(self):
         # owner rule 2026-10-22: new accounts get at most 5 Coworkers by default
@@ -159,8 +249,8 @@ class SettingsTabKeys(unittest.TestCase):
     def test_view_contract(self):
         js = JS.read_text(encoding='utf-8')
         for needle in ('window.__ntDesk.settingsTab', 'window.__ntShell', 'registerTab', "'nt-desk-shell-ready'",
-                       "'Saving...'", "'Applied'", "call('settings_schema', {})", "'Team'", "'Models & effort'",
-                       "'App look'", "'Notifications'", 'tab.shortcut()', "'data-nt-desk'"):
+                       "'Saving...'", "'Applied'", "call('settings_schema', {})", "'Account'", "'Models & Roles'",
+                       "'Limits'", "'Projects'", "'Tools & MCP'", "'Appearance'", "'Shortcuts'", 'tab.shortcut()', "'data-nt-desk'"):
             self.assertIn(needle, js)
         self.assertNotIn('\\r\\n', js)
         self.assertNotIn('removeChild', js)

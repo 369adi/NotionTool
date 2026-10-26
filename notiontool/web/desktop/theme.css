@@ -2,86 +2,124 @@
  * Notion surfaces. Every restyle rule is scoped to html.nt-theme (added by theme.js) and is off
  * when the kill switch class nt-desk-off is set. Notion nodes are only restyled, never removed. */
 :root {
-  --nt-bg: #0b0d12;
-  --nt-surface: #12151d;
-  --nt-raised: #181c26;
-  --nt-border: rgba(255, 255, 255, .07);
-  --nt-border-strong: rgba(255, 255, 255, .12);
-  --nt-text: #e8eaf0;
-  --nt-muted: #8a90a2;
-  --nt-accent-from: #7c5cff;
-  --nt-accent-to: #22d3ee;
-  --nt-accent: #7c5cff;
-  --nt-accent-gradient: linear-gradient(135deg, #7c5cff 0%, #22d3ee 100%);
-  --nt-accent-soft: rgba(124, 92, 255, .16);
+  /* ---- Design tokens (redesign P1). One source of truth: Chat, Projects, Live and Settings reuse them. ---- */
+  /* Surfaces */
+  --nt-bg: #09090b;
+  --nt-surface-1: #0f0f13;           /* rail, sidebar, inputs */
+  --nt-surface-2: #16161d;           /* cards, tooltips, menus */
+  --nt-surface-3: #1e1e27;           /* hover fill */
+  --nt-press: #26262f;               /* pressed fill, disabled background */
+  --nt-border: #26262f;              /* every 1px line */
+  --nt-border-strong: #34343f;       /* inputs, secondary buttons */
+  /* Text */
+  --nt-text: #f4f4f5;
+  --nt-text-2: #a1a1aa;              /* secondary text, idle icons */
+  --nt-text-3: #8a8a94;              /* meta text, at least 12px */
+  --nt-placeholder: #71717a;         /* placeholder, disabled text */
+  /* Accent */
+  --nt-accent: #8b5cf6;              /* primary button, focus border */
+  --nt-accent-hover: #9d74f8;
+  --nt-accent-press: #7c4deb;
+  --nt-accent-2: #22d3ee;            /* end of the gradient only */
+  --nt-accent-soft: rgba(139, 92, 246, .14);
+  --nt-gradient: linear-gradient(135deg, #8b5cf6, #22d3ee);  /* active indicator and logo mark only */
+  --nt-focus: #a78bfa;
+  /* Status */
   --nt-success: #22c55e;
   --nt-warning: #f59e0b;
+  --nt-unread: #3b82f6;
   --nt-danger: #ef4444;
-  --nt-radius: 12px;
-  --nt-radius-sm: 8px;
+  --nt-danger-text: #f87171;
+  /* Aurora: app background only, no animation */
+  --nt-aurora: radial-gradient(900px 600px at 0 0, rgba(139, 92, 246, .10), transparent 60%),
+    radial-gradient(800px 600px at 100% 100%, rgba(34, 211, 238, .06), transparent 60%), #09090b;
+  /* Shape, spacing (4px grid), motion, layout */
+  --nt-radius-chip: 6px;
+  --nt-radius-sm: 8px;               /* buttons, rows, inputs */
+  --nt-radius: 12px;                 /* cards, panels */
+  --nt-radius-pill: 999px;
+  --nt-space-1: 4px;
+  --nt-space-2: 8px;
+  --nt-space-3: 12px;
+  --nt-space-4: 16px;
+  --nt-space-5: 24px;
+  --nt-space-6: 32px;
+  --nt-space-7: 48px;
+  --nt-motion: 120ms ease;
+  --nt-blur: 12px;                   /* top bar only */
+  --nt-rail-w: 84px;                 /* nav rail, visible on every page */
+  --nt-sidebar-w: 300px;
+  --nt-chat-w: 860px;                /* chat column: messages and composer */
+  --nt-chat-font: 17px;              /* chat message text */
   --nt-font: Inter, "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
   --nt-shadow: 0 8px 28px rgba(0, 0, 0, .45), 0 0 0 1px rgba(255, 255, 255, .04);
-  --nt-shadow-glow: 0 0 0 1px rgba(124, 92, 255, .35), 0 6px 24px rgba(124, 92, 255, .22), 0 0 32px rgba(34, 211, 238, .10);
-  --nt-ring: 0 0 0 2px rgba(124, 92, 255, .55), 0 0 18px rgba(34, 211, 238, .25);
-  --nt-glass: rgba(18, 21, 29, .72);
+  --nt-ring: 0 0 0 2px rgba(167, 139, 250, .6);
+  --nt-font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   --nt-hover: rgba(255, 255, 255, .05);
-  --nt-active: rgba(124, 92, 255, .14);
-  --nt-transition: 150ms ease;
-  /* Aliases used by individual parts; they all follow the tokens above. */
-  --nt-accent-1: var(--nt-accent-from);
-  --nt-accent-2: var(--nt-accent-to);
-  --nt-accent-start: var(--nt-accent-from);
-  --nt-accent-end: var(--nt-accent-to);
+  /* Legacy names: parts that are not migrated yet (studio, live, settings, notes, overlay) still read these.
+   * They only point at the tokens above; do not use them in new code. */
+  --nt-surface: var(--nt-surface-1);
+  --nt-raised: var(--nt-surface-2);
+  --nt-muted: var(--nt-text-3);
+  --nt-accent-from: var(--nt-accent);
+  --nt-accent-to: var(--nt-accent-2);
+  --nt-accent-gradient: var(--nt-gradient);
+  --nt-accent-1: var(--nt-accent);
+  --nt-accent-start: var(--nt-accent);
+  --nt-accent-end: var(--nt-accent-2);
+  --nt-accent-glow: rgba(139, 92, 246, .18);
   --nt-fg: var(--nt-text);
   --nt-line: var(--nt-border);
-  /* Round 3: premium surfaces. */
-  --nt-sidebar: #10131b;
-  --nt-sidebar-border: rgba(255, 255, 255, .06);
-  --nt-glow-a: rgba(124, 92, 255, .13);
-  --nt-glow-b: rgba(34, 211, 238, .08);
-  --nt-bg-glow: radial-gradient(1100px 700px at 0% 0%, var(--nt-glow-a), transparent 62%),
-    radial-gradient(1000px 680px at 100% 100%, var(--nt-glow-b), transparent 60%), var(--nt-bg);
+  --nt-glass: rgba(15, 15, 19, .72);
+  --nt-active: var(--nt-accent-soft);
+  --nt-transition: var(--nt-motion);
+  --nt-shadow-glow: 0 0 0 1px rgba(139, 92, 246, .35), 0 6px 24px rgba(0, 0, 0, .4);
+  --nt-sidebar: var(--nt-surface-1);
+  --nt-sidebar-border: var(--nt-border);
+  --nt-bg-glow: var(--nt-aurora);
 }
 
 /* ---- Notion's own color variables (live DOM: getComputedStyle(document.body), dark theme) ----
  * Overriding them recolors every Notion surface that uses them, so no per-node rules are needed.
  * Set on body and .notion-dark-theme because Notion defines them there (body.notion-dark-theme). */
+html.nt-theme:not(.nt-desk-off),
 html.nt-theme:not(.nt-desk-off) body,
-html.nt-theme:not(.nt-desk-off) .notion-dark-theme {
-  --c-bacPri: #0b0d12;                       /* was #191919: main area, .layout-chat, cursor listener */
-  --ca-bacPriTra: rgba(11, 13, 18, 0);       /* was rgba(25,25,25,0): fades to the main area */
-  --c-bacSec: #10131b;                       /* was #202020 */
-  --c-bacEle: #181c26;                       /* was #202020: raised elements */
-  --c-bacTer: #252b3a;                       /* was #383836 */
-  --c-bacInt: #1a1f2b;                       /* was #262626 */
-  --c-bacAccPri: #1f2433;                    /* was #2c2c2b */
-  --ca-bacSecTra: rgba(124, 92, 255, .05);   /* was rgba(252,252,252,.03) */
-  --ca-bacIntTra: rgba(124, 92, 255, .12);   /* was rgba(255,255,255,.055): inline code background */
-  --c-popBac: #181c26;                       /* was #252525: menus and popovers */
-  --ca-popWaxPapBac: rgba(16, 19, 27, .92);  /* was rgba(32,32,32,.9) */
-  --ca-modUndBac: rgba(5, 6, 10, .78);       /* was rgba(15,15,15,.8) */
-  --c-borPri: #262b38;                       /* was #383836 */
-  --c-borSec: #1c2130;                       /* was #2c2c2b */
+html.nt-theme:not(.nt-desk-off) .notion-dark-theme,
+html.nt-theme:not(.nt-desk-off) .notion-light-theme {
+  --c-bacPri: #09090b;                       /* was #191919: main area, .layout-chat, cursor listener */
+  --ca-bacPriTra: rgba(9, 9, 11, 0);         /* was rgba(25,25,25,0): fades to the main area */
+  --c-bacSec: #0f0f13;                       /* was #202020 */
+  --c-bacEle: #16161d;                       /* was #202020: raised elements */
+  --c-bacTer: #26262f;                       /* was #383836 */
+  --c-bacInt: #16161d;                       /* was #262626 */
+  --c-bacAccPri: #1e1e27;                    /* was #2c2c2b */
+  --ca-bacSecTra: rgba(139, 92, 246, .05);   /* was rgba(252,252,252,.03) */
+  --ca-bacIntTra: rgba(139, 92, 246, .12);   /* was rgba(255,255,255,.055): inline code background */
+  --c-popBac: #16161d;                       /* was #252525: menus and popovers */
+  --ca-popWaxPapBac: rgba(22, 22, 29, .96);  /* was rgba(32,32,32,.9) */
+  --ca-modUndBac: rgba(5, 5, 7, .78);        /* was rgba(15,15,15,.8) */
+  --c-borPri: #26262f;                       /* was #383836 */
+  --c-borSec: #1e1e27;                       /* was #2c2c2b */
   --ca-borPriTra: rgba(255, 255, 255, .08);  /* was rgba(255,255,235,.1) */
   --ca-borSecTra: rgba(255, 255, 255, .06);  /* was rgba(255,255,243,.082) */
-  --c-texPri: #eef0f6;                       /* was #f0efed: cooler, high contrast */
-  --c-texSec: #a9afc2;                       /* was #ada9a3 */
-  --c-texTer: #8c93a8;                       /* was #7d7a75: readable secondary text */
-  --ca-sidIteSelBac: rgba(124, 92, 255, .18);/* was rgba(255,255,255,.055): selected sidebar item */
+  --c-texPri: #f4f4f5;                       /* was #f0efed: high contrast */
+  --c-texSec: #a1a1aa;                       /* was #ada9a3 */
+  --c-texTer: #8a8a94;                       /* was #7d7a75: readable secondary text */
+  --ca-sidIteSelBac: rgba(139, 92, 246, .18);/* was rgba(255,255,255,.055): selected sidebar item */
   --ca-sidSecBac: transparent;               /* was rgba(0,0,0,.024) */
-  --ca-butHovBac: rgba(124, 92, 255, .12);   /* was rgba(255,255,255,.055) */
-  --ca-outButHovBac: rgba(124, 92, 255, .12);/* was rgba(255,255,255,.055) */
-  --ca-ligGraButHovBac: rgba(124, 92, 255, .12); /* was rgba(255,255,255,.055) */
-  --ca-tabRowHovBac: rgba(124, 92, 255, .07);/* was rgba(255,255,255,.055) */
-  --c-whiButBac: #181c26;                    /* was #252525 */
-  --c-whiButHovBac: #232838;                 /* was #2f2f2f */
-  --c-butGroBac: #232838;                    /* was #2f2f2f */
-  --cl-hovDisBac: #181c26;                   /* was #202020 */
-  --c-hovMarDisBac: #181c26;                 /* was #202020 */
-  --c-selMarDisBac: #1f2433;                 /* was #252525 */
-  --cd-codBloBac: rgba(124, 92, 255, .06);   /* was rgba(255,255,255,.03): code blocks */
-  --c-timBac: #0b0d12;                       /* was #191919 */
-  --c-peeTimBac: #10131b;                    /* was #202020 */
+  --ca-butHovBac: rgba(139, 92, 246, .12);   /* was rgba(255,255,255,.055) */
+  --ca-outButHovBac: rgba(139, 92, 246, .12);/* was rgba(255,255,255,.055) */
+  --ca-ligGraButHovBac: rgba(139, 92, 246, .12); /* was rgba(255,255,255,.055) */
+  --ca-tabRowHovBac: rgba(139, 92, 246, .07);/* was rgba(255,255,255,.055) */
+  --c-whiButBac: #16161d;                    /* was #252525 */
+  --c-whiButHovBac: #1e1e27;                 /* was #2f2f2f */
+  --c-butGroBac: #1e1e27;                    /* was #2f2f2f */
+  --cl-hovDisBac: #16161d;                   /* was #202020 */
+  --c-hovMarDisBac: #16161d;                 /* was #202020 */
+  --c-selMarDisBac: #1e1e27;                 /* was #252525 */
+  --cd-codBloBac: rgba(139, 92, 246, .06);   /* was rgba(255,255,255,.03): code blocks */
+  --c-timBac: #09090b;                       /* was #191919 */
+  --c-peeTimBac: #0f0f13;                    /* was #202020 */
 }
 
 /* ---- app background and base text ---------------------------------------------------- */
@@ -129,6 +167,9 @@ html.nt-theme:not(.nt-desk-off) .notion-sidebar [aria-current="page"] {
   box-shadow: inset 2px 0 0 var(--nt-accent);
 }
 
+/* Sidebar width stays Notion's own: forcing the container width (commit 3268293) collapsed the
+ * chat rows to width 0, so no chats were visible. Never force .notion-sidebar-container width. */
+
 /* ---- main content, top bar, panels ----------------------------------------------------- */
 html.nt-theme:not(.nt-desk-off) .notion-cursor-listener,
 html.nt-theme:not(.nt-desk-off) .layout-chat,
@@ -142,19 +183,13 @@ html.nt-theme:not(.nt-desk-off) .notion-scroller {
 /* Inner sidebars keep the sidebar surface even though the frame above is transparent. */
 html.nt-theme:not(.nt-desk-off) .notion-sidebar-container .notion-scroller { background: transparent !important; }
 
-/* ---- chat: user message bubbles on the raised surface ---------------------------------- */
-html.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] > div > div > div > div[style*="min-height: 40px"] {
-  background: var(--nt-raised) !important;
-  border: 1px solid var(--nt-border) !important;
-  border-radius: var(--nt-radius) !important;
-  box-shadow: 0 4px 18px rgba(0, 0, 0, .35), inset 0 1px 0 rgba(255, 255, 255, .03);
-}
+/* The user message bubble is styled once, in section (5) below. */
 html.nt-theme:not(.nt-desk-off) .notion-topbar,
 html.nt-theme:not(.nt-desk-off) .notion-topbar-container,
 html.nt-theme:not(.nt-desk-off) header[role="banner"] {
-  background: rgba(11, 13, 18, .35) !important;
-  -webkit-backdrop-filter: blur(16px) saturate(140%);
-  backdrop-filter: blur(16px) saturate(140%);
+  background: rgba(9, 9, 11, .55) !important;
+  -webkit-backdrop-filter: blur(var(--nt-blur));
+  backdrop-filter: blur(var(--nt-blur));
   border-bottom: 1px solid var(--nt-border) !important;
   box-shadow: none !important;
 }
@@ -268,35 +303,35 @@ html.nt-theme:not(.nt-desk-off) a:not([role]) { color: var(--nt-accent-to); }
  * inside .notion-inline-code-container (Notion colors it red via inline style). */
 html.nt-theme:not(.nt-desk-off) a.notion-link-token {
   color: #a996ff !important;
-  text-decoration-color: rgba(124, 92, 255, .55) !important;
+  text-decoration-color: rgba(139, 92, 246, .55) !important;
 }
 html.nt-theme:not(.nt-desk-off) a.notion-link-token:hover { color: var(--nt-accent-to) !important; }
 html.nt-theme:not(.nt-desk-off) .notion-inline-code-container > span {
   color: #7ee8fa !important;
-  background: rgba(124, 92, 255, .14) !important;
-  border: 1px solid rgba(124, 92, 255, .22);
+  background: rgba(139, 92, 246, .14) !important;
+  border: 1px solid rgba(139, 92, 246, .22);
   border-radius: 5px !important;
 }
 
 /* ---- scrollbars: thin, rounded ---------------------------------------------------------- */
 html.nt-theme:not(.nt-desk-off) * {
   scrollbar-width: thin;
-  scrollbar-color: #262b38 transparent;
+  scrollbar-color: #26262f transparent;
 }
 html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar { width: 8px; height: 8px; background: transparent; }
 html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-track { background: transparent; }
 html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-thumb {
-  background: #262b38;
+  background: #26262f;
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
-html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-thumb:hover { background-color: rgba(124, 92, 255, .55); }
+html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-thumb:hover { background-color: rgba(139, 92, 246, .55); }
 html.nt-theme:not(.nt-desk-off) ::-webkit-scrollbar-corner { background: transparent; }
 
 /* ---- selection --------------------------------------------------------------------------- */
 html.nt-theme:not(.nt-desk-off) ::selection {
-  background: rgba(124, 92, 255, .45);
+  background: rgba(139, 92, 246, .45);
   color: #ffffff;
 }
 
@@ -323,18 +358,18 @@ html.nt-theme:not(.nt-desk-off) .nt-desk-toast-success { border-color: rgba(34, 
  * ===================================================================================== */
 html.nt-theme:not(.nt-desk-off) body,
 html.nt-theme:not(.nt-desk-off) .notion-dark-theme {
-  --c-graBacPri: #161a24;                    /* was #202020: gray tags and grey fills */
-  --c-graBacSec: #232838;                    /* was #383836 */
-  --c-graBacTer: #343b4f;                    /* was #5f5e59 */
-  --ca-graBacSecTra: rgba(124, 92, 255, .10);/* was rgba(255,255,235,.1) */
-  --ca-graBacTerTra: rgba(124, 92, 255, .22);/* was rgba(255,252,235,.306) */
-  --c-graBorPri: #262b38;                    /* was #383836 */
-  --c-sidSecCol: #8a90a2;                    /* was #9b9b9b: sidebar section labels */
-  --ca-oveSmo: rgba(5, 6, 10, .78);          /* was rgba(15,15,15,.8) */
-  --ca-popOveBac: rgba(5, 6, 10, .6);        /* was rgba(15,15,15,.6) */
-  --ca-tokInpMenIteBac: rgba(124, 92, 255, .08); /* was rgba(255,255,255,.03) */
-  --c-shaCol: #05060a;                       /* was #0f0f0f */
-  --c-focSha: rgba(124, 92, 255, .6) 0px 0px 0px 1px inset, rgba(34, 211, 238, .35) 0px 0px 0px 2px; /* was blue */
+  --c-graBacPri: #16161d;                    /* was #202020: gray tags and grey fills */
+  --c-graBacSec: #1e1e27;                    /* was #383836 */
+  --c-graBacTer: #34343f;                    /* was #5f5e59 */
+  --ca-graBacSecTra: rgba(139, 92, 246, .10);/* was rgba(255,255,235,.1) */
+  --ca-graBacTerTra: rgba(139, 92, 246, .22);/* was rgba(255,252,235,.306) */
+  --c-graBorPri: #26262f;                    /* was #383836 */
+  --c-sidSecCol: #8a8a94;                    /* was #9b9b9b: sidebar section labels */
+  --ca-oveSmo: rgba(5, 5, 7, .78);           /* was rgba(15,15,15,.8) */
+  --ca-popOveBac: rgba(5, 5, 7, .6);         /* was rgba(15,15,15,.6) */
+  --ca-tokInpMenIteBac: rgba(139, 92, 246, .08); /* was rgba(255,255,255,.03) */
+  --c-shaCol: #050507;                       /* was #0f0f0f */
+  --c-focSha: rgba(139, 92, 246, .6) 0px 0px 0px 1px inset, rgba(34, 211, 238, .35) 0px 0px 0px 2px; /* was blue */
   --c-shaSMThiOut: 0 0 0 1px rgba(255, 255, 255, .07), 0px 4px 12px -2px rgba(0, 0, 0, .4);  /* was #383836 ring */
   --c-shaMDThiOut: 0 0 0 1px rgba(255, 255, 255, .07), 0px 14px 28px -6px rgba(0, 0, 0, .5), 0px 2px 4px -1px rgba(0, 0, 0, .3);
   --c-shaMDPriOut: inset 0 0 0 1px rgba(255, 255, 255, .07), 0px 14px 28px -6px rgba(0, 0, 0, .5), 0px 2px 4px -1px rgba(0, 0, 0, .3);
@@ -345,7 +380,7 @@ html.nt-theme:not(.nt-desk-off) .notion-dark-theme {
   --c-shaOutScr: 0px 0px 0px 1px rgba(255, 255, 255, .07), 0px 24px 48px 0px rgba(0, 0, 0, .64), 0px 4px 12px 0px rgba(0, 0, 0, .56);
 }
 
-/* ---- (1) typography: Inter / Segoe UI Variable, tight bold headings, gradient titles --- */
+/* ---- (1) typography: Inter / Segoe UI Variable, tight bold headings, solid titles --- */
 html.nt-theme:not(.nt-desk-off) .layout-content h1,
 html.nt-theme:not(.nt-desk-off) .layout-content h2,
 html.nt-theme:not(.nt-desk-off) .layout-content h3,
@@ -362,72 +397,47 @@ html.nt-theme:not(.nt-desk-off) .layout-content b { font-weight: 650; }
 html.nt-theme:not(.nt-desk-off) .notion-page-block h1,
 html.nt-theme:not(.nt-desk-off) .notion-frame h1[contenteditable],
 html.nt-theme:not(.nt-desk-off) .nt-desk-chat-title > div {
-  background: var(--nt-accent-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  caret-color: var(--nt-accent-to);
-  font-weight: 750 !important;
-  letter-spacing: -0.025em;
+  color: var(--nt-text);
+  caret-color: var(--nt-accent);
+  font-weight: 700 !important;
+  letter-spacing: -0.02em;
 }
-html.nt-theme:not(.nt-desk-off) .nt-desk-chat-title > div { font-weight: 650 !important; letter-spacing: -0.01em; }
+html.nt-theme:not(.nt-desk-off) .nt-desk-chat-title > div { font-weight: 600 !important; letter-spacing: -0.01em; }
 
-/* ---- (2) glass: top bar, popovers/menus (incl. the effort menu), composer -------------- */
+/* ---- (2) surfaces: top bar (the only blurred element), popovers/menus (incl. the effort menu), composer ---- */
 html.nt-theme:not(.nt-desk-off) .layout-content > .autolayout-col > div:first-child {
-  background: rgba(11, 13, 18, .55) !important;
-  -webkit-backdrop-filter: blur(16px) saturate(140%);
-  backdrop-filter: blur(16px) saturate(140%);
-  border-bottom: 1px solid rgba(255, 255, 255, .07);
+  background: rgba(9, 9, 11, .55) !important;
+  -webkit-backdrop-filter: blur(var(--nt-blur));
+  backdrop-filter: blur(var(--nt-blur));
+  border-bottom: 1px solid var(--nt-border);
 }
 html.nt-theme:not(.nt-desk-off) .notion-overlay [role="menu"],
 html.nt-theme:not(.nt-desk-off) .notion-overlay [role="listbox"],
 html.nt-theme:not(.nt-desk-off) .notion-overlay [role="dialog"],
 html.nt-theme:not(.nt-desk-off) .notion-overlay [role="tooltip"] {
-  background: rgba(24, 28, 38, .86) !important;
-  -webkit-backdrop-filter: blur(16px) saturate(140%);
-  backdrop-filter: blur(16px) saturate(140%);
-  border: 1px solid rgba(255, 255, 255, .07) !important;
+  background: var(--nt-surface-2) !important;
+  border: 1px solid var(--nt-border) !important;
 }
 html.nt-theme:not(.nt-desk-off) .notion-overlay [role="tooltip"] {
-  background: rgba(24, 28, 38, .94) !important;
+  background: var(--nt-surface-2) !important;
   color: var(--nt-text) !important;
   font-weight: 500;
 }
-/* Composer: [data-notion-chat-input-container] (live DOM [424,698,1166,800]) with an animated glow. */
+/* Composer: [data-notion-chat-input-container], a calm surface with a focus ring (no glow, no animation). */
 html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] {
   position: relative;
-  isolation: isolate;
-}
-html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container]::before {
-  content: '';
-  position: absolute;
-  inset: 4px 16px 2px 16px;              /* stays inside the composer box: no bleed */
-  z-index: -1;
-  border-radius: 22px;
-  background: linear-gradient(120deg, rgba(124, 92, 255, .32), rgba(34, 211, 238, .22), rgba(124, 92, 255, .32));
-  background-size: 220% 220%;
-  filter: blur(14px);
-  opacity: .35;
-  pointer-events: none;
-  animation: nt-desk-composer-glow 9s ease-in-out infinite;
 }
 html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] > div {
-  background: rgba(18, 21, 29, .72) !important;
-  -webkit-backdrop-filter: blur(16px) saturate(140%);
-  backdrop-filter: blur(16px) saturate(140%);
-  border: 1px solid rgba(255, 255, 255, .07);
+  background: var(--nt-surface-1) !important;
+  border: 1px solid var(--nt-border-strong);
   border-radius: 16px;
   transition: box-shadow var(--nt-transition), border-color var(--nt-transition);
 }
 html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] > div:focus-within {
-  border-color: rgba(124, 92, 255, .45);
+  border-color: rgba(139, 92, 246, .45);
   box-shadow: var(--nt-shadow-glow);
 }
 html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container] [role="textbox"] { background: transparent !important; }
-@keyframes nt-desk-composer-glow {
-  0%, 100% { background-position: 0% 50%; opacity: .25; }
-  50% { background-position: 100% 50%; opacity: .4; }
-}
 
 /* ---- (3) rebrand: breadcrumb 'Notion AI' -> 'NotionTool', workspace switcher chip ------ */
 /* theme.js marks the breadcrumb button (.nt-desk-crumb-host) and its text (.nt-desk-crumb-src);
@@ -443,12 +453,9 @@ html.nt-theme:not(.nt-desk-off) .nt-desk-crumb-src {
 }
 html.nt-theme:not(.nt-desk-off) .nt-desk-crumb-host::after {
   content: 'NotionTool';
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: -0.015em;
-  background: var(--nt-accent-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--nt-text);
 }
 html.nt-theme:not(.nt-desk-off) .notion-sidebar-switcher {
   margin: 4px 10px !important;
@@ -462,13 +469,13 @@ html.nt-theme:not(.nt-desk-off) .notion-sidebar-switcher {
   transition: border-color var(--nt-transition), box-shadow var(--nt-transition);
 }
 html.nt-theme:not(.nt-desk-off) .notion-sidebar-switcher:hover {
-  border-color: rgba(124, 92, 255, .45);
-  box-shadow: 0 0 0 1px rgba(124, 92, 255, .2);
+  border-color: rgba(139, 92, 246, .45);
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, .2);
 }
 
 /* ---- (4) focus rings, hover lift on cards and rows ---------------------------------------- */
 html.nt-theme:not(.nt-desk-off) :focus-visible {
-  outline: 2px solid rgba(124, 92, 255, .75) !important;
+  outline: 2px solid rgba(139, 92, 246, .75) !important;
   outline-offset: 2px;
 }
 html.nt-theme:not(.nt-desk-off) .notion-collection-item,
@@ -483,15 +490,15 @@ html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"]:hover {
 }
 
 /* ---- (5) messages ------------------------------------------------------------------------- */
-/* User message bubble (live DOM: bg #181c26, 1px border): calm raised surface, faint accent edge. */
+/* User message bubble (live DOM: bg #16161d, 1px border): calm raised surface, faint accent edge. */
 html.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] > div > div > div > div[style*="min-height: 40px"] {
-  border: 1px solid rgba(124, 92, 255, .22) !important;
+  border: 1px solid rgba(139, 92, 246, .22) !important;
   background: var(--nt-raised) !important;
   box-shadow: 0 2px 10px rgba(0, 0, 0, .28) !important;
 }
 /* Assistant answer (content root wrapper [data-active-edit-reference-id]): raised panel, accent line. */
 html.nt-theme:not(.nt-desk-off) .layout-chat [data-active-edit-reference-id] {
-  background: rgba(24, 28, 38, .38);
+  background: rgba(22, 22, 29, .38);
   border: 1px solid rgba(255, 255, 255, .05);
   border-image: none;
   border-radius: var(--nt-radius);
@@ -500,8 +507,8 @@ html.nt-theme:not(.nt-desk-off) .layout-chat [data-active-edit-reference-id] {
 }
 html.nt-theme:not(.nt-desk-off) .layout-chat .notion-inline-code-container > span {
   color: #9ff0ff !important;
-  background: rgba(124, 92, 255, .18) !important;
-  border: 1px solid rgba(124, 92, 255, .32);
+  background: rgba(139, 92, 246, .18) !important;
+  border: 1px solid rgba(139, 92, 246, .32);
   padding: 0 5px;
   font-weight: 500;
 }
@@ -520,12 +527,11 @@ html.nt-theme:not(.nt-desk-off) .nt-desk-steps {
   transition: background-color var(--nt-transition), border-color var(--nt-transition);
 }
 html.nt-theme:not(.nt-desk-off) [role="button"]:hover > .nt-desk-steps {
-  background: rgba(124, 92, 255, .14);
-  border-color: rgba(124, 92, 255, .3);
+  background: rgba(139, 92, 246, .14);
+  border-color: rgba(139, 92, 246, .3);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  html.nt-theme:not(.nt-desk-off) [data-notion-chat-input-container]::before { animation: none; }
   html.nt-theme:not(.nt-desk-off) .notion-collection-item:hover,
   html.nt-theme:not(.nt-desk-off) [data-nt-desk="chat-row"]:hover { transform: none; }
 }
@@ -559,8 +565,8 @@ html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head::before {
   transition: background-color var(--nt-transition), border-color var(--nt-transition);
 }
 html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head:hover::before {
-  background: rgba(124, 92, 255, .10);
-  border-color: rgba(124, 92, 255, .25);
+  background: rgba(139, 92, 246, .10);
+  border-color: rgba(139, 92, 246, .25);
 }
 html.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head.nt-desk-toolgroup-open::before {
   content: '\25BE\00a0\00a0' attr(data-nt-tool-count) ' tool steps';

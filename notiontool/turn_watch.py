@@ -199,14 +199,22 @@ def interrupted_turn(transcript, now=None):
         return None  # no session status: unknown is never 'interrupted', so no automatic continue is sent
     entities = sorted((p.get('entity') or {} for p in (transcript.get('patches') or []) if p.get('op') == 'put'),
                       key=lambda e: e.get('sequence') or 0)  # None sequences broke sorting (TypeError since 18:03)
-    stalled = False
+    stalled = hung = False
+    relevant = [e for e in entities if _role(e)]
     if state == 'running':
         # A turn that still says 'running' but wrote nothing for STALL_SECONDS is hung, not working.
         newest_any = max([stamp(e) for e in entities] or [0])
-        if now is None or not newest_any or now - newest_any < STALL_SECONDS:
+        if now is None or not newest_any:
             return None
+        # A tool call without result for PENDING_TOOL_SECONDS is hung even when newer metadata arrived
+        # (live 25.10.: 'nt_job_result: tool running, no result yet' 20+ min, task left 'uncertain').
+        # A fully quiet turn keeps the STALL_SECONDS rule below.
+        if now - newest_any < STALL_SECONDS:
+            hung = bool(relevant) and _pending_tool(relevant[-1], entities) and \
+                now - stamp(relevant[-1]) >= PENDING_TOOL_SECONDS
+            if not hung:
+                return None
         stalled = True
-    relevant = [e for e in entities if _role(e)]
     if not relevant or (_role(relevant[-1]) == 'assistant_message' and not stalled):
         return None
     last = relevant[-1]
@@ -218,9 +226,10 @@ def interrupted_turn(transcript, now=None):
     visible = [e for e in users if not _is_resume(e)]
     user_text = text_of(visible[-1].get('content', visible[-1].get('text', ''))) if visible else ''
     # Any newer entry (also metadata) is activity: quiet time counts from the newest entry, not the last step.
-    newest = max([stamp(e) for e in entities] + [stamp(last)])
-    return dict(key=key, kind=str(last.get('kind') or last.get('type') or ''), stamp=newest,
-                pending=False if stalled else _pending_tool(last, entities), stalled=stalled,
+    newest = stamp(last) if hung else max([stamp(e) for e in entities] + [stamp(last)])
+    return dict(key=('hung:' + key) if hung else key, kind=str(last.get('kind') or last.get('type') or ''),
+                stamp=newest, pending=True if hung else (False if stalled else _pending_tool(last, entities)),
+                stalled=stalled, hung_tool=hung,
                 user_ids=[str(x) for x in (user.get('client_message_id'), user.get('id')) if x],
                 user_text=user_text)
 
@@ -453,6 +462,13 @@ class TurnWatch:
                 self.scan_restart_cuts()
             except Exception as exc:
                 failed = failed or exc
+            try:
+                # RBX fix: age of ALL known chats (also own chats) from the Notion thread created_time; own
+                # chats at >= 22 h get the context switch. Mains/Coworkers keep their own switch logic.
+                from . import foreign_chat_guard
+                foreign_chat_guard.sweep(self.store, self.adapter, self.clock())
+            except Exception as exc:
+                failed = failed or exc
             if failed and not self.blocked:
                 self.blocked = True
                 from .telemetry import classify
@@ -505,7 +521,7 @@ class TurnWatch:
                 if fresh.get('context_usage') != usage:
                     fresh['context_usage'] = usage
                     self.store.put('workers', fresh)
-                notice = main_switch.check(self.store, fresh, usage, settings, now=now) if fresh.get('purpose') == OPERATOR else None
+                notice = main_switch.check(self.store, fresh, usage, settings, now=now) if fresh.get('purpose') in (OPERATOR, 'main') else None
             if notice and not previous:
                 self.store.event('main_context_ask', worker_id=worker['id'], thread_id=worker['thread_id'],
                                  tokens=usage['estimated_tokens'], turns=usage['turns'],
@@ -778,7 +794,8 @@ class TurnWatch:
                     task['resume_steps'] = (list(task.get('resume_steps') or []) + [step])[-10:]
                     self.store.put('tasks', task)
             self.sending.add(worker['id'])
-        self.store.event('turn_stalled' if found.get('stalled') else 'turn_interrupted', worker_id=worker['id'],
+        self.store.event('turn_tool_hung' if found.get('hung_tool') else
+                         'turn_stalled' if found.get('stalled') else 'turn_interrupted', worker_id=worker['id'],
                          thread_id=worker['thread_id'], after=found['kind'],
                          chain=chain, mode='click' if click else 'message',
                          message=('Stopped turn detected; NotionTool clicks Continue (no message)' if click else

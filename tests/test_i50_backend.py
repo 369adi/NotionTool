@@ -154,6 +154,19 @@ class ChatAgesTests(unittest.TestCase):
         self.assertEqual((rows['c_unknown']['age_h'], rows['c_unknown']['blocked']), (None, False))
         json.dumps(data)  # plain JSON
 
+    def test_switched_main_counts_from_the_switch(self):
+        # Bug 2026-10-25: after a Main switch the old chat record made the new Main look 27 h old.
+        now = time.time()
+        store = FakeStore(
+            chats=[dict(id='c_main', main_worker='w_new', created=now - 27 * HOUR)],
+            workers=[dict(id='w_new', thread_id='t_new')])
+        store.data['main_switches'] = {
+            's1': dict(id='s1', new_chat_id='t_new', state='switched', prompt_at=now - 0.5 * HOUR),
+            's0': dict(id='s0', new_chat_id='t_other', state='switched', prompt_at=now)}
+        app = make_app(store)
+        entry = server_mod.Application.chat_age(app, store.get('chats', 'c_main'), now=now)
+        self.assertAlmostEqual(entry['age_s'], 0.5 * HOUR, delta=2)
+
     def test_age_is_seconds_since_created(self):
         entry = server_mod.Application.chat_age(self.app, dict(created=1000.0), now=1000.0 + 90)
         self.assertEqual(entry, {'age_s': 90, 'created_at': 1000.0})
@@ -255,7 +268,7 @@ class ContextSwitchTests(unittest.TestCase):
         self.assertEqual(view.new_id('s', '00a9'), FakeAdapter.NEW)
         view.rename_thread(None, 'old', 'Cowork (retired)')
         self.assertEqual(adapter.renamed, [('old', 'X (archived)')])
-        self.assertEqual(server_mod.archived_title(''), 'Main (archived)')
+        self.assertEqual(server_mod.archived_title(''), 'Main (expired)')
 
     def test_bad_requests_are_400(self):
         for body in ({}, {'chat_id': 'c_plain'}, {'chat_id': 'nope'}, {'worker_id': 'nope'}):

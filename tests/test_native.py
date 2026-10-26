@@ -45,6 +45,7 @@ class NativeTests(unittest.TestCase):
         self.store.close();self.temp.cleanup()
     def adapter(self):
         adapter=NotionAdapter(self.store)
+        adapter.welcome_gap_s=0  # fake transport needs no pacing
         self.client=FakeClient()
         adapter.client=lambda *args,**kwargs:self.client
         self.store.put('accounts',dict(id='a',slot=1,email='test@example.test',label='Slot 1',state='ready'))
@@ -92,6 +93,28 @@ class NativeTests(unittest.TestCase):
         adapter=self.adapter();adapter.ensure_team('a', create_main=True);adapter.ensure_team('a', create_main=True)
         self.assertEqual(len(self.client.created),6)
         self.assertEqual(len(self.store.all('chats')),1)
+
+    def test_login_uses_five_coworkers_even_when_general_team_size_is_larger(self):
+        adapter=self.adapter()
+        self.store.put('settings',dict(self.store.settings(),per_account=10))
+        result=adapter.ensure_team('a', create_main=True, count=5)
+        self.assertEqual(result['team_size'],5)
+        self.assertEqual(len(self.client.created),6)
+
+    def test_resumed_setup_admits_persisted_slots_without_creating_duplicates(self):
+        adapter=self.adapter()
+        adapter.ensure_team('a', create_main=True)
+        account=self.store.get('accounts','a')
+        account['team_threads']['worker5']['pending']=True
+        self.store.put('accounts',account)
+        for worker in self.store.all('workers'):
+            if worker['purpose']=='worker':
+                worker.update(enabled=False,join_state='pending',pool_admitted=False)
+                self.store.put('workers',worker)
+        result=adapter.ensure_team('a', create_main=True)
+        self.assertEqual(result['workers'],5)
+        self.assertEqual(len(self.client.created),6)
+        self.assertFalse(self.store.get('accounts','a')['team_threads']['worker5']['pending'])
 
     def test_all_inference_payloads_override_auto_with_verified_opus(self):
         adapter=self.adapter()

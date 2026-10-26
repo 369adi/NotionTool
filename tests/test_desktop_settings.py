@@ -48,8 +48,33 @@ class DesktopSettingsTests(unittest.TestCase):
         for entry in ds.HARNESS_SETTINGS:
             if entry['type'] == 'int':
                 self.assertLessEqual(entry['min'], entry['max'])
-                self.assertEqual((entry['min'], entry['max']), SERVER_CLAMPS[entry['key']])
+                if not entry['app_local']:  # app-local ints are clamped by the app, not by /api/settings
+                    self.assertEqual((entry['min'], entry['max']), SERVER_CLAMPS[entry['key']])
                 self.assertTrue(entry['min'] <= entry['default'] <= entry['max'], entry['key'])
+
+    def test_models_and_roles_defaults_never_use_auto(self):
+        entries = self.by_key(ds.settings_schema({}))
+        self.assertNotIn('auto', ds.MODEL_OPTIONS)
+        self.assertEqual(entries['app_default_model']['value'], 'opus-5.5')
+        self.assertIs(entries['app_never_use_auto']['value'], True)
+        for key in ('app_role_researcher', 'app_role_architect', 'app_role_quality_planner'):
+            self.assertEqual(entries[key]['value'], 'opus-5.5', key)
+        self.assertEqual(entries['app_role_worker']['value'], 'sonnet-5.5')
+        self.assertEqual(entries['app_direct_model']['value'], 'sonnet-5.5')
+        for key in ('app_default_model', 'app_direct_model') + ds.ROLE_MODEL_KEYS:
+            self.assertTrue(entries[key]['app_local'], key)
+            self.assertEqual(entries[key]['options'], list(ds.MODEL_OPTIONS), key)
+
+    def test_limits_defaults(self):
+        entries = self.by_key(ds.settings_schema({}))
+        self.assertEqual(entries['app_send_block_hours']['value'], 23)
+        self.assertEqual(entries['app_steps_per_turn']['value'], 450)
+        self.assertIs(entries['app_auto_switch_context']['value'], True)
+        self.assertEqual(entries['app_auto_switch_percent']['value'], 80)
+        self.assertEqual(entries['app_load_last_messages']['value'], 5)
+        self.assertIs(entries['app_restart_safety']['value'], True)
+        # Server keys keep their owner-set defaults (22 h rotation, 5 coworkers); see the test in the tab tests.
+        self.assertLessEqual(entries['coworker_max_age_hours']['value'], entries['app_send_block_hours']['value'])
 
     def test_choices_have_options_and_ask(self):
         for entry in ds.HARNESS_SETTINGS:
@@ -67,7 +92,7 @@ class DesktopSettingsTests(unittest.TestCase):
                 self.assertTrue(entry['app_local'])
                 continue
             self.assertFalse(entry['app_local'])
-            known = set(SERVER_CLAMPS) | SERVER_BOOLS | set(SERVER_CHOICES)
+            known = set(SERVER_CLAMPS) | SERVER_BOOLS | set(SERVER_CHOICES) | {'mcp_full_access', 'mcp_browser_access'}
             self.assertIn(entry['key'], known)
             if entry['key'] in SERVER_CHOICES:
                 self.assertEqual(entry['options'], SERVER_CHOICES[entry['key']])

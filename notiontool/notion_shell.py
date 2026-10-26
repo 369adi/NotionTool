@@ -77,7 +77,7 @@ INT_SETTINGS = ('max_workers', 'per_account', 'max_attempts', 'task_timeout', 'm
 CHOICE_SETTINGS = ('coworker_fresh_context', 'context_replace_mode', 'notion_transport', 'coworker_rotate_mode',
                    'main_context_policy')
 TEXT_SETTINGS = ('theme',)
-BOOL_SETTINGS = ('harness_enabled', 'mcp_full_access', 'mcp_browser_access', 'coworker_delete_old_chat', 'idle_mode')
+BOOL_SETTINGS = ('harness_enabled', 'mcp_full_access', 'mcp_browser_access', 'coworker_delete_old_chat', 'idle_mode', 'patch_mode')
 # Shown on the page even before they were saved once; the values are the server defaults.
 PAGE_DEFAULTS = {'coworker_rotate_mode': 'new_welcome', 'main_context_policy': 'hint',
                  'coworker_delete_old_chat': True, 'idle_mode': True}
@@ -196,6 +196,10 @@ def request_thread_id(post):
     return re.sub(r'[^0-9a-f]', '', str(data.get('threadId') or '').lower())
 
 
+# Same text as foreign_chat_guard.BLOCK_MESSAGE (the composer toast of a refused send).
+OLD_CHAT_MESSAGE = 'This chat is older than 23 h. A fresh chat with the context was started.'
+
+
 def send_block_reason(ages, thread):
     """I50 desktop send block: the reason when ``thread`` is a chat at or over the send limit in a
     chat_ages payload ({limit_h, chats: [{thread_id, age_h, blocked}]}); '' otherwise. Unknown age or an
@@ -259,9 +263,21 @@ def sent_config(post):
 
 
 def pin_config_body(post, pin):
-    """Patched JSON body (str) with model/effort filled in, or None when nothing changes.
+    """Patched JSON body (str) with the model filled in, or None when nothing changes.
 
-    pin is a dict updated with explicit picks found in the request (model, effort)."""
+    Owner rule 2026-10-25: a model or effort the user picked in a chat stays until the user changes it;
+    only the harness (Coworker tasks, explicit values) sets model/effort. Live proof (data/model_pin.log
+    22:26:06, Main): the base config carried reasoningEffort 'xhigh', the updated-config steps were empty
+    ({} = no change) and the old pin wrote 'high' over it on every turn. Now:
+    - The effective value is the newest non-empty one in transcript order (base config, then every
+      updated-config step). An empty step means "no change", never Auto.
+    - The effort is never replaced; only a literal 'auto' effort becomes this chat's last explicit effort,
+      else PIN_DEFAULT_EFFORT.
+    - The model is filled in only when the effective model is missing or 'auto': this chat's last explicit
+      model, else the last explicit model of this window, else PIN_DEFAULT_MODEL. The step that gets the
+      model also gets the chat's effective effort, so Notion never falls back to the model's default effort.
+    pin is a dict: pin['model'] / pin['effort'] (window) and pin['threads'][thread_id] (per chat) learn the
+    explicit values found in the request."""
     try:
         data = json.loads(post) if isinstance(post, str) else None
     except ValueError:
@@ -269,31 +285,45 @@ def pin_config_body(post, pin):
     transcript = data.get('transcript') if isinstance(data, dict) else None
     if not isinstance(transcript, list):
         return None
+    base = next((s for s in transcript if isinstance(s, dict) and s.get('type') == 'config'), None)
     configs = [s for s in transcript if isinstance(s, dict) and s.get('type') == 'updated-config']
-    for step in configs:
+    model = effort = ''
+    for step in ([base] if base is not None else []) + configs:
         value = step.get('value') if isinstance(step.get('value'), dict) else {}
-        model = str(value.get('model') or '')
-        if model and model.lower() != 'auto':
-            pin['model'] = model
-        effort = str(value.get('reasoningEffort') or '').strip().lower()
-        if effort and effort != 'auto':
-            pin['effort'] = effort
-    if not configs:
+        step_model = str(value.get('model') or '').strip()
+        step_effort = str(value.get('reasoningEffort') or '').strip().lower()
+        if step_model:
+            model = step_model
+        if step_effort:
+            effort = step_effort
+    thread = re.sub(r'[^0-9a-f]', '', str(data.get('threadId') or '').lower())
+    memory = pin.setdefault('threads', {}).setdefault(thread, {}) if thread else {}
+    if model and model.lower() != 'auto':
+        pin['model'] = memory['model'] = model
+    if effort and effort != 'auto':
+        pin['effort'] = memory['effort'] = effort
+    fix_model = not model or model.lower() == 'auto'
+    # Live 26.10. (data/model_pin.log): the base config never carries an effort and the last
+    # updated-config step is often empty ({}). Without any effort Notion used the Opus default 'medium'
+    # in the user's own chats. A missing effort is no user choice: this chat's last explicit effort,
+    # else PIN_DEFAULT_EFFORT (high). The window's effort is NOT used, so a pick in one chat never
+    # changes another chat.
+    fix_effort = not effort or effort == 'auto'
+    target = configs[-1] if configs else base
+    if target is None:
         return None
-    last = configs[-1]
-    value = dict(last.get('value') if isinstance(last.get('value'), dict) else {})
-    changed = False
-    if not value.get('model') or str(value.get('model')).lower() == 'auto':
-        value['model'] = pin.get('model') or PIN_DEFAULT_MODEL
-        changed = True
-    if not value.get('reasoningEffort') or str(value.get('reasoningEffort')).lower() == 'auto':
-        # Never carry an old pick (e.g. a one-off 'low') into later turns: Auto effort is always high.
-        value['reasoningEffort'] = PIN_DEFAULT_EFFORT
-        changed = True
-    if not changed:
-        return None
-    value['modelFromUser'] = True
-    last['value'] = value
+    value = dict(target.get('value') if isinstance(target.get('value'), dict) else {})
+    wanted = (memory.get('effort') or PIN_DEFAULT_EFFORT) if fix_effort else effort
+    # The chat's effective effort always goes out explicitly in the last step, so Notion can never fall
+    # back to the model default; the value itself is the user's own pick and is never changed.
+    explicit = str(value.get('reasoningEffort') or '').strip().lower() == wanted
+    if not fix_model and explicit:
+        return None  # the chat's own model and effort go out unchanged
+    if fix_model:
+        value['model'] = memory.get('model') or pin.get('model') or PIN_DEFAULT_MODEL
+        value['modelFromUser'] = True
+    value['reasoningEffort'] = wanted
+    target['value'] = value
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -599,18 +629,49 @@ class NotionShell:
     # paused runInferenceTranscript requests. chat_ages_source() returns a chat_ages payload (DesktopShell
     # wires the chat_ages action); a chat 23 h or older is failed there and never reaches Notion.
     chat_ages_source = None
+    # RBX fix: thread_age_source(thread) -> POST /api/chat/send_check result ({allowed, message, ...}) for ANY
+    # Notion chat, also own chats NotionTool did not create; the age comes from the Notion thread created_time.
+    thread_age_source = None
 
     def _block_old_chat(self, ident, request):
         source = getattr(self, 'chat_ages_source', None)
-        if not callable(source):
+        check = getattr(self, 'thread_age_source', None)
+        if not callable(source) and not callable(check):
             return False
         try:
             thread = request_thread_id(request.get('postData'))
-            reason = send_block_reason(source() if thread else None, thread)
         except Exception:
             return False
+        if not thread:
+            return False
+        try:
+            if json.loads(request.get('postData') or '{}').get('createThread') is True:
+                return False  # a new chat: it has no age yet
+        except Exception:
+            pass
+        reason = ''
+        if callable(check):
+            unknown = 'chat_age_unknown: Chat age unknown: sending is blocked. Click to retry.'
+            try:
+                result = check(thread)
+            except Exception:  # review RBX: a failed check blocks the send
+                result = None
+            if not isinstance(result, dict):
+                reason = unknown
+            elif result.get('allowed') is False and result.get('level') == 'unknown':
+                reason = unknown
+            elif result.get('allowed') is False:
+                reason = ('chat_too_old: ' + str(result.get('message') or OLD_CHAT_MESSAGE)
+                          + ' Use Context Switch if the fresh chat does not open.')
+        if not reason and callable(source):
+            try:
+                reason = send_block_reason(source(), thread)
+            except Exception:
+                reason = ''
         if not reason:
             return False
+        if not reason.startswith(('chat_too_old: ' + OLD_CHAT_MESSAGE, 'chat_age_unknown: ')):
+            reason = OLD_CHAT_MESSAGE + ' ' + reason
         try:
             self.session.send('Fetch.failRequest', {'requestId': ident, 'errorReason': 'BlockedByClient'}, 10)
         except Exception:
@@ -637,6 +698,10 @@ class NotionShell:
                 aux = (params.get('context') or {}).get('auxData') or {}
                 if aux.get('isDefault', True):
                     self.repush()
+                    # Fetch.requestPaused interceptors are cleared on every new execution context
+                    # (Ctrl+R, navigation). Re-register the model pin immediately so Auto never
+                    # reaches Notion after a page refresh (bug 2026-10-25).
+                    self.enable_model_pin()
         except Exception:
             pass  # one bad call must never stop the bridge
 

@@ -171,5 +171,29 @@ class RotationKeepsNumber(unittest.TestCase):
         self.assertEqual(client.renamed, [(T(13), 'Coworker 3')])
         self.assertEqual(store.get('workers', 'r:' + T(12))['label'], 'Coworker 3')  # retired chat not renamed
 
+    def test_context_switch_duplicate_record_names_new_chat_once(self):
+        # Live bug 24 Oct: a context switch moved worker r:T21 to the new Welcome chat T22, and a second
+        # record r:T22 for the same chat existed. The chat was renamed twice per pass ('Coworker 4', then
+        # 'Coworker 9') and the working record kept the label 'Welcome to Notion'.
+        store = Store()
+        store.put('accounts', {'id': 'r', 'slot': 1, 'state': 'ready', 'team_threads': {
+            'worker4': {'id': T(22), 'pending': False}}})
+        store.put('workers', dict(id='r:' + T(21), account_id='r', thread_id=T(22), purpose='worker', enabled=True,
+                                  state='ready', lease='', join_state='joined', label=WELCOME_TITLE, harness_title='Coworker 2'))
+        store.put('workers', dict(id='r:' + T(22), account_id='r', thread_id=T(22), purpose='worker', enabled=False,
+                                  state='ready', lease='', join_state='pending', label=WELCOME_TITLE))
+        client = Client([], {T(22): DONE})
+        a = adapter(store, client)
+        res = name_coworkers(a, client, 'r', None, now=5.0)
+        self.assertEqual(client.renamed, [(T(22), 'Coworker 4')])
+        self.assertEqual(store.get('workers', 'r:' + T(21))['label'], 'Coworker 4')
+        self.assertEqual(store.get('workers', 'r:' + T(22))['label'], 'Coworker 4')
+        self.assertEqual(res['numbers'], {'r:' + T(21): 4})
+        # Next pass: the title is right, nothing is renamed again.
+        client.records[T(22)] = dict(DONE, data=dict(DONE['data'], title='Coworker 4', user_set_title=True))
+        client.renamed.clear()
+        name_coworkers(a, client, 'r', None, now=6.0)
+        self.assertEqual(client.renamed, [])
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)

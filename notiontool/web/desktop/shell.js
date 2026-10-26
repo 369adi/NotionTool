@@ -1,7 +1,8 @@
 /* NotionTool desktop overlay part: shell - Studio v3 navigation (docs/DESKTOP_APP.md, overlay part contract).
  * Contract: window.__ntDesk.shell = function (ctx) { ... return { stop, open, current } }.
  *
- * - Tab bar (Chat, Live, Notes, Settings) at the place of Notion's top icon row in the sidebar
+ * - Nav rail (84 px, fixed left, on every page: Chat, Projects, Live, Settings) with Lucide icons, labels and
+ *   the connection status. It replaces Notion's top icon row in the sidebar
  *   (Home, Chat, Meetings, Inbox, Search). Notion's row is only hidden with a class, never removed.
  *   Live DOM: the row is the nearest ancestor of the search button
  *   ([aria-label="Search"] / [aria-label="Suchen"], inside .notion-sidebar) whose text holds at least
@@ -14,20 +15,26 @@
  *   hidden Chat tab is clicked (Notion's own navigation). Live / Notes / Settings render into our own
  *   view layer that covers the main Notion frame (right of .notion-sidebar-container); not a modal.
  *   Parts that load before this one can queue: (window.__ntShellQueue = []).push([tab, view]).
- * - Ctrl+1..4 switch tabs. Brand header: connection dot with plain status text on hover.
+ * - Ctrl+1..4 switch tabs. The rail shows the one connection status (dot + short word, full text on hover).
  * - shell.css makes the brand header compact and hides the composer 'NotionTool' label.
  */
 (function () {
   'use strict';
   window.__ntDesk = window.__ntDesk || {};
 
+  // The rail shows the entries with rail !== false (Chat, Projects, Live, Settings: Ctrl+1..4).
+  // 'notes' stays a routable page so the Notes view (notes.js) keeps registering, but it has no rail item.
   var TABS = [
-    { id: 'chat', label: 'Chat', key: '1', hint: 'Chat with Notion AI' },
-    { id: 'live', label: 'Live', key: '2', hint: 'See what your team is doing now' },
-    { id: 'notes', label: 'Notes', key: '3', hint: 'Your Notion pages and notes' },
-    { id: 'settings', label: 'Settings', key: '4', hint: 'NotionTool settings' }
+    { id: 'chat', label: 'Chats', key: '1', hint: 'Chat with Notion AI' },
+    { id: 'projects', label: 'Projects', key: '2', hint: 'Your projects and their chats' },
+    { id: 'live', label: 'Live', key: '3', hint: 'See what your team is doing now' },
+    { id: 'settings', label: 'Settings', key: '4', hint: 'NotionTool settings' },
+    { id: 'notes', label: 'Notes', key: '', hint: 'Your Notion pages and notes', rail: false }
   ];
   var TAB_IDS = TABS.map(function (t) { return t.id; });
+  var NAV_TABS = TABS.filter(function (t) { return t.rail !== false; });
+  var NAV_IDS = NAV_TABS.map(function (t) { return t.id; });
+  var HISTORY_MAX = 20;
   var TAB_LABEL = {};
   TABS.forEach(function (t) { TAB_LABEL[t.id] = t.label; });
   // Labels of Notion's top icon row (English and German UI).
@@ -43,17 +50,28 @@
   var CLS_HAS_BADGE = 'nt-shell-has-badge';
   var CLS_BRAND = 'nt-shell-brand';
   var CLS_TIGHT = 'nt-shell-tight';
+  // Lucide icons (24x24 viewBox, stroke drawn by shell.css): message-square, folder, activity, settings, file-text.
   var ICONS = {
-    chat: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg>',
-    live: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10h3l2-5 3 10 2-6 1.5 1H18"/></svg>',
-    notes: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2h7l4 4v12H5zM12 2v4h4M8 10h5M8 13h5"/></svg>',
-    settings: '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.6"/><path d="M10 2v2.5M10 15.5V18M2 10h2.5M15.5 10H18M4.3 4.3l1.8 1.8M13.9 13.9l1.8 1.8M4.3 15.7l1.8-1.8M13.9 6.1l1.8-1.8"/></svg>'
+    chat: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+    projects: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>',
+    live: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>',
+    notes: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>'
   };
+  var CONN_LABEL = { on: 'Online', off: 'Offline', wait: 'Connecting' };
+  // Shown only while a page has no view registered yet.
   var PLACEHOLDER = {
-    live: 'This view shows what your team is working on. It is still loading.',
-    notes: 'This view shows your Notion pages and notes. It is still loading.',
-    settings: 'This view shows the NotionTool settings. It is still loading.'
+    projects: 'Your projects will show up here once this page is set up.',
+    live: 'Live will show what your team is working on once this page is set up.',
+    notes: 'Your Notion pages and notes will show up here once this page is set up.',
+    settings: 'The NotionTool settings will show up here once this page is set up.'
   };
+  var TYPING_TAGS = { INPUT: 1, TEXTAREA: 1, SELECT: 1 };
+  var POPUP_SELECTOR = '[role="dialog"],[role="alertdialog"],[aria-modal="true"],[role="menu"],[role="listbox"]';
+  // Notion renders its dialogs, menus and listboxes inside this container.
+  var OVERLAY_SELECTOR = '.notion-overlay-container';
+  // Permanent navigation (our rail, Notion's sidebar) is never a popup.
+  var POPUP_IGNORE_SELECTOR = '.nt-rail,.notion-sidebar';
 
   function norm(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase(); }
   function isOwn(node) { return !!(node && node.getAttribute && node.getAttribute('data-nt-desk-own') === '1'); }
@@ -81,7 +99,45 @@
     if (!ev || !ev.ctrlKey || ev.altKey || ev.shiftKey || ev.metaKey) return null;
     var i = ['1', '2', '3', '4'].indexOf(String(ev.key || ''));
     if (i < 0 && ev.code) i = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(String(ev.code));
-    return i >= 0 ? TAB_IDS[i] : null;
+    return i >= 0 ? NAV_IDS[i] || null : null;
+  }
+
+  // A plain Esc press (no modifiers, not part of an IME composition, not already handled).
+  function isBackKey(ev) {
+    if (!ev || String(ev.key || '') !== 'Escape') return false;
+    if (ev.ctrlKey || ev.altKey || ev.shiftKey || ev.metaKey) return false;
+    return !ev.defaultPrevented && !ev.isComposing;
+  }
+
+  // True when the node is a text field: Esc must not navigate while the user types.
+  function isTyping(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (TYPING_TAGS[String(node.tagName || '').toUpperCase()]) return true;
+    if (node.isContentEditable) return true;
+    var ce = typeof node.getAttribute === 'function' ? node.getAttribute('contenteditable') : null;
+    if (ce !== null && ce !== undefined && ce !== 'false') return true;
+    return typeof node.getAttribute === 'function' && node.getAttribute('role') === 'textbox';
+  }
+
+  // True when a modal, menu or popup is visible: Esc belongs to it and closes it first.
+  // Only dialogs, menus and listboxes inside Notion's overlay container count, plus anything with
+  // aria-modal="true". Our rail and Notion's sidebar hold permanent menu-like nodes: they never count.
+  function popupOpen(doc) {
+    if (!doc || typeof doc.querySelectorAll !== 'function') return false;
+    var nodes = doc.querySelectorAll(POPUP_SELECTOR);
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') continue;
+      if (typeof n.closest === 'function') {
+        if (n.closest(POPUP_IGNORE_SELECTOR)) continue;
+        var modal = n.getAttribute && n.getAttribute('aria-modal') === 'true';
+        if (!modal && !n.closest(OVERLAY_SELECTOR)) continue;
+      }
+      if (typeof n.getBoundingClientRect !== 'function') return true;
+      var r = n.getBoundingClientRect();
+      if (r && r.width > 0 && r.height > 0) return true;
+    }
+    return false;
   }
 
   function badgeText(n) {
@@ -92,14 +148,14 @@
 
   // Tab bar keyboard: arrows move (wrapping), Home/End jump. Returns the target tab id or null.
   function tabStep(current, key) {
-    var n = TAB_IDS.length;
-    var i = TAB_IDS.indexOf(current);
+    var n = NAV_IDS.length;
+    var i = NAV_IDS.indexOf(current);
     if (i < 0) i = 0;
     key = String(key || '');
-    if (key === 'ArrowRight' || key === 'ArrowDown') return TAB_IDS[(i + 1) % n];
-    if (key === 'ArrowLeft' || key === 'ArrowUp') return TAB_IDS[(i + n - 1) % n];
-    if (key === 'Home') return TAB_IDS[0];
-    if (key === 'End') return TAB_IDS[n - 1];
+    if (key === 'ArrowRight' || key === 'ArrowDown') return NAV_IDS[(i + 1) % n];
+    if (key === 'ArrowLeft' || key === 'ArrowUp') return NAV_IDS[(i + n - 1) % n];
+    if (key === 'Home') return NAV_IDS[0];
+    if (key === 'End') return NAV_IDS[n - 1];
     return null;
   }
 
@@ -142,6 +198,8 @@
     var current = 'chat';
     var mounted = null;
     var dead = false;
+    // Pages the user came from, newest last (Esc goes back through it).
+    var trail = [];
 
     function safe(fn, args) {
       try { return fn.apply(null, args); } catch (e) { warn('view failed', e); return undefined; }
@@ -175,10 +233,15 @@
         host.placeholder(tab, box);
       }
     }
-    function open(tab) {
+    function open(tab, opts) {
       tab = norm(tab);
       if (dead || TAB_IDS.indexOf(tab) < 0) return false;
       if (tab !== 'chat' && tab === current && mounted === tab) return true;
+      // Remember where the user came from (not when going back, not when re-opening the same page).
+      if (tab !== current && !(opts && opts.back)) {
+        trail.push(current);
+        if (trail.length > HISTORY_MAX) trail.shift();
+      }
       unmountCurrent();
       current = tab;
       if (tab === 'chat') {
@@ -190,6 +253,15 @@
       }
       host.changed();
       return true;
+    }
+    // Esc: return to the previous page. False when there is nowhere to go (history empty).
+    function back() {
+      if (dead) return false;
+      while (trail.length) {
+        var prev = trail.pop();
+        if (prev !== current && TAB_IDS.indexOf(prev) >= 0) return open(prev, { back: true });
+      }
+      return false;
     }
     function register(tab, view) {
       tab = norm(tab);
@@ -228,7 +300,8 @@
       views = {};
     }
     return {
-      open: open, register: register, badge: badge, destroy: destroy, views: registered,
+      open: open, back: back, register: register, badge: badge, destroy: destroy, views: registered,
+      get depth() { return trail.length; },
       get current() { return current; },
       get mounted() { return mounted; }
     };
@@ -319,7 +392,8 @@
   }
 
   window.__ntDesk.shellUtil = {
-    TABS: TABS, TAB_IDS: TAB_IDS, liveBadge: liveBadge, connInfo: connInfo, keyTab: keyTab,
+    TABS: TABS, TAB_IDS: TAB_IDS, NAV_IDS: NAV_IDS, liveBadge: liveBadge, connInfo: connInfo, keyTab: keyTab,
+    isTyping: isTyping, popupOpen: popupOpen, isBackKey: isBackKey,
     badgeText: badgeText, tabStep: tabStep, findTopRow: findTopRow, nativeTab: nativeTab, createRouter: createRouter,
     createCoworkerToggle: createCoworkerToggle, COWORKERS_KEY: COWORKERS_KEY
   };
@@ -344,6 +418,7 @@
     var offState = null;
     var tick = null;
     var bar = null;
+    var rail = null;
     var layer = null;
     var coworkers = createCoworkerToggle(window, doc);
 
@@ -450,10 +525,10 @@
 
     // ---- tab bar -----------------------------------------------------------------------------
     function buildBar() {
-      var node = own(mk('div', { cls: 'nt-shell-tabs', role: 'tablist', 'aria-label': 'NotionTool sections' }), 'tabbar');
-      TABS.forEach(function (t) {
+      var node = own(mk('div', { cls: 'nt-shell-tabs', role: 'tablist', 'aria-orientation': 'vertical', 'aria-label': 'NotionTool sections' }), 'tabbar');
+      NAV_TABS.forEach(function (t) {
         var btn = own(mk('button', { type: 'button', cls: 'nt-shell-tab', role: 'tab', 'data-nt-shell-tab': t.id,
-          title: t.hint + ' (Ctrl+' + t.key + ')', 'aria-selected': 'false', tabindex: t.id === 'chat' ? '0' : '-1' }), 'tab');
+          title: t.hint + ' (Ctrl+' + t.key + ')', 'aria-keyshortcuts': 'Control+' + t.key, 'aria-selected': 'false', tabindex: t.id === 'chat' ? '0' : '-1' }), 'tab');
         var icon = mk('span', { cls: 'nt-shell-tab-icon', 'aria-hidden': 'true' });
         icon.innerHTML = ICONS[t.id];
         btn.appendChild(icon);
@@ -488,6 +563,30 @@
       return node;
     }
 
+    // The rail: our own fixed element on <body>, left of Notion's sidebar, on every page (Chat included).
+    // Top to bottom: logo mark, the tab list, connection status. No avatar.
+    function buildRail(list) {
+      var node = own(mk('nav', { cls: 'nt-rail', 'aria-label': 'NotionTool' }), 'rail');
+      node.appendChild(mk('div', { cls: 'nt-rail-logo', 'aria-hidden': 'true' }, 'N'));
+      node.appendChild(list);
+      var status = own(mk('div', { cls: 'nt-rail-status', role: 'status', tabindex: '0' }), 'conn');
+      status.appendChild(mk('span', { cls: 'nt-rail-dot', 'aria-hidden': 'true' }));
+      status.appendChild(mk('span', { cls: 'nt-rail-status-text' }));
+      node.appendChild(status);
+      return node;
+    }
+
+    function ensureRail() {
+      if (rail && rail.parentNode && bar) return rail;
+      // Never adopt a rail of an older mount: its click handlers talk to a dead router.
+      dropAll('[data-nt-desk="rail"]');
+      dropAll('[data-nt-desk="tabbar"]');
+      bar = buildBar();
+      rail = buildRail(bar);
+      (doc.body || html).appendChild(rail);
+      return rail;
+    }
+
     // Notion's header wrapper around the hidden top row keeps its padding/height: the empty gap
     // between the brand header and the tab bar. Collapse it with our own class (node is kept).
     function tightenWrap(sb, row) {
@@ -504,7 +603,8 @@
       wrap.setAttribute('data-nt-shell', 'wrap');
     }
 
-    function placeBar(sb) {
+    // Notion's own top icon row is replaced by the rail: hide it (class only, node is kept).
+    function hideTopRow(sb) {
       var row = findTopRow(sb);
       var marked = doc.querySelectorAll('[data-nt-shell="toprow"]');
       for (var i = 0; i < marked.length; i++) {
@@ -516,21 +616,7 @@
         if (!row.classList.contains(CLS_HIDE)) row.classList.add(CLS_HIDE);
         if (row.getAttribute('data-nt-shell') !== 'toprow') row.setAttribute('data-nt-shell', 'toprow');
       }
-      // Never adopt a bar of an older mount: its click handlers talk to a dead router.
-      if (!bar) bar = buildBar();
-      dropAll('[data-nt-desk="tabbar"]', bar);
       tightenWrap(sb, row);
-      if (row) {
-        if (bar.parentNode !== row.parentNode || bar.nextSibling !== row) row.parentNode.insertBefore(bar, row);
-      } else {
-        // No Notion row found: right below our brand header.
-        var brand = sb.querySelector('[data-nt-desk="brand"]');
-        if (brand && brand.parentNode === sb) {
-          if (bar.parentNode !== sb || bar.previousSibling !== brand) sb.insertBefore(bar, brand.nextSibling);
-        } else if (bar.parentNode !== sb) {
-          sb.insertBefore(bar, sb.firstChild);
-        }
-      }
     }
 
     function renderBar() {
@@ -557,7 +643,7 @@
       }
     }
 
-    // ---- brand header: connection dot -------------------------------------------------------
+    // ---- brand header: compact look and click forwarding to Notion's workspace switcher ------
     function applyConn(sb) {
       var brand = sb.querySelector('[data-nt-desk="brand"]');
       if (!brand) return;
@@ -571,8 +657,6 @@
         brand.setAttribute('role', 'button');
         brand.setAttribute('aria-label', 'Workspace and profile');
         brand.addEventListener('click', function (ev) {
-          var t0 = ev.target;
-          if (t0 && t0.closest && t0.closest('[data-nt-desk="conn"]')) return;
           var sw = document.querySelector('.notion-sidebar-switcher');
           if (!sw) return;
           var t = sw.querySelector('[role=button]') || sw;
@@ -581,19 +665,22 @@
           t.click();
         });
       }
-      var dot = null;
-      var kids = brand.children || [];
-      for (var i = 0; i < kids.length; i++) if (kids[i].getAttribute('data-nt-desk') === 'conn') { dot = kids[i]; break; }
-      if (!dot) {
-        dot = own(mk('span', { cls: 'nt-shell-conn', tabindex: '0' }), 'conn');
-        dot.appendChild(mk('span', { cls: 'nt-shell-conn-text', role: 'status' }));
-        var name = brand.querySelector('.nt-desk-brand-name');
-        brand.insertBefore(dot, name && name.parentNode === brand ? name.nextSibling : null);
-      }
+    }
+
+    // ---- rail footer: the one connection status (dot + short word, full text on hover) ----------
+    function renderConn() {
+      if (!rail) return;
+      var status = null;
+      var kids = rail.children || [];
+      for (var i = 0; i < kids.length; i++) if (kids[i].getAttribute('data-nt-desk') === 'conn') { status = kids[i]; break; }
+      if (!status) return;
       var info = connInfo(state(), lastTs, Date.now());
-      if (dot.getAttribute('data-level') !== info.level) dot.setAttribute('data-level', info.level);
-      if (dot.getAttribute('aria-label') !== info.text) dot.setAttribute('aria-label', info.text);
-      if (dot.firstChild && dot.firstChild.textContent !== info.text) dot.firstChild.textContent = info.text;
+      if (status.getAttribute('data-level') !== info.level) status.setAttribute('data-level', info.level);
+      if (status.getAttribute('aria-label') !== info.text) status.setAttribute('aria-label', info.text);
+      if (status.getAttribute('title') !== info.text) status.setAttribute('title', info.text);
+      var label = CONN_LABEL[info.level] || '';
+      var textNode = status.lastChild;
+      if (textNode && textNode.textContent !== label) textNode.textContent = label;
     }
 
     function apply() {
@@ -601,12 +688,15 @@
       if (stopped) return;
       try {
         if (!html.classList.contains(CLS_ON)) html.classList.add(CLS_ON);
+        // The rail does not depend on Notion's sidebar: it shows on every page.
+        ensureRail();
         var sb = sidebar();
         if (sb) {
-          placeBar(sb);
+          hideTopRow(sb);
           applyConn(sb);
         }
         renderBar();
+        renderConn();
         if (router.current !== 'chat') placeLayer();
         coworkers.syncAll();
       } catch (e) {
@@ -620,6 +710,17 @@
 
     function onKey(ev) {
       if (coworkers.handle(ev)) return;
+      if (isBackKey(ev)) {
+        // Esc goes straight back to Chat from any other page. Typing and open popups keep Esc for
+        // themselves (they close first). On Chat itself Esc stays with Notion.
+        var target = ev.target && ev.target.nodeType === 1 ? ev.target : null;
+        if (isTyping(target) || isTyping(doc.activeElement) || popupOpen(doc)) return;
+        if (router.current !== 'chat' && router.open('chat')) {
+          if (ev.preventDefault) ev.preventDefault();
+          if (ev.stopPropagation) ev.stopPropagation();
+        }
+        return;
+      }
       var tab = keyTab(ev);
       if (!tab) return;
       if (ev.preventDefault) ev.preventDefault();
@@ -640,6 +741,7 @@
       window.removeEventListener('resize', onResize);
       coworkers.stop();
       router.destroy();
+      dropAll('[data-nt-desk="rail"]');
       dropAll('[data-nt-desk="tabbar"]');
       dropAll('[data-nt-desk="shell-layer"]');
       dropAll('[data-nt-desk="conn"]');
@@ -659,11 +761,13 @@
       html.classList.remove(CLS_VIEW_OPEN);
       if (window.__ntShell === api) delete window.__ntShell;
       bar = null;
+      rail = null;
       layer = null;
     }
 
     var api = {
       open: function (tab) { return router.open(tab); },
+      back: function () { return router.back(); },
       register: function (tab, view) { return router.register(tab, view); },
       tabs: TAB_IDS.slice(),
       refresh: function () { schedule(); },

@@ -686,15 +686,18 @@ function layerEl() { return doc.querySelector('[data-nt-desk="shell-layer"]'); }
 function viewIds() { const l = layerEl(); return l ? l.children.map((c) => c.getAttribute('data-nt-desk-view')) : []; }
 const isOpen = () => html.classList.contains('nt-shell-view-open');
 
-out.mount = { bars: bars().length, stale: bar() === stale, staleGone: !stale.isConnected, inWrap: bar().parentNode === S.wrap,
-  beforeRow: bar().nextSibling === S.row, tight: S.wrap.classList.contains('nt-shell-tight'),
+function rails() { return doc.querySelectorAll('[data-nt-desk=\"rail\"]'); }
+out.mount = { bars: bars().length, stale: bar() === stale, staleGone: !stale.isConnected, rails: rails().length,
+  railOnBody: rails()[0].parentNode === body, barInRail: bar().parentNode === rails()[0],
+  conn: rails()[0].children.filter((c) => c.getAttribute('data-nt-desk') === 'conn').length,
+  tight: S.wrap.classList.contains('nt-shell-tight'),
   wrapMark: S.wrap.getAttribute('data-nt-shell'), chatBadge: btn('chat').lastChild.textContent, tabs: tabs() };
 btn('live').click();
 out.live = { current: api.current, tabs: tabs(), views: viewIds(), open: isOpen(), left: layerEl().style.left,
   chatListShown: !S.sb.querySelector('.chat-list').classList.contains('nt-shell-hide') };
-btn('notes').click(); btn('settings').click(); btn('live').click(); btn('notes').click();
+api.open('notes'); btn('settings').click(); btn('live').click(); api.open('notes');
 out.fast = { current: api.current, views: viewIds(), text: layerEl().textContent, calls: Object.assign({}, calls), active: active() };
-let ev = btn('notes').fire('keydown', { key: 'ArrowRight' });
+let ev = btn('live').fire('keydown', { key: 'ArrowRight' });
 out.kRight = { current: api.current, focus: doc.activeElement === btn('settings'), prevented: ev.defaultPrevented, active: active() };
 btn('settings').fire('keydown', { key: 'ArrowRight' });
 out.kWrap = { current: api.current, clicks: chatClicks, open: isOpen(), views: viewIds(), active: active() };
@@ -714,7 +717,7 @@ out.reenter = { current: api.current, views: viewIds(), cleanup: reCleanup, acti
 const S2 = buildSidebar(); box.removeChild(S.sb); box.appendChild(S2.sb);
 api.refresh();
 setTimeout(function () {
-  out.rerender = { bars: bars().length, inWrap2: bar().parentNode === S2.wrap, beforeRow2: bar().nextSibling === S2.row,
+  out.rerender = { bars: bars().length, rails: rails().length, railOnBody: rails()[0].parentNode === body,
     tight2: S2.wrap.classList.contains('nt-shell-tight'), row2Hidden: S2.row.classList.contains('nt-shell-hide'),
     current: api.current, active: active(), views: viewIds() };
   handle = window.__ntDesk.shell(ctx);
@@ -749,15 +752,24 @@ class ShellTabsUiTest(unittest.TestCase):
         self.assertEqual(self.out['mount']['chatBadge'], '3')
 
     def test_tab_step_keys(self):
-        self.assertEqual(self.out['step'], ['live', 'settings', 'chat', 'settings', None])
+        # Rail order is chat, projects, live, settings; notes has no rail item (an unknown id starts at the first).
+        self.assertEqual(self.out['step'], ['projects', 'settings', 'chat', 'settings', None])
 
     def test_stale_bar_not_adopted(self):
         m = self.out['mount']
         self.assertEqual(m['bars'], 1)
         self.assertFalse(m['stale'])
         self.assertTrue(m['staleGone'])
-        self.assertTrue(m['inWrap'])
-        self.assertTrue(m['beforeRow'])
+
+    def test_rail_is_our_own_element_on_the_page(self):
+        m = self.out['mount']
+        self.assertEqual(m['rails'], 1)
+        self.assertTrue(m['railOnBody'])
+        self.assertTrue(m['barInRail'])
+        self.assertEqual(m['conn'], 1)
+        r = self.out['rerender']
+        self.assertEqual(r['rails'], 1)
+        self.assertTrue(r['railOnBody'])
 
     def test_header_wrapper_collapsed_no_gap(self):
         self.assertTrue(self.out['mount']['tight'])
@@ -771,9 +783,11 @@ class ShellTabsUiTest(unittest.TestCase):
         self.assertTrue(live['open'])
         self.assertEqual(live['left'], '260px')
         self.assertTrue(live['chatListShown'])
-        self.assertEqual(live['tabs'], [['chat', 'false', '-1', False], ['live', 'true', '0', True],
-                                        ['notes', 'false', '-1', False], ['settings', 'false', '-1', False]])
+        # Rail tabs: chat, projects, live, settings. Notes stays routable but has no rail item.
+        self.assertEqual(live['tabs'], [['chat', 'false', '-1', False], ['projects', 'false', '-1', False],
+                                        ['live', 'true', '0', True], ['settings', 'false', '-1', False]])
         self.assertEqual(self.out['mount']['tabs'][0], ['chat', 'true', '0', True])
+        self.assertEqual([t[0] for t in self.out['mount']['tabs']], ['chat', 'projects', 'live', 'settings'])
 
     def test_fast_switching_leaves_one_view(self):
         fast = self.out['fast']
@@ -781,7 +795,8 @@ class ShellTabsUiTest(unittest.TestCase):
         self.assertEqual(fast['views'], ['notes'])
         self.assertNotIn('Live view', fast['text'])
         self.assertEqual(fast['calls'], {'live': 2, 'liveOff': 2, 'notes': 2})
-        self.assertEqual(fast['active'], ['notes'])
+        # Notes is routable but has no rail item, so no rail tab is highlighted for it.
+        self.assertEqual(fast['active'], [])
 
     def test_keyboard(self):
         out = self.out
@@ -790,26 +805,27 @@ class ShellTabsUiTest(unittest.TestCase):
         self.assertEqual(out['kEnd'], 'settings')
         self.assertEqual(out['kHome'], 'chat')
         self.assertEqual(out['kEnter'], {'current': 'live', 'prevented': True, 'views': ['live']})
-        self.assertEqual(out['kLeft'], 'chat')
-        self.assertEqual(out['kOther'], {'current': 'chat', 'prevented': False})
+        # ArrowLeft from Live goes to Projects (rail order: chat, projects, live, settings)
+        self.assertEqual(out['kLeft'], 'projects')
+        self.assertEqual(out['kOther'], {'current': 'projects', 'prevented': False})
 
     def test_layer_never_covers_sidebar(self):
         self.assertEqual(self.out['leftKeep'], '260px')
         self.assertEqual(self.out['leftSb'], '300px')
 
     def test_reentrant_mount_keeps_one_view(self):
-        self.assertEqual(self.out['reenter'], {'current': 'notes', 'views': ['notes'], 'cleanup': 1, 'active': ['notes']})
+        self.assertEqual(self.out['reenter'], {'current': 'notes', 'views': ['notes'], 'cleanup': 1, 'active': []})
 
     def test_sidebar_rerender_and_remount(self):
         r = self.out['rerender']
         self.assertEqual(r['bars'], 1)
-        self.assertTrue(r['inWrap2'])
-        self.assertTrue(r['beforeRow2'])
+        self.assertEqual(r['rails'], 1)
+        self.assertTrue(r['railOnBody'])
         self.assertTrue(r['row2Hidden'])
-        self.assertEqual((r['current'], r['active'], r['views']), ('notes', ['notes'], ['notes']))
+        self.assertEqual((r['current'], r['active'], r['views']), ('notes', [], ['notes']))
         m = self.out['remount']
         self.assertEqual((m['bars'], m['layers'], m['keyL']), (1, 1, 1))
-        self.assertEqual((m['current'], m['views'], m['active']), ('notes', ['notes'], ['notes']))
+        self.assertEqual((m['current'], m['views'], m['active']), ('notes', ['notes'], []))
         self.assertEqual(self.out['remountClick'], {'current': 'live', 'views': ['live'], 'active': ['live']})
 
     def test_stop_restores_wrapper(self):

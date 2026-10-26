@@ -143,7 +143,10 @@ def review_note(reviewed):
 
 # Plain labels for the Live view, per task patch_state.
 PATCH_LABELS = dict(working='Working in own copy', waiting='Waiting to merge', merged='Merged',
-                    conflict='Conflict - being resolved', failed='Not merged')
+                    conflict='Conflict - being resolved', failed='Not merged',
+                    salvaged='Kept as salvage patch for the next try')
+SALVAGE_NOTE = ('\n\nThis folder already contains the work of the earlier, abandoned try %s (salvage commit %s, '
+                '%d file(s)). Check it and continue from it instead of starting over.')
 
 # add_task: marks 'no explicit model' (Phase 4 change 1); resolves to DEFAULT_MODEL as before.
 _UNSET_MODEL = object()
@@ -898,17 +901,44 @@ class Engine:
         return dict(thread_id=thread_id, sent_at=sent, latest_user_ms=latest, completed_ms=completed,
                     status=str(status or ''))
 
-    def resolve_uncertain(self, task_id, resolution, note=''):
+    def resolve_uncertain(self, task_id, resolution, note='', stop=False):
         """The Main decides a task whose Notion turn finished but whose answer never reached the harness.
 
         Nothing is sent again (I5). 'accept': the Main checked the work directly and takes it as the result
         (RESULT: DONE). 'abandon': the task ends as failed, so its run stops for the Main. Either way the
         reserved thread is released and the task no longer holds its files. 'accept' always needs Notion's
         confirmation (remote_done_at); 'abandon' also works without it when Notion's thread record proves the
-        prompt never arrived (_unsent_proof, read before the lock)."""
+        prompt never arrived (_unsent_proof, read before the lock).
+
+        stop=True with 'abandon': a hung turn (e.g. a tool call that never returns) is stopped first through
+        adapter.stop_turn, then abandoned in the same call. Only the stop request goes to Notion, never the prompt
+        (I5). If Notion does not confirm the stop, nothing changes and the reason is raised."""
         if resolution not in ('accept', 'abandon'):
             raise ValueError("resolution must be 'accept' or 'abandon'")
         proof = self._unsent_proof(task_id) if resolution == 'abandon' else None
+        stopped = None
+        current = self.store.get('tasks', task_id) or {}
+        if stop and resolution == 'abandon' and not proof and current and not current.get('remote_done_at'):
+            # Network call, so before the lock (like _unsent_proof).
+            worker = (self.store.get('workers', current['worker_id']) if current.get('worker_id') else None) or {}
+            thread_id = current.get('thread_id') or worker.get('thread_id') or ''
+            stop_turn = getattr(self.adapter, 'stop_turn', None)
+            if not thread_id or not callable(stop_turn):
+                raise ValueError('This task has no Notion turn that can be stopped')
+            try:
+                answer = stop_turn(thread_id, dict(worker))
+            except Exception as exc:  # noqa: BLE001 - reported, nothing changes
+                answer = dict(ok=False, reason='error: ' + (type(exc).__name__ + ' ' + str(exc))[:200])
+            answer = answer if isinstance(answer, dict) else dict(ok=bool(answer), reason='')
+            reason = str(answer.get('reason') or '')
+            self.store.event('task_stop_turn', current.get('run_id', ''), task_id=task_id,
+                             worker_id=current.get('worker_id', ''), thread_id=thread_id, ok=bool(answer.get('ok')),
+                             reason=reason, message='The Main stopped the Notion turn' if answer.get('ok')
+                             else 'Stopping the Notion turn failed: ' + (reason or 'not confirmed'))
+            if not answer.get('ok'):
+                raise ValueError('Could not stop the Notion turn (%s); nothing was changed or resent'
+                                 % (reason or 'not confirmed'))
+            stopped = dict(thread_id=thread_id, sent_at=float(current.get('sent_at') or 0), at=time.time())
         with self.lock:
             task = self.store.get('tasks', task_id)
             if not task:
@@ -916,13 +946,19 @@ class Engine:
             if task.get('state') != 'uncertain' and not task.get('remote_unknown'):
                 raise ValueError('Only an unconfirmed task can be resolved by the Main (state: %s)' % task.get('state', ''))
             unsent = None
-            if not task.get('remote_done_at'):
+            if stopped and float(task.get('sent_at') or 0) != stopped['sent_at']:
+                raise ValueError('The task changed while its turn was being stopped; check it again')
+            if not task.get('remote_done_at') and not stopped:
                 # Only 'abandon' may skip the confirmation, and only with Notion's proof for this very send.
                 if not proof or float(task.get('sent_at') or 0) != proof['sent_at']:
                     raise ValueError('Notion has not confirmed that the turn finished; wait for it or stop the turn first')
                 unsent = proof
-            if any(info.get('task_id') == task_id for info in self.inflight.values()):
+            checks = [info for info in self.inflight.values() if info.get('task_id') == task_id]
+            if checks and not stopped:
                 raise ValueError('A reconciliation check is running for this task; try again in a few seconds')
+            for info in checks:
+                if info.get('cancel') is not None:
+                    info['cancel'].set()  # the stopped turn's read-back ends; the lease is released below
             note = ' '.join(str(note or '').split())[:2000]
             now = time.time()
             if task.get('worker_id'):
@@ -943,25 +979,31 @@ class Engine:
                           unsent['status'] or '-'))
                 set_state(self.store, task, 'failed', 'abandoned by the Main, prompt never arrived', unsent_proof=unsent,
                           error=('Abandoned by the Main; %s; nothing was resent. %s' % (why, note)).strip()[:600])
+            elif stopped and not task.get('remote_done_at'):
+                set_state(self.store, task, 'failed', 'abandoned by the Main after stopping the turn', stopped_turn=stopped,
+                          error=('Abandoned by the Main; the Notion turn in thread %s was stopped; nothing was resent. %s'
+                                 % (stopped['thread_id'], note)).strip()[:600])
             else:
                 set_state(self.store, task, 'failed', 'abandoned by the Main',
                           error=('Abandoned by the Main after reconciliation; nothing was resent. ' + note).strip()[:400])
             task.update(main_resolution=resolution, resolved_at=now, finished=now)
             self.store.put('tasks', task)
-            extra = dict(proof=unsent) if unsent else {}
+            extra = dict(proof=unsent) if unsent else dict(stopped=stopped) if stopped else {}
             self.store.event('task_resolved_by_main', task['run_id'], task_id=task_id, worker_id=task.get('worker_id', ''),
                              resolution=resolution,
                              message='The Main %s the unconfirmed task without resending it%s'
                                      % ('accepted' if resolution == 'accept' else 'abandoned',
-                                        ' (Notion proves the prompt never arrived)' if unsent else ''),
+                                        ' (Notion proves the prompt never arrived)' if unsent else
+                                        ' (its Notion turn was stopped first)' if stopped else ''),
                              **extra)
             return dict(id=task_id, state=task['state'], resolution=resolution)
 
-    def coordination(self):
+    def coordination(self, store=None):
+        # store: an optional read view (desktop_state_cache.LightStore with light task docs) for patch_status.
         budget = self._budget()
         out = budget.status() if budget is not None else dict(paused=False)
         try:
-            out = dict(out, patch=self.patch_status())
+            out = dict(out, patch=self.patch_status(store))
         except Exception:
             pass
         return out
@@ -1122,8 +1164,15 @@ class Engine:
 
     def _patch_prepare(self, task, run):
         """Own worktree for an executor before dispatch. On a git error the task runs as before (with locks off)."""
+        source = self._salvage_source(task)
         try:
             patcher = self._patcher(run)
+            if source:
+                # Re-delegated try: continue on the salvage branch (and its folder while it still exists).
+                salvage = source['patch_salvage']
+                task['patch_branch'] = salvage['branch']
+                if salvage.get('worktree') and (Path(salvage['worktree']) / '.git').exists():
+                    task['patch_worktree'] = salvage['worktree']
             task['patch_branch'] = patcher.branch_name(task)
             task['patch_worktree'] = patcher.prepare(task)
             task['patch_state'] = 'working'
@@ -1131,6 +1180,75 @@ class Engine:
             for key in ('patch_branch', 'patch_worktree', 'patch_state'):
                 task.pop(key, None)
             self.store.event('patch_prepare_failed', run['id'], commit=False, task_id=task['id'], message=str(exc)[:300])
+            return
+        if source:
+            salvage = dict(source['patch_salvage'], taken_by=task['id'], taken_at=time.time())
+            source['patch_salvage'] = salvage
+            self.store.put('tasks', source)
+            task['salvage_from'] = source['id']
+            task['prompt'] = (task.get('prompt') or '') + SALVAGE_NOTE % (
+                source['id'], str(salvage.get('commit') or '-')[:12], len(salvage.get('files') or []))
+            self.store.event('patch_salvage_taken', run['id'], commit=False, task_id=task['id'],
+                             message='Continues the salvaged work of %s on %s' % (source['id'], task['patch_branch']))
+
+    def _salvage_source(self, task):
+        """The abandoned task whose salvage patch this new task continues: same run and the explicit
+        salvage_of id, else the same title. Each salvage patch is handed out once."""
+        if task.get('salvage_from') or task.get('patch_origin'):
+            return None
+        wanted = task.get('salvage_of') or ''
+        title = ' '.join(str(task.get('title') or '').split()).lower()
+        best = None
+        for other in self.store.all('tasks'):
+            salvage = other.get('patch_salvage') or {}
+            if (other.get('id') == task.get('id') or other.get('run_id') != task.get('run_id')
+                    or other.get('patch_state') != 'salvaged' or not salvage.get('branch') or salvage.get('taken_by')):
+                continue
+            if wanted:
+                if other['id'] == wanted:
+                    return other
+                continue
+            if title and ' '.join(str(other.get('title') or '').split()).lower() == title:
+                if best is None or float(salvage.get('at') or 0) > float(best['patch_salvage'].get('at') or 0):
+                    best = other
+        return best
+
+    def patch_salvage(self, task_id, reason=''):
+        """Keep the copy of an abandoned task as a salvage patch instead of throwing it away.
+
+        Commits its uncommitted work on its own branch (PatchMode.collect; nothing reaches main) and marks
+        patch_state 'salvaged'. A re-delegated task of the same run (salvage_of, or the same title) then
+        continues on that branch (_patch_prepare). Returns the salvage record, or None when there is nothing
+        to keep. Git runs outside self.lock; nothing is sent to Notion."""
+        with self.lock:
+            task = self.store.get('tasks', task_id)
+            if (not task or task.get('state') not in ('failed', 'cancelled') or not task.get('patch_worktree')
+                    or task.get('patch_state') not in ('working', 'waiting')):
+                return None
+            run = self.store.get('runs', task['run_id'])
+        if not run:
+            return None
+        try:
+            stats = self._patcher(run).collect(dict(task))
+        except Exception as exc:
+            self.store.event('patch_salvage_failed', run['id'], task_id=task_id, message=str(exc)[:300])
+            return None
+        files = [f.get('path', '') if isinstance(f, dict) else str(f) for f in stats.get('files') or []]
+        if not files:
+            return None  # the copy holds no change against main: nothing to keep
+        with self.lock:
+            task = self.store.get('tasks', task_id)
+            if not task or task.get('patch_state') not in ('working', 'waiting'):
+                return None
+            salvage = dict(branch=task.get('patch_branch') or stats.get('branch') or '',
+                           worktree=task.get('patch_worktree', ''), commit=stats.get('commit') or stats.get('head') or '',
+                           files=files[:200], at=time.time(), reason=str(reason or '')[:300], taken_by='')
+            task.update(patch_state='salvaged', patch_salvage=salvage)
+            self.store.put('tasks', task)
+            self.store.event('patch_salvaged', run['id'], task_id=task_id,
+                             message='Kept %d file(s) of the abandoned task as salvage patch on %s (%s)'
+                                     % (len(files), salvage['branch'], str(salvage['commit'])[:12]))
+            return salvage
 
     def _start_merges(self):
         """collect -> verify -> merge for finished patch tasks, one at a time (PatchMode merge queue)."""
@@ -1141,6 +1259,14 @@ class Engine:
         merging = self.__dict__.setdefault('_patch_merging', set())
         heads = {}  # project root -> current main commit (only asked when a task waits for a red main)
         for task in self.store.all('tasks'):
+            if (task.get('state') == 'done' and task.get('patch_state') == 'working' and task.get('patch_worktree')
+                    and task['id'] not in merging):
+                # Done without a report that hands the copy over (e.g. accepted by the Main): the harness
+                # collects it itself (commit, merge main into the branch, touched tests, merge).
+                task['patch_state'] = 'waiting'
+                self.store.put('tasks', task)
+                self.store.event('patch_autocollect', task['run_id'], commit=False, task_id=task['id'],
+                                 message='Task is done but its copy was still open; NotionTool commits and merges it')
             if task.get('patch_state') != 'waiting' or task['id'] in merging or not task.get('patch_worktree'):
                 continue
             run = self.store.get('runs', task['run_id'])
@@ -1232,11 +1358,15 @@ class Engine:
             self.store.put('tasks', task)
             merging.discard(task_id)  # only after the new patch_state is stored, so no second merge starts
 
-    def patch_status(self):
-        """Settings status: is patch mode on, merges today, conflicts waiting, tasks waiting to merge."""
+    def patch_status(self, store=None):
+        """Settings status: is patch mode on, merges today, conflicts waiting, tasks waiting to merge.
+
+        store: optional read view; the desktop build passes its light task view so the pushed state never
+        parses every full task document (prompts, raw responses) a second time."""
+        store = store if store is not None else self.store
         start = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
-        tasks = self.store.all('tasks')
-        value = self.store.settings().get(patch_mod.SETTING, PATCH_MODE_DEFAULT)
+        tasks = store.all('tasks')
+        value = store.settings().get(patch_mod.SETTING, PATCH_MODE_DEFAULT)
         return dict(enabled=patch_mod.enabled({patch_mod.SETTING: value}),
                     merges_today=sum(1 for t in tasks if t.get('patch_state') == 'merged' and not t.get('patch_origin')
                                      and (t.get('patch_result') or {}).get('at', 0) >= start),
@@ -2101,8 +2231,8 @@ class Engine:
                 slot_free = bool(since) and not approval and self._done_poll_slot_free(task['id'], now, settings)
                 delay = 300 if overdue else reconcile_delay(checks, now, since, approval, slot_free, settings)
                 # B46: keep the liveness fields recover() just stored (this put would overwrite them otherwise).
-                for key in REMOTE_LIVE_FIELDS:
-                    if key in stored:
+                for key in REMOTE_LIVE_FIELDS + ('remote_done_at', 'cut_pending_tool', 'cut_tool_key'):
+                    if key in stored:  # a cut turn's remote_done_at (notion.note_cut_turn) must survive this put
                         task[key] = stored[key]
                 working = getattr(exc, 'reason', '') == 'remote_working' and not approval
                 if working:
@@ -2127,6 +2257,9 @@ class Engine:
                                 approval_seen=stored.get('approval_seen'),
                                 error=('Waiting for approval of ' + tool + ' in the coworker chat; the request is not resent'
                                        if evidence else
+                                       ('Notion ended the coworker turn while ' + tool + ' had no result (turn cut); the Main '
+                                        'can accept or abandon it and the turn watch continues it; the request is not resent')
+                                       if stored.get('cut_pending_tool') else
                                        'A tool call in the coworker chat has not finished yet (' + tool +
                                        (': ' + detail if detail else '') + '); the request is not resent'))
                 worker = self.store.get('workers', info['worker_id'])

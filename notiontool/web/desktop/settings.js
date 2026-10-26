@@ -118,6 +118,7 @@
 
   function mcpStatus(s) {
     s = s || {};
+    if (s.installed === false) return 'not installed';
     if (s.state) return String(s.state);
     if (s.status) return String(s.status);
     if (s.enabled === false) return 'disabled';
@@ -127,7 +128,7 @@
 
   function mcpTone(s) {
     s = s || {};
-    return s.error ? 'error' : (s.enabled === false ? 'off' : 'on');
+    return s.error ? 'error' : (s.enabled === false || s.installed === false ? 'off' : 'on');
   }
 
   function mcpCount(s) {
@@ -1170,16 +1171,27 @@
   var POLL_MS = 1000;
   var POLL_MAX = 300;
   var TAB_ID = 'settings';
+  // Settings menu (the 2nd column next to the shell rail). Order: Account, Models & Roles, Limits, Projects,
+  // Tools & MCP, Appearance, Shortcuts. One page shows at a time; Settings stays active in the rail.
   var TAB_SECTIONS = [
-    { id: 'team', label: 'Team', help: 'How many helper chats work for you and when they get a fresh chat.',
-      keys: ['per_account', 'coworker_max_age_hours', 'max_workers'] },
-    { id: 'models', label: 'Models & effort', help: 'How hard the AI thinks. Automatic picks a level for each kind of task.',
-      keys: ['app_effort_override'] },
-    { id: 'look', label: 'App look', help: 'How the app looks on this computer.',
-      keys: ['app_theme_intensity', 'app_compact', 'app_declutter'] },
-    { id: 'notify', label: 'Notifications', help: 'When the app tells you that something happened.',
-      keys: ['app_notify_desktop', 'app_notify_done', 'app_notify_needs_you', 'app_notify_sound'] }
+    { id: 'account', label: 'Account', help: 'Who is signed in, the Notion connection and the accounts you can switch between.', keys: [] },
+    { id: 'models', label: 'Models & Roles', help: 'Which model each job uses. Models are always named, never Auto. Press Save to keep your changes.',
+      keys: ['app_default_model', 'app_never_use_auto', 'app_effort_override', 'app_role_researcher', 'app_role_architect',
+        'app_role_worker', 'app_role_quality_planner', 'app_direct_model'] },
+    { id: 'limits', label: 'Limits', help: 'How long chats live, how much one turn may do and how many coworkers work at once.',
+      keys: ['coworker_max_age_hours', 'app_send_block_hours', 'app_steps_per_turn', 'per_account', 'max_workers',
+        'main_context_policy', 'app_auto_switch_context', 'app_auto_switch_percent', 'app_load_last_messages', 'app_restart_safety'] },
+    { id: 'projects', label: 'Projects', help: 'How coworkers share project files, and the Main chat.', keys: [] },
+    { id: 'tools', label: 'Tools & MCP', help: 'MCP servers, backups and usage.', keys: [] },
+    { id: 'appearance', label: 'Appearance', help: 'How the app looks and when it tells you that something happened.',
+      keys: ['app_theme_intensity', 'app_compact', 'app_declutter', 'app_notify_desktop', 'app_notify_done',
+        'app_notify_needs_you', 'app_notify_sound'] },
+    { id: 'shortcuts', label: 'Shortcuts', help: 'Keys that work in the app.', keys: [] }
   ];
+  // Pages whose controls are staged first and written by the Save button (Reset puts the defaults back).
+  var DRAFT_SECTIONS = ['models'];
+  var SLIDERS = ['coworker_max_age_hours', 'app_send_block_hours', 'app_steps_per_turn', 'app_auto_switch_percent'];
+  var UNITS = { coworker_max_age_hours: ' h', app_send_block_hours: ' h', app_auto_switch_percent: ' %' };
   var TAB_TEXT = {
     per_account: ['Coworkers', 'Helper chats per Notion account. 1 to 40.'],
     coworker_max_age_hours: ['Replace chats after (hours)', 'A helper chat older than this gets a fresh chat. The old one is kept.'],
@@ -1191,10 +1203,28 @@
     app_notify_desktop: ['Desktop pop-ups', 'Show a pop-up from Windows.'],
     app_notify_done: ['When a task is done', 'Tell me when a task is finished.'],
     app_notify_needs_you: ['When the app needs you', 'Tell me when a chat waits for my answer.'],
-    app_notify_sound: ['Play a sound', 'Play a short sound with each notice.']
+    app_notify_sound: ['Play a sound', 'Play a short sound with each notice.'],
+    app_default_model: ['Default model', 'The model new chats start with. It stays pinned until you change it.'],
+    app_never_use_auto: ['Never use Auto', 'Always use the model named here. The app never picks one for you.'],
+    app_role_researcher: ['Researcher', 'Model for the Researcher role.'],
+    app_role_architect: ['Architect', 'Model for the Architect role.'],
+    app_role_worker: ['Worker', 'Model for the Worker role.'],
+    app_role_quality_planner: ['Quality planner', 'Model for the Quality planner role.'],
+    app_direct_model: ['Direct mode model', 'Model used when you work in Direct mode.'],
+    coworker_max_age_hours: ['Chat max age for auto switch', 'A coworker chat older than this gets a fresh chat.'],
+    app_send_block_hours: ['Send block', 'A chat older than this cannot send any more messages.'],
+    app_steps_per_turn: ['Steps per turn', 'Most steps one turn may take before it stops.'],
+    per_account: ['Max coworkers', 'Helper chats per Notion account.'],
+    max_workers: ['Coworkers in total', 'Most helper chats working at the same time.'],
+    main_context_policy: ['When the Main chat context is full', 'What the Main chat does when its context is nearly full.'],
+    app_auto_switch_context: ['Switch context automatically', 'Move to a fresh chat when the context is nearly full.'],
+    app_auto_switch_percent: ['Switch context at', 'How full the context is when the automatic switch starts.'],
+    app_load_last_messages: ['Load last messages', 'How many messages a chat shows at first. Older ones via Load older messages.'],
+    app_restart_safety: ['Restart safety', 'Restart only when no task is running. Tasks wait until the restart is done.']
   };
   var OPTION_TEXT = { auto: 'Automatic', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Very high',
-    max: 'Maximum', soft: 'Soft', normal: 'Normal', strong: 'Strong' };
+    max: 'Maximum', soft: 'Soft', normal: 'Normal', strong: 'Strong',
+    'opus-5.5': 'Opus 5.5', 'sonnet-5.5': 'Sonnet 5.5', 'haiku-5.5': 'Haiku 5.5', hint: 'Show a hint', ask: 'Ask me' };
   var EFFORT_RULE = 'Automatic: coworkers use medium for light work and high otherwise. The Main keeps its own pick.';
   // Design g1: the Effort control offers only these; a saved low, xhigh or max is stale and shows a warning.
   var EFFORT_OPTIONS = ['auto', 'medium', 'high'];
@@ -1307,9 +1337,40 @@
       });
   }
 
+  // Writes several staged values one after the other through saveField (the Save button of Models & Roles).
+  function saveMany(call, schema, values, report) {
+    var note = typeof report === 'function' ? report : function () {};
+    var current = schema;
+    var failures = [];
+    var chain = Promise.resolve();
+    Object.keys(values).forEach(function (key) {
+      chain = chain.then(function () {
+        return saveField(call, current, key, values[key], function (kind, text) { note(kind, text, key); })
+          .then(function (res) {
+            if (res && res.schema) current = res.schema;
+            if (!res || !res.ok) failures.push({ key: key, error: res && res.error ? res.error : 'Not saved.' });
+          });
+      });
+    });
+    return chain.then(function () { return { ok: failures.length === 0, failures: failures, schema: current }; });
+  }
+
+  // Accounts as the Account page shows them. Reads the same fields as GET /api/state (accounts, harness_account_id).
+  function accountRows(state) {
+    var list = state && Array.isArray(state.accounts) ? state.accounts : [];
+    var active = state && (state.harness_account_id || state.account_id) ? String(state.harness_account_id || state.account_id) : '';
+    return list.filter(function (a) { return a && a.id; }).map(function (a, i) {
+      return { id: String(a.id), title: String(a.name || a.label || a.email || a.id), email: String(a.email || ''),
+        space: String(a.space_name || a.workspace || ''), role: (active ? String(a.id) === active : i === 0) ? 'Main' : 'Backup',
+        state: String(a.state || ''), error: String(a.error || ''),
+        active: active ? String(a.id) === active : i === 0 };
+    });
+  }
+
   window.__ntDesk.settingsLogic = { sections: TAB_SECTIONS, text: TAB_TEXT, entriesOf: entriesOf, validate: validate,
     planWrite: planWrite, verify: verify, teamSize: teamSize, saveField: saveField, optionsOf: optionsOf,
-    effortWarning: effortWarning, effortOptions: EFFORT_OPTIONS };
+    effortWarning: effortWarning, effortOptions: EFFORT_OPTIONS, saveMany: saveMany, accountRows: accountRows,
+    sliders: SLIDERS, draftSections: DRAFT_SECTIONS };
 
   // Backups and Details cards (notiontool/backup.py: backup_status, backup_now, usage_report).
   function backupText(res) {
@@ -1418,6 +1479,7 @@
     var views = [];
     var host = null;
     var registered = false;
+    var unregister = null;
     var pollTimer = 0;
     var polls = 0;
 
@@ -1467,17 +1529,22 @@
     function syncControl(row) {
       var entry = entriesOf(schema)[row.key];
       if (!entry) return;
+      // A staged (not yet saved) value wins over the saved one on pages that use Reset and Save.
+      var staged = row.view && row.view.draft && Object.prototype.hasOwnProperty.call(row.view.draft, row.key);
+      var value = staged ? row.view.draft[row.key] : entry.value;
       if (entry.type === 'bool') {
-        row.control.setAttribute('aria-checked', entry.value === true ? 'true' : 'false');
-        row.control.textContent = entry.value === true ? 'On' : 'Off';
+        row.control.setAttribute('aria-checked', value === true ? 'true' : 'false');
+        row.control.textContent = value === true ? 'On' : 'Off';
       } else if (row.control.getAttribute('role') === 'radiogroup') {
         var btns = row.control.querySelectorAll('.nt-desk-stab-seg-btn');
         for (var i = 0; i < btns.length; i++) {
-          btns[i].setAttribute('aria-checked', btns[i].getAttribute('data-value') === String(entry.value) ? 'true' : 'false');
+          btns[i].setAttribute('aria-checked', btns[i].getAttribute('data-value') === String(value) ? 'true' : 'false');
         }
       } else {
-        row.control.value = String(entry.value);
+        row.control.value = String(value);
       }
+      if (row.out) row.out.textContent = String(value) + (UNITS[row.key] || '');
+      if (row.wrap) row.wrap.classList.toggle('nt-desk-stab-row-dirty', !!staged);
       if (row.warn) {
         var warning = effortWarning(entry);
         row.warn.textContent = warning;
@@ -1486,7 +1553,26 @@
       }
     }
 
+    function updateDraftButtons(view) {
+      var n = Object.keys(view.draft || {}).length;
+      if (view.saveBtn) view.saveBtn.disabled = n === 0;
+      if (view.draftNote && n) setStatus(view.draftNote, '', n === 1 ? '1 change not saved yet.' : n + ' changes not saved yet.');
+    }
+
+    // Models & Roles: a change is staged first. Save writes it, Reset puts the defaults back.
+    function stage(view, row, raw) {
+      var entry = entriesOf(schema)[row.key];
+      var check = validate(entry, raw, schema);
+      if (!check.ok) { setStatus(row.status, 'error', check.error); syncControl(row); return; }
+      if (String(check.value) === String(entry.value)) delete view.draft[row.key]; else view.draft[row.key] = check.value;
+      setStatus(row.status, '', '');
+      syncControl(row);
+      if (!Object.keys(view.draft).length && view.draftNote) setStatus(view.draftNote, '', '');
+      updateDraftButtons(view);
+    }
+
     function commit(view, row, raw) {
+      if (row.draft) { stage(view, row, raw); return; }
       row.control.disabled = true;
       saveField(call, schema, row.key, raw, function (kind, text) { setStatus(row.status, kind, text); })
         .then(function (res) {
@@ -1530,6 +1616,14 @@
           c.appendChild(opt);
         });
         c.addEventListener('change', function () { commit(view, row, c.value); });
+      } else if (entry.type === 'int' && SLIDERS.indexOf(entry.key) >= 0) {
+        c = node('input', 'nt-desk-stab-range');
+        c.type = 'range';
+        if (entry.min != null) c.min = String(entry.min);
+        if (entry.max != null) c.max = String(entry.max);
+        c.step = '1';
+        c.addEventListener('input', function () { if (row.out) row.out.textContent = c.value + (UNITS[entry.key] || ''); });
+        c.addEventListener('change', function () { commit(view, row, c.value); });
       } else {
         c = node('input', 'nt-desk-stab-number');
         c.type = 'number';
@@ -1541,9 +1635,10 @@
       return c;
     }
 
-    function rowFor(view, entry) {
+    function rowFor(view, entry, draft) {
       var text = TAB_TEXT[entry.key] || [entry.label || entry.key, entry.help || ''];
-      var row = { key: entry.key };
+      var row = { key: entry.key, view: view, draft: !!draft };
+      if (SLIDERS.indexOf(entry.key) >= 0) row.out = node('output', 'nt-desk-stab-out');
       var wrap = node('div', 'nt-desk-stab-row');
       var info = node('div', 'nt-desk-stab-info');
       var label = node('label', 'nt-desk-stab-label', text[0]);
@@ -1564,6 +1659,7 @@
       row.control.setAttribute('aria-label', text[0]);
       wrap.appendChild(info);
       wrap.appendChild(row.control);
+      if (row.out) wrap.appendChild(row.out);
       view.rows[entry.key] = row;
       syncControl(row);
       return wrap;
@@ -1573,29 +1669,253 @@
       view.nav.textContent = '';
       view.body.textContent = '';
       view.rows = {};
+      view.pages = {};
+      view.navBtns = {};
+      view.draft = view.draft || {};
       banner(view, '');
       if (!schema) { view.body.appendChild(node('p', 'nt-desk-stab-empty', 'Loading settings...')); return; }
       var map = entriesOf(schema);
       TAB_SECTIONS.forEach(function (sec) {
-        var card = node('section', 'nt-desk-stab-card');
-        card.setAttribute('data-nt-section', sec.id);
-        card.appendChild(node('h3', 'nt-desk-stab-h', sec.label));
-        card.appendChild(node('p', 'nt-desk-stab-sub', sec.help));
-        if (sec.id === 'models') card.appendChild(node('p', 'nt-desk-stab-rule', EFFORT_RULE));
-        var count = 0;
-        sec.keys.forEach(function (k) { if (map[k]) { card.appendChild(rowFor(view, map[k])); count += 1; } });
-        if (!count) card.appendChild(node('p', 'nt-desk-stab-empty', 'Not available yet.'));
-        view.body.appendChild(card);
+        var page = node('section', 'nt-desk-stab-page');
+        page.setAttribute('data-nt-page', sec.id);
+        page.hidden = sec.id !== view.cur;
+        view.pages[sec.id] = page;
+        view.body.appendChild(page);
+        page.appendChild(node('h3', 'nt-desk-stab-title', sec.label));
+        page.appendChild(node('p', 'nt-desk-stab-sub', sec.help));
         var btn = node('button', 'nt-desk-stab-navbtn', sec.label);
         btn.type = 'button';
-        btn.addEventListener('click', function (ev) {
-          ev.preventDefault();
-          try { card.scrollIntoView({ block: 'start', behavior: 'smooth' }); } catch (err) { /* ignore */ }
-        });
+        btn.setAttribute('data-nt-nav', sec.id);
+        btn.addEventListener('click', function (ev) { ev.preventDefault(); showPage(view, sec.id); });
         view.nav.appendChild(btn);
+        view.navBtns[sec.id] = btn;
+        view.target = page;
+        pageBody(view, sec, map, page);
       });
-      extraCards(view);
-      mainCard(view);
+      view.target = null;
+      showPage(view, view.cur);
+    }
+
+    // One page shows at a time; the menu button of the open page is marked as current.
+    function showPage(view, id) {
+      if (!view.pages[id]) id = TAB_SECTIONS[0].id;
+      view.cur = id;
+      Object.keys(view.pages).forEach(function (k) {
+        view.pages[k].hidden = k !== id;
+        var b = view.navBtns[k];
+        if (!b) return;
+        if (k === id) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+      });
+    }
+
+    function pageBody(view, sec, map, page) {
+      if (sec.id === 'account') { accountPage(view); return; }
+      if (sec.id === 'models') {
+        [['Default model', ['app_default_model', 'app_never_use_auto', 'app_effort_override']],
+          ['Roles', ['app_role_researcher', 'app_role_architect', 'app_role_worker', 'app_role_quality_planner']],
+          ['Direct mode', ['app_direct_model']]].forEach(function (group) {
+          var box = card(view, group[0].toLowerCase().replace(/ /g, '-'), group[0], '');
+          group[1].forEach(function (key) { if (map[key]) box.appendChild(rowFor(view, map[key], true)); });
+        });
+        modelsActions(view, page, sec);
+        return;
+      }
+      if (sec.keys.length) {
+        var rows = node('div', 'nt-desk-stab-card');
+        var staged = DRAFT_SECTIONS.indexOf(sec.id) >= 0;
+        sec.keys.forEach(function (k) { if (map[k]) rows.appendChild(rowFor(view, map[k], staged)); });
+        page.appendChild(rows);
+      }
+      if (sec.id === 'models') modelsActions(view, page, sec);
+      if (sec.id === 'limits') restartCard(view);
+      if (sec.id === 'projects') { patchCard(view); mainCard(view); }
+      if (sec.id === 'tools') toolsCards(view);
+      if (sec.id === 'shortcuts') shortcutsCard(view);
+    }
+
+    // Models & Roles: Reset puts the defaults back (staged), Save writes every staged value.
+    function modelsActions(view, page, sec) {
+      var bar = node('div', 'nt-desk-stab-actions');
+      var reset = node('button', 'nt-desk-stab-btn-secondary', 'Reset');
+      var save = node('button', 'nt-desk-stab-btn-primary', 'Save');
+      reset.type = 'button';
+      save.type = 'button';
+      save.disabled = true;
+      var note = node('div', 'nt-desk-stab-status');
+      note.setAttribute('role', 'status');
+      note.setAttribute('aria-live', 'polite');
+      view.saveBtn = save;
+      view.draftNote = note;
+      reset.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        var map = entriesOf(schema);
+        sec.keys.forEach(function (k) {
+          var e = map[k];
+          if (!e) return;
+          if (String(e.value) === String(e['default'])) delete view.draft[k]; else view.draft[k] = e['default'];
+          if (view.rows[k]) syncControl(view.rows[k]);
+        });
+        updateDraftButtons(view);
+        setStatus(note, '', Object.keys(view.draft).length ? 'Defaults are back. Press Save to keep them.' : 'Already on the defaults.');
+      });
+      save.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        var values = {};
+        Object.keys(view.draft).forEach(function (k) { values[k] = view.draft[k]; });
+        if (!Object.keys(values).length) return;
+        save.disabled = true;
+        reset.disabled = true;
+        setStatus(note, 'saving', 'Saving...');
+        saveMany(call, schema, values, null).then(function (res) {
+          if (res.schema) { schema = res.schema; applyLook(); }
+          var bad = {};
+          res.failures.forEach(function (f) { bad[f.key] = true; });
+          Object.keys(values).forEach(function (k) { if (!bad[k]) delete view.draft[k]; });
+          reset.disabled = false;
+          views.forEach(function (v) { Object.keys(v.rows).forEach(function (k) { syncControl(v.rows[k]); }); });
+          if (res.ok) setStatus(note, 'applied', 'Saved'); else setStatus(note, 'error', 'Not saved: ' + res.failures[0].error);
+          updateDraftButtons(view);
+          if (res.ok) setStatus(note, 'applied', 'Saved');
+        });
+      });
+      bar.appendChild(reset);
+      bar.appendChild(save);
+      bar.appendChild(note);
+      page.appendChild(bar);
+    }
+
+    // Account: Profile, the Notion connection (with a small Sign out) and the accounts. No danger zone.
+    // Sign out and Switch call shell actions; they are never run by the tests.
+    function accountPage(view) {
+      var profile = card(view, 'profile', 'Profile', 'Who is signed in to NotionTool.');
+      var who = node('p', 'nt-desk-stab-who', 'Loading...');
+      var mail = node('p', 'nt-desk-stab-help', '');
+      profile.appendChild(who);
+      profile.appendChild(mail);
+      var conn = card(view, 'connection', 'Notion connection', 'NotionTool talks to Notion with this account.');
+      var line = node('p', 'nt-desk-stab-help', 'Loading...');
+      var signIn = node('button', 'nt-desk-stab-btn-primary', 'Sign in / Add account');
+      signIn.type = 'button';
+      signIn.setAttribute('data-account-action', 'sign-in');
+      var signOut = node('button', 'nt-desk-stab-small', 'Sign out');
+      signOut.type = 'button';
+      signOut.setAttribute('data-account-action', 'sign-out');
+      var cstat = node('div', 'nt-desk-stab-status');
+      cstat.setAttribute('role', 'status');
+      conn.appendChild(line);
+      conn.appendChild(signIn);
+      conn.appendChild(signOut);
+      conn.appendChild(cstat);
+      var accs = card(view, 'accounts', 'Accounts', 'Main is used first. Backup takes over when you switch to it.');
+      var list = node('ul', 'nt-desk-stab-accounts');
+      var astat = node('div', 'nt-desk-stab-status');
+      astat.setAttribute('role', 'status');
+      accs.appendChild(list);
+      accs.appendChild(astat);
+      var activeId = '';
+      var armed = false;
+      function render(state) {
+        var rows = accountRows(state);
+        list.textContent = '';
+        activeId = '';
+        signOut.disabled = true;
+        who.textContent = 'Not signed in';
+        mail.textContent = '';
+        if (!rows.length) {
+          who.textContent = 'Not signed in';
+          line.textContent = 'No Notion account found.';
+          list.appendChild(node('li', 'nt-desk-stab-help', 'No accounts yet.'));
+          return;
+        }
+        rows.forEach(function (a) {
+          if (a.active) {
+            activeId = a.id;
+            who.textContent = a.title;
+            mail.textContent = a.email;
+            var connected = a.state === 'ready' && !a.error;
+            line.textContent = connected ? 'Connected' + (a.space ? ' to ' + a.space : '') + '.'
+              : (a.error || 'Sign in required.');
+            signOut.disabled = false;
+          }
+          var li = node('li', 'nt-desk-stab-account' + (a.active ? ' nt-desk-stab-account-active' : ''));
+          var info = node('div', 'nt-desk-stab-info');
+          info.appendChild(node('div', 'nt-desk-stab-label', a.title + ' \u00b7 ' + a.role));
+          info.appendChild(node('div', 'nt-desk-stab-help', a.email || a.space));
+          li.appendChild(info);
+          if (a.active) {
+            li.appendChild(node('span', 'nt-desk-stab-pill', 'Active'));
+          } else {
+            var sw = node('button', 'nt-desk-stab-small', 'Switch');
+            sw.type = 'button';
+            sw.addEventListener('click', function (ev) {
+              ev.preventDefault();
+              sw.disabled = true;
+              setStatus(astat, 'saving', 'Switching...');
+              Promise.resolve().then(function () { return call('account_select', { account_id: a.id }); }).then(function (res) {
+                if (failed(res)) throw res;
+                setStatus(astat, 'applied', 'Switched to ' + a.title + '.');
+                if (res && res.navigate) window.location.assign(res.navigate);
+                sw.disabled = false;
+              }, function (err) {
+                sw.disabled = false;
+                setStatus(astat, 'error', 'Could not switch accounts: ' + errText(err));
+              });
+            });
+            li.appendChild(sw);
+          }
+          list.appendChild(li);
+        });
+      }
+      Promise.resolve().then(function () { return call('account_status', {}); }).then(render, function (err) {
+        who.textContent = 'Not available';
+        line.textContent = 'Could not read the account (' + errText(err) + ').';
+      });
+      signIn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        signIn.disabled = true;
+        setStatus(cstat, 'saving', 'Opening Notion sign-in...');
+        Promise.resolve().then(function () { return call('account_sign_in', {}); }).then(function (res) {
+          if (failed(res)) throw res;
+          if (res && res.navigate) window.location.assign(res.navigate);
+          else setStatus(cstat, 'applied', 'Complete sign-in in the Notion window, then close that window.');
+          signIn.disabled = false;
+        }).catch(function (err) {
+          signIn.disabled = false;
+          setStatus(cstat, 'error', 'Could not open sign-in: ' + errText(err));
+        });
+      });
+      signOut.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        if (!activeId) { setStatus(cstat, 'error', 'No account is signed in.'); return; }
+        if (!armed) {
+          armed = true;
+          signOut.textContent = 'Confirm sign out';
+          setStatus(cstat, '', 'Click again to sign out. Your chats and projects will be kept.');
+          return;
+        }
+        armed = false;
+        signOut.textContent = 'Sign out';
+        signOut.disabled = true;
+        setStatus(cstat, 'saving', 'Signing out...');
+        Promise.resolve().then(function () { return call('account_sign_out', { account_id: activeId }); }).then(function (res) {
+          if (failed(res)) throw res;
+          signOut.disabled = false;
+          setStatus(cstat, 'applied', 'Signed out.');
+          if (res && res.navigate) window.location.assign(res.navigate);
+        }, function (err) {
+          signOut.disabled = false;
+          setStatus(cstat, 'error', 'Could not sign out: ' + errText(err));
+        });
+      });
+    }
+
+    function shortcutsCard(view) {
+      var c = card(view, 'keys', 'Keys', 'These keys work anywhere in the app.');
+      var list = node('ul', 'nt-desk-stab-usage');
+      [['Open Settings', 'Ctrl+,'], ['Close a panel', 'Esc']].forEach(function (pair) {
+        list.appendChild(node('li', 'nt-desk-stab-help', pair[0] + ': ' + pair[1]));
+      });
+      c.appendChild(list);
     }
 
     // Main chat card: 'Refresh Main' makes a fresh Main; the old one is retired only when the new one is ready.
@@ -1625,14 +1945,7 @@
       c.setAttribute('data-nt-section', id);
       c.appendChild(node('h3', 'nt-desk-stab-h', title));
       c.appendChild(node('p', 'nt-desk-stab-sub', help));
-      view.body.appendChild(c);
-      var btn = node('button', 'nt-desk-stab-navbtn', title);
-      btn.type = 'button';
-      btn.addEventListener('click', function (ev) {
-        ev.preventDefault();
-        try { c.scrollIntoView({ block: 'start', behavior: 'smooth' }); } catch (err) { /* ignore */ }
-      });
-      view.nav.appendChild(btn);
+      (view.target || view.body).appendChild(c);
       return c;
     }
 
@@ -1673,10 +1986,81 @@
       }, function () { line.textContent = patchText(null); });
     }
 
-    function extraCards(view) {
-      patchCard(view);
+    function notionConnections(view) {
+      var box = card(view, 'notion-connections', 'Connected in Notion',
+        'MCP connections added to the signed-in Notion account.');
+      var summary = node('p', 'nt-desk-stab-help', 'Loading connections...');
+      var list = node('div', 'nt-desk-connections');
+      var status = node('div', 'nt-desk-stab-status');
+      status.setAttribute('role', 'status');
+      var refresh = node('button', 'nt-desk-stab-small', 'Refresh connections');
+      refresh.type = 'button';
+      box.appendChild(summary); box.appendChild(list); box.appendChild(refresh); box.appendChild(status);
+      var openId = '';
+      function paint(result) {
+        var rows = (result && result.connections) || [];
+        summary.textContent = rows.length + ' connected MCP' + (rows.length === 1 ? '' : 's');
+        list.textContent = '';
+        if (!rows.length) list.appendChild(node('p', 'nt-desk-stab-help', 'No MCP connections added to this Notion account.'));
+        rows.forEach(function (item) {
+          var row = node('div', 'nt-desk-connection');
+          row.setAttribute('data-notion-connection', item.id);
+          var head = node('div', 'nt-desk-connection-head');
+          head.appendChild(node('strong', '', item.name));
+          head.appendChild(node('span', 'nt-desk-stab-pill', 'Connected'));
+          var manage = node('button', 'nt-desk-stab-small', 'Manage'); manage.type = 'button';
+          var details = node('div', 'nt-desk-connection-details'); details.hidden = openId !== item.id;
+          manage.setAttribute('aria-expanded', String(!details.hidden));
+          manage.addEventListener('click', function () {
+            details.hidden = !details.hidden; openId = details.hidden ? '' : item.id;
+            manage.setAttribute('aria-expanded', String(!details.hidden));
+          });
+          head.appendChild(manage); row.appendChild(head);
+          details.appendChild(node('p', 'nt-desk-stab-help', item.url));
+          details.appendChild(node('p', 'nt-desk-stab-help', 'Enabled by default in chats: ' + (item.enabled ? 'On' : 'Off')));
+          [['read_auto', 'Run read tools automatically'], ['write_auto', 'Run write tools automatically']].forEach(function (field) {
+            var label = node('label', 'nt-desk-connection-permission');
+            var input = document.createElement('input'); input.type = 'checkbox'; input.checked = !!item[field[0]];
+            input.setAttribute('role', 'switch'); input.setAttribute('aria-label', field[1] + ': ' + item.name);
+            input.addEventListener('change', function () {
+              input.disabled = true; setStatus(status, 'saving', 'Saving tool permissions...');
+              var values = { id: item.id, read_auto: item.read_auto, write_auto: item.write_auto };
+              values[field[0]] = input.checked;
+              Promise.resolve(call('notion_connection_permissions', values)).then(function (fresh) {
+                if (failed(fresh)) throw fresh;
+                paint(fresh); setStatus(status, 'applied', 'Permissions saved in Notion.');
+              }).catch(function (err) {
+                input.checked = !!item[field[0]]; input.disabled = false;
+                setStatus(status, 'error', errText(err));
+              });
+            });
+            label.appendChild(input); label.appendChild(node('span', '', field[1])); details.appendChild(label);
+          });
+          row.appendChild(details); list.appendChild(row);
+        });
+      }
+      function load() {
+        refresh.disabled = true;
+        return Promise.resolve(call('notion_connections', {})).then(function (result) {
+          if (failed(result)) throw result;
+          paint(result); setStatus(status, '', '');
+        }).catch(function (err) {
+          summary.textContent = 'Could not load Notion connections.'; setStatus(status, 'error', errText(err));
+        }).then(function () { refresh.disabled = false; });
+      }
+      refresh.addEventListener('click', load);
+      load();
+    }
+
+    function toolsCards(view) {
+      var pc = card(view, 'pc-access', 'PC access', 'File and command access for your NotionTool connection.');
+      var map = entriesOf(schema);
+      ['mcp_full_access', 'mcp_browser_access'].forEach(function (key) {
+        if (map[key]) pc.appendChild(rowFor(view, map[key], false));
+      });
+      notionConnections(view);
       if (typeof window.__ntDesk.settingsMcp === 'function') {
-        var m = card(view, 'mcp', 'MCP servers', 'Servers Notion can use through NotionTool: switch them on, ' +
+        var m = card(view, 'mcp', 'Local MCP servers', 'Servers Notion can use through NotionTool: switch them on, ' +
           'add your own, refresh their tools and set up remote access.');
         window.__ntDesk.settingsMcp({ call: call, toast: function (text, kind) {
           try { if (typeof ctx.toast === 'function') ctx.toast(text, kind || 'info'); } catch (err) { /* ignore */ }
@@ -1717,7 +2101,6 @@
         if (failed(res)) throw res;
         usageLines(res).forEach(function (t) { lines.appendChild(node('li', 'nt-desk-stab-help', t)); });
       }, function (err) { lines.appendChild(node('li', 'nt-desk-stab-help', 'Not available: ' + errText(err))); });
-      restartCard(view);
     }
 
     // ---- Restart NotionTool ----
@@ -1852,10 +2235,11 @@
     function mount(container) {
       var root = node('div', 'nt-desk-stab');
       var head = node('div', 'nt-desk-stab-head');
-      head.appendChild(node('h2', 'nt-desk-stab-title', 'Settings'));
-      head.appendChild(node('p', 'nt-desk-stab-sub', 'Changes save right away.'));
+      head.appendChild(node('h2', 'nt-desk-stab-title', 'NotionTool Studio'));
+      head.appendChild(node('p', 'nt-desk-stab-sub', 'Settings'));
       var view = { root: root, banner: node('div', 'nt-desk-stab-banner'), nav: node('nav', 'nt-desk-stab-nav'),
-        body: node('div', 'nt-desk-stab-body'), rows: {} };
+        body: node('div', 'nt-desk-stab-body'), rows: {}, cur: TAB_SECTIONS[0].id, draft: {}, pages: {}, navBtns: {} };
+      view.nav.setAttribute('aria-label', 'Settings menu');
       view.banner.setAttribute('role', 'alert');
       var main = node('div', 'nt-desk-stab-main');
       main.appendChild(view.nav);
@@ -1882,7 +2266,12 @@
       var shell = window.__ntShell;
       var fn = shell && (shell.registerTab || shell.register || shell.addTab);
       if (typeof fn !== 'function') return false;
-      try { fn.call(shell, descriptor); registered = true; } catch (err) { return false; }
+      try {
+        var view = { mount: function (container) { var handle = mount(container); return handle.stop; } };
+        if (fn === shell.register) unregister = fn.call(shell, TAB_ID, view);
+        else unregister = fn.call(shell, descriptor);
+        registered = true;
+      } catch (err) { return false; }
       if (pollTimer) clearTimeout(pollTimer);
       pollTimer = 0;
       if (host) closeHost();
@@ -1965,6 +2354,8 @@
         views.slice().forEach(function (v) { if (v.root.parentNode) v.root.remove(); });
         views = [];
         var shell = window.__ntShell;
+        if (typeof unregister === 'function') unregister();
+        unregister = null;
         var un = registered && shell && (shell.unregisterTab || shell.unregister || shell.removeTab);
         if (typeof un === 'function') { try { un.call(shell, TAB_ID); } catch (err) { /* ignore */ } }
         registered = false;

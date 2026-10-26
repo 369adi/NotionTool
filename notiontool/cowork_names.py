@@ -40,7 +40,7 @@ __all__ = [
     'LEGACY_RETIRED_TITLE', 'LEGACY_TITLE', 'LEGACY_TITLES', 'POOL_TITLES', 'PROTECTED_TITLES', 'RETIRED_TITLE',
     'RETIRED_TITLES', 'TITLE_PREFIX', 'WELCOME_TITLE', 'assign_numbers', 'chat_title', 'harness_titled',
     'is_legacy_numbered', 'is_numbered_title', 'is_pool_title', 'is_protected_title', 'is_retired_title',
-    'is_unnamed_welcome', 'rename_plan', 'slot_number', 'title_for', 'user_renamed',
+    'is_unnamed_welcome', 'one_per_thread', 'rename_plan', 'slot_number', 'title_for', 'user_renamed',
 ]
 
 
@@ -130,6 +130,35 @@ def _role_number(worker, by_thread):
     return by_thread.get(tid) or by_thread.get(tid.replace('-', ''))
 
 
+def _live_rank(worker):
+    """Higher wins when two records point at the same chat."""
+    retired = bool(worker.get('retired')) or worker.get('state') in RETIRED_STATES
+    working = bool(worker.get('enabled')) and worker.get('join_state') == 'joined'
+    return (not retired, working, bool(worker.get('pool_admitted')))
+
+
+def one_per_thread(workers):
+    """Keep one worker record per chat, in the original order.
+
+    A Coworker context switch moves its worker record to a new Welcome chat that refresh or the
+    rotation may already have registered as a record of its own. Two records for one chat got two
+    numbers, so the chat was renamed twice per pass ('Coworker 4', then 'Coworker 9') and the
+    working record kept the label 'Welcome to Notion'. The kept record is the live one: not retired,
+    then enabled and joined, then pool-admitted, then the first one.
+    """
+    kept, order = {}, []
+    for worker in workers or ():
+        tid = str(worker.get('thread_id') or '').replace('-', '') if isinstance(worker, dict) else ''
+        if not tid:
+            order.append(worker)
+        elif tid not in kept:
+            order.append(tid)
+            kept[tid] = worker
+        elif _live_rank(worker) > _live_rank(kept[tid]):
+            kept[tid] = worker
+    return [kept[item] if isinstance(item, str) else item for item in order]
+
+
 def assign_numbers(workers, saved, ledger=None):
     """Return {worker_id: number} for every coworker slot in workers.
 
@@ -144,7 +173,7 @@ def assign_numbers(workers, saved, ledger=None):
     by_thread = _ledger_numbers(ledger)
     reserved = set(by_thread.values())
     slots = []
-    for worker in workers or ():
+    for worker in one_per_thread(workers):
         if is_protected_title(worker.get('label') if isinstance(worker, dict) else '') and not _role_number(worker, by_thread):
             continue  # the user's own chats (NotionTool, Roblox, Main*) never take a Coworker number
         if _is_slot(worker) and worker['id'] not in [s['id'] for s in slots]:
@@ -234,7 +263,7 @@ def rename_plan(workers, chats, saved, ledger=None, now=None):
     by_thread = _ledger_numbers(ledger)
     index = _chat_index(chats)
     plan, seen = [], set()
-    for worker in workers or ():
+    for worker in one_per_thread(workers):
         if not _is_slot(worker) or worker['id'] not in numbers:
             continue
         thread_id = worker.get('thread_id')

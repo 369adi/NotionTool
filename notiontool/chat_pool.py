@@ -167,17 +167,21 @@ def name_coworkers(adapter, client, account_id, records=None, now=None, store=No
         records = adapter.thread_records(client, wanted) if (wanted and budget_ok) else {}
     result = apply_cowork_names(adapter, client, workers, records or {}, account.get('cowork_numbers'), settings,
                                 ledger, budget_ok, MAX_RENAMES_PER_PASS, now, require_record=True)
-    by_thread = {w.get('thread_id'): w for w in workers if w.get('purpose', 'worker') == 'worker'}
+    def records_of(thread_id):
+        # Every record of the chat: after a context switch a second record may point at the same chat,
+        # and updating only one of them left the working record labelled 'Welcome to Notion'.
+        key = str(thread_id or '').replace('-', '')
+        return [w for w in workers if w.get('purpose', 'worker') == 'worker'
+                and str(w.get('thread_id') or '').replace('-', '') == key]
+
     for thread_id, title in result['renamed']:
-        worker = by_thread.get(thread_id)
-        if worker:
+        for worker in records_of(thread_id):
             worker.update(label=title, harness_title=title, renamed_at=now)
             worker.pop('rename_retry_at', None)
             store.put('workers', worker)
         store.event('coworker_renamed', message=title + ' ' + thread_id, slot=account.get('slot'))
     for thread_id, title, error in result['failed']:
-        worker = by_thread.get(thread_id)
-        if worker:
+        for worker in records_of(thread_id):
             worker['rename_retry_at'] = now + RENAME_RETRY_S
             store.put('workers', worker)
         store.event('coworker_rename_failed', message=title + ' ' + thread_id + ': ' + error, slot=account.get('slot'))

@@ -23,7 +23,8 @@ from .cowork_names import is_pool_title
 
 PROTECTED_TITLES = ('NotionTool', 'Sonstiges', 'Studio432', 'Roblox')
 ARCHIVE_PREFIX = 'Main (Archive '
-OLD_OPERATOR_PREFIX = 'Main (old, '  # main_switch.OLD_TITLE: old operator Main after a switch (never auto-deleted)
+LEGACY_OLD_OPERATOR_PREFIX = 'Main (old, '  # titles before 2026-10-25
+OLD_OPERATOR_PREFIX = 'Main (expired, '  # main_switch.OLD_TITLE: old operator Main after a switch (never auto-deleted)
 PROMPTS = 'main_handoff_prompts'
 WELCOMES = 'main_handoff_welcomes'
 MAX_STEPS = 24
@@ -316,7 +317,7 @@ class MainHandoffOps:
             reason = 'chat not listed'
         elif is_protected(current) or is_protected(title) or self._user_named(chat_id):
             reason = 'named chat'
-        elif self.operator and self._old_operator_of_switch(chat_id) and str(title).startswith((ARCHIVE_PREFIX, OLD_OPERATOR_PREFIX)):
+        elif self.operator and self._old_operator_of_switch(chat_id) and str(title).startswith((ARCHIVE_PREFIX, OLD_OPERATOR_PREFIX, LEGACY_OLD_OPERATOR_PREFIX)):
             reason = ''
         elif self._our_welcome(chat_id):
             reason = '' if title == 'Main' else 'Welcome chat may only become Main'
@@ -326,7 +327,7 @@ class MainHandoffOps:
             elif not (current.startswith('Main') or is_pool_title(current) or current.lower().startswith('welcome')):
                 reason = 'old Main has a custom title'
         elif self.operator and self._old_operator_of_switch(chat_id):
-            if not str(title).startswith((ARCHIVE_PREFIX, OLD_OPERATOR_PREFIX)):
+            if not str(title).startswith((ARCHIVE_PREFIX, OLD_OPERATOR_PREFIX, LEGACY_OLD_OPERATOR_PREFIX)):
                 reason = 'old operator Main may only get an archive title'
         else:
             reason = 'not our Welcome chat or Main archive'
@@ -366,6 +367,8 @@ class MainHandoffOps:
             text = self.operator_first_message(record)  # same file and token as main_switch wrote
         client = self._client()
         transcript = client.transcript(chat) or {}
+        from . import foreign_chat_guard  # RBX review: one age check on every send path (before the record)
+        foreign_chat_guard.require_young(self.store, self.adapter, chat, None, str(self.account_id or ''))
         step_id = self.adapter.new_id(client.info['space_id'])
         doc = dict(id=fingerprint, chat_id=chat, account_id=self.account_id, token=record['token'],
                    path=record['path'], step_id=step_id, state='attempted', acked=False,
@@ -456,7 +459,8 @@ class MainHandoffOps:
             self._event('main_handoff_repoint_pending', 'New Main not in the worker list yet',
                         handoff_id=handoff['id'])
             return False
-        new_worker.update(purpose='main', enabled=True, welcome=True)
+        new_worker.update(purpose='main', enabled=True, welcome=True,
+                          created_at=new_worker.get('created_at') or self.now())  # chat age starts fresh
         records = [('workers', new_worker)]
         if old_worker and old_worker['id'] != new_worker['id']:
             old_worker.update(purpose='archived_main', enabled=False)
@@ -708,4 +712,162 @@ def sweep_archives(store, adapter, clock=None):
         except Exception as exc:
             result['errors'] += 1
             store.event('main_handoff_first_reply_failed', message=str(exc)[:200], account_id=prompt['account_id'])
+    return result
+
+
+# Expired chats (periodic sweep) ------------------------------------------------------------------
+# Before this sweep an old Main was renamed only inside a running switch (main_switch._advance, the
+# operator_thread of a switch record) or handoff (old_chat_id). A Main whose worker record is gone
+# (worker_state 'missing') or that never became the operator Main never got a switch or handoff, so
+# its chat record stayed 'active' with its old title forever (bug: 'Main 20', ~47 h old).
+EXPIRED_SUFFIX = ' (expired)'
+EXPIRED_STATE = 'expired'
+EXPIRED_MAX_HOURS = 22  # never later than 22 h, even when coworker_max_age_hours is set higher
+_EXPIRED_SKIP_STATES = ('released', 'retired')
+_COWORKER_PURPOSES = ('worker', 'retired_worker')  # old Coworker chats: retire/delete flow only
+_ARCHIVE_TITLES = (ARCHIVE_PREFIX, LEGACY_OLD_OPERATOR_PREFIX, 'Main (expired')
+
+
+def expired_title(title):
+    """'<title> (expired)' exactly once; archive titles of earlier switches stay as they are."""
+    text = ' '.join(str(title or '').split()) or 'Main'
+    if text.lower().endswith('(expired)') or text.startswith(_ARCHIVE_TITLES):
+        return text
+    return text + EXPIRED_SUFFIX
+
+
+def _created_op(store, chat):
+    """The create_main operation behind a 'c_create_main_<request>' chat record ({} for other chats)."""
+    ident = str(chat.get('id') or '')
+    if not ident.startswith(CREATED_CHAT_PREFIX):
+        return {}
+    return store.get('operations', 'create_main:' + ident[len(CREATED_CHAT_PREFIX):]) or {}
+
+
+def _expiry_exempt(store):
+    """(chat ids, thread ids) that never expire here: each account's current Main, the live operator
+    Main record, and chats an open Main switch or handoff is still moving (that flow renames them)."""
+    from . import main_switch
+    chats, threads = set(), set()
+    workers = store.all('workers')
+    accounts = {w.get('account_id') for w in workers if w.get('account_id')}
+    accounts.update(a.get('id') for a in store.all('accounts') if a.get('id'))
+    for account in accounts:
+        main, chat = _current_main(store, account)
+        if chat:
+            chats.add(chat.get('id'))
+        if main:
+            threads.add(main.get('thread_id'))
+    by_id = {w.get('id'): w for w in workers}
+    for chat in store.all('chats'):
+        worker = by_id.get(chat.get('main_worker')) or {}
+        if chat.get('operator') and worker.get('purpose') == OPERATOR:
+            chats.add(chat.get('id'))
+            threads.add(worker.get('thread_id'))
+    for record in store.all(SWITCHES):
+        if record.get('state') in main_switch.ACTIVE:
+            chats.add(record.get('operator_chat_id'))
+            threads.add(record.get('operator_thread'))
+    for doc in store.all('main_handoffs'):
+        if doc.get('state') in mh.ACTIVE:
+            threads.add(doc.get('old_chat_id'))
+    return chats - {None, ''}, threads - {None, ''}
+
+
+def _remote_threads(store, adapter, account_id, thread_ids):
+    """(listed {thread: title} or None when unreadable, thread records, client) for one account."""
+    if (store.get('accounts', account_id) or {}).get('state') != 'ready':
+        return None, {}, None
+    try:
+        client = adapter.client(account_id)
+        listed = {_tid(t): str(t.get('title') or '') for t in (client.threads() or []) if _tid(t)}
+    except Exception:
+        return None, {}, None
+    try:
+        records = adapter.thread_records(client, list(thread_ids)) or {}
+    except Exception:
+        records = {}
+    return listed, records, client
+
+
+def sweep_expired(store, adapter, now=None, settings=None):
+    """Expire every Main or user-named chat whose Notion thread is >= 22 h old and that is not the
+    current active Main: record title '<title> (expired)', state 'expired', and the Notion thread title
+    too while the thread still exists. Coworker chats are left to the retire/delete flow. Idempotent;
+    a failed Notion rename is retried at the next sweep. Never raises for a single chat.
+    """
+    from .team_rotation import epoch, max_age_hours
+    now = time.time() if now is None else float(now)
+    if settings is None:
+        settings = store.settings() if callable(getattr(store, 'settings', None)) else {}
+    limit = min(max_age_hours(settings), EXPIRED_MAX_HOURS) * 3600
+    result = dict(checked=0, renamed=0, threads_renamed=0, errors=0)
+    workers = {w.get('id'): w for w in store.all('workers')}
+    exempt_chats, exempt_threads = _expiry_exempt(store)
+    todo = []
+    for chat in store.all('chats'):
+        if chat.get('id') in exempt_chats or chat.get('state') in _EXPIRED_SKIP_STATES:
+            continue
+        if chat.get('state') == EXPIRED_STATE and chat.get('expired_thread_done'):
+            continue
+        worker = workers.get(chat.get('main_worker')) or {}
+        if worker.get('purpose') in _COWORKER_PURPOSES and not chat.get('user_named'):
+            continue
+        if is_protected(chat.get('title')):
+            continue
+        op = _created_op(store, chat)
+        thread = worker.get('thread_id') or chat.get('thread_id') or op.get('thread_id') or ''
+        if thread and thread in exempt_threads:
+            continue
+        account = worker.get('account_id') or chat.get('account_id') or op.get('account_id') or ''
+        todo.append((chat, worker, thread, account))
+    if not todo:
+        return result
+    remote = {}
+    for account in {a for _c, _w, t, a in todo if a and t}:
+        remote[account] = _remote_threads(store, adapter, account, [t for _c, _w, t, a in todo if a == account and t])
+    for chat, worker, thread, account in todo:
+        result['checked'] += 1
+        try:
+            listed, records, client = remote.get(account) or (None, {}, None)
+            if chat.get('state') != EXPIRED_STATE:
+                record = records.get(thread) or {}
+                created = (epoch(record.get('created_time') or record.get('createdTime') or record.get('created_at'))
+                           or epoch(worker.get('created_at') or worker.get('thread_created_at'))
+                           or epoch(chat.get('created')))
+                if not created or now - created < limit:
+                    continue
+            notion_title = listed.get(thread) if (listed is not None and thread) else None
+            if notion_title is not None and is_protected(notion_title):
+                continue
+            title = expired_title(chat.get('title'))
+            changed = chat.get('state') != EXPIRED_STATE or chat.get('title') != title
+            if not thread:
+                done = True  # no Notion thread known: only the record can expire
+            elif listed is None:
+                done = False  # chat list unreadable now: rename the thread at the next sweep
+            elif notion_title is None:
+                done = True  # thread no longer listed in Notion: nothing to rename there
+            else:
+                wanted = expired_title(notion_title or chat.get('title'))
+                done = True
+                if wanted != notion_title:
+                    try:
+                        adapter.rename_thread(client, thread, wanted)
+                        result['threads_renamed'] += 1
+                    except Exception as exc:
+                        done = False
+                        store.event('chat_expired_rename_failed', message=str(exc)[:200], chat_id=chat.get('id', ''),
+                                    account_id=account)
+            if changed or done != bool(chat.get('expired_thread_done')):
+                chat.update(title=title, state=EXPIRED_STATE, expired_at=chat.get('expired_at') or now,
+                            expired_thread_done=done)
+                store.put('chats', chat)
+            if changed:
+                result['renamed'] += 1
+                store.event('chat_expired', message='Chat older than %d h renamed to %s' % (limit // 3600, title),
+                            chat_id=chat.get('id', ''), account_id=account)
+        except Exception as exc:
+            result['errors'] += 1
+            store.event('chat_expire_failed', message=str(exc)[:200], chat_id=chat.get('id', ''), account_id=account)
     return result

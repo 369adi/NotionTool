@@ -1,0 +1,67 @@
+{
+  "routes": {
+    "list": "GET /api/ui/projects -> list_response (archived projects only with ?archived=1)",
+    "detail": "GET /api/ui/projects/<id> -> detail_response"
+  },
+  "source": "notiontool/projects.py: project_view (list items) and project_detail (detail, adds commits). Stored in the objects table, kind 'projects'.",
+  "project_fields": {
+    "id": "string, unique project id (prefix p)",
+    "name": "string, not empty",
+    "goal": "string, may be empty",
+    "repo_path": "string, absolute path of the project's git repo, may be empty",
+    "main_chat_id": "string, the one Main chat of the project, empty while none is set; always the first entry of chat_ids",
+    "chat_ids": "array of string, all chats of the project; a chat belongs to at most one active project",
+    "coworker_ids": "array of string, derived: workers that ran tasks of this project (tasks carry project_id), without the Main chat's own worker",
+    "created": "number, unix seconds",
+    "updated": "number, unix seconds",
+    "archived": "boolean, derived from status; archived projects are hidden from the list, never deleted",
+    "status": "string, 'active' or 'archived' (the stored archive flag)"
+  },
+  "commit_fields": {
+    "sha": "string, short sha",
+    "subject": "string",
+    "author": "string",
+    "date": "string, ISO 8601 author date"
+  },
+  "commits_rule": "Newest first, at most n (default 10, max 100). Empty array when repo_path is empty, missing or not a git repo.",
+  "list_response": {
+    "projects": [
+      {
+        "id": "p3f9c1a2b7d4e48a9b0c1d2e3f4a5b6c7",
+        "name": "Redesign",
+        "goal": "Ship the new app scaffold and Projects page",
+        "repo_path": "C:\\Projects\\NotionTool",
+        "main_chat_id": "c1",
+        "chat_ids": ["c1", "c2"],
+        "coworker_ids": ["w7"],
+        "created": 1792886400.0,
+        "updated": 1792890000.0,
+        "archived": false,
+        "status": "active"
+      }
+    ]
+  },
+  "detail_response": {
+    "project": {
+      "id": "p3f9c1a2b7d4e48a9b0c1d2e3f4a5b6c7",
+      "name": "Redesign",
+      "goal": "Ship the new app scaffold and Projects page",
+      "repo_path": "C:\\Projects\\NotionTool",
+      "main_chat_id": "c1",
+      "chat_ids": ["c1", "c2"],
+      "coworker_ids": ["w7"],
+      "created": 1792886400.0,
+      "updated": 1792890000.0,
+      "archived": false,
+      "status": "active",
+      "commits": [
+        {
+          "sha": "631cd17",
+          "subject": "fix: re-pin model after Ctrl+R reload",
+          "author": "Example User",
+          "date": "2026-10-24T21:10:16+02:00"
+        }
+      ]
+    }
+  }
+}

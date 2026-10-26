@@ -133,12 +133,13 @@ def main():
         pass
     finally:
         app.close()
-        if app.exit_event.is_set():
-            stop_gateway(app)
+        # 25.10.2026 (user rule): the MCP gateway (process 2) must survive EVERY end of the app, also a full
+        # quit (window closed, e.g. after the app hung for 293 s). Before, this called stop_gateway(app) and
+        # Notion lost the MCP with the app. The gateway answers 'restarting/busy' until the next start.
 
 
 def stop_gateway(app):
-    """Full quit (window closed): also stop process 2, the MCP gateway; restarts keep it running."""
+    """Manual stop of process 2 only (never called on quit or restart; the gateway outlives the app)."""
     try:
         import urllib.request
         from notiontool import gateway as gw

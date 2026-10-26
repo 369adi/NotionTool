@@ -136,9 +136,9 @@ class DesktopChromeTest(unittest.TestCase):
         comp = rule(css, '.nt-desk-chrome-on .nt-desk-composer')
         self.assertIn('border-radius', comp)
         self.assertIn('var(--nt-radius, 12px)', comp)
-        self.assertIn('var(--nt-raised, #181c26)', comp)
+        self.assertIn('var(--nt-raised, #16161d)', comp)
         focus = rule(css, '.nt-desk-chrome-on .nt-desk-composer:focus-within')
-        self.assertIn('linear-gradient(135deg, var(--nt-accent-1, #7c5cff), var(--nt-accent-2, #22d3ee))', focus)
+        self.assertIn('linear-gradient(135deg, var(--nt-accent-1, #8b5cf6), var(--nt-accent-2, #22d3ee))', focus)
         hint = rule(css, '.nt-desk-chrome-on .nt-desk-composer-empty::after')
         self.assertIn("content: 'NotionTool'", hint)
         self.assertIn('pointer-events: none', hint)
@@ -146,7 +146,7 @@ class DesktopChromeTest(unittest.TestCase):
         self.assertIn('max-width', msg)
         self.assertIn('line-height: 1.6', msg)
         code = rule(css, '.nt-desk-chrome-on .nt-desk-message .nt-desk-code')
-        self.assertIn('var(--nt-raised, #181c26)', code)
+        self.assertIn('var(--nt-raised, #16161d)', code)
         # every var() has a fallback so the part works without the theme part
         for call in re.findall(r'var\(--nt-[\w-]+[^)]*\)', css):
             self.assertIn(',', call, call)

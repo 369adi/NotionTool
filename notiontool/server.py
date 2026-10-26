@@ -273,6 +273,9 @@ class Application:
                         if method=='GET' and path=='/api/report':
                             task = app.store.get('tasks',query.get('id',[''])[0])
                             return self.response(200,{'task':app.safe_task(task),'result':task['result'],'partial':task.get('raw_response') or task.get('partial','')})
+                        if method in ('GET','POST') and (path=='/api/ui/projects' or path.startswith('/api/ui/projects/')):
+                            from .projects_routes import http_route as projects_http_route  # Projects page: list, detail, create, update, open, archive
+                            return self.response(*projects_http_route(app,method,path,query,self.read_body() if method=='POST' else None))
                         if method=='GET' and (path=='/api/notes' or path.startswith('/api/notes/')):
                             from .notes_routes import http_route as notes_http_route
                             return self.response(*notes_http_route(app,path,query))
@@ -942,42 +945,44 @@ class Application:
 
     def first_login_setup(self, account_id):
         """First sign-in of an account: NotionTool MCP (read and write tools run automatically) if it is not
-        connected yet, then one Main and the Welcome Coworkers (team_size: 10 by default), all as Welcome chats.
+        connected yet, then one Main and five Welcome Coworkers, all as Welcome chats.
 
         Runs once per account (first_setup_done); ensure_team is idempotent, so nothing is created twice."""
         account = self.store.get('accounts', account_id, {}) or {}
         result = {'account_id': account_id}
         if account.get('state') != 'ready':
             return {**result, 'skipped': 'account state ' + str(account.get('state'))}
-        if account.get('first_setup_done'):
-            return {**result, 'skipped': 'already set up'}
-        if not account.get('bridge_connected'):
-            try:
-                url = self.store.settings().get('public_mcp_url')
-                if not url:
-                    self.start_tunnel()
-                    url = self.store.settings().get('public_mcp_url')
-                if not (self.store.get('accounts', account_id, {}) or {}).get('bridge_connected'):
-                    if not url:
-                        raise ValueError('No public MCP URL for NotionTool yet')
-                    self.adapter.connect_bridge(account_id, url, self.bridge_token, read_auto=True, write_auto=True)
-                result['mcp'] = 'connected'
-                self.store.event('mcp_auto_setup', message='First sign-in: NotionTool MCP added (tools run automatically)')
-            except Exception as exc:  # noqa: BLE001
-                result['mcp_error'] = str(exc)[:250]
-                self.store.event('mcp_auto_setup_failed', message='First sign-in: ' + str(exc)[:230])
+        from .setup_status import account_setup
+        from .account_settings import open_main
+        # A local flag is not proof: read Notion's connection and read/write permissions on every login.
+        from .notion_connections import ensure_notiontool
         try:
-            result['team'] = self.adapter.ensure_team(account_id, create_main=True)
+            result['mcp'] = ensure_notiontool(self, account_id)
+            account = self.store.get('accounts', account_id, {}) or {}
+        except Exception as exc:  # noqa: BLE001
+            result['mcp_error'] = str(exc)[:250]
+            account = dict(self.store.get('accounts', account_id, {}) or {})
+            account.update(bridge_connected=False, bridge_error=result['mcp_error'])
+            self.store.put('accounts', account)
+            self.store.event('mcp_auto_setup_failed', message='Sign-in: ' + str(exc)[:230])
+        if ('mcp_error' not in result and account.get('first_setup_done') and
+                account_setup(account, self.store.all('workers'), size=5)['complete']):
+            open_main(self, account_id)
+            return {**result, 'skipped': 'already set up'}
+        try:
+            result['team'] = self.adapter.ensure_team(account_id, create_main=True, count=5)
         except Exception as exc:  # noqa: BLE001
             result['team_error'] = str(exc)[:250]
             self.store.event('first_login_setup_failed', message='Main/Coworkers: ' + str(exc)[:220])
+            open_main(self, account_id)
             return result
-        if 'mcp_error' not in result:
+        if 'mcp_error' not in result and result['team'].get('verified'):
             fresh = self.store.get('accounts', account_id, {}) or {}
             fresh['first_setup_done'] = True
             self.store.put('accounts', fresh)
-        self.store.event('first_login_setup', message='First sign-in setup: MCP %s, Main + Welcome Coworkers ready'
-                         % ('connected' if 'mcp_error' not in result else 'failed'))
+        self.store.event('first_login_setup', message='Main and five Welcome Coworkers ' +
+                         ('ready' if result['team'].get('verified') else 'created; waiting for confirmation'))
+        open_main(self, account_id)
         return result
 
     def window_signed_in(self, cookies):
@@ -1058,13 +1063,25 @@ class Application:
         chat = chat or {}
         worker = (self.store.get('workers', chat['main_worker']) or {}) if chat.get('main_worker') else {}
         created = 0.0
-        for value in (worker.get('created_at'), worker.get('thread_created_at'), chat.get('created_at'), chat.get('created')):
+        for value in (worker.get('created_at'), worker.get('thread_created_at'), Application._switched_at(self, worker),
+                      chat.get('created_at'), chat.get('created')):
             created = epoch(value)
             if created:
                 break
         if not created:
             return dict(age_s=None, created_at=None)
         return dict(age_s=int(max(0.0, now - created)), created_at=created)
+
+    def _switched_at(self, worker):
+        """Time a Main switch moved a chat to this worker's thread (0 if none). Bug 2026-10-25: after a switch
+        the chat record keeps its old 'created', so a fresh Main was shown as 27 h old."""
+        thread = str((worker or {}).get('thread_id') or '')
+        if not thread:
+            return 0
+        for record in self.store.all('main_switches'):
+            if record.get('new_chat_id') == thread and record.get('state') == 'switched':
+                return record.get('prompt_at') or record.get('updated') or 0
+        return 0
 
     CHAT_AGE_WARN_HOURS = 20
     SWITCH_BUSY_STATES = ('running', 'sending', 'sent', 'uncertain', 'reviewing', 'cancelling', 'claimed',
@@ -1139,6 +1156,12 @@ class Application:
         if any(t.get('worker_id') == worker_id and t.get('state') in Application.SWITCH_BUSY_STATES
                for t in self.store.all('tasks')):
             raise ValueError('This chat is working on a task; switch after it finishes')
+        from . import foreign_chat_guard
+        if foreign_chat_guard.is_own(worker):
+            # RBX fix: an own chat switches like the 22 h auto switch (fresh chat keeps the user's name,
+            # the old one becomes '<title> (expired)').
+            result = foreign_chat_guard.switch_own_chat(self.store, self.adapter, worker, now, reason='user')
+            return dict(result, chat_id=chat_id)
         if worker.get('purpose') != 'worker':
             # One way only: a Main always switches through the file handoff (main_switch.py).
             from . import main_switch
@@ -1157,7 +1180,7 @@ class Application:
         task = dict(id='', run_id=str(body.get('run_id') or '')[:100])
         main = worker.get('purpose') != 'worker'
         # Manual switch: the old chat is never deleted (it stays in the sidebar archive), only renamed;
-        # a Main's old chat becomes '<label> (archived)', a Coworker's keeps the retire_old title.
+        # a Main's old chat becomes '<label> (expired)', a Coworker's keeps the retire_old title.
         switch_adapter = ManualSwitchAdapter(self.adapter, archived_title(label) if main else None)
         moved = ChatContext(self.store).fresh_welcome(switch_adapter, client, worker, task, dict(handoff=handoff),
                                                       worker.get('context_usage') or {})
@@ -1193,13 +1216,45 @@ class Application:
 
     def require_young_chat(self, chat_id, now=None):
         """I50 hard send block: a chat 23 h or older (coworker_age_guard.HARD_MAX_AGE_HOURS) is never written to.
-        Raises ValueError (HTTP 400) before anything reaches the engine or Notion. Unknown age is not blocked."""
-        from .coworker_age_guard import HARD_MAX_AGE_HOURS, HARD_MAX_AGE_S
-        age = Application.chat_age(self, self.store.get('chats', chat_id), now)['age_s']
+        Raises ValueError (HTTP 400) before anything reaches the engine or Notion. Unknown age is not blocked.
+        RBX fix: the chat's Notion thread is also checked by its Notion created_time (foreign_chat_guard), so
+        a chat record that restarted its age can never hide an old thread."""
+        from .coworker_age_guard import HARD_MAX_AGE_S
+        from . import foreign_chat_guard
+        chat = self.store.get('chats', chat_id)
+        age = Application.chat_age(self, chat, now)['age_s']
         if age is not None and age >= HARD_MAX_AGE_S:
-            raise ValueError('%s: this chat is %.1f h old (limit %d h); sending is blocked. '
-                             'Use Context switch (POST /api/chat/context_switch).'
-                             % (Application.CHAT_TOO_OLD, age / 3600.0, HARD_MAX_AGE_HOURS))
+            self.store.event('chat_send_blocked_too_old', '', message='%s: %.1f h old (chat record)' % (chat_id, age / 3600.0))
+            raise ValueError(foreign_chat_guard.block_text())
+        worker = self.store.get('workers', str((chat or {}).get('main_worker') or '')) or {}
+        if worker.get('thread_id'):
+            foreign_chat_guard.require_young(self.store, self.adapter, worker['thread_id'], now,
+                                             str(worker.get('account_id') or ''))
+
+    def chat_send_check(self, body, now=None):
+        """POST /api/chat/send_check {thread_id, send}: the one age check of the composer send paths (desktop
+        and Edge shell) for ANY Notion chat, also chats NotionTool did not create (RBX). Age = Notion thread
+        created_time. send=true and >= 23 h: refused (allowed=false, message) and the own chat's context switch
+        starts in the background; the composer never passes the text to Notion."""
+        from . import foreign_chat_guard
+        body = body if isinstance(body, dict) else {}
+        thread = foreign_chat_guard.thread_key(body.get('thread_id'))
+        if len(thread) != 32:
+            raise ValueError('Choose a chat (thread_id) to check')
+        account = str(body.get('account_id') or '')[:100]
+        on_block = None
+        if body.get('send'):
+            def on_block(info):
+                work = lambda: foreign_chat_guard.blocked_send(self.store, self.adapter, thread, account)
+                job = getattr(self, 'job_once', None)
+                if callable(job) and not getattr(self, 'app_chat_inline', False):
+                    job('Context switch (chat age) ' + thread[:8], work, 'age-switch:' + thread)
+                else:
+                    work()
+        result = foreign_chat_guard.send_check(self.store, self.adapter, thread, now, account, on_block)
+        if body.get('send') and not result.get('allowed', True):
+            raise ValueError(foreign_chat_guard.refusal_text(result))  # 400: a 23 h chat or unknown age is refused
+        return result
 
     def retry_run_request(self, body):
         """POST /api/run/retry {id, allow_resend}: (status, payload). Only the engine's resend refusal becomes 409."""
@@ -1339,6 +1394,9 @@ class Application:
             if path=='/api/chat/context_switch':
                 # I50 Context switch button: real switch of one chat (worker_id or chat_id) into a fresh chat.
                 return Application.chat_context_switch(self, body)
+            if path=='/api/chat/send_check':
+                # RBX fix: one age check (Notion thread created_time) for the composer sends of ANY chat.
+                return Application.chat_send_check(self, body)
             if path=='/api/send':
                 # I50 hard send block: a chat 23 h or older is refused (400) before the engine or Notion sees the text.
                 Application.require_young_chat(self, body['chat_id'])
@@ -1369,7 +1427,7 @@ class Application:
             if path=='/api/task/reconcile':
                 if body.get('resolution'):
                     # The Main decides an unconfirmed task after checking the work itself; nothing is resent (I5).
-                    result = self.engine.resolve_uncertain(str(body['id']), str(body['resolution']), body.get('note', ''))
+                    result = self.engine.resolve_uncertain(str(body['id']), str(body['resolution']), body.get('note', ''), stop=body.get('stop') is True)
                     return dict(ok=True, **result)
                 task = self.store.get('tasks',body['id'])
                 # Unconfirmed tasks (uncertain, or overdue and reserved) are checked again; nothing is resent.
@@ -1682,15 +1740,25 @@ class Application:
                 team = self.adapter.ensure_team(ident)
                 return dict(deleted=deleted, dropped=dropped, skipped=skipped, failed=failed, team=team)
             return self.job('Reset Coworker chats', reset, ident)
+        if path=='/api/main/switch/request':
+            # Switch context button (owner 2026-10-25 23:06): the Main gets a request into its own chat and
+            # does the switch itself (handoff + brief, /api/main/switch/start with brief_text, advance).
+            # MainWake delivers it when the chat is idle; one immediate try here (switch_request.py).
+            from . import switch_request
+            result = switch_request.request(self.store, body)
+            wake = getattr(self, 'main_wake', None)
+            if wake is not None and not result.get('duplicate'):
+                threading.Thread(target=wake.switch_request_tick, daemon=True, name='switch-request').start()
+            return result
         if path=='/api/main/switch/start':
             # Ask-first Main switch (main_switch.py): a coworker writes the handoff brief for a fresh Welcome Main.
             from . import main_switch
-            from .operator_main import delegate, operator_chat
-            chat_id = str(body.get('chat_id') or (operator_chat(self.store) or {}).get('id', ''))
+            from .operator_main import delegate, switch_chat_id
+            chat_id = switch_chat_id(self.store, body)
             request_id = str(body.get('request_id') or ('main-switch-' + time.strftime('%Y%m%d-%H%M%S')))
             return main_switch.start(self.store, chat_id,
                 lambda b: delegate(self.engine, b['chat_id'], b['goal'], b['tasks'], b['request_id']), request_id,
-                brief_text=body.get('brief_text'))
+                brief_text=body.get('brief_text'), trigger=str(body.get('trigger') or 'user'))
         if path=='/api/main/switch/rollback':
             # Undo a switched operator switch whose new Main broke: the old chat is the Main again.
             from .main_handoff_ops import rollback_switch
@@ -1936,8 +2004,8 @@ def compact_run_response(engine, run):
 
 
 def archived_title(label):
-    """Notion title of a Main's old chat after a manual context switch (I50), e.g. 'Main 3 (archived)'."""
-    return (str(label or 'Main').strip()[:80] or 'Main') + ' (archived)'
+    """Notion title of a Main's old chat after a manual context switch (I50), e.g. 'Main 3 (expired)'."""
+    return (str(label or 'Main').strip()[:80] or 'Main') + ' (expired)'
 
 
 class ManualSwitchAdapter:

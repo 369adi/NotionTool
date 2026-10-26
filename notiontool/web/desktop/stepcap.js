@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 12;
+  var VERSION = 14;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -74,6 +74,20 @@
     var len = all ? all.length : 0;
     var hit = baseCache[id];
     if (hit && hit.len === len) return hit.cap;
+    // v13: fast path - if only tool/AI steps were added since last cap, skip the full O(n) scan.
+    // During streaming Notion delivers one step at a time; with no new user step just extend the window.
+    if (hit && len > hit.len && len - hit.len < 50) {
+      var onlyTool13 = true;
+      for (var q13 = hit.len; q13 < len; q13++) {
+        var st13 = null;
+        try { st13 = all[q13] && all[q13].getStep && all[q13].getStep(); } catch (e) { st13 = null; }
+        if (st13 && st13.type === 'user') { onlyTool13 = false; break; }
+      }
+      if (onlyTool13) {
+        var grownN13 = hit.cap + (len - hit.len); if (grownN13 > BASE_MAX) grownN13 = BASE_MAX;
+        baseCache[id] = { len: len, cap: grownN13 }; return grownN13;
+      }
+    }
     var users = 0;
     var stop = len - BASE_MAX;
     var i = len - 1;
@@ -450,9 +464,11 @@
   function attempt() {
     var r = install();
     window.__ntStepCapState = r === true ? 'active' : r === 'missing' ? 'module-missing' : 'waiting';
-    if (r === true) bind();
-    if (r === true || r === 'missing') return;
-    if (++tries < 240) setTimeout(attempt, 500);
+    if (r === true) { bind(); return; }
+    // v14: 'missing' is retried too. Notion loads the ThreadStore chunk only when a chat opens; a window that
+    // starts on the Notion AI home page used to give up here for good and every chat then rendered all steps.
+    // Fast for 2 minutes, then every 3 s (one cheap require per try).
+    setTimeout(attempt, ++tries < 240 ? 500 : 3000);
   }
   attempt();
 })();

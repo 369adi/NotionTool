@@ -332,6 +332,14 @@ class PushTests(ShellCase):
         self.session.emit('Runtime.executionContextCreated', {'context': {'id': 2, 'auxData': {'isDefault': True}}})
         self.assertEqual(self.pushes(), [])
 
+    def test_model_pin_reenabled_after_reload(self):
+        # Ctrl+R: a new default context must register the Fetch pin again (else Notion gets 'Auto')
+        before = self.session.methods().count('Fetch.enable')
+        self.session.emit('Runtime.executionContextCreated', {'context': {'id': 2, 'auxData': {'isDefault': True}}})
+        self.assertEqual(self.session.methods().count('Fetch.enable'), before + 1)
+        self.session.emit('Runtime.executionContextCreated', {'context': {'id': 3, 'auxData': {'isDefault': False}}})
+        self.assertEqual(self.session.methods().count('Fetch.enable'), before + 1)
+
     def test_push_waits_for_overlay_in_new_document(self):
         self.shell.push({'v': 1})
         expression = self.session.evaluated()[-1]

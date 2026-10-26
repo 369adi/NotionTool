@@ -166,6 +166,32 @@
     });
   }
 
+  // A non-Main chat has an open question for the user: its coworker is the one the context question
+  // is about, or the run of its current step waits for the user/Main (same signals as mainStatus).
+  function threadWaiting(state, key) {
+    if (!key) return false;
+    var found = false;
+    list(state && state.workers).forEach(function (w) {
+      if (!w || !w.thread_id || threadKey(w.thread_id) !== key) return;
+      var ask = state && state.context_ask;
+      if (ask && ask.worker_id === w.id) found = true;
+      var tasks = list(state && state.tasks).filter(function (t) {
+        return t && (t.id === w.task_id || (!w.task_id && t.worker_id === w.id &&
+          FINAL_RUN_STATES.indexOf(String(t.state || '').toLowerCase()) < 0));
+      });
+      tasks.forEach(function (t) {
+        list(state && state.runs).forEach(function (run) {
+          if (!run || run.id !== t.run_id) return;
+          if (FINAL_RUN_STATES.indexOf(String(run.state || '').toLowerCase()) >= 0) return;
+          var needs = Array.isArray(run.needs_main) ? run.needs_main.length > 0 : !!run.needs_main;
+          if (needs || WAITING_RUN_STATES.indexOf(String(run.state || '').toLowerCase()) >= 0 ||
+            awaitingIds(state).indexOf(String(run.id || '')) >= 0) found = true;
+        });
+      });
+    });
+    return found;
+  }
+
   // 'waiting' (the newest open run needs the user/Main, or the Main asks about its context),
   // 'running' (an open run, or a busy Main worker) or 'idle'. Progress is the run's done/total tasks.
   function mainStatus(state, main) {
@@ -310,7 +336,7 @@
     return keep;
   }
 
-  window.__ntDesk.sidebarUtil = { mainStatus: mainStatus, runsOfMain: runsOfMain, ageHours: ageHours,
+  window.__ntDesk.sidebarUtil = { mainStatus: mainStatus, threadWaiting: threadWaiting, runsOfMain: runsOfMain, ageHours: ageHours,
     ageClass: ageClass, ageLabel: ageLabel, coworkerRows: coworkerRows,
     createdText: createdText, ageBadge: ageBadge, coworkerAges: coworkerAges, ensureHeading: ensureHeading };
 
@@ -892,7 +918,16 @@
       for (var i = 0; i < row.children.length; i++) {
         if (row.children[i].getAttribute('data-nt-desk') === 'card') card = row.children[i];
       }
-      if (!main) { if (card) dropOwn(card); return; }
+      var key = row.getAttribute('data-nt-desk-thread') || '';
+      var flag = row.getAttribute('aria-selected') || row.getAttribute('aria-current');
+      var open = !!key && (threadFromHref(location.href) === key || flag === 'true' || flag === 'page');
+      var unread = key ? trackUnread(key, rowRunning(state, key, main), open) : false;
+      if (!main) {
+        if (card) dropOwn(card);
+        styleRowDot(row, rowDotState(state, key, unread));
+        return;
+      }
+      styleRowDot(row, null);
       var info = mainStatus(state, main);
       if (!card) {
         card = el('div', { cls: 'nt-desk-card', 'data-nt-desk': 'card' }, [
@@ -911,13 +946,64 @@
       if (card.getAttribute('title') !== tip) card.setAttribute('title', tip);
       if (card.getAttribute('data-nt-role') !== 'main') card.setAttribute('data-nt-role', 'main');
       var dot = part(card, 'dot');
-      setCls(dot, 'nt-desk-dot nt-desk-dot-' + info.status);
+      var dotState = info.status === 'idle' && unread ? 'unread' : info.status;
+      setCls(dot, 'nt-desk-dot nt-desk-dot-' + dotState);
       if (dot && dot.getAttribute('title') !== labels[info.status]) dot.setAttribute('title', labels[info.status]);
       setText(part(card, 'run-title'), info.title || (info.status === 'idle' ? 'No active run' : labels[info.status]));
       var width = info.total ? Math.round(100 * info.done / info.total) + '%' : '0%';
       var fill = part(card, 'progress-fill');
       if (fill && fill.style.width !== width) fill.style.width = width;
       setText(part(card, 'progress-count'), info.total ? info.done + '/' + info.total : '');
+    }
+
+    // ---- One status dot per chat row ------------------------------------------------------
+    // running = pulsing, waiting = amber, unread = blue, idle = no dot. Main rows show the dot of their
+    // card (styleCard); every other row gets one own 'row-dot' child. Unread has no harness field: a
+    // chat that was running and finished while it was not the open chat stays 'unread' until opened.
+    var ranBefore = {}, unreadChats = {};
+
+    function trackUnread(key, running, active) {
+      if (running) ranBefore[key] = true;
+      else if (ranBefore[key]) {
+        delete ranBefore[key];
+        if (!active) unreadChats[key] = true;
+      }
+      if (active) delete unreadChats[key];
+      return !!unreadChats[key];
+    }
+
+    function threadBusy(state, key) {
+      var busy = false;
+      list(state && state.workers).forEach(function (w) {
+        if (w && w.thread_id && threadKey(w.thread_id) === key && (w.task_id || workerBusy(w))) busy = true;
+      });
+      return busy;
+    }
+
+    // Order: running, then waiting (open question for the user), then unread, then idle (no dot).
+    function rowDotState(state, key, unread) {
+      if (key && threadBusy(state, key)) return 'running';
+      if (key && threadWaiting(state, key)) return 'waiting';
+      return unread ? 'unread' : 'idle';
+    }
+
+    function rowRunning(state, key, main) {
+      return main ? mainStatus(state, main).status !== 'idle' : threadBusy(state, key);
+    }
+
+    function styleRowDot(row, status) {
+      var dot = null;
+      for (var i = 0; i < row.children.length; i++) {
+        if (row.children[i].getAttribute('data-nt-desk') === 'row-dot') dot = row.children[i];
+      }
+      if (!status || status === 'idle') { if (dot) dropOwn(dot); return; }
+      if (!dot) {
+        dot = el('span', { cls: 'nt-desk-dot', 'data-nt-desk': 'row-dot', 'aria-hidden': 'true' });
+        row.appendChild(dot);
+      }
+      var labels = { running: 'Running', waiting: 'Waiting for you', unread: 'Unread' };
+      setCls(dot, 'nt-desk-dot nt-desk-dot-' + status);
+      if (dot.getAttribute('title') !== labels[status]) dot.setAttribute('title', labels[status] || '');
     }
 
     // Age badge on Notion's own coworker row: an own child element; the row itself is not changed.
@@ -1267,6 +1353,81 @@
       var disabled = level === 'switching' || !entry.worker_id;
       if (btn.disabled !== disabled) btn.disabled = disabled;
       setText(btn, level === 'switching' ? 'Switching ...' : 'Context Switch');
+    }
+
+    // RBX fix: composer age badge for ANY open chat (also own chats NotionTool did not create). The age
+    // comes from the Notion thread created_time (ctx.call('chat_thread_age') -> POST /api/chat/send_check,
+    // send=false). Badge from 20 h (warn #FB923C), composer disabled from 23 h (locked #DC2626). The real
+    // block is in the shell (NotionShell._block_old_chat); this is the visible part.
+    var threadAges = {};
+    var THREAD_AGE_REFRESH_MS = 60000;
+    var composerBadge = null;
+
+    function refreshThreadAge(key) {
+      if (stopped || typeof ctx.call !== 'function') return;
+      var cur = threadAges[key];
+      if (cur && (cur.busy || Date.now() - cur.at < THREAD_AGE_REFRESH_MS)) return;
+      threadAges[key] = { busy: true, at: Date.now(), age_h: cur ? cur.age_h : null, level: cur ? cur.level : 'unknown' };
+      Promise.resolve().then(function () {
+        return ctx.call('chat_thread_age', { thread_id: key, send: false });
+      }).then(function (reply) {
+        var age = reply && typeof reply.age_h === 'number' ? reply.age_h : null;
+        threadAges[key] = { busy: false, at: Date.now(), age_h: age, level: (reply && reply.level) || 'unknown' };
+        schedule();
+      }, function () {
+        threadAges[key] = { busy: false, at: Date.now(), age_h: cur ? cur.age_h : null, level: cur ? cur.level : 'unknown' };
+      });
+    }
+
+    function composerAgeLevel(ageH) {
+      if (typeof ageH !== 'number') return 'unknown';
+      if (ageH >= 23) return 'locked';
+      if (ageH >= 22) return 'switching';
+      if (ageH >= 20) return 'warn';
+      return 'ok';
+    }
+
+    function applyComposerAge() {
+      var key = chatAgeKey(threadFromHref(location.href));
+      var composer = document.querySelector('.nt-desk-composer');
+      if (!key || !composer || !composer.parentNode) {
+        if (composerBadge) { dropOwn(composerBadge); composerBadge = null; }
+        return;
+      }
+      refreshThreadAge(key);
+      var info = threadAges[key] || {};
+      var ageH = typeof info.age_h === 'number' ? info.age_h + (Date.now() - (info.at || Date.now())) / 3600000 : null;
+      var level = composerAgeLevel(ageH);
+      if (composer.getAttribute('data-nt-age-level') !== level) composer.setAttribute('data-nt-age-level', level);
+      var locked = level === 'locked';
+      if (locked) composer.setAttribute('data-nt-age-locked', '1');
+      else if (composer.hasAttribute('data-nt-age-locked')) composer.removeAttribute('data-nt-age-locked');
+      var editors = composer.querySelectorAll('[contenteditable]');
+      for (var i = 0; i < editors.length; i++) {
+        if (locked && editors[i].getAttribute('contenteditable') !== 'false') {
+          editors[i].setAttribute('data-nt-age-was-editable', editors[i].getAttribute('contenteditable') || 'true');
+          editors[i].setAttribute('contenteditable', 'false');
+        } else if (!locked && editors[i].hasAttribute('data-nt-age-was-editable')) {
+          editors[i].setAttribute('contenteditable', editors[i].getAttribute('data-nt-age-was-editable'));
+          editors[i].removeAttribute('data-nt-age-was-editable');
+        }
+      }
+      if (level === 'ok' || level === 'unknown') {
+        if (composerBadge) { dropOwn(composerBadge); composerBadge = null; }
+        return;
+      }
+      if (!composerBadge) composerBadge = el('div', { cls: 'nt-desk-age-badge', role: 'status', 'data-nt-desk': 'age-badge' });
+      if (composerBadge.parentNode !== composer.parentNode || composerBadge.nextSibling !== composer) {
+        composer.parentNode.insertBefore(composerBadge, composer);
+      }
+      if (composerBadge.getAttribute('data-nt-age-level') !== level) composerBadge.setAttribute('data-nt-age-level', level);
+      var hours = Math.floor(ageH);
+      var text = locked ? 'This chat is older than 23 h. A fresh chat with the context was started.'
+        : (level === 'switching' ? 'Chat age ' + hours + ' h. Switching to a fresh chat\u2026'
+        : 'Chat age ' + hours + ' h. Auto-switch to a fresh chat at 22 h.');
+      setText(composerBadge, text);
+      var tip = locked ? 'Send locked (23 h). Use Context switch.' : 'Auto-switch to a fresh chat at 22 h.';
+      if (composerBadge.getAttribute('title') !== tip) composerBadge.setAttribute('title', tip);
     }
 
     // ---- Named chats: own New chat dialog, Chats section, gear menu ------------------------
@@ -2131,6 +2292,7 @@
       } catch (e) { /* branding is cosmetic; never break the filter or the New chat routing */ }
       try { applyChatAges(sidebarRoot()); } catch (e) { /* I50 age chips are cosmetic */ }
       try { applyLockBanner(); } catch (e) { /* the lock banner is a hint; the backend still blocks */ }
+      try { applyComposerAge(); } catch (e) { /* the age badge is a hint; the shell still blocks */ }
       try { applyPendingOpen(); } catch (e) { pendingOpen = null; }
       try { applyChatScroll(); } catch (e) { pendingScroll = null; }
       try { applyRenderSkip(); } catch (e) { /* performance only */ }

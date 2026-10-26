@@ -430,10 +430,21 @@ class MainWake:
         except Exception:
             pass
 
+    def switch_request_tick(self, now=None):
+        """Deliver Switch context button requests into idle Main chats (switch_request.py)."""
+        from . import switch_request
+        return switch_request.deliver(self.store, self.adapter, self.chat_busy, self._send,
+                                      _num(self.clock()) if now is None else now, self._failed)
+
     def tick(self):
         """One pass; returns the list of run ids that were sent."""
         if not self.baselined:
             self.baseline()
+        try:
+            # Switch context button requests are user actions: delivered even when wake messages are off.
+            self.switch_request_tick()
+        except Exception as exc:
+            self._failed("switch-request", exc)
         if not self.enabled():
             return []
         now = _num(self.clock())
@@ -585,6 +596,9 @@ class MainWake:
         # Main chats keep the user's own model and reasoning; never Auto, never the model default.
         model, effort = user_config(client, thread)
         body = self.adapter.body(client, thread, step_id, text, model, computer=True, effort=effort)
+        from . import foreign_chat_guard  # RBX review: never wake a >= 23 h Main chat
+        foreign_chat_guard.require_young(self.store, self.adapter, thread, None,
+                                         str(getattr(client, "account_id", "") or ""))
         try:
             for _ in client.transport.stream("runInferenceTranscript", body, client.headers(), timeout=180):
                 pass

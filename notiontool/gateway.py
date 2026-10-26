@@ -5,6 +5,12 @@ Tailscale Funnel targets this fixed local port instead of the core. The core can
 and delivered once the new core is up. A request that already reached the core is never resent (I5).
 While the core stays down, the gateway answers initialize/tools/list/ping itself from its cache so the
 Notion connection stays valid, and tool calls get a clear 'restarting' result instead of a dead endpoint.
+
+v3 (25.10.2026, MCP 'Failed to connect' while nothing crashed): the core can also be UP but busy or
+blocked (a long action holding the engine lock). v2 then waited up to 900 s and Notion's MCP client gave
+up first. Now safe methods answer from the gateway after SAFE_SECONDS, tool calls get a 'busy, not
+retried' result after CALL_SECONDS, the cache and accepted logins survive a gateway restart
+(runtime/gateway_cache.json) and every request is logged to runtime/gateway.log.
 """
 import hashlib
 import http.client
@@ -18,10 +24,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = 2
+VERSION = 3
 DEFAULT_PORT = 8792
 HOLD_SECONDS = 25  # Notion's MCP client gives up before 120 s -> 'Failed to connect'; answer fast instead
-SAFE_METHODS = {'initialize', 'notifications/initialized', 'tools/list', 'ping', 'resources/list', 'prompts/list'}
+SAFE_SECONDS = 8  # initialize/ping/tools/list: answer from the gateway when the core is slower than this
+CALL_SECONDS = 90  # tools/call: longest legit call is ~55 s (job tools hand off after 45-50 s)
+CONNECT_SECONDS = 5
+LOG_MAX_BYTES = 5 * 1024 * 1024
+SAFE_METHODS = {'initialize', 'notifications/initialized', 'ping', 'tools/list', 'resources/list', 'prompts/list'}
 CACHED_METHODS = ('initialize', 'tools/list')
 FORWARD_HEADERS = ('authorization', 'content-type', 'accept', 'mcp-session-id', 'mcp-protocol-version', 'last-event-id')
 RETURN_HEADERS = ('content-type', 'mcp-session-id', 'cache-control')
@@ -58,33 +68,91 @@ class CoreDown(Exception):
         self.sent = sent  # True: the request may already have reached the core
 
 
+class CoreBusy(Exception):
+    """The core took the request but did not answer in time (busy or blocked). It may still run it."""
+
+
 class Gateway:
-    def __init__(self, data_dir, port=DEFAULT_PORT, hold=HOLD_SECONDS, poll=0.5):
+    def __init__(self, data_dir, port=DEFAULT_PORT, hold=HOLD_SECONDS, poll=0.5,
+                 safe_timeout=SAFE_SECONDS, call_timeout=CALL_SECONDS):
         self.data_dir, self.port, self.hold, self.poll = str(data_dir), int(port), hold, poll
+        self.safe_timeout, self.call_timeout = safe_timeout, call_timeout
         self.control = secrets.token_urlsafe(24)
         self.cache = {}          # rpc method -> (headers, body)
         self.accepted = set()    # sha256 of Authorization values the core accepted
         self.lock = threading.Lock()
+        self.log_lock = threading.Lock()
         self.stopping = threading.Event()
         self.server = None
+        self.load_cache()
 
+    # --- persistence and log -------------------------------------------------------------------
+    def cache_path(self):
+        return runtime_dir(self.data_dir) / 'gateway_cache.json'
+
+    def log_path(self):
+        return runtime_dir(self.data_dir) / 'gateway.log'
+
+    def load_cache(self):
+        data = read_json(self.cache_path())
+        for name, entry in (data.get('cache') or {}).items():
+            if name not in CACHED_METHODS or not isinstance(entry, dict):
+                continue
+            try:
+                self.cache[name] = ([tuple(h) for h in entry.get('headers') or []], entry['body'].encode('utf-8'))
+            except (KeyError, AttributeError, TypeError, ValueError):
+                pass
+        self.accepted.update(a for a in data.get('accepted') or [] if isinstance(a, str))
+
+    def save_cache(self):
+        """Caller holds self.lock."""
+        try:
+            write_json(self.cache_path(), {
+                'cache': {name: {'headers': [list(h) for h in kept], 'body': body.decode('utf-8', 'replace')}
+                          for name, (kept, body) in self.cache.items()},
+                'accepted': list(self.accepted)[:50], 'saved': time.time()})
+        except OSError:
+            pass
+
+    def log(self, started, calls, status, outcome):
+        call = calls[0] if calls else {}
+        params = call.get('params') if isinstance(call.get('params'), dict) else {}
+        line = json.dumps({'at': round(started, 3), 'time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started)),
+                           'method': call.get('method') or '', 'tool': params.get('name') or '',
+                           'ms': int((time.time() - started) * 1000), 'status': status, 'outcome': outcome,
+                           'core_port': self.target()})
+        with self.log_lock:
+            try:
+                path = self.log_path()
+                if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+                    os.replace(path, path.with_name(path.name + '.1'))
+                with open(path, 'a', encoding='utf-8') as handle:
+                    handle.write(line + '\n')
+            except OSError:
+                pass
+
+    # --- forwarding ----------------------------------------------------------------------------
     def target(self):
         return int(read_json(runtime_dir(self.data_dir) / 'core.json').get('mcp_port') or 0)
 
-    def forward(self, method, path, headers, body):
+    def forward(self, method, path, headers, body, timeout=None):
         port = self.target()
         if not port:
             raise CoreDown(False)
-        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=900)
+        timeout = self.call_timeout if timeout is None else timeout
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=min(CONNECT_SECONDS, timeout))
         try:
             try:
                 conn.connect()
             except OSError:
                 raise CoreDown(False) from None
+            conn.sock.settimeout(timeout)
             try:
                 conn.request(method, path, body=body, headers=headers)
                 response = conn.getresponse()
                 data = response.read()
+            except (socket.timeout, TimeoutError):
+                raise CoreBusy() from None
             except (OSError, http.client.HTTPException):
                 raise CoreDown(True) from None
             kept = [(k, v) for k, v in response.getheaders() if k.lower() in RETURN_HEADERS]
@@ -108,29 +176,46 @@ class Gateway:
         return 200, [('Content-Type', 'application/json')], json.dumps(data).encode()
 
     def handle(self, method, path, headers, body):
+        started = time.time()
         parsed, calls = self.rpc_calls(body)
         names = {c.get('method') for c in calls}
-        safe = method in ('GET', 'DELETE') or (bool(calls) and names <= SAFE_METHODS)
+        rpc_safe = bool(calls) and names <= SAFE_METHODS
+        safe = method in ('GET', 'DELETE') or rpc_safe
         auth = hashlib.sha256((headers.get('authorization') or '').encode()).hexdigest()
         sent = {k: v for k, v in headers.items() if k in FORWARD_HEADERS}
-        deadline = time.time() + self.hold
+        timeout = self.safe_timeout if rpc_safe else self.call_timeout
+        deadline = started + (min(self.hold, self.safe_timeout) if rpc_safe else self.hold)
         while True:
             try:
-                status, kept, data = self.forward(method, path, sent, body)
+                status, kept, data = self.forward(method, path, sent, body, timeout)
+            except CoreBusy:
+                if rpc_safe:
+                    result, outcome = self.backup(parsed, calls, auth, busy=True), 'busy_answered'
+                else:
+                    result, outcome = self.busy(calls), 'busy'
+                break
             except CoreDown as down:
                 if down.sent and not safe:
-                    return self.interrupted(calls)
+                    result, outcome = self.interrupted(calls), 'interrupted'
+                    break
                 if time.time() >= deadline or self.stopping.is_set():
+                    result, outcome = self.backup(parsed, calls, auth), 'core_down_answered'
                     break
                 time.sleep(self.poll)
                 continue
             if status == 200 and headers.get('authorization'):
                 with self.lock:
+                    changed = auth not in self.accepted
                     self.accepted.add(auth)
                     if isinstance(parsed, dict) and parsed.get('method') in CACHED_METHODS:
+                        changed = changed or self.cache.get(parsed['method']) != (kept, data)
                         self.cache[parsed['method']] = (kept, data)
-            return status, kept, data
-        return self.backup(parsed, calls, auth)
+                    if changed:
+                        self.save_cache()
+            result, outcome = (status, kept, data), 'forwarded'
+            break
+        self.log(started, calls, result[0], outcome)
+        return result
 
     def interrupted(self, calls):
         call = calls[0] if calls else {}
@@ -140,8 +225,19 @@ class Gateway:
             return self.reply(call.get('id'), {'content': [{'type': 'text', 'text': text}], 'isError': True})
         return self.reply(call.get('id'), error={'code': -32000, 'message': text})
 
-    def backup(self, parsed, calls, auth):
-        """Core still down after the hold window: answer what is safe from the gateway itself."""
+    def busy(self, calls):
+        """The core is up but did not answer a non-safe call in time: never resent, may still be running."""
+        call = calls[0] if calls else {}
+        if 'id' not in call:
+            return 202, [('Content-Type', 'application/json')], b'{}'
+        text = ('NotionTool is busy: the app did not answer within %d s. This call was NOT retried and may '
+                'still be running in the app; check its effect before calling it again.' % self.call_timeout)
+        if call.get('method') == 'tools/call':
+            return self.reply(call.get('id'), {'content': [{'type': 'text', 'text': text}], 'isError': True})
+        return self.reply(call.get('id'), error={'code': -32000, 'message': text})
+
+    def backup(self, parsed, calls, auth, busy=False):
+        """Core down after the hold window (or busy for a safe method): answer what is safe from the gateway."""
         if auth not in self.accepted:
             return 503, [('Content-Type', 'application/json')], b'{"error":"NotionTool is restarting"}'
         if not isinstance(parsed, dict):
@@ -149,8 +245,9 @@ class Gateway:
         name, ident = parsed.get('method'), parsed.get('id')
         if 'id' not in parsed:
             return 202, [('Content-Type', 'application/json')], b'{}'
-        # A cached schema is not proof that the disconnected server can execute it.
-        if name == 'tools/list':
+        # A cached schema is not proof that a DISCONNECTED server can execute it. A busy core is alive:
+        # its cached tool list stays valid, so the tools do not vanish from Notion while it works.
+        if name == 'tools/list' and not busy:
             return self.reply(ident, {'tools': []})
         # initialize is NOT refused any more: the cached answer below keeps the connection alive
         # while the app restarts (a refused initialize is what Notion shows as 'Failed to connect').
@@ -164,6 +261,8 @@ class Gateway:
                 pass
         if name == 'ping':
             return self.reply(ident, {})
+        if name == 'tools/list':
+            return self.reply(ident, {'tools': []})
         text = 'NotionTool is restarting; this tool call was not executed. Try again in about a minute.'
         if name == 'tools/call':
             return self.reply(ident, {'content': [{'type': 'text', 'text': text}], 'isError': True})
@@ -180,7 +279,7 @@ class Gateway:
             protocol_version = 'HTTP/1.1'
 
             def log_message(self, *args):
-                pass
+                pass  # every MCP request is logged by Gateway.log (runtime/gateway.log)
 
             def send(self, status, headers, data):
                 self.send_response(status)
@@ -221,6 +320,7 @@ class Gateway:
         class Server(ThreadingHTTPServer):
             allow_reuse_address = False
             daemon_threads = True
+            request_queue_size = 64
 
             def server_bind(self):
                 if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
@@ -234,6 +334,7 @@ class Gateway:
         self.make_server()
         write_json(runtime_dir(self.data_dir) / 'gateway.json',
                    {'pid': os.getpid(), 'port': self.port, 'version': VERSION, 'control': self.control, 'started': time.time()})
+        self.log(time.time(), [{'method': '__gateway_start'}], 0, 'started v%d' % VERSION)
         try:
             self.server.serve_forever()
         finally:

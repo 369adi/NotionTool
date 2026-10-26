@@ -56,7 +56,7 @@ class PoolSwitchTest(base.OperatorSwitchBase):
         self.assertEqual(self.store.get('accounts', ACCT)['team_threads']['main']['id'], new)
         # The operator Main is untouched; the old pool Main gets the archive title, never deleted.
         self.assertEqual(self.store.get('workers', base.OP_WORKER)['purpose'], 'operator')
-        self.assertRegex(self.title(T_OLD), r'^Main \(old, Archive ')
+        self.assertRegex(self.title(T_OLD), r'^Main \(expired, ')
         self.assertEqual(self.adapter.deletes, [])
 
     def test_no_ack_keeps_old_pool_main(self):

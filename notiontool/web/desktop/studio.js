@@ -36,11 +36,26 @@
     var key = String(code).toLowerCase();
     return MODEL_LABEL[key] || String(code);
   }
+  // Notion 'Auto' routes to Haiku/Sonnet, so it is never shown or kept. notion_shell.py pins every Auto/empty
+  // request to the last explicit pick or Opus 5.5 (effort high); the strip shows that pinned model instead.
+  var LAST_MODEL_KEY = 'nt-last-model';
+  var DEFAULT_MODEL = 'Opus 5.5';
+  // Bug 2026-10-25 (live probe): Notion's menu entry textContent is 'AutoBalances speed, ...' (title and
+  // description without a space). With the /i flag (?![a-z]) also rejected the capital B, so the Auto entry
+  // was never recognised. Only a lowercase letter or digit right after 'Auto' means another word.
+  var AUTO_RE = /^[Aa][Uu][Tt][Oo](?![a-z0-9])/;
+  function isAutoText(text) { return AUTO_RE.test(String(text == null ? '' : text).replace(/\s+/g, ' ').trim()); }
+  function pinnedModel() {
+    var last = getKey(LAST_MODEL_KEY);
+    return last && !isAutoText(last) ? String(last) : DEFAULT_MODEL;
+  }
   var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', auto: 'Auto' };
   function nextTurnText(nt) {
     var code = nt && nt.model ? String(nt.model) : '';
-    var model = code && code.toLowerCase() !== 'auto' ? modelLabel(code) : 'Auto model';
-    var e = nt && nt.effort ? String(nt.effort).toLowerCase() : 'auto';
+    var pinned = !code || isAutoText(code);
+    var model = pinned ? pinnedModel() : modelLabel(code);
+    var e = nt && nt.effort ? String(nt.effort).toLowerCase() : '';
+    if (!e || e === 'auto') e = pinned ? 'high' : 'auto';  // the request pin sends effort high with the pinned model
     var effort = EFFORT_LABEL[e] || (e.charAt(0).toUpperCase() + e.slice(1)).replace(/_/g, ' ');
     return 'Next turn: ' + model + ' \u00b7 ' + effort + ' effort';
   }
@@ -68,7 +83,8 @@
       'Run id: ' + run.id].join('\n');
   }
   window.__ntDesk.studioUtil = { nextTurn: nextTurn, coworkers: coworkers, currentRun: currentRun,
-    runSummary: runSummary, modelLabel: modelLabel, nextTurnText: nextTurnText };
+    runSummary: runSummary, modelLabel: modelLabel, nextTurnText: nextTurnText, isAutoText: isAutoText,
+    pinnedModel: pinnedModel };
 
   window.__ntDesk.studio = function (ctx) {
     ctx = ctx || {};
@@ -296,6 +312,128 @@
       }
       return '';
     }
+
+    // ---- Auto guard: Notion's composer model chip must never stay on 'Auto' ----------------
+    // Once per chip change (chat + chip text), never in a loop: open Notion's own model menu and pick the
+    // explicit model (localStorage nt-last-model, else Opus 5.5). Never while a menu or dialog is open (the
+    // user's), never sends anything. Menu entries are found by role and text only, never by Notion classes.
+    var MENU_ITEMS = '[role="menuitem"], [role="menuitemradio"], [role="option"]';
+    var MODEL_NAME_RE = /^((?:Opus|Sonnet|Haiku|GPT|Gemini)(?:[ \-]?\d[\d.]*)?|o\d[\w\-]*)/i;
+    var AUTO_TRY_GAP_MS = 5000;   // safety net: at most one switch attempt per 5 s
+    var AUTO_MENU_WAIT_MS = 300;  // time for Notion's menu to render
+    var AUTO_MENU_TRIES = 6;      // about 1.8 s, then give up for this chip change
+    var AUTO_SWITCH_TRIES = 3;    // switch attempts per chip change before the warning toast
+    var autoGuard = { key: '', pending: false, busy: false, last: 0, tries: 0 };
+    // innerText keeps the spaces between Notion's spans ('Opus 5.5 Beta'); textContent glues them ('Opus5.5Beta').
+    function itemText(n) { return String((n && (n.innerText || n.textContent)) || '').replace(/\s+/g, ' ').trim(); }
+    function compact(text) { return norm(text).replace(/\s+/g, ''); }
+    function modelName(text) { var m = MODEL_NAME_RE.exec(String(text || '').trim()); return m ? m[1].trim() : ''; }
+    function composerChip() {
+      var chips = document.querySelectorAll('.nt-desk-composer [role="button"]');
+      for (var i = 0; i < chips.length; i++) {
+        var b = chips[i];
+        if (b.closest && b.closest('[data-nt-desk], [data-nt-desk-own]')) continue;
+        var t = itemText(b);
+        if (!t || !MODEL_RE.test(t)) continue;
+        var rc = b.getBoundingClientRect();
+        if (rc.width > 0 && rc.height > 0) return { node: b, text: t };
+      }
+      return null;
+    }
+    function menuItems() {
+      var list = [];
+      Array.prototype.forEach.call(document.querySelectorAll(MENU_ITEMS), function (n) {
+        if (n.closest && n.closest('[data-nt-desk-own]')) return;
+        var rc = n.getBoundingClientRect();
+        if (rc.width > 0 && rc.height > 0) list.push(n);
+      });
+      return list;
+    }
+    function hideAutoEntries() {
+      // Only inside a model menu: the open menu must also list an explicit model name.
+      var items = menuItems();
+      if (!items.some(function (n) { return !!modelName(itemText(n)); })) return;
+      items.forEach(function (n) {
+        if (!isAutoText(itemText(n))) return;
+        n.setAttribute('aria-disabled', 'true');
+        n.setAttribute('data-nt-desk-auto-hidden', '1');
+        n.style.display = 'none';  // hidden, never removed (Notion owns the node)
+      });
+    }
+    function hideAutoSafe() { try { if (!stopped) hideAutoEntries(); } catch (e) { /* ignore */ } }
+    function rememberPick(ev) {
+      // An explicit model picked in Notion's menu becomes this window's last explicit model.
+      var item = ev && ev.target && ev.target.closest ? ev.target.closest(MENU_ITEMS) : null;
+      if (item && !item.closest('[data-nt-desk-own]')) {
+        var name = modelName(itemText(item));
+        if (name && !isAutoText(name)) setKey(LAST_MODEL_KEY, name);
+      }
+      setTimeout(hideAutoSafe, 80);  // a menu that just opened: hide its Auto entry before the next tick
+      setTimeout(hideAutoSafe, 250);
+    }
+    function pressDown(node) {
+      // Fallback for menus that open on pointer/mouse down instead of click.
+      ['pointerdown', 'mousedown'].forEach(function (type) {
+        var Ev = type === 'pointerdown' && typeof window.PointerEvent === 'function' ? window.PointerEvent : window.MouseEvent;
+        try { node.dispatchEvent(new Ev(type, { bubbles: true, cancelable: true, view: window, button: 0 })); } catch (e) { /* ignore */ }
+      });
+    }
+    function closeMenu() {
+      var target = document.activeElement || document.body;
+      try { target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })); } catch (e) { /* ignore */ }
+    }
+    function switchFromAuto(chipNode) {
+      var want = pinnedModel(), tries = 0;
+      autoGuard.busy = true;
+      autoGuard.last = Date.now();
+      function finish(ok) {
+        autoGuard.busy = false;
+        // A failed try is retried (5 s gap) up to AUTO_SWITCH_TRIES times per chip change, then one warning.
+        if (!ok && autoGuard.tries < AUTO_SWITCH_TRIES) { autoGuard.pending = true; return; }
+        if (!ok) toast('Notion shows "Auto" as the model. Pick ' + want + ' in the model menu; NotionTool still sends ' + want + '.', 'warning');
+      }
+      function pick() {
+        if (stopped) { autoGuard.busy = false; return; }
+        var items = menuItems();
+        if (!items.length) {
+          tries += 1;
+          if (tries === 2) pressDown(chipNode);
+          if (tries < AUTO_MENU_TRIES) { setTimeout(pick, AUTO_MENU_WAIT_MS); return; }
+          finish(false);
+          return;
+        }
+        hideAutoEntries();
+        var hit = null;
+        [want, DEFAULT_MODEL].forEach(function (name) {
+          var key = compact(name);
+          items.forEach(function (n) {
+            var t = itemText(n);
+            if (!hit && !isAutoText(t) && compact(t).indexOf(key) === 0) hit = n;
+          });
+        });
+        if (hit) { hit.click(); finish(true); return; }  // Notion's own menu entry; nothing is sent
+        closeMenu();
+        finish(false);
+      }
+      try { chipNode.click(); } catch (e) { autoGuard.busy = false; return; }
+      setTimeout(pick, AUTO_MENU_WAIT_MS);
+    }
+    function guardAuto() {
+      if (autoGuard.busy || document.documentElement.classList.contains('nt-desk-off') || !inChatView()) return;
+      var chip = composerChip();
+      var key = chip ? String(location.pathname || '') + String(location.search || '') + '|' + chip.text : '';
+      if (key !== autoGuard.key) {
+        autoGuard.key = key;
+        autoGuard.pending = !!chip && isAutoText(chip.text);  // a few tries per chip change, never an endless loop
+        autoGuard.tries = 0;
+      }
+      if (!autoGuard.pending || !chip || overlayOpen()) return;  // never click while a menu or dialog is open
+      if (Date.now() - autoGuard.last < AUTO_TRY_GAP_MS) return;
+      autoGuard.pending = false;
+      autoGuard.tries = (autoGuard.tries || 0) + 1;
+      switchFromAuto(chip.node);
+    }
+
     function renderStrip() {
       if (!ui.strip) buildStrip();
       if (!ui.strip.isConnected) document.body.appendChild(ui.strip);
@@ -307,12 +445,15 @@
       // model could not be changed. Any open Notion dialog/menu/listbox hides the strip.
       if (!r || off || !inChatView() || overlayOpen()) { ui.strip.hidden = true; root.classList.remove(STRIP_ON); return; }
       var nt = nextTurn(state);
-      // Bug 2026-10-21: the harness never publishes next_turn, so the strip always said 'Auto model'.
-      // Without harness data, show the model Notion's own composer chip really uses.
+      // Bug 2026-10-21: the harness never publishes next_turn. Without harness data, show the model Notion's
+      // own composer chip uses; when that chip says Auto, show the model the request pin really sends.
       var dm = nt.model ? '' : domModel(r);
+      var autoChip = !!dm && isAutoText(dm);
+      if (autoChip) dm = pinnedModel();  // never 'Auto' in the strip
       if (dm) { ui.model.textContent = 'Model: ' + dm; nt = { model: dm, effort: '', fromNotion: true }; }
       else ui.model.textContent = nextTurnText(nt);
-      ui.model.setAttribute('title', nt.fromNotion ? 'Model shown by Notion for this chat' : nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
+      ui.model.setAttribute('title', autoChip ? 'Notion shows Auto here; NotionTool switches it and sends this model'
+        : nt.fromNotion ? 'Model shown by Notion for this chat' : nt.model ? 'Model and reasoning effort the harness picked for the Main\'s next turn'
         : 'The harness has not published the next-turn model yet');
       // Every number comes from window.__ntDesk.counts, the same helper the Live tab and grid use.
       var c = typeof window.__ntDesk.counts === 'function' ? window.__ntDesk.counts(state) : null;
@@ -383,6 +524,7 @@
     function render() {
       if (stopped || !document.body) return;
       try { placeBell(); renderStrip(); checkOffline(); } catch (e) { /* never throw into the page */ }
+      try { hideAutoEntries(); guardAuto(); } catch (e) { /* never throw into the page */ }
     }
 
     // ---- palette entries -----------------------------------------------------------------
@@ -454,6 +596,7 @@
       document.addEventListener('mousedown', onDocDown, true);
       window.addEventListener('keydown', onKey, true);
       window.addEventListener('resize', render);
+      window.addEventListener('click', rememberPick, true);
       tick = setInterval(render, TICK_MS);
       render();
     } catch (e) { /* never throw into the page */ }
@@ -469,6 +612,7 @@
           document.removeEventListener('mousedown', onDocDown, true);
           window.removeEventListener('keydown', onKey, true);
           window.removeEventListener('resize', render);
+          window.removeEventListener('click', rememberPick, true);
           document.documentElement.classList.remove(STRIP_ON, COMPACT);
           [ui.bell, ui.drawer, ui.strip].forEach(function (n) { if (n && n.parentNode) n.parentNode.removeChild(n); });
         } catch (e) { /* ignore */ }

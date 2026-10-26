@@ -40,6 +40,16 @@ def _choice(key, label, group, options, default, help_text, app_local=False):
                 default=default, help=help_text, app_local=app_local)
 
 
+def _app_int(key, label, low, high, default, help_text):
+    # App-local integer: saved through app_settings_set (the server does not know these keys yet).
+    return dict(key=key, label=label, group='App', type='int', min=low, max=high, options=None,
+                default=default, help=help_text, app_local=True)
+
+
+# Models are always named explicitly: there is no Auto entry (redesign, Settings > Models & Roles).
+MODEL_OPTIONS = ('opus-5.5', 'sonnet-5.5', 'haiku-5.5')
+ROLE_MODEL_KEYS = ('app_role_researcher', 'app_role_architect', 'app_role_worker', 'app_role_quality_planner')
+
 # Items the overlay can hide in the Notion chrome (app_hide_<item>); default True = hidden.
 APP_HIDE_ITEMS = (
     ('home', 'Home', True),
@@ -118,6 +128,38 @@ HARNESS_SETTINGS = [
           'Tell me when a chat waits for my answer.', app_local=True),
     _bool('app_notify_sound', 'Play a sound', 'App', False,
           'Play a short sound with each notice.', app_local=True),
+    # Models & Roles (redesign P5): every model is named explicitly, never Auto. Saved by the app route.
+    _choice('app_default_model', 'Default model', 'App', MODEL_OPTIONS, 'opus-5.5',
+            'The model new chats start with. It stays pinned until you change it.', app_local=True),
+    _bool('app_never_use_auto', 'Never use Auto', 'App', True,
+          'Always use the model named here. Never let the app pick one for you.', app_local=True),
+    _choice('app_role_researcher', 'Researcher', 'App', MODEL_OPTIONS, 'opus-5.5',
+            'Model for the Researcher role.', app_local=True),
+    _choice('app_role_architect', 'Architect', 'App', MODEL_OPTIONS, 'opus-5.5',
+            'Model for the Architect role.', app_local=True),
+    _choice('app_role_worker', 'Worker', 'App', MODEL_OPTIONS, 'sonnet-5.5',
+            'Model for the Worker role.', app_local=True),
+    _choice('app_role_quality_planner', 'Quality planner', 'App', MODEL_OPTIONS, 'opus-5.5',
+            'Model for the Quality planner role.', app_local=True),
+    _choice('app_direct_model', 'Direct mode model', 'App', MODEL_OPTIONS, 'sonnet-5.5',
+            'Model used when you work in Direct mode.', app_local=True),
+    # Limits (redesign P5). coworker_max_age_hours, per_account, max_workers and main_context_policy are server keys.
+    _app_int('app_send_block_hours', 'Block sending after (hours)', 1, 23, 23,
+             'A chat older than this cannot send any more messages (the hard 23 h Notion limit).'),
+    _app_int('app_steps_per_turn', 'Steps per turn', 50, 1000, 450,
+             'Most steps one turn may take before it stops.'),
+    _bool('app_auto_switch_context', 'Switch context automatically', 'App', True,
+          'Move to a fresh chat when the context is nearly full.', app_local=True),
+    _app_int('app_auto_switch_percent', 'Switch context at (%)', 50, 95, 80,
+             'How full the context is when the automatic switch starts.'),
+    _app_int('app_load_last_messages', 'Load last messages', 1, 50, 5,
+             'How many messages a chat shows at first. Older ones via Load older messages.'),
+    _bool('app_restart_safety', 'Restart safety', 'App', True,
+          'Restart only when no task is running. Tasks wait until the restart is done.', app_local=True),
+    _bool('mcp_full_access', 'Full PC access for coworkers', 'App', False,
+          'Allow assigned coworker tasks to use files outside their project. Your owner connection has PC access.'),
+    _bool('mcp_browser_access', 'Browser access', 'App', False,
+          'Allow the NotionTool browser tools to use their own browser profile.'),
 ] + [
     _bool('app_hide_' + item, 'Hide ' + label, 'App', default,
           'Hide ' + label + ' in the Notion window.', app_local=True)

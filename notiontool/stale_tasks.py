@@ -400,8 +400,25 @@ def sweep(engine, now=None, worktree_exists=None, branch_exists=None, check_proo
         checked.pop(action['task_id'], None)
         _cleanup_event(store, action,
                        reason='Auto cleanup: abandoned without resending: ' + action['reason'] + '. ' + NO_SEND)
+        salvage = _salvage(engine, action)
+        if salvage:
+            action = dict(action, salvage=salvage)
         taken.append(action)
     return taken
+
+
+def _salvage(engine, action):
+    """Rule (d) never throws work away: the abandoned task's uncommitted worktree changes are committed on
+    its own branch as a salvage patch (Engine.patch_salvage), which the re-delegated task continues."""
+    keep = getattr(engine, 'patch_salvage', None)
+    if not callable(keep):
+        return None
+    try:
+        return keep(action['task_id'], reason=action['reason'])
+    except Exception as exc:
+        engine.store.event('patch_salvage_failed', action['run_id'], task_id=action['task_id'],
+                           message=(type(exc).__name__ + ': ' + str(exc))[:300])
+        return None
 
 
 class ReadOnlyStore:

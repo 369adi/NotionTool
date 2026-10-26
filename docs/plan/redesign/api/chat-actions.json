@@ -1,0 +1,23 @@
+{
+ "source": "P0 redesign. Forms taken from working harness code (notiontool/notion.py transaction/rename_thread/delete_thread); archive is NOT captured yet.",
+ "endpoint": "POST /api/v3/saveTransactionsFanout",
+ "envelope": {"requestId": "<uuid4>", "transactions": [{"id": "<uuid4>", "spaceId": "<space_id>", "debug": {"userAction": "<action>", "clientCommitTimeMs": "<epoch ms>"}, "operations": ["<op>"]}]},
+ "rename": {
+  "status": "verified (used by NotionAdapter.rename_thread and the Main archive-by-rename, I50 Fix 2)",
+  "userAction": "agentThreads.rename",
+  "operation": {"pointer": {"table": "thread", "id": "<thread_id>", "spaceId": "<space_id>"}, "path": ["data", "title"], "command": "set", "args": "<new title>"},
+  "check": "syncRecordValuesSpaceInitial thread record -> data.title"
+ },
+ "delete": {
+  "status": "verified on hg 2026-10-16 (NotionAdapter.delete_thread)",
+  "userAction": "agentThreads.delete",
+  "operation": {"pointer": {"table": "thread", "id": "<thread_id>", "spaceId": "<space_id>"}, "path": [], "command": "update", "args": {"alive": false}},
+  "check": "thread record alive == false",
+  "ui_rule": "Never for Mains (I50): a Main chat is archived by rename only"
+ },
+ "archive": {
+  "status": "UNVERIFIED - not captured. The harness only archives by rename (title prefix 'Main (archived ').",
+  "next_step": "Run work/redesign_p0/capture_api.py, then use ... > Archive on ONE throwaway coworker chat in the Notion app; the recorder stores the real saveTransactions body in docs/plan/redesign/api/capture-*.json",
+  "ui_fallback": "Until captured, the redesign 'Archive' button calls rename with the archive prefix"
+ }
+}

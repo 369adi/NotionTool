@@ -19,8 +19,10 @@ This module:
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -150,6 +152,41 @@ class LightServer:
         return getattr(self._server, name)
 
 
+READ_VIEW_WRITES = ('put', 'delete', 'batch', 'event', 'delete_events', 'message', 'remember', 'next_counter',
+                    'raise_counter', 'set_schema_version', 'compact', 'close')
+
+
+def read_view(store):
+    """Copy of the store with its OWN read-only sqlite connection and lock; every write goes to the real store.
+
+    Lag fix 2026-10-25: a desktop build read ~15 kinds through the one shared connection and the one store lock
+    every engine, Notion, upkeep and UI thread needs, so builds waited behind long writes and scans (live avg
+    2.6 s, max 10 s, on the copy without contention 30 ms). WAL lets this connection read the latest committed
+    data without that lock. None when no real sqlite store is behind it (tests, fakes): the old path is used.
+    """
+    directory = getattr(store, 'directory', None)
+    if getattr(store, 'db', None) is None or getattr(store, 'lock', None) is None or directory is None:
+        return None
+    try:
+        path = Path(directory) / 'notiontool.db'
+        if not path.is_file():
+            return None
+        db = sqlite3.connect('file:%s?mode=ro' % path.as_posix(), uri=True, check_same_thread=False)
+        db.execute('PRAGMA query_only=1')
+        db.execute('PRAGMA busy_timeout=3000')
+        db.execute('SELECT 1 FROM objects LIMIT 1').fetchall()
+        view = copy.copy(store)
+    except Exception:
+        return None
+    view.db = db
+    view.lock = threading.RLock()
+    for name in READ_VIEW_WRITES:
+        if hasattr(store, name):
+            setattr(view, name, getattr(store, name))
+    view.read_only_view = True
+    return view
+
+
 class PushStats:
     """Timings (ms) and counters for /api/app/status."""
 
@@ -202,6 +239,8 @@ class DesktopStateCache:
         self._state = None
         self._built_at = None
         self.task_cache = TaskCache(clock)
+        self._view = None
+        self._view_failed = False
 
     def _settings_mtime(self):
         path = self.settings_path
@@ -215,6 +254,13 @@ class DesktopStateCache:
 
     def revision(self):
         return (store_revision(self.server.store), self._settings_mtime(), int(self.wall() // TIME_BUCKET_S))
+
+    def read_store(self):
+        """Read-only view for builds (own connection, own lock); the real store when none can be opened."""
+        if self._view is None and not self._view_failed:
+            self._view = read_view(self.server.store)
+            self._view_failed = self._view is None
+        return self._view if self._view is not None else self.server.store
 
     def get(self):
         """(state, rebuilt)."""
@@ -231,7 +277,15 @@ class DesktopStateCache:
         app = loader(self.data_dir)
         self.stats.record('load_app_settings_ms', _ms(start))
         start = time.perf_counter()
-        state = builder(LightServer(self.server, LightStore(self.server.store, self.task_cache)), app)
+        view = self.read_store()
+        try:
+            state = builder(LightServer(self.server, LightStore(view, self.task_cache)), app)
+        except Exception:
+            if view is self.server.store:
+                raise
+            self._view, self._view_failed = None, True   # read view broke: old path for the rest of this run
+            self.stats.count('read_view_failures')
+            state = builder(LightServer(self.server, LightStore(self.server.store, self.task_cache)), app)
         if isinstance(state, dict) and isinstance(state.get('events'), list):
             state['events'] = state['events'][-EVENT_LIMIT:]
         self.stats.record('desktop_state_ms', _ms(start))

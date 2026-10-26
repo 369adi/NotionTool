@@ -231,6 +231,23 @@
         }
       } catch (err) { /* never throw */ }
     }
+    // Expanding a tool row: group the freshly rendered rows in a microtask, before the next paint,
+    // so the expanded list never flashes ungrouped for the 400 ms scan throttle.
+    var expandObs = null, expandUntil = 0;
+    function onExpandClick(ev) {
+      var t = ev && ev.target, b = t && t.closest ? t.closest('[role="button"][aria-expanded]') : null;
+      if (!b || stopped || typeof MutationObserver !== 'function') return;
+      var chat = document.querySelector('.layout-chat');
+      if (!chat) return;
+      expandUntil = Date.now() + 900;
+      if (expandObs) return;
+      expandObs = new MutationObserver(function () {
+        if (Date.now() > expandUntil) { if (expandObs) expandObs.disconnect(); expandObs = null; return; }
+        scan();
+      });
+      expandObs.observe(chat, { childList: true, subtree: true });
+      setTimeout(function () { if (expandObs && Date.now() > expandUntil) { expandObs.disconnect(); expandObs = null; } }, 1000);
+    }
     function scheduleScan() {
       if (stopped || scanTimer) return;
       scanTimer = setTimeout(scan, SCAN_MS);
@@ -272,6 +289,7 @@
       }
       if (typeof document.addEventListener === 'function') {
         document.addEventListener('click', onClick, true);
+        document.addEventListener('click', onExpandClick, true);
         clickBound = true;
       }
     } catch (err) { /* never throw */ }
@@ -287,7 +305,8 @@
         scanTimer = 0;
         if (bodyObserver) bodyObserver.disconnect();
         bodyObserver = null;
-        if (clickBound) document.removeEventListener('click', onClick, true);
+        if (clickBound) { document.removeEventListener('click', onClick, true); document.removeEventListener('click', onExpandClick, true); }
+        if (expandObs) { expandObs.disconnect(); expandObs = null; }
         clickBound = false;
         try { unmark(); } catch (err) { /* never throw */ }
         if (root) {

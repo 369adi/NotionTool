@@ -7,39 +7,60 @@ from notiontool import token_budget
 from notiontool.notion_shell import pin_config_body, PIN_DEFAULT_MODEL
 
 
-def body(*values):
-    tr = [{'type': 'config', 'value': {'model': 'albuquerque-quinn'}}]
+def body(*values, base=None, thread=''):
+    tr = [{'type': 'config', 'value': dict({'model': 'albuquerque-quinn'} if base is None else base)}]
     for v in values:
         tr.append({'type': 'updated-config', 'value': v})
     tr.append({'type': 'user', 'value': [['hi']]})
-    return json.dumps({'transcript': tr})
+    data = {'transcript': tr}
+    if thread:
+        data['threadId'] = thread
+    return json.dumps(data)
 
 
 def last_cfg(text):
-    steps = [s for s in json.loads(text)['transcript'] if s['type'] == 'updated-config']
+    steps = [s for s in json.loads(text)['transcript'] if s['type'] in ('config', 'updated-config')]
     return steps[-1]['value']
 
 
-def test_auto_gets_default_opus_high():
-    out = pin_config_body(body({}), {})
-    v = last_cfg(out)
-    assert v['model'] == PIN_DEFAULT_MODEL and v['reasoningEffort'] == 'high' and v['modelFromUser'] is True
+# Owner rule 2026-10-25: a model/effort the user picked stays; an empty updated-config step means
+# "no change" and is never treated as Auto (live bug: the Main's xhigh was overwritten with high).
+
+def test_empty_steps_keep_the_chats_own_config():
+    assert pin_config_body(body({}), {}) is None
+    assert pin_config_body(body({}, {}, {}), {}) is None
 
 
-def test_explicit_choice_passes_and_is_learned():
+def test_base_effort_from_the_user_is_never_overwritten():
+    base = {'model': 'albuquerque-quinn', 'reasoningEffort': 'xhigh', 'modelFromUser': True}
+    assert pin_config_body(body({}, {}, {}, base=base), {}) is None
+
+
+def test_effort_pick_in_an_earlier_step_stays():
+    assert pin_config_body(body({'reasoningEffort': 'max'}, {}, {'useWebSearch': True}), {}) is None
+    assert pin_config_body(body({'reasoningEffort': 'medium'}), {}) is None
+    assert pin_config_body(body({'model': 'achira-donut', 'reasoningEffort': 'low'}, {}), {}) is None
+
+
+def test_auto_model_is_filled_and_keeps_the_users_effort():
+    v = last_cfg(pin_config_body(body({'reasoningEffort': 'max'}, {}, base={'model': 'auto'}), {}))
+    assert v['model'] == PIN_DEFAULT_MODEL and v['reasoningEffort'] == 'max' and v['modelFromUser'] is True
+
+
+def test_missing_model_gets_opus_without_inventing_an_effort():
+    v = last_cfg(pin_config_body(body({}, base={}), {}))
+    assert v['model'] == PIN_DEFAULT_MODEL and 'reasoningEffort' not in v
+    v = last_cfg(pin_config_body(body(base={'type': 'workflow'}), {}))
+    assert v['model'] == PIN_DEFAULT_MODEL and 'reasoningEffort' not in v
+
+
+def test_explicit_choice_passes_and_is_learned_per_chat():
     pin = {}
-    assert pin_config_body(body({'model': 'achira-donut', 'reasoningEffort': 'max'}), pin) is None
-    assert pin == {'model': 'achira-donut', 'effort': 'max'}
-    v = last_cfg(pin_config_body(body({'modelFromUser': True}), pin))
-    # The model pick is kept; an old effort pick is never carried over (no accidental 'low').
-    assert v['model'] == 'achira-donut' and v['reasoningEffort'] == 'high'
-
-
-def test_old_low_effort_never_sticks():
-    pin = {}
-    assert pin_config_body(body({'model': 'achira-donut', 'reasoningEffort': 'low'}), pin) is None
-    v = last_cfg(pin_config_body(body({}), pin))
-    assert v['reasoningEffort'] == 'high'
+    assert pin_config_body(body({'model': 'achira-donut', 'reasoningEffort': 'max'}, thread='ab-12'), pin) is None
+    assert pin['threads']['ab12'] == {'model': 'achira-donut', 'effort': 'max'}
+    # The same chat later shows Auto: its own model and effort come back.
+    v = last_cfg(pin_config_body(body({'model': 'auto', 'reasoningEffort': 'auto'}, thread='ab12'), pin))
+    assert v['model'] == 'achira-donut' and v['reasoningEffort'] == 'max'
 
 
 def test_auto_string_replaced_and_bad_input_ignored():
