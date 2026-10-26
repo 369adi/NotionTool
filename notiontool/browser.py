@@ -226,14 +226,14 @@ class Browser:
         raise RuntimeError('Browser did not start its DevTools endpoint')
 
     def _launch_options(self, args):
-        """Owned Notion transport Edge: off screen and never activated (games, full screen)."""
+        """Owned Notion transport Edge: hidden window (SW_HIDE -> no taskbar button) and off screen."""
         options = {}
         if self.hidden():
             args.insert(-1, '--window-position=-32000,-32000')
             if os.name == 'nt':
                 startup = subprocess.STARTUPINFO()
                 startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startup.wShowWindow = 4  # SW_SHOWNOACTIVATE
+                startup.wShowWindow = 0  # SW_HIDE: no window, no taskbar icon
                 options['startupinfo'] = startup
         return options
 
@@ -274,22 +274,26 @@ class Browser:
             return False
 
     def _owned_pids(self):
-        """PIDs of browser processes that use exactly this owned profile (transport included)."""
+        """PIDs of all processes (main + child UI) that use exactly this owned profile."""
         profile = str(getattr(self, 'profile', '') or '')
         if os.name != 'nt' or not profile:
             return []
-        pids = []
-        for item in self.list_processes():
-            cmd = str(item.get('cmd') or '')
-            if profile.lower() in cmd.lower():
-                try:
-                    pids.append(int(item.get('pid') or 0))
-                except (TypeError, ValueError):
-                    pass
-        return pids
+        code = ('$ErrorActionPreference="SilentlyContinue"; '
+                '$p=$env:NT_PROFILE; '
+                'Get-CimInstance Win32_Process -Filter "Name=\'msedge.exe\' OR Name=\'chrome.exe\'" | '
+                'Where-Object { $_.CommandLine -and $_.CommandLine.Contains($p) } | '
+                'ForEach-Object { $_.ProcessId } | Sort-Object -Unique')
+        try:
+            env = dict(os.environ)
+            env['NT_PROFILE'] = profile
+            result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', code],
+                                    capture_output=True, text=True, timeout=15, env=env)
+            return [int(x) for x in (result.stdout or '').split() if x.strip().isdigit()]
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return []
 
     def _native_windows(self):
-        """Top-level visible HWNDs of this owned browser's processes."""
+        """Top-level HWNDs of this owned browser's processes (visible or not) + main-window fallback."""
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -301,14 +305,33 @@ class Browser:
 
         @WNDENUMPROC
         def cb(hwnd, _lparam):
-            if user32.IsWindowVisible(hwnd):
-                pid = wintypes.DWORD()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if pid.value in pids:
-                    found.append(hwnd)
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                found.append(hwnd)
             return True
 
         user32.EnumWindows(cb, 0)
+        if not found:
+            # Fallback: main window handles reported by Get-Process (some Edge windows are not
+            # enumerated on the caller's desktop but still carry a main-window handle).
+            try:
+                pidlist = ','.join(str(p) for p in sorted(pids))
+                code = ('$ErrorActionPreference="SilentlyContinue"; '
+                        'Get-Process -Id ' + pidlist + ' | '
+                        'Where-Object { $_.MainWindowHandle -ne 0 } | '
+                        'ForEach-Object { $_.MainWindowHandle }')
+                result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', code],
+                                        capture_output=True, text=True, timeout=15)
+                for x in (result.stdout or '').split():
+                    try:
+                        h = int(x)
+                        if h > 0:
+                            found.append(h)
+                    except ValueError:
+                        pass
+            except (OSError, subprocess.SubprocessError):
+                pass
         return found
 
     def hide_native(self):
@@ -327,14 +350,15 @@ class Browser:
             user32 = ctypes.windll.user32
             show = 5 if visible else 0  # SW_SHOW / SW_HIDE
             # The browser window may appear a moment after the process starts: retry briefly.
-            for _ in range(8):
+            for _ in range(10):
                 wins = self._native_windows()
                 if wins or not visible:
                     break
                 time.sleep(0.25)
-            for hwnd in self._native_windows():
+            wins = self._native_windows()
+            for hwnd in wins:
                 user32.ShowWindow(hwnd, show)
-            return True
+            return bool(wins)
         except Exception:
             return False
 
