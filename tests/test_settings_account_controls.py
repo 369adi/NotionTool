@@ -60,6 +60,14 @@ class AccountControlsTests(unittest.TestCase):
         self.assertTrue(open_main(self.server,'a'))
         self.assertNotIn('Page.navigate',[c.args[0] for c in self.cdp.send.call_args_list])
 
+    def test_open_main_does_not_reopen_a_signed_out_account(self):
+        account = self.store.get('accounts', 'a')
+        account['team_threads'] = {'main': {'id': '00000000-0000-4000-8000-000000000002'}}
+        account['state'] = 'signin'
+        self.store.put('accounts', account)
+        self.assertFalse(open_main(self.server, 'a'))
+        self.cdp.send.assert_not_called()
+
     def test_desktop_startup_calls_main_routing_once(self):
         from notiontool import desktop_shell as ds
         controller=ds.DesktopController(self.server,exe_finder=lambda:'fake',runtime_check=False)

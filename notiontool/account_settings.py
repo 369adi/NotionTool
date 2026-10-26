@@ -10,6 +10,9 @@ def open_main(server, account_id):
     if target is None or selected_account(server.store) != account_id:
         return False
     account = server.store.get('accounts', account_id, {}) or {}
+    # A signed-out account must never re-open its Main chat (the old account's chats would stay visible).
+    if account.get('state') == 'signin':
+        return False
     thread = ((account.get('team_threads') or {}).get('main') or {}).get('id')
     if not thread:
         return False
