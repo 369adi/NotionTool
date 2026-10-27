@@ -52,6 +52,10 @@ class Store:
         self.db.execute("CREATE INDEX IF NOT EXISTS event_task ON events(json_extract(doc, '$.task_id'))")
         self.db.commit()
         self.projects = {}
+        try:
+            self.prune_old_tasks()  # before compact: the freed pages go back to the disk in the same start
+        except Exception:
+            pass  # never block the start; the hourly upkeep tries again
         self.compact()
 
     # Free pages above this share are given back to the disk at start (incremental, cheap).
@@ -130,6 +134,74 @@ class Store:
             rows = self.db.execute('SELECT rowid, doc FROM objects WHERE kind=?', (kind,)).fetchall()
         rows.sort(key=lambda row: row[0])
         return [json.loads(row[1]) for row in rows]
+
+    # Startup lag fix 2026-10-27: the hot engine/watch loops only care about unfinished tasks, but all('tasks')
+    # parsed every task ever (1374 docs, 37 MB) in Python on every call. With ~10 threads doing that at startup
+    # the GIL piled up and ticks took 26-182 s. SQLite filters here in C; only the few open docs are parsed.
+    # Kept: unfinished states, tasks with an open patch copy (patch_state working/waiting) and remote_unknown.
+    _OPEN_TASKS_SQL = ("SELECT rowid, doc FROM objects WHERE kind='tasks' AND ("
+                       "COALESCE(json_extract(doc,'$.state'),'') NOT IN ('done','failed','blocked','cancelled') "
+                       "OR json_extract(doc,'$.patch_state') IN ('working','waiting') "
+                       "OR (json_type(doc,'$.remote_unknown') NOT IN ('false','null') "
+                       "AND json_extract(doc,'$.remote_unknown') NOT IN (0,'')))")
+
+    def open_tasks(self):
+        """Tasks that are not finished, in rowid order (same order as all('tasks')). Fresh dicts per call.
+
+        Callers must still apply their own state filter: this is only a fast superset of the open tasks."""
+        with self.lock:
+            rows = self.db.execute(self._OPEN_TASKS_SQL).fetchall()
+        rows.sort(key=lambda row: row[0])
+        return [json.loads(row[1]) for row in rows]
+
+    # Owner 2026-10-27: only recent tasks are kept, old ones are deleted (no archive). A task goes when it is
+    # finished, has no open patch copy, is not remote_unknown, its run is finished (or gone), its newest time
+    # (finished/started/created) is older than TASK_KEEP_S and no kept task points at it (deps, review_of, ...).
+    # Runs at every start (Store init) and hourly from CoworkerUpkeep.loop.
+    TASK_KEEP_S = 2 * 86400
+    TASK_FINISHED = ('done', 'failed', 'blocked', 'cancelled')
+    RUN_FINISHED = ('done', 'cancelled', 'blocked')
+    TASK_REF_KEYS = ('deps', 'review_of', 'review_task', 'salvage_of', 'salvage_from')
+
+    def prune_old_tasks(self, now=None, keep_s=None):
+        """Delete old finished tasks (rules above) and any leftover 'tasks_archive' rows. Returns the count."""
+        now = time.time() if now is None else now
+        keep_s = self.TASK_KEEP_S if keep_s is None else keep_s
+        with self.lock:
+            rows = self.db.execute("SELECT id, doc FROM objects WHERE kind='tasks'").fetchall()
+            runs = {i: json.loads(d) for i, d in self.db.execute("SELECT id, doc FROM objects WHERE kind='runs'")}
+
+        def newest(task):
+            best = 0.0
+            for key in ('finished', 'started', 'created'):
+                value = task.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 1e9:
+                    best = max(best, float(value))
+            return best
+
+        doomed, wanted = [], set()
+        for ident, doc in rows:
+            task = json.loads(doc)
+            run = runs.get(str(task.get('run_id') or ''))
+            age = newest(task)
+            if (task.get('state') in self.TASK_FINISHED and task.get('patch_state') not in ('working', 'waiting')
+                    and not task.get('remote_unknown') and age and now - age > keep_s
+                    and (run is None or run.get('state') in self.RUN_FINISHED)):
+                doomed.append(str(ident))
+                continue
+            for key in self.TASK_REF_KEYS:
+                value = task.get(key)
+                for item in (value if isinstance(value, list) else [value]):
+                    if isinstance(item, (str, int)) and item:
+                        wanted.add(str(item))
+        doomed = [i for i in doomed if i not in wanted]
+        with self.lock, self.db:
+            for ident in doomed:
+                # re-check the state in SQL: a task that was reopened meanwhile is never deleted
+                self.db.execute("DELETE FROM objects WHERE kind='tasks' AND id=? AND json_extract(doc,'$.state') "
+                                "IN ('done','failed','blocked','cancelled')", (ident,))
+            archived = self.db.execute("DELETE FROM objects WHERE kind='tasks_archive'").rowcount
+        return len(doomed) + max(0, archived or 0)
 
     def put(self, kind, doc):
         with self.lock:

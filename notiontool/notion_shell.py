@@ -262,7 +262,7 @@ def sent_config(post):
         return '', ''
 
 
-def pin_config_body(post, pin):
+def pin_config_body(post, pin, picks=None):
     """Patched JSON body (str) with the model filled in, or None when nothing changes.
 
     Owner rule 2026-10-25: a model or effort the user picked in a chat stays until the user changes it;
@@ -313,7 +313,12 @@ def pin_config_body(post, pin):
     if target is None:
         return None
     value = dict(target.get('value') if isinstance(target.get('value'), dict) else {})
-    wanted = (memory.get('effort') or PIN_DEFAULT_EFFORT) if fix_effort else effort
+    # A pick set by the user in the NotionTool header (chat_effort_pick) always wins: it is enforced
+    # even when Notion's composer reset the chat to its own default (e.g. 'medium') after a switch.
+    if picks and thread in picks:
+        wanted = str(picks[thread]).strip().lower() or effort
+    else:
+        wanted = (memory.get('effort') or PIN_DEFAULT_EFFORT) if fix_effort else effort
     # The chat's effective effort always goes out explicitly in the last step, so Notion can never fall
     # back to the model default; the value itself is the user's own pick and is never changed.
     explicit = str(value.get('reasoningEffort') or '').strip().lower() == wanted
@@ -601,7 +606,18 @@ class NotionShell:
         try:
             if str(request.get('method') or '').upper() == 'POST':
                 pin = self.__dict__.setdefault('model_pin', {})
-                patched = pin_config_body(request.get('postData'), pin)
+                post = request.get('postData')
+                thread = request_thread_id(post)
+                picks = None
+                src = getattr(self, 'effort_pick_source', None)
+                if thread and callable(src):
+                    try:
+                        rec = src(thread)
+                        if isinstance(rec, dict) and rec.get('effort'):
+                            picks = {thread: str(rec['effort']).strip().lower()}
+                    except Exception:
+                        picks = None
+                patched = pin_config_body(post, pin, picks=picks)
         except Exception:
             patched = None
         args = {'requestId': ident}

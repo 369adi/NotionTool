@@ -1363,6 +1363,9 @@
       return { id: String(a.id), title: String(a.name || a.label || a.email || a.id), email: String(a.email || ''),
         space: String(a.space_name || a.workspace || ''), role: (active ? String(a.id) === active : i === 0) ? 'Main' : 'Backup',
         state: String(a.state || ''), error: String(a.error || ''),
+        spaceId: String(a.space_id || ''),
+        spaces: (Array.isArray(a.spaces) ? a.spaces : []).filter(function (s) { return s && s.id; })
+          .map(function (s) { return { id: String(s.id), name: String(s.name || 'Workspace') }; }),
         active: active ? String(a.id) === active : i === 0 };
     });
   }
@@ -1802,10 +1805,57 @@
       signOut.setAttribute('data-account-action', 'sign-out');
       var cstat = node('div', 'nt-desk-stab-status');
       cstat.setAttribute('role', 'status');
+      var spaceBox = node('div', 'nt-desk-stab-space');
+      spaceBox.setAttribute('data-account-space', '');
+      var spaceLabel = node('label', 'nt-desk-stab-label', 'Workspace');
+      var spacePick = document.createElement('select');
+      spacePick.className = 'nt-desk-stab-select';
+      spacePick.setAttribute('data-account-action', 'workspace');
+      spaceLabel.appendChild(spacePick);
+      var spaceStat = node('div', 'nt-desk-stab-status');
+      spaceStat.setAttribute('role', 'status');
+      spaceBox.appendChild(spaceLabel);
+      spaceBox.appendChild(node('p', 'nt-desk-stab-help', 'NotionTool works in this workspace. Each workspace has its own Main and Coworkers.'));
+      spaceBox.appendChild(spaceStat);
+      spaceBox.hidden = true;
       conn.appendChild(line);
+      conn.appendChild(spaceBox);
       conn.appendChild(signIn);
       conn.appendChild(signOut);
       conn.appendChild(cstat);
+      function renderSpaces(a) {
+        spacePick.textContent = '';
+        var spaces = a && a.spaces ? a.spaces : [];
+        spaceBox.hidden = !spaces.length;
+        spacePick.disabled = spaces.length < 2;
+        spaces.forEach(function (s) {
+          var opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = s.name;
+          if (s.id === a.spaceId) opt.selected = true;
+          spacePick.appendChild(opt);
+        });
+        spacePick.setAttribute('data-current', a ? a.spaceId : '');
+      }
+      spacePick.addEventListener('change', function () {
+        var before = spacePick.getAttribute('data-current') || '';
+        var chosen = spacePick.value;
+        if (!activeId || !chosen || chosen === before) return;
+        var name = spacePick.options[spacePick.selectedIndex] ? spacePick.options[spacePick.selectedIndex].textContent : chosen;
+        spacePick.disabled = true;
+        setStatus(spaceStat, 'saving', 'Switching to ' + name + '...');
+        Promise.resolve().then(function () { return call('account_space', { account_id: activeId, space_id: chosen }); }).then(function (res) {
+          if (failed(res)) throw res;
+          spacePick.setAttribute('data-current', chosen);
+          spacePick.disabled = false;
+          line.textContent = 'Connected to ' + name + '.';
+          setStatus(spaceStat, 'applied', 'Now using ' + name + '. Main and Coworkers are set up there.');
+        }, function (err) {
+          spacePick.value = before;
+          spacePick.disabled = false;
+          setStatus(spaceStat, 'error', 'Could not switch workspace: ' + errText(err));
+        });
+      });
       var accs = card(view, 'accounts', 'Accounts', 'Main is used first. Backup takes over when you switch to it.');
       var list = node('ul', 'nt-desk-stab-accounts');
       var astat = node('div', 'nt-desk-stab-status');
@@ -1821,6 +1871,7 @@
         signOut.disabled = true;
         who.textContent = 'Not signed in';
         mail.textContent = '';
+        renderSpaces(null);
         if (!rows.length) {
           who.textContent = 'Not signed in';
           line.textContent = 'No Notion account found.';
@@ -1836,6 +1887,7 @@
             line.textContent = connected ? 'Connected' + (a.space ? ' to ' + a.space : '') + '.'
               : (a.error || 'Sign in required.');
             signOut.disabled = false;
+            renderSpaces(a);
           }
           var li = node('li', 'nt-desk-stab-account' + (a.active ? ' nt-desk-stab-account-active' : ''));
           var info = node('div', 'nt-desk-stab-info');

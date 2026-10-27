@@ -5,8 +5,9 @@ With target or hwnd one top-level window is captured with PrintWindow and
 PW_RENDERFULLCONTENT, which also renders DirectX/OpenGL content and works while the
 window is covered; a blank result falls back to copying that screen area.
 
-Images are never written to disk: a capture exists only in memory until its image
-data has been encoded into the tool response, then it is gone. Only a 64-bit
+Images are never written to disk. In the running app a capture is uploaded as a Notion chat
+attachment (notion_upload.py) and the result carries view_url, which a Notion chat opens with its
+file viewer (inline base64 is unreadable there); otherwise the image data goes into the response. Only a 64-bit
 difference hash per target stays in memory, so only_if_changed can skip unchanged
 images. A capture_taken event logs time, reason, task and hashes (never pixels).
 Captures stored on disk by older versions are deleted on first use.
@@ -23,6 +24,8 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+from . import notion_upload
 
 ALIASES = {
     'roblox': ('robloxstudiobeta', 'robloxstudio', 'robloxplayerbeta'),
@@ -54,7 +57,8 @@ SCREEN_TOOLS = {
     'screen_windows': ('List open desktop app windows (hwnd, title, process, size); screen_capture can target one of them', {}),
     'screen_capture': ('Capture the whole screen (all monitors) and return the image; pass target or hwnd to capture only '
                        'one app window (for example Roblox Studio or Blender). No assignment token or code is needed. '
-                       'Use it as often as needed to check what you are building. Images are never stored.', _PROPS),
+                       'Use it as often as needed to check what you are building. To SEE the image open the returned '
+                       'view_url with the Notion file viewer (viewFileUrl).', _PROPS),
 }
 _RO = {'readOnlyHint': True, 'destructiveHint': False}
 SCREEN_OPERATOR_TOOLS = [
@@ -438,7 +442,7 @@ class ScreenCapture:
             info['note'] = 'Unchanged since the previous capture of the same screen or window; no image attached'
         info['ms'] = round((time.monotonic() - started) * 1000)
         self._log(info, args.get('reason', ''), task_id, run_id, role)
-        if part:
+        if part and not notion_upload.publish(info, part['data'], part['mimeType'], window['process'] or 'capture'):
             info['_image'] = {'data': part['data'], 'mimeType': part['mimeType']}
         return info
 

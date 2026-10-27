@@ -401,7 +401,7 @@ def handoff_text(store, worker, age_h=None):
 
 
 def busy(store, worker_id):
-    return any(t.get('worker_id') == worker_id and t.get('state') in BUSY_STATES for t in store.all('tasks'))
+    return any(t.get('worker_id') == worker_id and t.get('state') in BUSY_STATES for t in (store.open_tasks() if hasattr(store, 'open_tasks') else store.all('tasks')))
 
 
 def check_expired_title(store, adapter, client, thread_id, now=None):

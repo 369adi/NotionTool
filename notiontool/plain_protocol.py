@@ -180,10 +180,11 @@ One line per task, no vertical bars inside a cell.'''
 VISUAL=re.compile(r'\b(roblox|blender|screens?|screenshots?|capture|viewport|gui|ui|layout|render(ing)?|visual(ly)?|bildschirm|fenster|aussehen)\b',re.I)
 SCREEN_HINT=(' For visual work in desktop apps such as Roblox Studio or Blender, call the screen_capture tool through mcp_call'
              ' (no target = the whole screen; target "roblox" or "blender" = only that window) as often as needed to see the current state'
-             ' before and after changes. Screen tools need no assignment token or code.')
+             ' before and after changes. To SEE a capture open its view_url with the Notion file viewer (viewFileUrl);'
+             ' never judge a picture you have not opened. Screen tools need no assignment token or code.')
 # Every coworker role may look at the screen; advisers and planners still only look.
 SCREEN_TOOLS_LINE=('\nScreen tools: screen_windows and screen_capture are available through mcp_call with no assignment token,'
-                   ' to check the current state when needed.')
+                   ' to check the current state when needed (open view_url with viewFileUrl to see a capture).')
 ADVISER_TOOLS_NOTE=' Use them only to look; this planning role has no write or shell rights.'
 
 

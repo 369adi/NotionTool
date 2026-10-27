@@ -373,9 +373,9 @@ html.nt-v6-on .nt-desk-composer {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; outline: 0 !important;
 }
 html.nt-v6-on .nt-desk-composer:focus-within { border-color: #16223a !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; }
-html.nt-v6-on .nt-desk-composer [aria-label*="ictat" i],
-html.nt-v6-on .nt-desk-composer [aria-label*="voice" i],
-html.nt-v6-on .nt-desk-composer [aria-label*="microphone" i] { display: none !important; }
+/* dictation (user 2026-10-27): Notion's own mic button stays in the composer */
+html.nt-v6-on [data-nt-v6="mic"] { opacity: 1 !important; pointer-events: auto !important; visibility: visible !important; color: #aeb8dc !important; border-radius: 7px !important; }
+html.nt-v6-on [data-nt-v6="mic"]:hover { background: rgba(120, 140, 200, 0.1) !important; color: var(--v6-text) !important; }
 html.nt-v6-on [data-nt-v6="attach"], html.nt-v6-on [data-nt-v6="cmd"] {
   width: auto !important; padding: 0 9px 0 6px !important; gap: 8px !important; border-radius: 7px !important;
 }
@@ -695,3 +695,56 @@ html.nt-v6-feed-on [data-testid="agent-chat-scroll-to-bottom-button"] { display:
 .nt-v6-code pre { margin: 0 !important; padding: 10px 12px !important; background: transparent !important; flex: 1; min-width: 0; overflow-x: auto; font: 12px/1.55 ui-monospace, Consolas, monospace !important; }
 .nt-v6-copy { position: absolute; top: 6px; right: 8px; padding: 3px 9px; border-radius: 6px; border: 1px solid #1a2238; background: #0b1120; color: #a0abc5; font: 500 11px/1.3 inherit; cursor: pointer; z-index: 1; }
 .nt-v6-copy:hover { color: #e2e4ea; background: #111a2e; }
+
+/* ---- round 12 (user 2026-10-27): own chats first, Done badge, compact coworkers, archive group ---- */
+.nt-v6-h.mine { font-size: 13px; font-weight: 700; color: #eef2ff; margin-top: 16px; }
+.nt-v6-h .nt-v6-hn.done { color: #3ff0b8; }
+.nt-v6-sep + .nt-v6-h.cwh { margin-top: 12px; font-size: 11px; font-weight: 600; color: #7f8fb3; }
+.nt-v6-donetag {
+  display: inline-flex; align-items: center; gap: 5px; margin-left: auto; flex: none; height: 18px; box-sizing: border-box; padding: 0 7px;
+  border-radius: 999px; font-size: 10px; font-weight: 600; color: #3ff0b8; background: rgba(24, 245, 186, 0.1); border: 1px solid rgba(24, 245, 186, 0.28);
+}
+.nt-v6-donetag i { width: 6px; height: 6px; border-radius: 50%; background: #39f3c6; box-shadow: 0 0 6px rgba(24, 245, 186, 0.8); }
+.nt-v6-row.done { background: rgba(24, 245, 186, 0.05); }
+.nt-v6-row.done .nt-v6-t1 { color: #ffffff; font-weight: 700; }
+.nt-v6-dot.ok { background: #39f3c6 !important; box-shadow: 0 0 8px rgba(24, 245, 186, 0.75) !important; }
+.nt-v6-live .nt-v6-dot.ok + b { color: #3ff0b8; }
+.nt-v6-fold { display: flex; align-items: center; gap: 7px; height: 28px; box-sizing: border-box; padding: 0 9px; margin: 2px 0; border-radius: 8px; font-size: 11px; color: #8d9cc0; flex: none; }
+.nt-v6-fold:hover { background: rgba(120, 140, 200, 0.07); color: var(--v6-text); }
+.nt-v6-sb .nt-v6-fold svg { width: 12px; height: 12px; }
+.nt-v6-fold i { font-style: normal; margin-left: auto; font-size: 10px; color: #8d9cc0; background: #0d1628; border-radius: 999px; padding: 1px 7px; }
+.nt-v6-fold.nt-v6-arch { margin-top: 8px; }
+.nt-v6-cwl { display: flex; align-items: center; gap: 9px; height: 30px; box-sizing: border-box; padding: 0 9px 0 12px; border-radius: 8px; flex: none; font-size: 11px; color: #aab6d3; }
+.nt-v6-cwl:hover { background: rgba(120, 140, 200, 0.06); }
+.nt-v6-cwl .nt-v6-t1 { flex: 1; min-width: 0; }
+.nt-v6-cwl .nt-v6-av { position: static !important; width: 18px !important; height: 18px !important; font-size: 9.5px !important; color: #7f8db0; background: #0a1224; border-color: #141e36; }
+.nt-v6-cwl.done .nt-v6-t1 { color: #ffffff; font-weight: 600; }
+.nt-v6-list.arch .nt-v6-row { height: 32px; }
+.nt-v6-list.arch .nt-v6-row .nt-v6-t1 { color: #8f9bba; font-weight: 400; }
+.nt-v6-list.arch .nt-v6-rico { opacity: 0.55; }
+
+/* round 12b: resize backdrop - Notion's own white/grey frame must never show behind the panel */
+html.nt-v6-on, html.nt-v6-on body, html.nt-v6-on .notion-app, html.nt-v6-on .notion-app-inner, html.nt-v6-on .notion-cursor-listener { background-color: var(--v6-sbbg) !important; }
+html.nt-v6-on .notion-sidebar-container { background: var(--v6-sbbg) !important; }
+
+/* round 13: Move to archive header button */
+.nt-v6-archbtn span { white-space: nowrap; }
+.nt-v6-archbtn.ask { color: #ffb86b !important; box-shadow: 0 0 0 1px rgba(255, 170, 90, 0.45); }
+/* round 13: no transitions while the panel is dragged, so nothing lags behind it */
+html.nt-v6-rz-drag .nt-v6-sb, html.nt-v6-rz-drag .nt-v6-hd, html.nt-v6-rz-drag .nt-v6-feed { transition: none !important; }
+
+/* round 13b (user 2026-10-27 21:33): bigger chat rows, more room */
+.nt-v6-sb { font-size: 13px; }
+.nt-v6-row { height: 42px; gap: 12px; padding: 0 10px 0 10px; }
+.nt-v6-row .nt-v6-t1 { font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-v6-rico svg, .nt-v6-row svg { width: 20px; height: 20px; }
+.nt-v6-when { font-size: 12px; }
+.nt-v6-h { font-size: 12.5px; }
+.nt-v6-h.mine { font-size: 14.5px; }
+.nt-v6-h .nt-v6-hn { font-size: 11.5px; }
+.nt-v6-fold { height: 34px; font-size: 12.5px; }
+.nt-v6-fold i { font-size: 11px; }
+.nt-v6-list.arch .nt-v6-row { height: 38px; }
+.nt-v6-list.arch .nt-v6-row .nt-v6-t1 { font-size: 13px; }
+.nt-v6-main .nt-v6-t1 { font-size: 14px; line-height: 18px; }
+.nt-v6-sep { margin-top: 10px; }

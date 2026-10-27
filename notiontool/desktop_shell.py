@@ -35,6 +35,8 @@ DATA_DIR = (Path(sys.executable).resolve().parent.parent if getattr(sys, 'frozen
             else Path(__file__).resolve().parent.parent) / 'data'
 APP_FILE = 'desktop_app.json'
 DEFAULT_PORT = 9333
+# How often the controller checks whether the user switched to another Notion tab (seconds).
+TAB_CHECK_INTERVAL = 2.0
 # File stems in load order; overlay.js registers the 'sidebar' part. 'theme' (design system) is first.
 PART_FILES = ('theme', 'chrome', 'declutter', 'overlay', 'shell', 'live', 'projects', 'settings', 'extras', 'studio', 'v6', 'stepcap', 'donesound')
 # 'v6' (Chat v6 layout 1:1 to the mockup: sidebar panel + chat header) mounts after the parts it reads.
@@ -48,7 +50,8 @@ DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_sche
                                               'app_chat_rename', 'app_chat_promote', 'main_refresh',
                                               'chat_context_switch', 'chat_ages', 'chat_age_switch',
                                               'chat_thread_age', 'live_answer', 'account_status', 'account_sign_in',
-                                              'account_sign_out', 'account_select', 'account_setup', 'backup_status', 'backup_now',
+                                              'account_sign_out', 'account_select', 'account_setup', 'account_space', 'backup_status', 'backup_now',
+                                              'chat_effort_pick', 'chat_effort_get', 'dictate',
                                               'usage_report', 'patch_status', 'app_restart', 'app_restart_status',
                                               'app_health', 'notion_connections', 'notion_connection_permissions') + PROJECT_ACTIONS
 # RBX fix: one age check (Notion thread created_time) for ANY chat, also chats NotionTool did not create.
@@ -1000,6 +1003,48 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
             return dict(allowed=False, level='unknown', thread_id=thread, age_h=None, warning='',
                         message='Chat age unknown: sending is blocked. Click to retry.', error=str(exc)[:200])
 
+    def chat_effort_pick(args):
+        # The user picked an effort for a chat in the v6 header. It is stored per thread and enforced by
+        # the request pin (notion_shell.pin_config_body), so Notion's own reset to 'medium' after a switch
+        # can never override the user's choice. Coworker chats keep the harness's band rule and are refused.
+        from .effort_policy import REASONING_ORDER
+        args = args or {}
+        thread = re.sub(r'[^0-9a-f]', '', str(args.get('thread_id') or '').lower())
+        effort = str(args.get('effort') or '').strip().lower()
+        if len(thread) != 32:
+            raise ValueError('Choose a chat first')
+        if effort not in REASONING_ORDER:
+            raise ValueError('Unknown effort level: ' + effort)
+        for worker in store.all('workers'):
+            if (re.sub(r'[^0-9a-f]', '', str(worker.get('thread_id') or '')).lower() == thread
+                    and worker.get('purpose') == 'worker'):
+                raise ValueError('Coworker chats keep their own effort band')
+        store.put('thread_efforts', dict(id=thread, effort=effort, at=time.time()))
+        return dict(ok=True, thread_id=thread, effort=effort)
+
+    def chat_effort_get(args):
+        args = args or {}
+        thread = re.sub(r'[^0-9a-f]', '', str(args.get('thread_id') or '').lower())
+        if len(thread) != 32:
+            return None
+        rec = store.get('thread_efforts', thread)
+        return rec if isinstance(rec, dict) else None
+
+    def dictate(args):
+        # Mic button (user 2026-10-27): Notion 7.40 has no dictation button and Electron's Web Speech service
+        # fails (live: error 'network'), so the button starts Windows voice typing (Win+H). The page focused
+        # the composer first; Windows types the spoken text into it.
+        if os.name != 'nt':
+            raise ValueError('Voice typing needs Windows')
+        import ctypes
+        user32 = ctypes.windll.user32
+        vk_win, vk_h, keyup = 0x5B, 0x48, 0x0002
+        user32.keybd_event(vk_win, 0, 0, 0)
+        user32.keybd_event(vk_h, 0, 0, 0)
+        user32.keybd_event(vk_h, 0, keyup, 0)
+        user32.keybd_event(vk_win, 0, keyup, 0)
+        return dict(ok=True, mode='windows_voice_typing')
+
     def projects_call(method, path, body=None):
         try:
             return api(method, path, body)
@@ -1043,7 +1088,8 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
     handlers.update(app_chat_create=app_chat_create, app_chat_rename=app_chat_rename,
                     app_chat_promote=app_chat_promote, chat_context_switch=chat_context_switch,
                     chat_ages=chat_ages, chat_age_switch=chat_age_switch, chat_thread_age=chat_thread_age,
-                    live_answer=live_answer)
+                    live_answer=live_answer, chat_effort_pick=chat_effort_pick,
+                    chat_effort_get=chat_effort_get, dictate=dictate)
     handlers.update(state=state, runs=lambda args: state(args)['runs'], new_welcome_chat=new_welcome_chat,
                     settings_schema=settings_schema, app_settings_get=app_settings_get,
                     app_settings_set=app_settings_set, main_switch_start=main_switch_start,
@@ -1064,6 +1110,8 @@ class DesktopShell(NotionShell):
         self.chat_ages_source = (lambda: ages({})) if callable(ages) else None
         check = self.handlers.get('chat_thread_age')  # RBX fix: any chat, age from the Notion thread created_time
         self.thread_age_source = (lambda thread: check({'thread_id': thread, 'send': True})) if callable(check) else None
+        pick = self.handlers.get('chat_effort_get')  # user effort picks: enforced by the request pin
+        self.effort_pick_source = (lambda thread: pick({'thread_id': thread})) if callable(pick) else None
         self.build = ''
         self.page_refresh = ''
         self.teardown_result = None
@@ -1241,7 +1289,9 @@ class DesktopController:
                     push=self.pusher.stats.snapshot() if getattr(self, 'pusher', None) is not None else None)
 
     def autostart(self):
-        if load_app_settings(self.data_dir).get('app_autostart'):
+        settings = load_app_settings(self.data_dir)
+        # app_ui_mode 'standalone': NotionTool's own window (main.py) replaces the Notion window + overlay.
+        if settings.get('app_autostart') and settings.get('app_ui_mode') != 'standalone':
             return self.start()
         return self.status()
 
@@ -1329,6 +1379,16 @@ class DesktopController:
                 self.stop_event.wait(interval)
 
         threading.Thread(target=watch, daemon=True, name='desktop-app-reopen').start()
+
+    def _other_tab_visible(self, shell):
+        """True when the user looks at another Notion tab than the one with the overlay."""
+        check = getattr(getattr(shell, 'app', None), 'other_tab_visible', None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 - a failed check never detaches the overlay
+            return False
 
     def _devtools_up(self):
         from .desktop_app import _default_http_get
@@ -1446,7 +1506,10 @@ class DesktopController:
             # Startup preference: always open this account's persisted Main, even when Notion restores a page.
             # This runs once per start/reattach, never from state pushes or while switching views.
             from .account_settings import open_main
-            open_main(self.server, selected_account(self.server.store) or '')
+            if getattr(self, '_tab_switch', False):
+                self._tab_switch = False  # moved to another tab: keep the page the user is looking at
+            else:
+                open_main(self.server, selected_account(self.server.store) or '')
             account = selected_account(self.server.store) or ''
             if (account and self.server.store.get('accounts', account, {}).get('state') == 'ready'
                     and hasattr(self.server, 'job_once')):
@@ -1463,13 +1526,27 @@ class DesktopController:
             from . import desktop_state_cache
             cache = desktop_state_cache.DesktopStateCache(self.server, self.data_dir)
             self.pusher = desktop_state_cache.StatePusher(shell, cache, store=self.server.store)
+            switched, next_tab_check = False, time.monotonic() + TAB_CHECK_INTERVAL
             while not self.stop_event.is_set() and shell.alive:
                 try:
                     self.pusher.tick()
                 except Exception as exc:
                     self.error = 'state: ' + str(exc)[:160]
+                if time.monotonic() >= next_tab_check:
+                    next_tab_check = time.monotonic() + TAB_CHECK_INTERVAL
+                    if self._other_tab_visible(shell):
+                        switched = True
+                        break
                 self.stop_event.wait(self.push_interval)
-            if not self.stop_event.is_set():
+            if switched and not self.stop_event.is_set():
+                # The user looks at another Notion tab: move the overlay there (no Main reopen, no reload).
+                self.state, self.error, self._tab_switch = 'starting', '', True
+                try:
+                    self.server.store.event('desktop_tab_switch', message='Overlay moves to the visible Notion tab')
+                except Exception:
+                    pass
+                self._await_reopen(interval=0.5)
+            elif not self.stop_event.is_set():
                 self.state, self.error = 'stopped', 'The NotionTool window was closed'
                 if not self._quit_with_window():
                     self._await_reopen()

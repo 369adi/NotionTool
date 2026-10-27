@@ -35,6 +35,12 @@ import time
 # Shared 'session finished' rule with recover and the send checks. No import cycle: notion.py never imports turn_watch.
 from .notion import FINISHED_STATUSES, session_state
 
+
+def _open_tasks(store):
+    # Startup lag fix 2026-10-27: only unfinished tasks are parsed (store.open_tasks); callers still filter.
+    fn = getattr(store, 'open_tasks', None)
+    return fn() if callable(fn) else store.all('tasks')
+
 RESUME_TEXT = ('Continue: your previous turn was interrupted before it finished (automatic resume by NotionTool). '
                'Pick up exactly where you stopped and finish the task.')
 ALL_DONE_TEXT = ('All coworkers are finished (automatic message by NotionTool). '
@@ -434,7 +440,7 @@ class TurnWatch:
             mains.add((main_chat(self.store, account_id) or {}).get('main_worker'))
             operators |= self.operator_workers(account_id)
         mains.discard(None)
-        busy = {t.get('worker_id') for t in self.store.all('tasks') if _active(t)}
+        busy = {t.get('worker_id') for t in _open_tasks(self.store) if _active(t)}
         return [w for w in self.store.all('workers')
                 if w.get('account_id') in ready and w.get('thread_id')
                 and w.get('state') not in EXCLUDED_STATES and w.get('join_state') != 'pending'
@@ -788,7 +794,7 @@ class TurnWatch:
                          steps=(steps + [step])[-10:], user_ids=list(found['user_ids'])[-10:])
             fresh['resume'] = state
             self.store.put('workers', fresh)
-            for task in self.store.all('tasks'):
+            for task in _open_tasks(self.store):
                 if task.get('worker_id') == worker['id'] and _active(task):
                     # The recovery keeps reading this turn past our continue message (notion.py).
                     task['resume_steps'] = (list(task.get('resume_steps') or []) + [step])[-10:]
@@ -888,7 +894,7 @@ class TurnWatch:
         from .network_budget import request_priority
         try:
             # The resume uses the task's own model when the adapter supports it (notion.py continue_turn).
-            task = next((t for t in self.store.all('tasks') if t.get('worker_id') == worker['id'] and _active(t)), None)
+            task = next((t for t in _open_tasks(self.store) if t.get('worker_id') == worker['id'] and _active(t)), None)
             with request_priority('rest'):
                 if text == RESUME_TEXT and self.click_mode():
                     sent = self.click(worker, step, task)

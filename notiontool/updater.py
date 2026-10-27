@@ -260,7 +260,7 @@ class Updater:
                 time.sleep(1)
 
     def idle(self):
-        return not any(t.get('state') == 'running' for t in self.store.all('tasks'))
+        return not any(t.get('state') == 'running' for t in (self.store.open_tasks() if hasattr(self.store, 'open_tasks') else self.store.all('tasks')))
 
     def check(self):
         return self.check_release() if self.kind == 'release' else self.check_git()

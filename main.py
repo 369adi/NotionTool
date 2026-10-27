@@ -35,7 +35,7 @@ def reopen_desktop_window(data_dir):
 
     Same argv as DesktopApp, so Electron focuses an already open window instead of a second one;
     the running harness attaches to it again (DesktopController._await_reopen)."""
-    if not new_app_is_ui(data_dir):
+    if not new_app_is_ui(data_dir) or app_ui_mode(data_dir) == 'standalone':
         return False
     try:
         import subprocess
@@ -54,6 +54,31 @@ def new_app_is_ui(data_dir):
         return bool(load_app_settings(data_dir).get('app_autostart'))
     except Exception:
         return False
+
+
+def app_ui_mode(data_dir):
+    """'standalone' (own NotionTool window over the Notion API) or 'overlay' (old Notion window, fallback)."""
+    try:
+        from notiontool.desktop_shell import load_app_settings
+        mode = load_app_settings(data_dir).get('app_ui_mode')
+        return mode if mode in ('standalone', 'overlay') else 'overlay'
+    except Exception:
+        return 'overlay'
+
+
+def standalone_url(url):
+    """Host URL http://127.0.0.1:<port>/#<token> -> the standalone UI page with the same token."""
+    base, _, token = str(url).partition('#')
+    return base.rstrip('/') + '/app/index.html#' + token
+
+
+def close_on_exit(app):
+    """Restart/quit from inside the app (exit_event) closes the standalone window, so main() ends."""
+    app.exit_event.wait()
+    try:
+        app.window.destroy()
+    except Exception:
+        pass
 
 
 def self_test_imports(report_path=None, importer=None, package='notiontool'):
@@ -118,8 +143,17 @@ def main():
     app = Application(args.data_dir)
     app.exit_event = threading.Event()  # set when the user closes the NotionTool window (desktop_shell)
     url = app.launch(args.port)
+    standalone = not args.serve and not args.classic and app_ui_mode(args.data_dir) == 'standalone'
     try:
-        if args.serve or (not args.classic and (args.headless or new_app_is_ui(args.data_dir))):
+        if standalone:
+            # Own NotionTool window (pywebview + WebView2) on the Host API UI; Notion only over /api/v3.
+            # Closing the window quits the app (I49); restart/quit from inside sets exit_event and closes it.
+            import webview
+            app.window = webview.create_window('NotionTool', standalone_url(url), width=1480, height=940,
+                                               min_size=(1000, 680), background_color='#0b0d12')
+            threading.Thread(target=close_on_exit, args=(app,), daemon=True, name='standalone-exit').start()
+            webview.start(gui='edgechromium')
+        elif args.serve or (not args.classic and (args.headless or new_app_is_ui(args.data_dir))):
             # The NotionTool desktop app (separate Notion instance) is the UI: no classic window.
             if args.serve:
                 print(url,flush=True)

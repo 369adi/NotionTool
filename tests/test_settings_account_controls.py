@@ -49,14 +49,14 @@ class AccountControlsTests(unittest.TestCase):
         self.store.put('accounts',account)
         self.assertTrue(open_main(self.server,'a'))
         self.cdp.send.assert_any_call('Page.navigate',{
-            'url':'https://app.notion.com/chat?t=4055ea8ee60a80b285db00a9b662ea8f'})
+            'url':'https://app.notion.com/chat?t=00000000000040008000000000000002'})
         self.assertFalse(open_main(self.server,'b'))
 
     def test_startup_does_not_reload_an_already_open_main(self):
         account=self.store.get('accounts','a')
         account['team_threads']={'main':{'id':'00000000-0000-4000-8000-000000000002'}}
         self.store.put('accounts',account)
-        self.cdp.send.return_value={'result':{'value':'https://app.notion.com/chat?t=4055ea8ee60a80b285db00a9b662ea8f'}}
+        self.cdp.send.return_value={'result':{'value':'https://app.notion.com/chat?t=00000000000040008000000000000002'}}
         self.assertTrue(open_main(self.server,'a'))
         self.assertNotIn('Page.navigate',[c.args[0] for c in self.cdp.send.call_args_list])
 
@@ -149,6 +149,57 @@ class AccountControlsTests(unittest.TestCase):
         self.server.action.assert_called_once_with('/api/account/select', {'account_id': 'b'})
         self.server.resume_after_sign_in.assert_called_once_with('b')
         self.server.first_login_setup.assert_called_once_with('b')
+
+    def _two_spaces(self):
+        account = self.store.get('accounts', 'a')
+        account['identity']['spaces'] = [{'id': 'space', 'name': 'My workspace'}, {'id': 'team', 'name': 'Team'}]
+        account['team_threads'] = {'main': {'id': 'old-main'}}
+        account['first_setup_done'] = True
+        self.store.put('accounts', account)
+        self.adapter.refresh = Mock()
+
+    def test_status_lists_the_workspaces_of_each_account(self):
+        self._two_spaces()
+        row = self.actions['account_status']({})['accounts'][0]
+        self.assertEqual(row['space_id'], 'space')
+        self.assertEqual([s['name'] for s in row['spaces']], ['My workspace', 'Team'])
+
+    def test_workspace_switch_keeps_each_workspaces_own_main_and_coworkers(self):
+        self._two_spaces()
+        self.actions['account_space']({'account_id': 'a', 'space_id': 'team'})
+        account = self.store.get('accounts', 'a')
+        self.assertEqual(account['identity']['space_id'], 'team')
+        self.assertEqual(account['team_threads'], {})
+        self.assertFalse(account['first_setup_done'])
+        self.assertEqual(account['space_threads']['space']['team_threads'], {'main': {'id': 'old-main'}})
+        self.server.job.call_args.args[1]()
+        self.adapter.refresh.assert_called_once_with('a')
+        self.server.first_login_setup.assert_called_once_with('a')
+        # Switching back restores the old Main.
+        self.actions['account_space']({'account_id': 'a', 'space_id': 'space'})
+        account = self.store.get('accounts', 'a')
+        self.assertEqual(account['team_threads'], {'main': {'id': 'old-main'}})
+        self.assertTrue(account['first_setup_done'])
+
+    def test_workspace_switch_rejects_unknown_workspace_and_busy_account(self):
+        self._two_spaces()
+        with self.assertRaisesRegex(ValueError, 'workspace of this account'):
+            self.actions['account_space']({'account_id': 'a', 'space_id': 'nope'})
+        self.store.put('workers', {'id': 'w', 'account_id': 'a'})
+        self.store.put('tasks', {'id': 't', 'worker_id': 'w', 'state': 'running'})
+        with self.assertRaisesRegex(ValueError, 'active tasks'):
+            self.actions['account_space']({'account_id': 'a', 'space_id': 'team'})
+        self.assertEqual(self.store.get('accounts', 'a')['identity']['space_id'], 'space')
+
+    def test_identity_keeps_the_chosen_workspace(self):
+        from notiontool.notion import NotionClient
+        client = NotionClient(Mock(), {'space_id': 'team'})
+        records = {'notion_user': {'u': {'value': {'email': 'o@x.test'}}},
+                   'space': {'space': {'value': {'name': 'A'}}, 'team': {'value': {'name': 'B'}}}}
+        with patch.object(NotionClient, 'call', return_value={'recordMap': records}):
+            self.assertEqual(client.identity()['space_id'], 'team')
+            client.info['space_id'] = 'gone'
+            self.assertEqual(client.identity()['space_id'], 'space')
 
 
 class SettingsRegistrationTests(unittest.TestCase):

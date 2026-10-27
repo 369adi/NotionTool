@@ -1641,10 +1641,13 @@
     function clickRow(key) {
       if (!key) return false;
       var rows = document.querySelectorAll('[data-nt-desk="chat-row"]');
-      // Safety rule: desktop JS never clicks chat rows itself; it only highlights the new row.
+      // Safety rule: overlay JS never clicks chat rows itself; v6 opens only the chat the user just created.
       for (var i = 0; i < rows.length; i++) {
         if (rows[i].getAttribute('data-nt-desk-thread') === key) {
           try { rows[i].scrollIntoView({ block: 'nearest' }); } catch (e) {}
+          // User 2026-10-27 21:05: after New chat the app opens the new chat directly; the v6 layer presses the row.
+          var openThread = window.__ntV6OpenThread;
+          if (typeof openThread === 'function' && openThread(key)) return true;
           ctx.toast('The chat is ready. Click it in the sidebar to open it.', 'info');
           return true;
         }

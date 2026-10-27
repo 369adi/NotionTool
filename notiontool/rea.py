@@ -19,7 +19,7 @@ def node_available():
     return bool(which('npx'))
 
 
-def image_result(result, max_side=1280, quality=72):
+def image_result(result, max_side=1600, quality=85):
     """Move MCP image content items into '_image' so the bridge sends a real image
     instead of base64 text (Roblox screen_capture, Blender renders, ...)."""
     items = result.get('content') if isinstance(result, dict) else None
@@ -48,11 +48,20 @@ def image_result(result, max_side=1280, quality=72):
     if len(images) > 1:
         note += '; %d more image(s) dropped' % (len(images) - 1)
     path = save_capture(data, mime)
-    inline = os.environ.get('NOTIONTOOL_INLINE_IMAGES', '0') == '1' or not path
+    view = {}
+    try:  # user 2026-10-27: upload so the Notion chat can really look at it (viewFileUrl)
+        from . import notion_upload
+        uploaded = notion_upload.publish(view, data, mime, 'mcp-image')
+    except ImportError:
+        uploaded = False
+    inline = not uploaded and (os.environ.get('NOTIONTOOL_INLINE_IMAGES', '0') == '1' or not path)
     if not inline:
-        note = note.replace('image sent as MCP image content', 'image saved (not inlined)') + ': ' + path
+        note = note.replace('image sent as MCP image content', 'image saved (not inlined)') + ': ' + (path or 'uploaded to Notion')
+    if uploaded:
+        note += '. ' + view['view_hint'] + ' view_url: ' + view['view_url']
     out = dict(result)
     out['content'] = [it for it in items if not any(it is im for im in images)] + [{'type': 'text', 'text': note}]
+    out.update(view)
     if inline:
         out['_image'] = {'data': data, 'mimeType': mime}
     return out

@@ -26,6 +26,12 @@ from .task_states import RUN_LIVE_STATES, set_state
 import subprocess
 from .timeouts import task_limit
 
+
+def _open_tasks(store):
+    # Startup lag fix 2026-10-27: only unfinished tasks are parsed (store.open_tasks); callers still filter.
+    fn = getattr(store, 'open_tasks', None)
+    return fn() if callable(fn) else store.all('tasks')
+
 # Late done detection (done_dig / crit_done): Notion often closes or breaks the reply stream minutes before
 # the coworker turn really ends. With the old backoff (5, 10, 20, 40, 60, 60 s) the real end was seen
 # 60-80 s late. After this attempt's stream has closed or broken, a task is now re-checked at least every
@@ -273,7 +279,7 @@ class Engine:
 
     def _restore(self):
         # Persisted assignment IDs fence old reports even after an app restart.
-        for task in self.store.all('tasks'):
+        for task in _open_tasks(self.store):
             if task.get('paused_by') == LIMIT_PAUSED_BY and task['state'] == 'retry':
                 # The token-limit latch lives in memory only: after a restart the first check rebuilds it from
                 # the ledger (and the dispatch gate holds coworker tasks again while the limit is still hit).
@@ -291,7 +297,7 @@ class Engine:
                     continue
                 set_state(self.store, task, 'uncertain', 'restart: recovering the previous request', reconcile_at=time.time(), error='Recovering the previous API request')
                 self.store.put('tasks', task)
-        assigned = {t.get('worker_id'):t for t in self.store.all('tasks') if t['state'] == 'uncertain' or t.get('remote_unknown')}
+        assigned = {t.get('worker_id'):t for t in _open_tasks(self.store) if t['state'] == 'uncertain' or t.get('remote_unknown')}
         for worker in self.store.all('workers'):
             if worker['id'] in assigned:
                 worker['state'] = 'recovering'
@@ -1118,7 +1124,7 @@ class Engine:
         keys = ([] if patch else self._resource_keys(run, self._lock_files(run, task['files']))) + task.get('absolute_resources',[])
         if not keys:
             return False
-        for other in self.store.all('tasks'):
+        for other in _open_tasks(self.store):
             if other['id'] == task['id'] or (other['state'] not in ('running', 'cancelling', 'uncertain') and not other.get('remote_unknown')):
                 continue
             other_run = self.store.get('runs', other['run_id'])
@@ -1258,7 +1264,7 @@ class Engine:
     def _start_merges_locked(self):
         merging = self.__dict__.setdefault('_patch_merging', set())
         heads = {}  # project root -> current main commit (only asked when a task waits for a red main)
-        for task in self.store.all('tasks'):
+        for task in _open_tasks(self.store):
             if (task.get('state') == 'done' and task.get('patch_state') == 'working' and task.get('patch_worktree')
                     and task['id'] not in merging):
                 # Done without a report that hands the copy over (e.g. accepted by the Main): the harness
@@ -1625,7 +1631,7 @@ class Engine:
         self.limit_latch = None
         self._limit_clear_since = 0.0
         resumed = 0
-        for task in self.store.all('tasks'):
+        for task in _open_tasks(self.store):
             if task.get('paused_by') != LIMIT_PAUSED_BY or task.get('state') != 'retry':
                 continue
             task.pop('paused_by', None)
@@ -2408,7 +2414,7 @@ class Engine:
 
     def _reconcile(self):
         assigned = {v['task_id'] for v in self.inflight.values()}
-        for task in self.store.all('tasks'):
+        for task in _open_tasks(self.store):
             if (task['state'] != 'uncertain' and not task.get('remote_unknown')) or task['id'] in assigned or task.get('reconcile_at',0)>time.time():
                 continue
             if len(self.inflight)>=40:

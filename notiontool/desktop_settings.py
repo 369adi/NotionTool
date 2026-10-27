@@ -105,6 +105,10 @@ HARNESS_SETTINGS = [
     _int('burst_spacing_s', 'Seconds between coworker turns when slowed', 'Coworkers', 1, 600, 20,
          'While slowed, a coworker turn starts at most this often.'),
     # App (app-local: new keys, not accepted by /api/settings yet)
+    _choice('app_ui_mode', 'App window', 'App', ('standalone', 'overlay'), 'overlay',
+            'standalone: own NotionTool window over the Notion API (no Notion page). '
+            'overlay: old Notion window with the NotionTool overlay (fallback). Restart to apply.',
+            app_local=True),
     _choice('app_chat_filter', 'Sidebar chats', 'App', ('mains_only', 'hide_coworkers'), 'mains_only',
             'mains_only: show only Main chats; hide_coworkers: show all chats except coworker chats.',
             app_local=True),

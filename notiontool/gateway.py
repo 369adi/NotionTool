@@ -16,20 +16,42 @@ v4 (user 26.10.2026: 'when NotionTool fails, the NotionTool MCP must not break w
 no longer empties tools/list. NotionTool's own cached tools (nt_*) stay advertised so Notion keeps the
 MCP and its tools; proxied tools (roblox_*, blender_*, mcp_* ...) stay hidden while down so their own MCP
 servers take over. Every call still gets a clear 'NOT executed' result until the app is back.
+
+v5 (user 27.10.2026: 'the MCP must be a COMPLETELY separate application, it must work when NotionTool
+does not'): NotionTool's own PC tools (nt_shell, nt_read_file, nt_write_file, nt_edit_file, nt_list_dir,
+nt_search_code, nt_file_outline, nt_find_symbol, nt_memory_read, nt_memory_update) now RUN INSIDE the
+gateway whenever the app does not answer a ping within PROBE_SECONDS. Only the owner's Host API bearer
+(decrypted from data/sessions with DPAPI, same Windows user) may use them. Calls that already reached the
+app are never resent, except read-only tools (no side effects). Long local calls hand off to a gateway
+job (job_id 'gw-...') fetched with nt_job_result, like the app's own jobs.
 """
 import hashlib
+import hmac
 import http.client
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = 4
+VERSION = 5
+LOCAL_TOOLS = {'nt_shell', 'nt_read_file', 'nt_write_file', 'nt_edit_file', 'nt_list_dir', 'nt_search_code',
+               'nt_file_outline', 'nt_find_symbol', 'nt_memory_read', 'nt_memory_update'}
+READ_ONLY_LOCAL = {'nt_read_file', 'nt_list_dir', 'nt_search_code', 'nt_file_outline', 'nt_find_symbol', 'nt_memory_read'}
+DATA_GUARDED = {'nt_list_dir': 'Listing', 'nt_search_code': 'Search', 'nt_file_outline': 'Outline',
+                'nt_find_symbol': 'Symbol search', 'nt_write_file': 'Write', 'nt_edit_file': 'Edit'}
+JOB_TOOL = 'nt_job_result'
+LOCAL_JOB_PREFIX = 'gw-'
+PROBE_SECONDS = 3      # the app must answer a ping this fast, else the PC tools run in the gateway
+LOCAL_SYNC_SECONDS = 45  # a local call longer than this becomes a gateway job (same as the app's jobs)
+JOB_WAIT_MAX = 50
+JOB_KEEP_SECONDS = 3600
 DEFAULT_PORT = 8792
 HOLD_SECONDS = 25  # Notion's MCP client gives up before 120 s -> 'Failed to connect'; answer fast instead
 SAFE_SECONDS = 8  # initialize/ping/tools/list: answer from the gateway when the core is slower than this
@@ -78,6 +100,134 @@ class CoreBusy(Exception):
     """The core took the request but did not answer in time (busy or blocked). It may still run it."""
 
 
+class LocalTools:
+    """v5: NotionTool's PC tools, run inside the gateway process itself (independent of the app)."""
+
+    def __init__(self, data_dir):
+        self.data_dir = Path(data_dir).resolve()
+        self.jobs = {}
+        self.lock = threading.Lock()
+        self._key, self._key_mtime, self._dev = '', None, None
+
+    def dev(self):
+        if self._dev is None:
+            from . import devtools
+            root = self.data_dir.parent
+            if (root / 'notiontool').is_dir():  # the gateway EXE lives in data/runtime: point at the app folder
+                devtools.ROOT = root
+                devtools.MEMORY = root / 'project-memory'
+            self._dev = devtools
+        return self._dev
+
+    def host_key(self):
+        path = self.data_dir / 'sessions' / 'session_host_api.bin'
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return ''
+        if mtime != self._key_mtime:
+            try:
+                from .vendor.sessions import SessionStore
+                value = SessionStore(data_dir=str(path.parent)).load_identity('host_api') or {}
+                self._key = str(value.get('key') or '')
+            except Exception:  # noqa: BLE001 - no key: local tools stay off, calls go to the app
+                self._key = ''
+            self._key_mtime = mtime
+        return self._key
+
+    def owner(self, authorization):
+        key = self.host_key()
+        return bool(key) and hmac.compare_digest(str(authorization or ''), 'Bearer ' + key)
+
+    @staticmethod
+    def handles(name, args):
+        if isinstance(args, dict) and args.get('assignment_token'):
+            return False  # coworker task writes go to their own worktree: only the app knows it
+        if name in LOCAL_TOOLS:
+            return True
+        return name == JOB_TOOL and str((args or {}).get('job_id') or '').startswith(LOCAL_JOB_PREFIX)
+
+    def in_data(self, path):
+        try:
+            Path(path).resolve().relative_to(self.data_dir)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def run(self, name, args):
+        dev = self.dev()
+        args = dict(args or {})
+        if name in DATA_GUARDED and self.in_data(dev._path(args.get('path') or '.')):
+            raise ValueError('%s inside the NotionTool data folder is refused: %s' % (DATA_GUARDED[name], args.get('path')))
+        result = dev.call(name, args)
+        if not isinstance(result, dict):
+            return result
+        if name == 'nt_list_dir':
+            base = dev._path(args.get('path') or '.')
+            result = dict(result, entries=[e for e in result.get('entries', []) if not self.in_data(base / str(e).rstrip('/'))])
+        elif name == 'nt_search_code':
+            kept = []
+            for hit in result.get('results', []):
+                match = _HIT_PATH.match(str(hit))
+                if not match or not self.in_data(dev._path(match.group(1))):
+                    kept.append(hit)
+            result = dict(result, results=kept)
+        return result
+
+    @staticmethod
+    def ok(value):
+        return {'content': [{'type': 'text', 'text': json.dumps(value, ensure_ascii=False)}]}
+
+    @staticmethod
+    def err(text):
+        return {'content': [{'type': 'text', 'text': text}], 'isError': True}
+
+    def call(self, name, args):
+        """Run one PC tool here; longer than LOCAL_SYNC_SECONDS -> gateway job."""
+        if name == JOB_TOOL:
+            return self.job_result(args or {})
+        job = {'id': LOCAL_JOB_PREFIX + uuid.uuid4().hex[:16], 'tool': name, 'done': threading.Event(),
+               'result': None, 'started': time.time()}
+
+        def work():
+            try:
+                job['result'] = self.ok(self.run(name, args))
+            except Exception as exc:  # noqa: BLE001 - a tool error is a tool result, never a dead request
+                job['result'] = self.err('%s: %s' % (type(exc).__name__, exc))
+            finally:
+                job['done'].set()
+
+        threading.Thread(target=work, daemon=True, name='gateway-' + name).start()
+        if job['done'].wait(LOCAL_SYNC_SECONDS):
+            return job['result']
+        with self.lock:
+            now = time.time()
+            for ident in [i for i, j in self.jobs.items() if now - j['started'] > JOB_KEEP_SECONDS]:
+                self.jobs.pop(ident, None)
+            self.jobs[job['id']] = job
+        return self.ok({'still_running': True, 'job_id': job['id'], 'tool': name, 'elapsed_s': LOCAL_SYNC_SECONDS,
+                        'hint': 'Still running on the PC (in the MCP gateway). Do not start it again. Call '
+                                'nt_job_result with this job_id to get the result.'})
+
+    def job_result(self, args):
+        ident = str(args.get('job_id') or '')
+        with self.lock:
+            job = self.jobs.get(ident)
+        if not job:
+            return self.err('Unknown or expired job_id: ' + ident)
+        try:
+            wait = float(args.get('wait_s') or JOB_WAIT_MAX)
+        except (TypeError, ValueError):
+            wait = JOB_WAIT_MAX
+        if not job['done'].wait(max(1.0, min(wait, JOB_WAIT_MAX))):
+            return self.ok({'still_running': True, 'job_id': ident, 'tool': job['tool'],
+                            'elapsed_s': round(time.time() - job['started'], 1),
+                            'hint': 'Still running on the PC. Call nt_job_result again.'})
+        with self.lock:
+            self.jobs.pop(ident, None)
+        return job['result']
+
+
 class Gateway:
     def __init__(self, data_dir, port=DEFAULT_PORT, hold=HOLD_SECONDS, poll=0.5,
                  safe_timeout=SAFE_SECONDS, call_timeout=CALL_SECONDS):
@@ -90,6 +240,7 @@ class Gateway:
         self.log_lock = threading.Lock()
         self.stopping = threading.Event()
         self.server = None
+        self.local = LocalTools(data_dir)
         self.load_cache()
 
     # --- persistence and log -------------------------------------------------------------------
@@ -191,16 +342,29 @@ class Gateway:
         sent = {k: v for k, v in headers.items() if k in FORWARD_HEADERS}
         timeout = self.safe_timeout if rpc_safe else self.call_timeout
         deadline = started + (min(self.hold, self.safe_timeout) if rpc_safe else self.hold)
+        local = self.local_target(method, parsed, headers)
+        if local is not None:
+            with self.lock:
+                self.accepted.add(auth)  # the owner's own Host API key: always accepted, app up or not
+            if local[0] == JOB_TOOL or not self.core_answers(path, sent):
+                result = self.reply(parsed.get('id'), self.local.call(*local))
+                self.log(started, calls, result[0], 'local')
+                return result
         while True:
             try:
                 status, kept, data = self.forward(method, path, sent, body, timeout)
             except CoreBusy:
-                if rpc_safe:
+                if local is not None and local[0] in READ_ONLY_LOCAL:
+                    result, outcome = self.reply(parsed.get('id'), self.local.call(*local)), 'busy_local'
+                elif rpc_safe:
                     result, outcome = self.backup(parsed, calls, auth, busy=True), 'busy_answered'
                 else:
                     result, outcome = self.busy(calls), 'busy'
                 break
             except CoreDown as down:
+                if local is not None and (not down.sent or local[0] in READ_ONLY_LOCAL):
+                    result, outcome = self.reply(parsed.get('id'), self.local.call(*local)), 'down_local'
+                    break
                 if down.sent and not safe:
                     result, outcome = self.interrupted(calls), 'interrupted'
                     break
@@ -222,6 +386,28 @@ class Gateway:
             break
         self.log(started, calls, result[0], outcome)
         return result
+
+    def local_target(self, method, parsed, headers):
+        """(name, args) when this request is one owner tools/call the gateway can run itself, else None."""
+        if method != 'POST' or not isinstance(parsed, dict) or parsed.get('method') != 'tools/call' or 'id' not in parsed:
+            return None
+        params = parsed.get('params') if isinstance(parsed.get('params'), dict) else {}
+        name = str(params.get('name') or '')
+        args = params.get('arguments') if isinstance(params.get('arguments'), dict) else {}
+        if not self.local.handles(name, args) or not self.local.owner(headers.get('authorization')):
+            return None
+        return name, args
+
+    def core_answers(self, path, sent):
+        """A ping runs nothing, so asking first never causes a double execution."""
+        probe = json.dumps({'jsonrpc': '2.0', 'id': 'gateway-probe', 'method': 'ping'}).encode()
+        headers = dict(sent)
+        headers['content-type'] = 'application/json'
+        try:
+            status, _, _ = self.forward('POST', path, headers, probe, PROBE_SECONDS)
+        except (CoreDown, CoreBusy):
+            return False
+        return status == 200
 
     def interrupted(self, calls):
         call = calls[0] if calls else {}
@@ -283,7 +469,8 @@ class Gateway:
 
     def health(self):
         return {'ok': True, 'service': 'notiontool-gateway', 'version': VERSION, 'pid': os.getpid(),
-                'target': self.target(), 'cached': sorted(self.cache)}
+                'target': self.target(), 'cached': sorted(self.cache), 'local_tools': sorted(LOCAL_TOOLS),
+                'local_jobs': len(self.local.jobs)}
 
     def make_server(self):
         gateway = self

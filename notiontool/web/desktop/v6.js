@@ -27,10 +27,11 @@
   var PROJECTS_MS = 120000;
   var LIMIT_H = 23;
   var CONFIRM_MS = 4000;
-  var ROW_H = 34;
+  var ROW_H = 42;
   var FIXED_H = 430;
   var CW_H = 70;
   var COWORKER_RE = /^cowork(er)?\s*\d+/i;
+  var ARCH_RE = /\((?:expired|archived?)\b|^archived?\b/i;
   var MODEL_RE = /^(opus|sonnet|haiku|auto|gpt|gemini|claude|o\d)\b/i;
   var BUSY = { busy: 1, working: 1, running: 1, sending: 1, sent: 1 };
   var THINK = { preparing: 1, thinking: 1, starting: 1, queued: 1 };
@@ -54,7 +55,9 @@
     swap: '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
     box: '<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
     msgDots: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/>',
-    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'
+    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    mic: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>',
+    archive: '<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>'
   };
   var TOOL_RE = /^(?:\S\s*)?[\w .-]{2,40}?\s*\/\s*[\w.-]{2,60}$/;
   function svg(name, cls) { return '<svg viewBox="0 0 24 24" aria-hidden="true"' + (cls ? ' class="' + cls + '"' : '') + '>' + (P[name] || '') + '</svg>'; }
@@ -314,6 +317,7 @@
       else if (al === 'Settings') { mark(cb[m], 'cmd'); cmd = cb[m]; }
       else if (/^Change effort/.test(al) || (!al && MODEL_RE.test(text(cb[m])))) mark(cb[m], 'quiet');
       else if (/^(Stop AI message|Submit|Send)/i.test(al)) mark(cb[m], 'send');
+      else if (/dictat|voice|microphone|speech|transcri/i.test(al)) mark(cb[m], 'mic');
     }
     return cmd && shown(cmd) ? cmd.getBoundingClientRect() : null;
   }
@@ -324,8 +328,34 @@
     var ages = { byKey: {}, byTitle: {}, limit: LIMIT_H }, agesAt = 0;
     var project = null, projectCommitMs = NaN, projectsAt = 0;
     var expanded = false, confirmUntil = 0, errLogged = false;
+    // Folded sidebar groups (user 2026-10-27): idle coworkers and the archive stay one line until opened.
+    var CWOPEN_KEY = 'nt-v6-cw-open', ARCHOPEN_KEY = 'nt-v6-arch-open', cwOpen = false, archOpen = false;
+    try { cwOpen = localStorage.getItem(CWOPEN_KEY) === '1'; archOpen = localStorage.getItem(ARCHOPEN_KEY) === '1'; } catch (e) { /* ignore */ }
+    // Finished answers (user 2026-10-27): a chat row that stops being live gets a Done badge until that chat
+    // is opened; the open chat shows "Answer finished" in its card for 10 minutes.
+    var DONE_KEY = 'nt-v6-done', doneMap = null, wasLive = {}, mainDoneAt = 0, mainWasRunning = false, mainRunTitle = '';
+    function loadDone() {
+      if (doneMap) return doneMap;
+      try { doneMap = JSON.parse(localStorage.getItem(DONE_KEY) || '{}') || {}; } catch (e) { doneMap = {}; }
+      return doneMap;
+    }
+    function trackDone(liveMap, title, running) {
+      var d = loadDone(), now = Date.now(), changed = false;
+      Object.keys(liveMap).forEach(function (t) {
+        if (liveMap[t]) { if (d[t]) { delete d[t]; changed = true; } }
+        else if (wasLive[t] && t !== title) { d[t] = now; changed = true; }
+        wasLive[t] = liveMap[t];
+      });
+      if (title && d[title]) { delete d[title]; changed = true; }
+      Object.keys(d).forEach(function (t) { if (!(now - d[t] < 43200000)) { delete d[t]; changed = true; } });
+      if (title !== mainRunTitle) { mainRunTitle = title; mainDoneAt = 0; mainWasRunning = running; }
+      else { if (running) mainDoneAt = 0; else if (mainWasRunning) mainDoneAt = now; mainWasRunning = running; }
+      if (changed) { try { localStorage.setItem(DONE_KEY, JSON.stringify(d)); } catch (e) { /* ignore */ } }
+      return d;
+    }
     var sb = null, hd = null, defs = null, dg = null, lastSb = '', lastHd = '', lastBox = '', lastHdBox = '', lastDg = '';
     var root = document.documentElement;
+    var archUntil = 0;
 
     function call(action, args) {
       if (!ctx || typeof ctx.call !== 'function') return Promise.reject(new Error('NotionTool is not connected'));
@@ -442,42 +472,32 @@
 
       var live = info.running
         ? '<i class="nt-v6-spin"></i><b>' + (info.tool ? 'Working' : 'Thinking') + '</b>' + (info.tool ? esc(info.tool) : '...')
-        : '<i class="nt-v6-dot n"></i>' + esc(info.state || 'Ready');
+        : (info.mainDoneAt && Date.now() - info.mainDoneAt < 600000
+          ? '<i class="nt-v6-dot ok"></i><b>Done</b>Answer finished ' + esc(agoText(info.mainDoneAt))
+          : '<i class="nt-v6-dot n"></i>' + esc(info.state || 'Ready'));
       html.push('<div class="nt-v6-main' + (info.running ? ' run' : '') + '"><div class="nt-v6-main-top"><div class="nt-v6-ico">' + svg('msgText') + '</div>' +
         '<div class="nt-v6-col"><div class="nt-v6-t1">' + esc(info.title || 'Chat') + '</div>' +
         (info.model ? '<span class="nt-v6-chip"><i class="nt-v6-dot"></i>' + esc(info.model) + '</span>' : '') + '</div>' +
         (info.ageLabel ? '<div class="nt-v6-age" title="Chat age (sending locks at ' + ages.limit + ' h)">' + esc(info.ageLabel) + ring(info.ageFrac) + '</div>' : '') +
         '</div><div class="nt-v6-live">' + live + '</div></div>');
 
-      var chats = info.chats, limit = expanded ? chats.length : Math.max(3, Math.min(chats.length, info.fit));
-      html.push('<div class="nt-v6-scroll"><div class="nt-v6-h">Chats</div><div class="nt-v6-list' + (expanded ? ' exp' : '') + '">');
+      var chats = info.chats, limit = expanded ? chats.length : Math.max(6, Math.min(chats.length, info.fit));
+      // Own chats first and larger than the coworkers (user 2026-10-27: too many coworkers, too little Main).
+      html.push('<div class="nt-v6-scroll"><div class="nt-v6-h mine">Your chats' + (info.doneCount ? '<i class="nt-v6-hn done">' + info.doneCount + ' done</i>' : '') + '</div><div class="nt-v6-list' + (expanded ? ' exp' : '') + '">');
       if (!chats.length) html.push('<div class="nt-v6-empty">No other chats</div>');
-      for (var i = 0; i < chats.length && i < limit; i++) {
-        var c = chats[i];
-        var href = !c.pending && /^[0-9a-f-]{32,36}$/i.test(c.thread_id || '') ? 'https://app.notion.com/chat?t=' + c.thread_id.replace(/-/g, '') : '';
-        var tag = href ? 'a' : 'div';
-        html.push('<' + tag + (href ? ' href="' + esc(href) + '" style="color:inherit;text-decoration:none"' : '') + ' class="nt-v6-row nt-v6-btn' + (c.live ? ' live' : '') + '" data-act="' + (c.pending ? 'creating' : 'chat') + '" data-arg="' + esc(c.title) + '" title="' +
-          esc(c.title) + (c.live ? ' - thinking or answering right now' : '') + '"><span class="nt-v6-rico">' + svg('msgDots') + '</span>' +
-          '<span class="nt-v6-t1">' + esc(c.title) + '</span>' +
-          (c.pending ? '<span class="nt-v6-livetag"><i class="nt-v6-spin"></i>Creating...</span>' :
-            (c.live ? '<span class="nt-v6-livetag"><i class="nt-v6-spin"></i>thinking</span>' : '<span class="nt-v6-when">' + esc(c.age) + '</span>')) + '</' + tag + '>');
-      }
+      pushRows(chats, limit, '');
       html.push('</div>');
-      if (chats.length > 3 && (expanded || limit < chats.length)) {
+      if (chats.length > 4 && (expanded || limit < chats.length)) {
         html.push('<div class="nt-v6-more nt-v6-btn" data-act="more">' + (expanded ? 'Show less' : 'Show all (' + info.total + ')') + svg('right') + '</div>');
       }
 
-      var cwBusy = info.coworkers.filter(function (w) { return !w.idle; }).length;
-      html.push('<div class="nt-v6-sep"></div><div class="nt-v6-h">Coworkers' + (info.coworkers.length ? '<i class="nt-v6-hn' + (cwBusy ? ' on' : '') + '">' + (cwBusy ? cwBusy + ' active' : 'all idle') + '</i>' : '') + '</div>');
-      if (!info.coworkers.length) html.push('<div class="nt-v6-empty">No coworkers right now</div>');
-      info.coworkers.forEach(function (w) {
-        if (w.idle) {
-          html.push('<div class="nt-v6-cw idle nt-v6-btn" data-act="cw" data-arg="' + esc(w.label) + '" title="Open ' + esc(w.label) + '"><i class="nt-v6-dot n"></i>' + avatar(w.label) +
-            '<div class="nt-v6-col"><div class="nt-v6-cw-top"><span class="nt-v6-t1">' + esc(w.label) + '</span><span class="nt-v6-when">' + esc(w.age) + '</span></div>' +
-            '<div class="nt-v6-cw-sub">Idle</div>' +
-            (w.ctxLabel ? '<div class="nt-v6-prog">' + bar(w.ctxFrac) + '<em>' + esc(w.ctxLabel) + '</em></div>' : '') + '</div></div>');
-          return;
-        }
+      // Coworkers: working or asking ones as cards, idle ones folded into one line (Done ones stay visible).
+      var cws = info.coworkers, idle = cws.filter(function (w) { return w.idle; });
+      var cwBusy = cws.length - idle.length;
+      html.push('<div class="nt-v6-sep"></div><div class="nt-v6-h cwh">Coworkers' + (cws.length ? '<i class="nt-v6-hn' + (cwBusy ? ' on' : '') + '">' + (cwBusy ? cwBusy + ' active' : 'all idle') + '</i>' : '') + '</div>');
+      if (!cws.length) html.push('<div class="nt-v6-empty">No coworkers right now</div>');
+      cws.forEach(function (w) {
+        if (w.idle) return;
         html.push('<div class="nt-v6-cw nt-v6-btn' + (w.live ? ' live' : '') + '" data-act="cw" data-arg="' + esc(w.label) + '" title="Open ' + esc(w.label) + '"><i class="nt-v6-dot ' + w.dot + '"></i>' + avatar(w.label) +
           '<div class="nt-v6-col"><div class="nt-v6-cw-top"><span class="nt-v6-t1">' + esc(w.label) + '</span><span class="nt-v6-when">' + esc(w.age) + '</span></div>' +
           (w.ask
@@ -486,6 +506,22 @@
               (w.ctxLabel ? '<div class="nt-v6-prog">' + bar(w.ctxFrac) + '<em>' + esc(w.ctxLabel) + '</em></div>' : '')) +
           '</div></div>');
       });
+      if (idle.length) {
+        html.push('<div class="nt-v6-fold nt-v6-btn" data-act="cwidle" title="' + (cwOpen ? 'Hide' : 'Show') + ' idle coworkers">' + svg(cwOpen ? 'down' : 'right') + '<span>' + idle.length + ' idle</span></div>');
+        idle.forEach(function (w) {
+          if (!cwOpen && !w.done) return;
+          html.push('<div class="nt-v6-cwl nt-v6-btn' + (w.done ? ' done' : '') + '" data-act="cw" data-arg="' + esc(w.label) + '" title="Open ' + esc(w.label) + (w.done ? ' - finished answering' : '') + '">' + avatar(w.label) +
+            '<span class="nt-v6-t1">' + esc(w.label) + '</span>' +
+            (w.done ? '<span class="nt-v6-donetag"><i></i>Done</span>' : '<span class="nt-v6-when">' + esc(w.age) + '</span>') + '</div>');
+        });
+      }
+
+      // Archive: expired and archived chats get their own folded group below the coworkers.
+      var arch = info.archived || [];
+      if (arch.length) {
+        html.push('<div class="nt-v6-sep"></div><div class="nt-v6-fold nt-v6-arch nt-v6-btn" data-act="arch" title="' + (archOpen ? 'Hide' : 'Show') + ' expired and archived chats">' + svg(archOpen ? 'down' : 'right') + '<span>Archive</span><i>' + arch.length + '</i></div>');
+        if (archOpen) { html.push('<div class="nt-v6-list arch">'); pushRows(arch, arch.length, ' arch'); html.push('</div>'); }
+      }
 
       var running = info.tasks.run, queued = info.tasks.queued;
       html.push('</div><div class="nt-v6-sep"></div><div class="nt-v6-pcard nt-v6-btn" data-act="proj" title="Open Projects"><div class="nt-v6-ico">' + svg('folder') + '</div>' +
@@ -495,6 +531,19 @@
       html.push('<div class="nt-v6-spacer"></div><div class="nt-v6-new nt-v6-btn" data-act="new" title="Start a new chat">' + svg('plus') + 'New chat</div>');
       html.push('</div>');
       return html.join('');
+      function pushRows(arr, n, extra) {
+      for (var i = 0; i < arr.length && i < n; i++) {
+        var c = arr[i];
+        var href = !c.pending && /^[0-9a-f-]{32,36}$/i.test(c.thread_id || '') ? 'https://app.notion.com/chat?t=' + c.thread_id.replace(/-/g, '') : '';
+        var tag = href ? 'a' : 'div';
+        var tail = c.pending ? '<span class="nt-v6-livetag"><i class="nt-v6-spin"></i>Creating...</span>' :
+          (c.live ? '<span class="nt-v6-livetag"><i class="nt-v6-spin"></i>thinking</span>' :
+            (c.done ? '<span class="nt-v6-donetag" title="Finished ' + esc(agoText(c.done)) + '"><i></i>Done</span>' : '<span class="nt-v6-when">' + esc(c.age) + '</span>'));
+        html.push('<' + tag + (href ? ' href="' + esc(href) + '" style="color:inherit;text-decoration:none"' : '') + ' class="nt-v6-row nt-v6-btn' + (c.live ? ' live' : '') + (c.done ? ' done' : '') + extra + '" data-act="' + (c.pending ? 'creating' : 'chat') + '" data-arg="' + esc(c.title) + '" title="' +
+          esc(c.title) + (c.live ? ' - thinking or answering right now' : (c.done ? ' - finished answering, not opened yet' : '')) + '"><span class="nt-v6-rico">' + svg('msgDots') + '</span>' +
+          '<span class="nt-v6-t1">' + esc(c.title) + '</span>' + tail + '</' + tag + '>');
+      }
+      }
     }
 
     // ---- render: header ----------------------------------------------------------------------
@@ -514,6 +563,12 @@
       var ask = confirmUntil > Date.now();
       h.push('<div class="nt-v6-si nt-v6-btn' + (cOver && !ask ? ' hint' : '') + '" data-act="switch" title="' + (cOver ? 'Context is over the limit: continue in a fresh chat with a handoff' : 'Continue in a fresh chat with a handoff') + '">' + svg('swap') +
         '<span class="nt-v6-sw' + (ask ? ' ask' : '') + '">' + (ask ? 'Click again to switch' : 'Switch context') + '</span></div>');
+      // Move to archive (user 2026-10-27 21:05): renames the chat to "Archived · <name>" so it lands in the Archive group.
+      if (!info.isCoworker && info.title && !ARCH_RE.test(str(info.title)) && str(info.title).trim().toLowerCase() !== 'main') {
+        var aask = archUntil > Date.now();
+        h.push('<div class="nt-v6-si nt-v6-btn nt-v6-archbtn' + (aask ? ' ask' : '') + '" data-act="archive" title="Rename this chat to Archived · name and move it into the Archive group">' + svg('archive') +
+          '<span>' + (aask ? 'Click again to archive' : 'Move to archive') + '</span></div>');
+      }
       h.push('<div class="nt-v6-si nt-v6-stop nt-v6-btn' + (info.running ? '' : ' off') + '" data-act="stop" title="' + (info.running ? 'Stop the answer' : 'Nothing is running') + '"><span><i></i>Stop</span></div>');
       h.push('</div>');
       return h.join('');
@@ -539,6 +594,16 @@
         chats.push({ title: r.title, age: ageText(ageFor(tmap[r.title] || '', r.title)), live: lv });
       });
       chats = mergePrivateChats(chats, list(state.private_chats));
+      // The open chat is shown in the main card; it must never also appear in the Chats list.
+      // Notion's own row for it was skipped above (r.title === title), but a private chat with the same
+      // title/thread was merged back in by mergePrivateChats, causing a duplicate (user report 2026-10-27).
+      var curKey = currentThread();
+      var curTitle = title;
+      chats = chats.filter(function (c) {
+        if (curKey && c.thread_id && key(c.thread_id) === curKey) return false;
+        if (curTitle && c.title === curTitle) return false;
+        return true;
+      });
       chats.forEach(function (chat) {
         if (!chat.age && chat.thread_id) chat.age = ageText(ageFor(chat.thread_id, chat.title));
       });
@@ -561,11 +626,22 @@
         };
       });
       cws.sort(function (a, b) { return (a.live ? 0 : (a.idle ? 2 : 1)) - (b.live ? 0 : (b.idle ? 2 : 1)); });
-      var cwH = 0;
-      cws.forEach(function (x) { cwH += x.idle ? 58 : (x.ask ? 62 : CW_H + 16); });
+      var running = !!sbtn || rowLiveMap[title] === true;
+      var dmap = trackDone(rowLiveMap, title, running);
+      chats.forEach(function (c, i) { c.done = !c.live && !c.pending ? (dmap[c.title] || 0) : 0; c.ord = i; });
+      var archived = chats.filter(function (c) { return !c.live && !c.pending && ARCH_RE.test(str(c.title)); });
+      chats = chats.filter(function (c) { return archived.indexOf(c) < 0; });
+      chats.sort(function (a, b) { return (a.live ? 0 : (a.done ? 1 : 2)) - (b.live ? 0 : (b.done ? 1 : 2)) || a.ord - b.ord; });
+      total = chats.length;
+      var doneCount = chats.filter(function (c) { return c.done; }).length;
+      cws.forEach(function (x) { x.done = x.idle && dmap[x.label] ? dmap[x.label] : 0; });
+      // Compact coworkers leave the room to the user's own chats.
+      var cwH = 0, idleN = 0;
+      cws.forEach(function (x) { if (x.idle) { idleN++; if (cwOpen || x.done) cwH += 30; } else cwH += x.ask ? 62 : CW_H + 16; });
+      if (idleN) cwH += 30;
+      if (archived.length) cwH += 44 + (archOpen ? archived.length * 37 : 0);
       var box = sidebarBox(), boxH = box ? box.getBoundingClientRect().height : innerHeight;
       var fit = Math.floor((boxH - FIXED_H - Math.max(44, cwH)) / ROW_H);
-      var running = !!sbtn || rowLiveMap[title] === true;
       return {
         title: title || (w ? str(w.label) : ''),
         model: mb ? text(mb) : (w ? str(w.model) : ''),
@@ -582,7 +658,8 @@
         ctxFrac: Number(wctx.limit) > 0 ? Number(wctx.estimated_tokens) / Number(wctx.limit) : 0,
         stepsLabel: stepsUsed + ' / ' + stepsLimit,
         stepsFrac: stepsUsed / stepsLimit,
-        chats: chats, total: total, fit: fit, coworkers: cws, tasks: tasksRunning()
+        chats: chats, total: total, fit: fit, coworkers: cws, tasks: tasksRunning(),
+        archived: archived, doneCount: doneCount, mainDoneAt: mainDoneAt
       };
     }
 
@@ -652,13 +729,14 @@
     // Own frame (user 26.10. 03:31): the sidebar is NotionTool's, with its own width and resize handle.
     // Notion's sidebar box only reserves that width and stays invisible behind it.
     var wk = null, lastWk = '';
-    var SBW_KEY = 'nt-v6-sbw', SBW_MIN = 220, SBW_MAX = 440, sbw = 270, rz = null, rzDrag = null;
+    var SBW_KEY = 'nt-v6-sbw2', SBW_MIN = 260, SBW_MAX = 520, sbw = 320, rz = null, rzDrag = null, rzRaf = 0;
     try { var sbv = parseInt(localStorage.getItem(SBW_KEY), 10); if (sbv >= SBW_MIN && sbv <= SBW_MAX) sbw = sbv; } catch (e) { /* ignore */ }
     function railRight() {
       var n = document.querySelector('nav.nt-rail'), r = n && n.getBoundingClientRect();
       return r && r.width ? Math.round(r.right) : 66;
     }
     function applySbw() {
+      if (rzDrag) return;  // user 2026-10-27 21:05: Notion re-laid out behind the panel while dragging; apply on release
       var v = sbw + 'px';
       if (root.style.getPropertyValue('--nt-v6-sbw') !== v) root.style.setProperty('--nt-v6-sbw', v);
     }
@@ -696,10 +774,17 @@
       var r = sbRect();
       lastBox = place(sb, r, lastBox);
       placeRz(r);
+      // Header, feed and composer follow in the same frame (user 2026-10-27: Notion showed through while dragging).
+      try { tick(); } catch (x) { /* ignore */ }  // header and feed follow in the same frame
+      try {  // rzHdFollow: Notion stays frozen while dragging, so the header follows the panel directly
+        var hdN = document.querySelector('.nt-v6-hd'), sR = sbRect(), hdL = Math.round(sR.left + sR.width + 12);
+        if (hdN) { hdN.style.left = hdL + 'px'; hdN.style.width = Math.max(0, window.innerWidth - hdL - 12) + 'px'; }
+      } catch (x) { /* ignore */ }
     }
     function onRzUp() {
       if (!rzDrag) return;
       rzDrag = null;
+      applySbw();
       rz.classList.remove('drag');
       root.classList.remove('nt-v6-rz-drag');
       rz.removeEventListener('pointermove', onRzMove);
@@ -854,6 +939,10 @@
     // Notion's message list keeps running hidden underneath (data-nt-v6-src); every visible turn
     // is mirrored into the feed, clicks on buttons are forwarded to the original element.
     var fd = null, fdIn = null, fdSc = null, fdOlder = null, fdWork = null, fdMap = new Map(), fdList = null, fdObs = null, fdQ = 0, fdStick = true;
+    // smooth + no blank chat (user 2026-10-27 22:25): only rows that changed are re-read; when Notion
+    // re-mounts its list (voice recording cancelled) the mirrored turns stay for up to FEED_GRACE_MS.
+    var fdDirty = new Set(), fdAll = true, fdFullAt = 0, fdGone = 0, fdThread = '', fdScr = null, fdScrAt = 0, fdPlaced = '', fdRo = null;
+    var FEED_GRACE_MS = 6000, FEED_FULL_MS = 3000;
     var FD_SEL = '[role="button"],button,a,[aria-expanded]';
     function feedList() {
       var lc = document.querySelector('.layout-content');
@@ -876,6 +965,20 @@
       }
       return null;
     }
+    function feedScr() {  // cached: the getComputedStyle walk ran on every sync
+      if (fdScr && fdScr.isConnected && fdList && fdScr.contains(fdList)) return fdScr;
+      if (Date.now() - fdScrAt < 2000) return null;
+      fdScrAt = Date.now();
+      fdScr = fdList ? feedScroller(fdList) : null;
+      return fdScr;
+    }
+    function feedVisible(list) {
+      for (var i = 0; i < list.children.length; i++) {
+        var n = list.children[i];
+        if (!n.hasAttribute('data-nt-desk-own') && n.getClientRects().length) return true;
+      }
+      return false;
+    }
     function feedEnsure(host) {
       if (fd && fd.parentNode === host) return;
       if (fd) fd.remove();
@@ -886,7 +989,12 @@
         '<button type="button" class="nt-v6-down" aria-label="Scroll to bottom"><svg viewBox="0 0 16 16" width="16" height="16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>';
       host.appendChild(fd);
       fdSc = fd.querySelector('.nt-v6-feed-sc'); fdIn = fd.querySelector('.nt-v6-feed-in'); fdOlder = fd.querySelector('.nt-v6-older');
-      fdMap = new Map(); fdWork = null;
+      fdMap = new Map(); fdWork = null; fdPlaced = '';
+      if (window.ResizeObserver) {  // keep the bottom in view when images or code blocks grow
+        if (fdRo) fdRo.disconnect();
+        fdRo = new ResizeObserver(function () { if (fdStick && fdSc) fdSc.scrollTop = fdSc.scrollHeight; });
+        fdRo.observe(fdIn);
+      }
       fdSc.addEventListener('scroll', function () {
         fdStick = fdSc.scrollHeight - fdSc.scrollTop - fdSc.clientHeight < 40;
         fd.classList.toggle('nt-v6-away', !fdStick);
@@ -968,14 +1076,23 @@
     }
     function feedObserve(list) {
       if (fdObs) fdObs.disconnect();
-      fdObs = new MutationObserver(function () { if (!fdQ) fdQ = setTimeout(feedSync, 90); });
+      fdObs = new MutationObserver(function (recs) {
+        for (var i = 0; i < recs.length; i++) {
+          var t = recs[i].target;
+          if (t === list) { fdAll = true; continue; }
+          while (t && t.parentNode !== list) t = t.parentNode;
+          if (t) fdDirty.add(t); else fdAll = true;
+        }
+        if (!fdQ) fdQ = setTimeout(feedSync, 80);
+      });
       fdObs.observe(list, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['aria-expanded', 'data-nt-v6-dur', 'data-nt-v6', 'class', 'data-nt-tl2'] });
     }
     function feedOff() {
       if (fdObs) { fdObs.disconnect(); fdObs = null; }
       if (fdQ) { clearTimeout(fdQ); fdQ = 0; }
       if (fdList) { fdList.removeAttribute('data-nt-v6-src'); fdList = null; }
-      fdMap = new Map();
+      fdMap = new Map(); fdDirty = new Set(); fdAll = true; fdGone = 0; fdScr = null; fdPlaced = '';
+      if (fdRo) { fdRo.disconnect(); fdRo = null; }
       if (fd) { fd.remove(); fd = null; fdIn = fdSc = fdOlder = fdWork = null; }
       root.classList.remove('nt-v6-feed-on');
     }
@@ -985,59 +1102,106 @@
       var top = h ? Math.round(h.getBoundingClientRect().bottom + 2) : 0;
       var bot = cp ? Math.round(cp.getBoundingClientRect().top - 8) : window.innerHeight;
       var want = [left, top, Math.max(0, window.innerWidth - left), Math.max(0, bot - top)];
+      var pk = want.join(',');
+      if (pk === fdPlaced) return false;  // unchanged: no style writes, no forced layout
+      fdPlaced = pk;
       fd.style.left = want[0] + 'px'; fd.style.top = want[1] + 'px'; fd.style.width = want[2] + 'px'; fd.style.height = want[3] + 'px';
       var r = fd.getBoundingClientRect();  // correct for a transformed / contained host
       if (Math.abs(r.left - want[0]) > 1 || Math.abs(r.top - want[1]) > 1) {
         fd.style.left = (want[0] * 2 - r.left) + 'px'; fd.style.top = (want[1] * 2 - r.top) + 'px';
       }
+      return true;
     }
     function feedSync() {
       fdQ = 0;
       if (stopped) return;
       var off = false;
       try { off = localStorage.getItem('nt-v6-feed') === '0'; } catch (e) { /* ignore */ }
-      var list = off ? null : feedList(), host = document.querySelector('.layout-chat');
-      if (!list || !host || !document.querySelector('.nt-v6-hd')) { if (fd || fdList) feedOff(); return; }
+      var list = off ? null : feedList(), host = document.querySelector('.layout-chat'), th = currentThread();
+      if (!list || !host || !document.querySelector('.nt-v6-hd')) {
+        if (!off && fd && host && fd.parentNode === host && fdMap.size && th === fdThread) {
+          if (!fdGone) fdGone = Date.now();
+          if (Date.now() - fdGone < FEED_GRACE_MS) return;  // Notion is re-mounting the list: keep the mirror
+        }
+        if (fd || fdList) feedOff();
+        return;
+      }
       feedEnsure(host);
       if (fdList !== list) {
+        if (fdMap.size && th === fdThread && !feedVisible(list)) {
+          if (!fdGone) fdGone = Date.now();
+          if (Date.now() - fdGone < FEED_GRACE_MS) return;  // new list not painted yet: keep the old turns
+        }
         if (fdList) fdList.removeAttribute('data-nt-v6-src');
         fdList = list; list.setAttribute('data-nt-v6-src', '1');
-        fdMap = new Map(); fdIn.textContent = ''; fdWork = null; fdStick = true;
+        fdMap = new Map(); fdIn.textContent = ''; fdWork = null; fdStick = true; fdAll = true; fdScr = null; fdScrAt = 0;
         feedObserve(list);
       }
-      var kids = list.children, prev = null, seen = new Set();
+      fdThread = th;
+      var now = Date.now(), full = fdAll || now - fdFullAt > FEED_FULL_MS;
+      var kids = list.children, prev = null, seen = new Set(), changed = false, vis = 0;
       for (var i = 0; i < kids.length; i++) {
         var n = kids[i];
         if (n.hasAttribute('data-nt-desk-own') || !n.getClientRects().length) continue;  // tail mode hides old rows
-        var sig = n.innerHTML.length + ':' + n.textContent.length;
+        vis++;
         var e = fdMap.get(n);
-        if (!e || e.sig !== sig) {
-          var c = feedClone(n);
-          if (e && e.c.parentNode) e.c.parentNode.replaceChild(c, e.c);
-          e = { sig: sig, c: c }; fdMap.set(n, e);
+        if (!e || full || fdDirty.has(n)) {  // only changed rows are serialized (was: every row, every sync)
+          var sig = n.innerHTML.length + ':' + n.textContent.length;
+          if (!e || e.sig !== sig) {
+            var c = feedClone(n);
+            if (e && e.c.parentNode) e.c.parentNode.replaceChild(c, e.c);
+            e = { sig: sig, c: c }; fdMap.set(n, e); changed = true;
+          }
         }
         var want = prev ? prev.nextSibling : fdIn.firstChild;
-        if (e.c !== want) fdIn.insertBefore(e.c, want);
+        if (e.c !== want) { fdIn.insertBefore(e.c, want); changed = true; }
         prev = e.c; seen.add(n);
       }
-      fdMap.forEach(function (en, k) { if (!seen.has(k)) { en.c.remove(); fdMap.delete(k); } });
+      if (!vis && fdMap.size) {  // every row hidden for a moment (recording UI): keep the mirror
+        if (!fdGone) fdGone = now;
+        if (now - fdGone < FEED_GRACE_MS) { fdDirty.clear(); return; }
+      }
+      fdGone = 0;
+      fdMap.forEach(function (en, k) { if (!seen.has(k)) { en.c.remove(); fdMap.delete(k); changed = true; } });
+      fdDirty.clear(); fdAll = false;
+      if (full) fdFullAt = now;
       if (stopButton()) {
         if (!fdWork) { fdWork = document.createElement('div'); fdWork.className = 'nt-v6-fwork'; fdWork.innerHTML = '<i></i><span>Model is working…</span>'; }
-        if (fdIn.lastChild !== fdWork) fdIn.appendChild(fdWork);
-      } else if (fdWork && fdWork.parentNode) fdWork.remove();
-      fdOlder.style.display = list.getAttribute('data-nt-tl2') || (feedScroller(list) || {}).scrollTop > 0 ? '' : 'none';
-      feedPlace();
-      if (fdStick) fdSc.scrollTop = fdSc.scrollHeight;
+        if (fdIn.lastChild !== fdWork) { fdIn.appendChild(fdWork); changed = true; }
+      } else if (fdWork && fdWork.parentNode) { fdWork.remove(); changed = true; }
+      var od = list.getAttribute('data-nt-tl2') || (feedScr() || {}).scrollTop > 0 ? '' : 'none';
+      if (fdOlder.style.display !== od) fdOlder.style.display = od;
+      var moved = feedPlace();
+      if (fdStick && (changed || moved)) fdSc.scrollTop = fdSc.scrollHeight;
     }
 
+    // New chat (user 2026-10-27 21:05): overlay.js asks v6 to open the chat it just created.
+    window.__ntV6OpenThread = function (k) {
+      var rows = document.querySelectorAll('[data-nt-desk="chat-row"]');
+      for (var i = 0; i < rows.length; i++) if (rows[i].getAttribute('data-nt-desk-thread') === k) return press(rows[i]);
+      return false;
+    };
+    // Mic (user 2026-10-27 22:25): only Notion's own "Start voice recording" button is shown (marked 'mic'
+    // in decorateChat). Notion hides it while an answer is running. There is no own dictation button.
+
+    var hidTicks = 0;
     function tick() {
       if (stopped) return;
+      // smooth (user 2026-10-27 22:25): while the window is hidden or covered only the sidebar is kept
+      // current (every 4th tick, so done tags still appear); the chat mirror waits until it is shown again.
+      if (document.hidden) {
+        if (hidTicks++ % 4 === 0) { try { render(); } catch (e) { /* ignore */ } }
+        return;
+      }
       try { feedSync(); } catch (e) { try { feedOff(); } catch (x) { /* ignore */ } }
       try { placeScrollBtn(); } catch (e) { /* ignore */ }
       try { render(); } catch (e) {
         if (!errLogged) { errLogged = true; try { console.warn('[NotionTool v6]', e); } catch (x) { /* ignore */ } }
       }
     }
+    var tickRaf = 0;
+    function tickSoon() { if (!tickRaf) tickRaf = requestAnimationFrame(function () { tickRaf = 0; tick(); }); }
+    function onVis() { if (!document.hidden) tickSoon(); }
 
     function openChatRow(title) {
       var go = function () {
@@ -1143,8 +1307,41 @@
     // (Medium) although NotionTool keeps sending the chat's last pick (data/model_pin.log). Remember the
     // level the user picked in each chat and show that instead of Notion's reset.
     var EFFORT_RE = /^(minimal|low|medium|high|extra[\s-]?high|x-?high|max)/i;
+    // Display label (e.g. 'Extra High', 'Maximum') -> canonical effort level the backend/pin accept.
+    function effortLevel(label) {
+      var s = str(label).toLowerCase().replace(/\s+/g, ' ');
+      if (s.indexOf('extra') === 0 || s.indexOf('xhigh') === 0 || s === 'x-high') return 'xhigh';
+      if (s.indexOf('max') === 0) return 'max';
+      if (s.indexOf('high') === 0) return 'high';
+      if (s.indexOf('medium') === 0 || s.indexOf('mid') === 0) return 'medium';
+      if (s.indexOf('low') === 0) return 'low';
+      if (s.indexOf('min') === 0) return 'low';
+      return str(label);
+    }
+    // Header label = what the request pin really sends (user 2026-10-27: the Roblox chat showed "Maximum" while
+    // data/model_pin.log sent xhigh). Truth order: the backend pick (chat_effort_get, enforced by the pin), then
+    // the locally remembered pick; both shown as one canonical label.
+    var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' };
+    var effortBackend = {}, effortAskAt = {};
+    function effortLabel(v) { var l = effortLevel(v); return EFFORT_LABEL[l] || cap(v); }
+    function askEffort(tid) {
+      var now = Date.now();
+      if (effortAskAt[tid] > now - 15000 || !ctx || typeof ctx.call !== 'function') return;
+      effortAskAt[tid] = now;
+      try {
+        Promise.resolve(ctx.call('chat_effort_get', { thread_id: tid })).then(function (r) {
+          var rec = obj(r), e = str(rec.effort || obj(rec.result).effort).toLowerCase();
+          effortBackend[tid] = EFFORT_LABEL[e] ? e : '';
+        }, function () {});
+      } catch (err) { /* ignore */ }
+    }
     function effortPick(tid) {
-      try { return tid ? str(localStorage.getItem('nt-effort-pick:' + tid)) : ''; } catch (e) { return ''; }
+      if (!tid) return '';
+      askEffort(tid);
+      if (effortBackend[tid]) return EFFORT_LABEL[effortBackend[tid]];
+      var v = '';
+      try { v = str(localStorage.getItem('nt-effort-pick:' + tid)); } catch (e) { v = ''; }
+      return v ? effortLabel(v) : '';
     }
     function nativeEffort() {
       var b = effortButton();
@@ -1160,6 +1357,17 @@
         var lvl = nativeEffort();
         if (!lvl || currentThread() !== tid) return;
         try { localStorage.setItem('nt-effort-pick:' + tid, lvl); } catch (err) { /* ignore */ }
+        // The pick is also stored on the backend and enforced by the request pin, so Notion's own
+        // reset to 'medium' after a chat switch can never override the user's choice.
+        try {
+          if (ctx && typeof ctx.call === 'function') {
+            ctx.call('chat_effort_pick', { thread_id: tid, effort: effortLevel(lvl) }).then(function () {
+              var lv = effortLevel(lvl);
+              if (EFFORT_LABEL[lv]) effortBackend[tid] = lv;
+              if (!stopped) tick();
+            }, function () {});
+          }
+        } catch (err) { /* ignore */ }
         if (!stopped) tick();
       }, 400);
     }
@@ -1194,6 +1402,11 @@
       }
       if (act === 'chat' || act === 'cw') { openChatRow(arg); return; }
       if (act === 'more') { expanded = !expanded; lastSb = ''; tick(); return; }
+      if (act === 'cwidle' || act === 'arch') {
+        if (act === 'cwidle') cwOpen = !cwOpen; else archOpen = !archOpen;
+        try { localStorage.setItem(act === 'cwidle' ? CWOPEN_KEY : ARCHOPEN_KEY, (act === 'cwidle' ? cwOpen : archOpen) ? '1' : '0'); } catch (x) { /* ignore */ }
+        lastSb = ''; tick(); return;
+      }
       if (act === 'new') {
         var nb = document.querySelector('.nt-desk-newchat');
         if (!press(nb)) toast('New chat is not available right now', 'error');
@@ -1214,6 +1427,19 @@
       if (act === 'model') { if (!press(modelButton())) toast('The model menu is not available right now', 'error'); else placeMenu(t); return; }
       if (act === 'effort') { if (!press(effortButton())) toast('The effort menu is not available right now', 'error'); else placeMenu(t); return; }
       if (act === 'stop') { if (!press(stopButton())) toast('Nothing is running', 'info'); return; }
+      if (act === 'archive') {
+        if (archUntil <= Date.now()) { archUntil = Date.now() + CONFIRM_MS; lastHd = ''; tick(); setTimeout(function () { lastHd = ''; tick(); }, CONFIRM_MS + 50); return; }
+        archUntil = 0; lastHd = '';
+        var aTitle = currentTitle(), aw = currentWorker(aTitle);
+        if (!aw || !aw.thread_id) { toast('Move to archive works for NotionTool chats only', 'error'); tick(); return; }
+        var aName = 'Archived · ' + aTitle;
+        toast('Moving "' + aTitle + '" to the archive...', 'info');
+        call('app_chat_rename', { thread_id: aw.thread_id, name: aName }).then(function (res) {
+          if (res && res.error) throw new Error(res.error);
+          toast('Archived as "' + aName + '"', 'info'); lastHd = ''; tick();
+        }).catch(function (err) { toast('Archive failed: ' + ((err && err.message) || err), 'error'); lastHd = ''; tick(); });
+        return;
+      }
       if (act === 'switch') {
         if (confirmUntil <= Date.now()) { confirmUntil = Date.now() + CONFIRM_MS; lastHd = ''; tick(); setTimeout(function () { lastHd = ''; tick(); }, CONFIRM_MS + 50); return; }
         confirmUntil = 0; lastHd = '';
@@ -1235,7 +1461,8 @@
     }
     tick();
     timer = setInterval(tick, TICK_MS);
-    window.addEventListener('resize', tick);
+    window.addEventListener('resize', tickSoon);
+    document.addEventListener('visibilitychange', onVis);
       startGone();
     document.addEventListener('pointerdown', onEffortPick, true);
 
@@ -1243,11 +1470,14 @@
       stopped = true;
       closeProjMenu();
       if (timer) clearInterval(timer);
-      window.removeEventListener('resize', tick);
+      window.removeEventListener('resize', tickSoon);
+      document.removeEventListener('visibilitychange', onVis);
+      if (tickRaf) { cancelAnimationFrame(tickRaf); tickRaf = 0; }
       stopGone();
       if (rz) { rz.remove(); rz = null; }
       if (wk) { wk.remove(); wk = null; }
       feedOff();
+      try { delete window.__ntV6OpenThread; } catch (x) { /* ignore */ }
       root.style.removeProperty('--nt-v6-sbw');
       document.removeEventListener('pointerdown', onEffortPick, true);
       if (typeof offState === 'function') { try { offState(); } catch (e) { /* ignore */ } }

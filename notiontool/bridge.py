@@ -36,6 +36,10 @@ TOOLS = {
                  'each cell max 300 characters, whole result max 6000; stops after 30 s. Works for every role',
                  {'sql':{'type':'string'},'limit':{'type':'integer'}}),
     'db_schema': ('List the tables and columns of the NotionTool database (read-only; works for every role)', {}),
+    'perplexity_search': ('Search via Perplexity (Sonar API): returns an AI-sourced answer with citations. Use for EVERY '
+                          'research task instead of a plain search engine. Requires a Perplexity API key (Settings > '
+                          'Perplexity or env PPLX_API_KEY).',
+                          {'query':{'type':'string'}, 'max_tokens':{'type':'integer'}}),
 }
 DB_TOOLS = ('db_query', 'db_schema')
 
@@ -98,6 +102,7 @@ INLINE_TOOLS = ('write_file', 'nt_write_file', 'nt_edit_file')
 CUSTOM_READ_ONLY = 'read_only'
 READ_ONLY_REFUSAL = 'This planning/review role has read-only PC access'
 from .screen_capture import SCREEN_TOOLS, SCREEN_OPERATOR_TOOLS, SCREEN_OPERATOR_NAMES, ScreenCapture
+from .research import RESEARCH_OPERATOR_TOOLS, RESEARCH_OPERATOR_NAMES
 from .agent_guard import GUARD_RULE, PLAN_RULE
 
 
@@ -254,7 +259,7 @@ _HIT_PATH = re.compile(r'^(.*?):\d+: ')
 def _key_inside(key, base):
     base = base.rstrip('\\/')
     return key == base or key.startswith(base + os.sep)
-OPERATOR_TOOLS = OPERATOR_TOOLS + DEV_TOOLS + SCREEN_OPERATOR_TOOLS
+OPERATOR_TOOLS = OPERATOR_TOOLS + DEV_TOOLS + SCREEN_OPERATOR_TOOLS + RESEARCH_OPERATOR_TOOLS
 OPERATOR_NAMES = {t['name'] for t in OPERATOR_TOOLS}
 for _tool in OPERATOR_TOOLS:
     if _tool['name'] in ('nt_write_file', 'nt_edit_file'):
@@ -286,6 +291,15 @@ class Bridge:
         if getattr(self, '_screen', None) is None:
             self._screen = ScreenCapture(self.store)
         return self._screen
+
+    def _perplexity_key(self):
+        """Perplexity API key from settings, else the environment. '' when unset."""
+        try:
+            settings = self.store.settings()
+        except Exception:
+            settings = {}
+        from .perplexity import api_key as _api_key
+        return _api_key(settings)
 
     def tools(self, role=None):
         tools = dict(TOOLS)
@@ -348,11 +362,11 @@ class Bridge:
 
     # ---- capability -------------------------------------------------------
     def has_assignment(self, token):
-        return bool(token) and any(t.get('lease')==token and t.get('state') in LIVE_TASK_STATES for t in self.store.all('tasks'))
+        return bool(token) and any(t.get('lease')==token and t.get('state') in LIVE_TASK_STATES for t in (self.store.open_tasks() if hasattr(self.store, 'open_tasks') else self.store.all('tasks')))
 
     def assignment(self, token):
         # Capability is revoked as soon as an attempt ends or is superseded.
-        task = next((t for t in self.store.all('tasks') if t.get('lease')==token and t['state'] in LIVE_TASK_STATES),None)
+        task = next((t for t in (self.store.open_tasks() if hasattr(self.store, 'open_tasks') else self.store.all('tasks')) if t.get('lease')==token and t['state'] in LIVE_TASK_STATES),None)
         if not task:
             raise ValueError('Assignment expired or invalid; do not join again')
         run = self.store.get('runs',task['run_id'])
@@ -585,6 +599,14 @@ class Bridge:
                 ident = run.get('folder_id') or run['chat_id']
                 self.store.remember(ident, str(args.get('text','')), task['id'])
                 return {'saved':True}
+            elif name=='perplexity_search':
+                # Read-only research; runs outside the coordinator lock (like the database calls).
+                key = self._perplexity_key()
+                if not key:
+                    raise ValueError('Perplexity API key missing: set it in Settings > Perplexity (perplexity_api_key) '
+                                     'or set the PPLX_API_KEY environment variable.')
+                from .perplexity import search as _perp_search
+                return _perp_search(args.get('query'), key, max_tokens=args.get('max_tokens') or 1024)
             elif name=='run_shell' and self.role_is_read_only(task['role']):
                 # Read-only test run: fixed project root (a cwd argument is ignored),
                 # no folder claim, only the lease check.
@@ -990,6 +1012,9 @@ class Bridge:
         self.limit_gate(name, args, (args.get('assignment_token') or '') if isinstance(args, dict) else '',
                         caller='operator')
         if name in SCREEN_OPERATOR_NAMES: return self.screen().call(name[3:], args, role='operator')
+        if name in RESEARCH_OPERATOR_NAMES:
+            from . import research
+            return research.call(args)
         if name in DEV_NAMES:
             area = self.hidden_area(dev_path('.'))
             if name in DEV_GUARDED:

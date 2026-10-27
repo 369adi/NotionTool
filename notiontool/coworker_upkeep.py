@@ -7,6 +7,7 @@ Welcome coworkers until the pool reaches the target (setting coworker_target, de
 """
 
 import json
+import time
 
 from .context_archive import prune_ids
 
@@ -209,7 +210,7 @@ class CoworkerUpkeep:
         if self.last_vacuum is not None and now - self.last_vacuum < VACUUM_INTERVAL:
             return False
         with self.engine.lock:
-            if any(t.get('state') in BUSY_TASK_STATES for t in self.store.all('tasks')):
+            if any(t.get('state') in BUSY_TASK_STATES for t in (self.store.open_tasks() if hasattr(self.store, 'open_tasks') else self.store.all('tasks'))):
                 return False
             with self.store.lock:
                 self.store.db.commit()
@@ -299,3 +300,26 @@ class CoworkerUpkeep:
                     self.store.event('thread_context_prune_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
                 except Exception:
                     return
+            try:
+                self.prune_tasks()
+            except Exception as exc:
+                try:
+                    self.store.event('old_tasks_prune_failed', message=(type(exc).__name__ + ': ' + str(exc))[:300])
+                except Exception:
+                    return
+
+    def prune_tasks(self):
+        """Owner 2026-10-27: delete old finished tasks (Store.prune_old_tasks); at most once per hour."""
+        now = time.time()
+        last = getattr(self, 'last_task_prune', None)
+        if last is not None and now - last < 3600:
+            return None
+        self.last_task_prune = now
+        prune = getattr(self.store, 'prune_old_tasks', None)
+        if prune is None:
+            return None
+        with self.engine.lock:
+            count = prune()
+        if count:
+            self.store.event('old_tasks_pruned', count=count)
+        return count

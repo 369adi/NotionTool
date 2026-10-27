@@ -46,6 +46,14 @@ class V6PolishUiTest(unittest.TestCase):
         self.assertIn('.notion-table-block th', CSS)
         self.assertIn('div[style*="max-width: 798px"][style*="padding-inline: 52px"]', CSS)
 
+    def test_open_chat_is_never_duplicated_in_the_chats_list(self):
+        # User report 2026-10-27: after clicking a chat (e.g. Roblox) it appeared BOTH in the main
+        # card and as a row in the Chats list (a private chat of the open thread was merged back in).
+        self.assertIn('var curKey = currentThread();', JS)
+        self.assertIn('chats = chats.filter', JS)
+        self.assertIn("if (curKey && c.thread_id && key(c.thread_id) === curKey) return false;", JS)
+        self.assertIn("if (curTitle && c.title === curTitle) return false;", JS)
+
 
 if __name__ == '__main__':
     unittest.main()

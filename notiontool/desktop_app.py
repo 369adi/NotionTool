@@ -103,16 +103,75 @@ class DesktopApp:
             self._sleep(POLL_INTERVAL)
         if self.session is not None and self.alive:
             return self.info(True)
-        targets = self._http_get(self._url('/json/list'))
-        target = next((t for t in (targets if isinstance(targets, list) else [])
-                       if is_notion_page(t) and local_ws(t.get('webSocketDebuggerUrl'), self.port)), None)
+        candidates = self._notion_targets()
+        target = candidates[0] if candidates else None
         if target is None:
             self.target_id, self.ws_url = '', ''
             return self.info(False)
+        session = None
+        if len(candidates) > 1:
+            # Notion can open several tabs: attach to the one the user sees, not just the first one.
+            target, session = self._pick_visible(candidates)
         self.target_id = str(target.get('id') or '')
         self.ws_url = str(target['webSocketDebuggerUrl'])
-        self.session = self._connect(self.ws_url)
+        self.session = session if session is not None else self._connect(self.ws_url)
         return self.info(True)
+
+    def _pick_visible(self, candidates):
+        """(target, open session) of the visible tab, else of the first tab. Other probes are closed."""
+        probes = []
+        for t in candidates:
+            try:
+                probes.append((t, self._connect(str(t['webSocketDebuggerUrl']))))
+            except Exception:
+                continue
+        if not probes:
+            return candidates[0], None
+        chosen = next(((t, s) for t, s in probes if self._visibility(t, s) == 'visible'), probes[0])
+        for _, s in probes:
+            if s is not chosen[1]:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        return chosen
+
+    def _notion_targets(self):
+        targets = self._http_get(self._url('/json/list'))
+        return [t for t in (targets if isinstance(targets, list) else [])
+                if is_notion_page(t) and local_ws(t.get('webSocketDebuggerUrl'), self.port)]
+
+    def _visibility(self, target, session=None):
+        """document.visibilityState of a tab ('visible'/'hidden'), or '' if it cannot be asked."""
+        own = session is None
+        try:
+            if own:
+                session = self._connect(str(target['webSocketDebuggerUrl']))
+            result = session.send('Runtime.evaluate', {'expression': 'document.visibilityState',
+                                                       'returnByValue': True}, 5) or {}
+            value = (result.get('result') or {}).get('value') if isinstance(result, dict) else None
+            return value if isinstance(value, str) else ''
+        except Exception:
+            return ''
+        finally:
+            if own and session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    def other_tab_visible(self):
+        """True when our tab is hidden and another Notion tab is the one the user sees.
+
+        Then the overlay should move to that tab. When the whole window is hidden or minimised
+        (every tab hidden) nothing changes.
+        """
+        if not self.alive or not self.target_id:
+            return False
+        if self._visibility(None, self.session) != 'hidden':
+            return False
+        return any(str(t.get('id') or '') != self.target_id and self._visibility(t) == 'visible'
+                   for t in self._notion_targets())
 
     def _leaks(self, text):
         return any(m in text for m in INJECT_MARKERS) or any(s in text for s in self.secrets)

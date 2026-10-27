@@ -92,7 +92,8 @@ class StartTests(unittest.TestCase):
         self.assertEqual(fakes.spawned, [[EXE, '--user-data-dir=' + PROFILE, '--remote-debugging-port=9333']])
         self.assertEqual(fakes.urls[:3], ['http://127.0.0.1:9333/json/version'] * 2 + ['http://127.0.0.1:9333/json/list'])
         self.assertEqual(len(fakes.sleeps), 1)  # first /json/version was None
-        self.assertEqual(fakes.connected, [WS % 'notion'])
+        # Two Notion tabs: both are asked which one is visible; none is, so the first one is kept.
+        self.assertEqual(fakes.connected, [WS % 'notion', WS % 'second'])
         self.assertEqual(info, dict(pid=4242, port=9333, target_id='notion', ws_url=WS % 'notion', ready=True))
         self.assertTrue(app.alive)
 
@@ -130,6 +131,7 @@ class InjectCloseTests(unittest.TestCase):
         fakes = Fakes(MIXED, version_after=0)
         app = fakes.app()
         app.start()
+        fakes.session.calls.clear()  # start() asked both Notion tabs which one is visible
         source = 'window.__ntDesk = window.__ntDesk || {};'
         self.assertEqual(app.inject(source), 'script-7')
         self.assertEqual(app.script_id, 'script-7')
@@ -142,6 +144,7 @@ class InjectCloseTests(unittest.TestCase):
         fakes = Fakes(MIXED, version_after=0)
         app = fakes.app(secrets=('s3cr3t-value',))
         app.start()
+        fakes.session.calls.clear()  # start() asked both Notion tabs which one is visible
         for source in ('var a = "s3cr3t-value";', 'fetch("http://127.0.0.1:8765")'):
             with self.assertRaises(ValueError):
                 app.inject(source)

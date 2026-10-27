@@ -276,6 +276,9 @@ class Application:
                         if method in ('GET','POST') and (path=='/api/ui/projects' or path.startswith('/api/ui/projects/')):
                             from .projects_routes import http_route as projects_http_route  # Projects page: list, detail, create, update, open, archive
                             return self.response(*projects_http_route(app,method,path,query,self.read_body() if method=='POST' else None))
+                        if method in ('GET','POST') and (path=='/api/ui/app' or path.startswith('/api/ui/app/')):
+                            from .app_routes import http_route as app_http_route  # standalone NotionTool window: own UI over the Notion API
+                            return self.response(*app_http_route(app,method,path,query,self.read_body() if method=='POST' else None))
                         if method=='GET' and (path=='/api/notes' or path.startswith('/api/notes/')):
                             from .notes_routes import http_route as notes_http_route
                             return self.response(*notes_http_route(app,path,query))
@@ -341,6 +344,13 @@ class Application:
         self.port = self.http.server_port
         self.adapter.sessions.save('runtime',{'port':self.port,'token':self.token})
         threading.Thread(target=self.http.serve_forever,daemon=True,name='local-http').start()
+        try:
+            # Captures become Notion chat attachments (viewable by the chats) only in the real app.
+            from . import notion_upload
+            notion_upload.ACTIVE=(__import__('os').environ.get('NOTIONTOOL_TEST_INSTANCE')!='1'
+                                  and 'unittest' not in __import__('sys').modules)
+        except Exception:
+            pass
         if __import__('os').environ.get('NOTIONTOOL_TEST_INSTANCE')=='1':
             # B40 test app (test_app.py): local API, engine and desk actions on its own port and empty data
             # folder. No Notion window, gateway, tunnel, updater, backups, coworker upkeep or wake, so it can
@@ -712,7 +722,7 @@ class Application:
             now = time.time() if now is None else now
             workers = {w.get('id'): w for w in self.store.all('workers')}
             tasks, turns, open_ids = {}, [], set()
-            for task in self.store.all('tasks'):
+            for task in (self.store.open_tasks() if hasattr(self.store, 'open_tasks') else self.store.all('tasks')):
                 if task.get('state') not in TERMINAL and not task.get('remote_done_at'):
                     open_ids.add(task.get('id'))  # open turn, also while recovering ('uncertain') after a restart
                 if task.get('state') != 'running' or not task.get('sent_at') or task.get('remote_done_at'):
@@ -1529,6 +1539,8 @@ class Application:
                         settings[key] = str(body[key]).lower() in ('true', '1', 'on', 'yes')
                 if 'browser_path' in body:
                     settings['browser_path'] = str(body['browser_path']).strip()
+                if 'perplexity_api_key' in body:
+                    settings['perplexity_api_key'] = str(body['perplexity_api_key']).strip()
                 if 'notion_transport' in body:
                     if body['notion_transport'] not in ('edge', 'native'):
                         raise ValueError('Choose Edge or native API transport')

@@ -590,7 +590,7 @@ class NotionClient:
                   for ident,value in records.get('space',{}).items() if unwrap(value).get('alive',True)]
         self.info = dict(user_id=user_id, email=user.get('email',''), user_name=user.get('name',''),
                          client_version=self.info.get('client_version') or '23.13.20261017.0942',
-                         space_id=self.info.get('space_id') or (spaces[0]['id'] if spaces else ''),
+                         space_id=next((s['id'] for s in spaces if s['id'] == self.info.get('space_id')), spaces[0]['id'] if spaces else (self.info.get('space_id') or '')),
                          spaces=spaces, onboarded=user.get('onboarding_completed'), records=records)
         return self.info
 
