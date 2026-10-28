@@ -24,6 +24,14 @@ gateway whenever the app does not answer a ping within PROBE_SECONDS. Only the o
 (decrypted from data/sessions with DPAPI, same Windows user) may use them. Calls that already reached the
 app are never resent, except read-only tools (no side effects). Long local calls hand off to a gateway
 job (job_id 'gw-...') fetched with nt_job_result, like the app's own jobs.
+
+v6 (user 28.10.2026: 'WHEN NOTIONTOOL IS GONE THE MCP MUST STILL WORK, NOTIONTOOL HAS NOTHING TO DO
+WITH IT'): v5 only ran the PC tools here when the app missed a ping. A busy app (one long Roblox call
+holding its single tool queue) still answers pings, so every PC tool call waited behind it for 40-90 s,
+Notion gave up after ~60 s ('Request timed out') and the waiting calls slowed the app window too. Now
+the owner's PC tools ALWAYS run inside the gateway and never reach the app. Tools that need the app
+(roblox_*, blender_*, nt_api, coworker writes with an assignment_token ...) are still forwarded and get
+a clear 'busy, NOT retried' result after CALL_SECONDS (55 s), before Notion's own timeout.
 """
 import hashlib
 import hmac
@@ -40,7 +48,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = 5
+VERSION = 6
 LOCAL_TOOLS = {'nt_shell', 'nt_read_file', 'nt_write_file', 'nt_edit_file', 'nt_list_dir', 'nt_search_code',
                'nt_file_outline', 'nt_find_symbol', 'nt_memory_read', 'nt_memory_update'}
 READ_ONLY_LOCAL = {'nt_read_file', 'nt_list_dir', 'nt_search_code', 'nt_file_outline', 'nt_find_symbol', 'nt_memory_read'}
@@ -48,14 +56,14 @@ DATA_GUARDED = {'nt_list_dir': 'Listing', 'nt_search_code': 'Search', 'nt_file_o
                 'nt_find_symbol': 'Symbol search', 'nt_write_file': 'Write', 'nt_edit_file': 'Edit'}
 JOB_TOOL = 'nt_job_result'
 LOCAL_JOB_PREFIX = 'gw-'
-PROBE_SECONDS = 3      # the app must answer a ping this fast, else the PC tools run in the gateway
+PROBE_SECONDS = 3      # core_answers() ping limit (v6: the PC tools no longer wait for this probe)
 LOCAL_SYNC_SECONDS = 45  # a local call longer than this becomes a gateway job (same as the app's jobs)
 JOB_WAIT_MAX = 50
 JOB_KEEP_SECONDS = 3600
 DEFAULT_PORT = 8792
 HOLD_SECONDS = 25  # Notion's MCP client gives up before 120 s -> 'Failed to connect'; answer fast instead
 SAFE_SECONDS = 8  # initialize/ping/tools/list: answer from the gateway when the core is slower than this
-CALL_SECONDS = 90  # tools/call: longest legit call is ~55 s (job tools hand off after 45-50 s)
+CALL_SECONDS = 55  # v6: Notion's MCP client gives up at ~60 s; app jobs hand off after 45-50 s
 CONNECT_SECONDS = 5
 LOG_MAX_BYTES = 5 * 1024 * 1024
 SAFE_METHODS = {'initialize', 'notifications/initialized', 'ping', 'tools/list', 'resources/list', 'prompts/list'}
@@ -346,10 +354,11 @@ class Gateway:
         if local is not None:
             with self.lock:
                 self.accepted.add(auth)  # the owner's own Host API key: always accepted, app up or not
-            if local[0] == JOB_TOOL or not self.core_answers(path, sent):
-                result = self.reply(parsed.get('id'), self.local.call(*local))
-                self.log(started, calls, result[0], 'local')
-                return result
+            # v6: the PC tools ALWAYS run here, never in the app: a busy or hung app cannot block them,
+            # and they never wait in (or slow down) the app's tool queue.
+            result = self.reply(parsed.get('id'), self.local.call(*local))
+            self.log(started, calls, result[0], 'local')
+            return result
         while True:
             try:
                 status, kept, data = self.forward(method, path, sent, body, timeout)
