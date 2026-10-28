@@ -1462,6 +1462,7 @@
       try { feedSync(); } catch (e) { try { feedOff(); } catch (x) { /* ignore */ } }
       try { placeScrollBtn(); } catch (e) { /* ignore */ }
       try { draftTick(); } catch (e) { /* ignore */ }
+      try { effortWatch(); } catch (e) { /* ignore */ }
       try { render(); } catch (e) {
         if (!errLogged) { errLogged = true; try { console.warn('[NotionTool v6]', e); } catch (x) { /* ignore */ } }
       }
@@ -1617,17 +1618,34 @@
       var m = str(b && b.getAttribute('aria-label')).match(/currently\s+([\w-]+(?:\s[\w-]+)*)/i);
       return m ? cap(m[1]) : '';
     }
+    // round 31 (user 2026-10-28 16:08: every chat switch went back to Medium). Live: no pick of the new
+    // chats was ever stored (no nt-effort key in localStorage, no thread_efforts record), so the menu check
+    // never matched Notion's current effort menu. Now a press on the effort pill or on Notion's effort
+    // button arms this chat; the pick in the menu, or else the next change of Notion's effort label in that
+    // same chat (effortWatch in tick), is stored. A press anywhere else or a chat switch disarms it, so
+    // Notion's own reset to Medium after a switch is never taken as a pick. Event-based, no timer.
+    var effortArm = null;
     function onEffortPick(e) {
-      // round 19 (user 2026-10-28 05:02: the chat was on xHigh, the header said High and the pin sent high):
-      // the level comes from the clicked menu row itself and is stored at once. The old delayed read of
-      // Notion's button label (400 ms later) missed picks, so the backend kept the old level.
-      var it = e.target && e.target.closest ? e.target.closest('[role^="menuitem"],[role="option"]') : null;
-      var box = it && it.closest('.notion-overlay-container');
-      if (!box || !EFFORT_RE.test(text(it))) return;
-      var menu = it.closest('[role="menu"],[role="dialog"],[role="listbox"]') || box;
-      if (!/\beffort\b/i.test(text(menu)) && !/\beffort\b/i.test(text(box))) return;
-      var tid = currentThread(), lv = effortLevel(text(it));
+      // round 19 (user 2026-10-28 05:02): the level comes from the clicked menu row itself and is stored at once.
+      var tid = '', lv = '', direct = e && e.ntPick;
+      if (direct) { tid = direct.tid; lv = direct.lv; }
+      else {
+        var tg = e && e.target && e.target.closest ? e.target : null;
+        if (!tg) return;
+        var eb = effortButton();
+        if (tg.closest('[data-act="effort"]') || (eb && (eb === tg || eb.contains(tg)))) { armEffort(); return; }
+        var box = tg.closest('.notion-overlay-container');
+        if (!box) { effortArm = null; return; }
+        var it = tg.closest('[role^="menuitem"],[role="option"],[role="radio"]');
+        if (!it || !EFFORT_RE.test(text(it))) return;
+        tid = currentThread(); lv = effortLevel(text(it));
+        if (!(effortArm && effortArm.tid === tid)) {
+          var menu = it.closest('[role="menu"],[role="dialog"],[role="listbox"]') || box;
+          if (!/\beffort\b/i.test(text(menu)) && !/\beffort\b/i.test(text(box))) return;
+        }
+      }
       if (!tid || !EFFORT_LABEL[lv]) return;
+      effortArm = null;
       try { localStorage.setItem('nt-effort-pick:' + tid, lv); localStorage.setItem('nt-effort-be:' + tid, lv); } catch (err) { /* ignore */ }
       effortBackend[tid] = lv; effortAskAt[tid] = Date.now();
       // The pick is also stored on the backend and enforced by the request pin, so Notion's own
@@ -1639,7 +1657,19 @@
           }, function () { effortAskAt[tid] = 0; delete effortBackend[tid]; if (!stopped) tick(); });
         }
       } catch (err) { /* ignore */ }
-      if (!stopped) tick();
+      if (!stopped) tickSoon();
+    }
+    function armEffort() {
+      var at = currentThread();
+      effortArm = at ? { tid: at, from: effortLevel(nativeEffort()) } : null;
+    }
+    function effortWatch() {
+      if (!effortArm) return;
+      var tid = currentThread();
+      if (!tid || tid !== effortArm.tid) { effortArm = null; return; }
+      var lv = effortLevel(nativeEffort());
+      if (!EFFORT_LABEL[lv] || lv === effortArm.from) return;
+      onEffortPick({ ntPick: { tid: tid, lv: lv } });
     }
     var pillDownOpen = false;
     function onPillDown(e) {

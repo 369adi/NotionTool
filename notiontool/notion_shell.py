@@ -283,7 +283,30 @@ def request_effort(post):
     return effort
 
 
-def choose_effort(request_value, stored):
+def history_effort(post):
+    # round 31 (user 2026-10-28 16:08, model_pin.log 15:51:32): the user picked xHigh, then Notion's chat
+    # switch added its own {'reasoningEffort': 'medium'} step before the next send, so the pick was never
+    # the newest value and was never stored. This is the newest explicit effort of the request that is not
+    # Notion's reset value 'medium' (nor 'auto'), or ''.
+    try:
+        data = json.loads(post) if isinstance(post, str) else None
+    except ValueError:
+        return ''
+    transcript = data.get('transcript') if isinstance(data, dict) else None
+    if not isinstance(transcript, list):
+        return ''
+    base = next((s for s in transcript if isinstance(s, dict) and s.get('type') == 'config'), None)
+    configs = [s for s in transcript if isinstance(s, dict) and s.get('type') == 'updated-config']
+    effort = ''
+    for step in ([base] if base is not None else []) + configs:
+        value = step.get('value') if isinstance(step.get('value'), dict) else {}
+        found = str(value.get('reasoningEffort') or '').strip().lower()
+        if found and found not in ('auto', 'medium'):
+            effort = found
+    return effort
+
+
+def choose_effort(request_value, stored, history=''):
     # round 25 (user 2026-10-28 07:10, model_pin.log: the chat was on xHigh, the stored pick 'high' was
     # sent): the stored pick only wins against Notion's own reset value ('medium' after a switch) or a
     # missing / 'auto' effort. Any other explicit effort in the request is a fresh pick of the user in
@@ -292,6 +315,11 @@ def choose_effort(request_value, stored):
     st = str(stored or '').strip().lower()
     if req and req not in ('auto', 'medium') and req != st:
         return req, True
+    # round 31: no stored pick and only Notion's reset (or nothing) in the newest step: the request's
+    # own history still holds the user's pick (history_effort). It is fresh, so it gets stored.
+    hist = str(history or '').strip().lower()
+    if not st and hist and hist not in ('auto', 'medium') and req in ('', 'auto', 'medium'):
+        return hist, True
     return (st or req), False
 
 
@@ -649,10 +677,21 @@ class NotionShell:
                         # round 30: also without a stored pick, so a fresh pick in Notion's menu is
                         # stored at once and Notion's later reset to 'medium' cannot win.
                         stored = rec.get('effort') if isinstance(rec, dict) else ''
-                        wanted, fresh = choose_effort(request_effort(post), stored)
+                        req_effort = request_effort(post)
+                        wanted, fresh = choose_effort(req_effort, stored)
+                        sink = getattr(self, 'effort_pick_sink', None)
+                        # round 31: the pick from the request's history is used only when it can be
+                        # stored as this chat's own pick. The sink refuses Coworker chats, so they keep
+                        # the harness's effort band.
+                        late, late_fresh = choose_effort(req_effort, stored, history_effort(post))
+                        if late_fresh and late != wanted and callable(sink):
+                            try:
+                                sink(thread, late)
+                                wanted, fresh = late, False
+                            except Exception:
+                                pass
                         if wanted:
                             picks = {thread: wanted}
-                            sink = getattr(self, 'effort_pick_sink', None)
                             if fresh and callable(sink):
                                 try:
                                     sink(thread, wanted)  # round 25: the fresh pick is stored
