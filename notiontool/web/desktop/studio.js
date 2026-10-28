@@ -49,7 +49,7 @@
     var last = getKey(LAST_MODEL_KEY);
     return last && !isAutoText(last) ? String(last) : DEFAULT_MODEL;
   }
-  var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', auto: 'Auto' };
+  var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'xHigh', max: 'Max', auto: 'Auto' };
   function nextTurnText(nt) {
     var code = nt && nt.model ? String(nt.model) : '';
     var pinned = !code || isAutoText(code);

@@ -464,10 +464,10 @@ class TurnWatch:
                     self.check(worker)
                 except Exception as exc:  # one unreadable chat never stops the others
                     failed = failed or exc
-            try:
-                self.scan_restart_cuts()
-            except Exception as exc:
-                failed = failed or exc
+            # Round 33 (user 2026-10-28 18:55): the restart-cut scan is no longer run. A NotionTool restart does
+            # not drop running turns any more - the MCP gateway keeps running without the app and Notion keeps
+            # writing - so its automatic 'NotionTool wurde neu gestartet ... weiter' message only landed in chats
+            # that were still working (live 18:53:22, the user's own chat ...6585f2).
             try:
                 # RBX fix: age of ALL known chats (also own chats) from the Notion thread created_time; own
                 # chats at >= 22 h get the context switch. Mains/Coworkers keep their own switch logic.
@@ -842,8 +842,9 @@ class TurnWatch:
     def scan_restart_cuts(self):
         """After a restart: one automatic continue for EVERY chat of the ready accounts whose turn the restart
         dropped, also chats NotionTool does not manage (the user's own chats). Harness chats keep their
-        regular resume in check(). Setting restart_resume_all (default on) switches it off."""
-        if not self.store.settings().get('restart_resume_all', True):
+        regular resume in check(). Off since round 33 (user 2026-10-28: a restart no longer drops turns); the
+        loop never calls it and it only runs with the setting restart_resume_all explicitly on."""
+        if not self.store.settings().get('restart_resume_all', False):
             return []
         now = self.clock()
         if now - self.started < RESTART_SETTLE or now - self.started > RESTART_SCAN_END:

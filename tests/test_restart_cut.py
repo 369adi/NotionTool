@@ -68,12 +68,14 @@ class FakeClient:
 
 
 class FakeStore:
-    def __init__(self):
+    def __init__(self, settings=None):
         self.objects = {('accounts', 'acc'): {'id': 'acc', 'state': 'ready'}}
         self.events = []
+        # Round 33: the restart-cut scan is opt-in; these scan tests switch it on explicitly.
+        self._settings = {'restart_resume_all': True} if settings is None else settings
 
     def settings(self):
-        return {}
+        return dict(self._settings)
 
     def get(self, kind, ident, default=None):
         return self.objects.get((kind, ident), default)
@@ -142,3 +144,22 @@ def test_scan_skips_archived_main_threads(monkeypatch):
     watch.spawn = lambda fn, *args: fn(*args)
     assert watch.scan_restart_cuts() == ['userchat']
     assert [t for t, _, _ in adapter.sent] == ['userchat']
+
+
+def test_restart_cut_is_off_by_default(monkeypatch):
+    # Round 33 (user 2026-10-28 18:55): a restart no longer drops running turns (the MCP gateway keeps
+    # running without the app), so no chat gets the automatic 'NotionTool wurde neu gestartet' message.
+    monkeypatch.setattr(tw, 'budget_used_up', lambda store, now: False)
+    client = FakeClient({'roblox': transcript([user(1, START - 200), tool(2, START + 20, START + 25)])})
+    adapter, store = FakeAdapter(client), FakeStore(settings={})
+    watch = tw.TurnWatch(store, adapter, FakeEngine(), clock=lambda: START + 120)
+    watch.started = START
+    watch.spawn = lambda fn, *args: fn(*args)
+    assert watch.scan_restart_cuts() == []
+    assert adapter.sent == []
+
+
+def test_loop_never_runs_the_restart_cut_scan():
+    import inspect
+    src = inspect.getsource(tw.TurnWatch.loop)
+    assert 'scan_restart_cuts(' not in src
