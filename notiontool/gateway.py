@@ -48,6 +48,9 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# nt_search_code hits look like 'path:line: text' (same pattern as bridge.py).
+_HIT_PATH = re.compile(r'^(.*?):\d+: ')
+
 VERSION = 6
 LOCAL_TOOLS = {'nt_shell', 'nt_read_file', 'nt_write_file', 'nt_edit_file', 'nt_list_dir', 'nt_search_code',
                'nt_file_outline', 'nt_find_symbol', 'nt_memory_read', 'nt_memory_update'}

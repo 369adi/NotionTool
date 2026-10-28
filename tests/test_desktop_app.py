@@ -89,7 +89,8 @@ class StartTests(unittest.TestCase):
         fakes = Fakes(MIXED)
         app = fakes.app()
         info = app.start()
-        self.assertEqual(fakes.spawned, [[EXE, '--user-data-dir=' + PROFILE, '--remote-debugging-port=9333']])
+        self.assertEqual(fakes.spawned, [[EXE, '--user-data-dir=' + PROFILE, '--remote-debugging-port=9333',
+                                          '--disable-features=SpareRendererForSitePerProcess']])
         self.assertEqual(fakes.urls[:3], ['http://127.0.0.1:9333/json/version'] * 2 + ['http://127.0.0.1:9333/json/list'])
         self.assertEqual(len(fakes.sleeps), 1)  # first /json/version was None
         # Two Notion tabs: both are asked which one is visible; none is, so the first one is kept.

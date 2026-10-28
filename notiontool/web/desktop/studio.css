@@ -149,3 +149,9 @@ html.nt-desk-compact .nt-desk-strip-item { padding: 1px 8px; }
 html.nt-desk-compact .nt-desk-message { line-height: 1.45 !important; }
 html.nt-desk-compact .notion-sidebar { font-size: 13px; }
 html.nt-desk-compact .nt-desk-notify-item { padding: 5px 8px; }
+
+/* round 27 (user 07:46: a model/effort menu pops up for a moment on a chat switch): while the Auto guard picks
+   the model in Notion's own menu, that menu is invisible. It still works; found by role only. */
+html.nt-desk-auto-quiet [role="dialog"], html.nt-desk-auto-quiet [role="menu"], html.nt-desk-auto-quiet [role="listbox"] {
+  opacity: 0 !important; transition: none !important; animation: none !important;
+}

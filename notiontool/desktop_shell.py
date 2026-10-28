@@ -1250,6 +1250,8 @@ class DesktopShell(NotionShell):
         self.thread_age_source = (lambda thread: check({'thread_id': thread, 'send': True})) if callable(check) else None
         pick = self.handlers.get('chat_effort_get')  # user effort picks: enforced by the request pin
         self.effort_pick_source = (lambda thread: pick({'thread_id': thread})) if callable(pick) else None
+        put = self.handlers.get('chat_effort_pick')  # round 25: a fresh pick in Notion's own menu is stored too
+        self.effort_pick_sink = (lambda thread, effort: put({'thread_id': thread, 'effort': effort})) if callable(put) else None
         self.build = ''
         self.page_refresh = ''
         self.teardown_result = None
@@ -1441,6 +1443,11 @@ class DesktopController:
             self.state, self.error, self.started_at = 'starting', '', time.time()
             self.thread = threading.Thread(target=self._run, daemon=True, name='desktop-app')
             self.thread.start()
+            if sys.platform == 'win32' and getattr(self, 'guard', None) is None:
+                from .desktop_guard import DesktopGuard  # user 2026-10-28: usable with low RAM
+                self.guard = DesktopGuard(self, lambda: our_processes(self.profile_dir), self.stop_event)
+            if getattr(self, 'guard', None) is not None:
+                self.guard.start()
         return self.status()
 
     def _ensure_protocol(self):

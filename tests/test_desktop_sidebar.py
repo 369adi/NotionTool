@@ -66,7 +66,9 @@ class DesktopSidebarTests(unittest.TestCase):
         self.assertIn('preventDefault', self.js)
         self.assertIn('stopPropagation', self.js)
         self.assertIn("document.addEventListener('click', onClick, true);", self.js)
-        self.assertIn('location.href = result.url', self.js)
+        # Round 28 (I71): no page load; the new chat opens through its own sidebar row.
+        self.assertNotIn('location.href = result.url', self.js)
+        self.assertIn('openChat(threadKey(result.thread_id), result.url)', self.js)
         self.assertIn("'Could not create a Welcome chat: '", self.js)
 
     def test_never_removes_notion_nodes_or_uses_network(self):

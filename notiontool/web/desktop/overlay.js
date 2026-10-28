@@ -1986,7 +1986,9 @@
       busy = true;
       node.classList.add(CLS_BUSY);
       Promise.resolve().then(function () { return ctx.call('new_welcome_chat', {}); }).then(function (result) {
-        if (result && result.url) location.href = result.url;
+        // Round 28: no page load (I71). Open the new chat through Notion's own sidebar row.
+        if (result && result.thread_id) openChat(threadKey(result.thread_id), result.url);
+        else if (result && result.pending) ctx.toast('The Welcome chat is still being created. It shows up in the sidebar soon.', 'info');
       }, function (err) {
         ctx.toast('Could not create a Welcome chat: ' + message(err), 'error');
       }).then(function () {

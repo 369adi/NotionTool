@@ -64,3 +64,5 @@ project-memory/
 # Editor/agent backups
 *.bak*
 *.bak_*
+# Local patch backups in the repo root (work/backups is already ignored)
+/backups/

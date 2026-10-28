@@ -460,8 +460,10 @@
     function newWelcomeChat() {
       toast('Creating a Welcome chat...', 'info');
       return call('new_welcome_chat', {}).then(function (result) {
-        if (result && result.url) location.href = result.url;
-        else toast('Welcome chat created', 'ok');
+        // Round 28: no page load (I71); v6 presses Notion's own sidebar row for the new chat.
+        var open = window.__ntV6OpenThread;
+        if (result && result.thread_id && typeof open === 'function' && open(result.thread_id)) return;
+        toast('Welcome chat created. Open it from the sidebar.', 'ok');
       }, function (err) {
         toast('Could not create a Welcome chat: ' + message(err), 'error');
       });

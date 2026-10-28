@@ -382,18 +382,31 @@
       var target = document.activeElement || document.body;
       try { target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })); } catch (e) { /* ignore */ }
     }
+    // round 27 (user 07:46: a model/effort menu pops up for a moment on a chat switch): the menu this guard
+    // opens stays invisible while it picks the model. The class goes away once the menu is closed (so its
+    // fade-out is not seen either) or after at most 30 frames, then a menu that is still open is visible.
+    var AUTO_QUIET = 'nt-desk-auto-quiet';
+    function quietOff() {
+      var frames = 0;
+      (function check() {
+        frames += 1;
+        if (frames < 30 && menuItems().length) { requestAnimationFrame(check); return; }
+        document.documentElement.classList.remove(AUTO_QUIET);
+      })();
+    }
     function switchFromAuto(chipNode) {
       var want = pinnedModel(), tries = 0;
       autoGuard.busy = true;
       autoGuard.last = Date.now();
       function finish(ok) {
         autoGuard.busy = false;
+        quietOff();
         // A failed try is retried (5 s gap) up to AUTO_SWITCH_TRIES times per chip change, then one warning.
         if (!ok && autoGuard.tries < AUTO_SWITCH_TRIES) { autoGuard.pending = true; return; }
         if (!ok) toast('Notion shows "Auto" as the model. Pick ' + want + ' in the model menu; NotionTool still sends ' + want + '.', 'warning');
       }
       function pick() {
-        if (stopped) { autoGuard.busy = false; return; }
+        if (stopped) { autoGuard.busy = false; quietOff(); return; }
         var items = menuItems();
         if (!items.length) {
           tries += 1;
@@ -415,7 +428,8 @@
         closeMenu();
         finish(false);
       }
-      try { chipNode.click(); } catch (e) { autoGuard.busy = false; return; }
+      document.documentElement.classList.add(AUTO_QUIET);
+      try { chipNode.click(); } catch (e) { autoGuard.busy = false; quietOff(); return; }
       setTimeout(pick, AUTO_MENU_WAIT_MS);
     }
     function guardAuto() {

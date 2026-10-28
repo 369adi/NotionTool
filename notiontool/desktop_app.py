@@ -81,7 +81,9 @@ class DesktopApp:
         self._closed = False
 
     def argv(self):
-        return [self.exe_path, '--user-data-dir=' + self.profile_dir, '--remote-debugging-port=' + str(self.port)]
+        # no spare renderer process kept in RAM (user 2026-10-28: less RAM)
+        return [self.exe_path, '--user-data-dir=' + self.profile_dir, '--remote-debugging-port=' + str(self.port),
+                '--disable-features=SpareRendererForSitePerProcess']
 
     def _url(self, path):
         return 'http://%s:%d%s' % (HOST, self.port, path)

@@ -397,6 +397,12 @@ html.nt-v6-on [data-nt-v6="cmd"]::after { content: "Commands"; font: 500 9.7px v
 html.nt-v6-on [data-nt-v6="attach"]:hover, html.nt-v6-on [data-nt-v6="cmd"]:hover { background: rgba(120, 140, 200, 0.1) !important; color: var(--v6-text) !important; }
 /* model + effort stay in place (header pills press them, popups anchor here) but are not drawn twice */
 html.nt-v6-on [data-nt-v6="quiet"] { opacity: 0 !important; pointer-events: none !important; }
+/* round 24: Notion's own effort button is hidden by CSS at once, not only by the 600 ms tick mark,
+   so it never pops up for a moment after a chat switch (user 2026-10-28 06:47). */
+html.nt-v6-on [aria-label^="Change effort"] { opacity: 0 !important; pointer-events: none !important; }
+/* round 25 (user 07:10: the effort bar at the bottom still pops up): Notion's model button next to its effort
+   button is hidden from the first paint, not only after the JS tick marks it. */
+html.nt-v6-on [aria-label^="Change effort"] ~ [role="button"]:not([aria-label]) { opacity: 0 !important; pointer-events: none !important; }
 html.nt-v6-on [data-nt-v6="send"] {
   width: 58px !important; height: 29px !important; border-radius: 8px !important; color: #fff !important; opacity: 1 !important;
   background: var(--v6-grad) !important; box-shadow: 0 4px 12px rgba(46, 120, 255, 0.35) !important;
@@ -887,3 +893,20 @@ html.nt-v6-on.nt-v6-mask #notion-app [role="dialog"],
 html.nt-v6-on.nt-v6-mask #notion-app [role="tooltip"],
 html.nt-v6-on.nt-v6-mask #notion-app [role="alert"],
 html.nt-v6-on.nt-v6-mask:not(.nt-v6-feed-on) #notion-app .layout-chat { visibility: visible; }
+
+/* ---- round 27 (user 07:46: the chat box is too small): about 4 lines at once, it grows with the text up to
+   40 % of the window and then scrolls, bigger letters. The send button looks off while there is nothing to send. */
+html.nt-v6-on .nt-desk-composer.nt-desk-composer [contenteditable][role="textbox"] {
+  min-height: 88px !important; max-height: 40vh !important; overflow-y: auto !important;
+  font-size: 14.5px !important; line-height: 22px !important;
+}
+html.nt-v6-on [data-nt-v6="send"][aria-disabled="true"], html.nt-v6-on [data-nt-v6="send"]:disabled {
+  opacity: 0.45 !important; box-shadow: none !important;
+}
+/* header pill: label and number of Context and Steps side by side (one line), the bar below */
+html.nt-v6-on .nt-v6-ctx { flex-direction: row !important; flex-wrap: wrap; align-items: baseline; column-gap: 5px; }
+html.nt-v6-on .nt-v6-ctx .nt-v6-bar { flex: 0 0 100%; }
+/* Round 28c: Switch context in a private chat is not available yet - dimmed, the click explains why. */
+.nt-v6-si.nt-v6-swoff { cursor: default; }
+.nt-v6-si.nt-v6-swoff svg, .nt-v6-si.nt-v6-swoff .nt-v6-sw { opacity: 0.45; }
+.nt-v6-si.nt-v6-swoff:hover { color: inherit; }
