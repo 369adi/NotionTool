@@ -887,12 +887,15 @@ html.nt-v6-on.nt-v6-mask #notion-app { visibility: hidden !important; }
 html.nt-v6-on.nt-v6-mask #notion-app [data-nt-desk-own],
 html.nt-v6-on.nt-v6-mask #notion-app .nt-rail,
 html.nt-v6-on.nt-v6-mask #notion-app .nt-desk-composer,
+html.nt-v6-on.nt-v6-mask #notion-app [data-nt-v6-comp],
 html.nt-v6-on.nt-v6-mask #notion-app .notion-overlay-container,
 html.nt-v6-on.nt-v6-mask #notion-app .notion-peek-renderer,
 html.nt-v6-on.nt-v6-mask #notion-app [role="dialog"],
 html.nt-v6-on.nt-v6-mask #notion-app [role="tooltip"],
 html.nt-v6-on.nt-v6-mask #notion-app [role="alert"],
 html.nt-v6-on.nt-v6-mask:not(.nt-v6-feed-on) #notion-app .layout-chat { visibility: visible; }
+/* round 32: no composer on the page (voice recording bar): the chat area shows, the source list stays hidden */
+html.nt-v6-on.nt-v6-mask.nt-v6-nocomp #notion-app .layout-chat { visibility: visible; }
 
 /* ---- round 27 (user 07:46: the chat box is too small): about 4 lines at once, it grows with the text up to
    40 % of the window and then scrolls, bigger letters. The send button looks off while there is nothing to send. */

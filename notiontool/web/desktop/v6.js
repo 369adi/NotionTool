@@ -1145,7 +1145,7 @@
       feedEnsure(host);
       fdIn.textContent = '';
       for (var i = 0; i < keep.length; i++) fdIn.appendChild(keep[i]);
-      fdSnap = keep; fdSnapAt = Date.now(); fdThread = th; fdStick = true;
+      fdSnap = keep; fdSnapAt = Date.now(); fdThread = th; fdStick = true; fdSnapTh = th;
       root.classList.add('nt-v6-feed-on');
       feedPlace(); fdSc.scrollTop = fdSc.scrollHeight;
       return true;
@@ -1156,6 +1156,8 @@
       fdSnap = null;
     }
     var FD_SEL = '[role="button"],button,a,[aria-expanded]';
+    // round 32 (user 18:35): levels from a user row up to Notion's turn list (4 today, learned from 2+ rows)
+    var fdDepth = 4, fdSnapTh = '', fdBusy = false, fdCost = 0;
     function feedList() {
       var lc = document.querySelector('.layout-content');
       var u = lc && lc.querySelector('[data-agent-chat-user-step-id]');
@@ -1166,8 +1168,12 @@
       for (e = u.parentElement, i = 0; e && e !== lc && i < 12; i++, e = e.parentElement) {
         var n = 0;
         for (var k = 0; k < e.children.length && n < 2; k++) if (e.children[k].querySelector('[data-agent-chat-user-step-id]')) n++;
-        if (n >= 2) return e;
+        if (n >= 2) { fdDepth = i + 1; return e; }
       }
+      // round 32 (user 18:35: the newest message showed, then vanished): a chat with one user turn has no
+      // second user row, so its list was never found and the kept old turns came back again and again.
+      for (e = u, i = 0; e && i < fdDepth; i++) e = e.parentElement;
+      if (e && e !== lc && lc.contains(e) && e.children.length >= 2 && !e.querySelector('.nt-desk-composer,[data-nt-v6-comp]')) return e;
       return null;
     }
     function feedSig(list) {
@@ -1311,7 +1317,7 @@
           while (t && t.parentNode !== list) t = t.parentNode;
           if (t) fdDirty.add(t); else fdAll = true;
         }
-        if (!fdQ) fdQ = setTimeout(feedSync, 80);
+        if (!fdQ) fdQ = setTimeout(feedSync, Math.min(400, Math.max(80, Math.round(fdCost * 4))));  // round 32: a heavy turn syncs less often (lag)
       });
       fdObs.observe(list, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['aria-expanded', 'data-nt-v6-dur', 'data-nt-v6', 'class', 'data-nt-tl2'] });
     }
@@ -1325,11 +1331,30 @@
       if (fd) { fd.remove(); fd = null; fdIn = fdSc = fdOlder = fdWork = null; }
       root.classList.remove('nt-v6-feed-on');
     }
+    // round 32 (user 18:35: a voice recording made the chat box vanish): Notion swaps the text box for its
+    // recording bar, chrome.js then drops the composer mark and the chat mask hid the whole box. The last
+    // composer keeps an own mark while it is on the page; with no box at all the chat area is shown
+    // (html.nt-v6-nocomp) and the feed keeps the last bottom edge, so the recording bar stays free.
+    var compKeep = null, compTop = 0;
+    function composerNow() {
+      var cp = document.querySelector('.nt-desk-composer');
+      if (cp && compKeep !== cp) {
+        if (compKeep) compKeep.removeAttribute('data-nt-v6-comp');
+        compKeep = cp; cp.setAttribute('data-nt-v6-comp', '1');
+      }
+      if (!cp && compKeep && !compKeep.isConnected) compKeep = null;
+      cp = cp || compKeep;
+      var none = !cp && !!document.querySelector('.layout-chat');
+      if (root.classList.contains('nt-v6-nocomp') !== none) root.classList.toggle('nt-v6-nocomp', none);
+      return cp;
+    }
     function feedPlace() {
-      var s = sbRect(), h = document.querySelector('.nt-v6-hd'), cp = document.querySelector('.nt-desk-composer');
+      var s = sbRect(), h = document.querySelector('.nt-v6-hd'), cp = composerNow();
       var left = Math.round(s.left + s.width);
       var top = h ? Math.round(h.getBoundingClientRect().bottom + 2) : 0;
-      var bot = cp ? Math.round(cp.getBoundingClientRect().top - 8) : window.innerHeight;
+      var ct = cp ? cp.getBoundingClientRect() : null;
+      if (ct && ct.height > 0) compTop = Math.round(ct.top);
+      var bot = ct && ct.height > 0 ? Math.round(ct.top - 8) : (compTop ? compTop - 8 : window.innerHeight);
       var want = [left, top, Math.max(0, window.innerWidth - left), Math.max(0, bot - top)];
       var pk = want.join(',');
       if (pk === fdPlaced) return false;  // unchanged: no style writes, no forced layout
@@ -1366,7 +1391,7 @@
         }
         // Notion still loads the chat: show its kept last turns meanwhile
         if (!off && host && hdOn && th && th === fdThread && !fdMap.size &&
-            (fdSnap ? Date.now() - fdSnapAt < FD_SNAP_MS : feedSnapShow(host, th))) return;  // round 25: a slow load never deletes the kept turns
+            (fdSnap ? Date.now() - fdSnapAt < FD_SNAP_MS : fdSnapTh !== th && feedSnapShow(host, th))) return;  // round 25: a slow load never deletes the kept turns; round 32: once per visit, never again after they ended
         if (!off && host && hdOn && th && th === fdThread && !fdMap.size && feedHold(host)) return;  // still loading: never blank, never Notion
         if (!off && th && fd && fdHoldAt && Date.now() - fdHoldAt < FEED_GRACE_MS) {  // round 22: mid-switch
           root.classList.add('nt-v6-feed-on');
@@ -1395,7 +1420,7 @@
         if (pv < Math.min(fdSnap.length, 2) && now - fdSnapAt < FD_SNAP_MS) { feedPlace(); return; }
         feedSnapDrop();
       }
-      var kids = list.children, prev = null, seen = new Set(), changed = false, vis = 0;
+      var kids = list.children, prev = null, seen = new Set(), changed = false, vis = 0, t0 = performance.now();
       for (var i = 0; i < kids.length; i++) {
         var n = kids[i];
         if (n.hasAttribute('data-nt-desk-own') || !n.getClientRects().length) continue;  // tail mode hides old rows
@@ -1403,7 +1428,8 @@
         var e = fdMap.get(n);
         if (!e || full || fdDirty.has(n)) {  // only changed rows are serialized (was: every row, every sync)
           var cs = n.textContent.length + ':' + n.getElementsByTagName('*').length;  // user 04:41 (switch lagged): cheap check first
-          var sig = e && !fdDirty.has(n) && e.cs === cs ? e.sig : n.innerHTML.length + ':' + cs;  // full pass: unchanged rows are not serialized again
+          var grown = !e || e.cs !== cs;  // round 32 (lag): a row that grew changed for sure, no innerHTML needed
+          var sig = grown ? 'c' + cs : e && !fdDirty.has(n) && e.cs === cs ? e.sig : n.innerHTML.length + ':' + cs;  // full pass: unchanged rows are not serialized again
           if (!e || e.sig !== sig) {
             var c = feedClone(n);
             if (e && e.c.parentNode) e.c.parentNode.replaceChild(c, e.c);
@@ -1420,9 +1446,14 @@
       }
       fdGone = 0; fdHoldAt = 0;
       fdMap.forEach(function (en, k) { if (!seen.has(k)) { en.c.remove(); fdMap.delete(k); changed = true; } });
-      fdDirty.clear(); fdAll = false;
+      fdDirty.clear(); fdAll = false; fdCost = performance.now() - t0;
       if (full) fdFullAt = now;
-      if (stopButton()) {
+      var busy = !!stopButton();
+      if (busy !== fdBusy) {  // round 32 (user 18:35: a finished answer did not show): re-read every row once it ends
+        fdBusy = busy;
+        if (!busy) { fdAll = true; if (!fdQ) fdQ = setTimeout(feedSync, 80); }
+      }
+      if (busy) {
         if (!fdWork) { fdWork = document.createElement('div'); fdWork.className = 'nt-v6-fwork'; fdWork.innerHTML = '<i></i><span>Model is working…</span>'; }
         if (fdIn.lastChild !== fdWork) { fdIn.appendChild(fdWork); changed = true; }
       } else if (fdWork && fdWork.parentNode) { fdWork.remove(); changed = true; }
@@ -1459,6 +1490,7 @@
         if (hidTicks++ % 4 === 0) { try { render(); } catch (e) { /* ignore */ } }
         return;
       }
+      try { composerNow(); } catch (e) { /* ignore */ }
       try { feedSync(); } catch (e) { try { feedOff(); } catch (x) { /* ignore */ } }
       try { placeScrollBtn(); } catch (e) { /* ignore */ }
       try { draftTick(); } catch (e) { /* ignore */ }
