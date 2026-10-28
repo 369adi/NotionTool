@@ -873,11 +873,24 @@
     // round 19 (user 2026-10-28 05:02: Notion showed through on chat switch, window move and start): in a chat
     // Notion's app paints nothing by default (v6.css html.nt-v6-mask); only our nodes, the composer, menus and
     // the chat area paint. The boot cover of the desktop bootstrap goes once Notion's own layout is there.
+    // round 34 (user 2026-10-28 19:05: 'ich sehe keine chats mehr', the window was all black): Notion's own
+    // crash page ('Oops! Something went wrong' + Refresh, no .layout-chat) was hidden by the mask. Never mask
+    // it: the user sees Notion's buttons, and error_page_heal.py presses 'Back to my content' by itself.
+    // Only checked in a chat URL without a chat layout (small DOM), so a running chat pays nothing.
+    function notionCrashed() {
+      var app = document.getElementById('notion-app');
+      if (!app) return false;
+      if (app.querySelector('svg.eyes')) return true;
+      var t = String(app.textContent || '');
+      return t.length < 600 && /Something went wrong/.test(t) && /Refresh/.test(t);
+    }
     function maskSync() {
       var chat = document.querySelector('.layout-chat');
-      var on = !!(chat || currentThread());
+      var tid = currentThread();
+      var crashed = !chat && !!tid && notionCrashed();
+      var on = !crashed && !!(chat || tid);
       if (root.classList.contains('nt-v6-mask') !== on) root.classList.toggle('nt-v6-mask', on);
-      if (typeof window.__ntBootCoverOff === 'function' && (chat || document.querySelector('.layout-content,.notion-frame'))) {
+      if (typeof window.__ntBootCoverOff === 'function' && (chat || crashed || document.querySelector('.layout-content,.notion-frame'))) {
         var off = window.__ntBootCoverOff; window.__ntBootCoverOff = null; off();
       }
     }

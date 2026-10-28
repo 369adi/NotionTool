@@ -1544,7 +1544,11 @@ class DesktopController:
             return False
 
     def _heal_error_page(self, shell):
-        """For about a minute after start: reload only Notion's 'Something went wrong' page (error_page_heal.py)."""
+        """Keep the window out of Notion's 'Something went wrong' page for the whole session (error_page_heal.py).
+
+        Reloads only during the start; later (and when a reload did not help) it presses Notion's own
+        'Back to my content' button. Runs until stop_event is set (round 34, user 2026-10-28 19:05).
+        """
         from . import error_page_heal
         try:
             error_page_heal.heal(lambda: getattr(getattr(shell, 'app', None), 'session', None),
