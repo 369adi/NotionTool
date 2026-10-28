@@ -178,13 +178,14 @@ One line per task, no vertical bars inside a cell.'''
 
 # Visual work (desktop apps, UI, renders) needs the screen tools even without a project folder.
 VISUAL=re.compile(r'\b(roblox|blender|screens?|screenshots?|capture|viewport|gui|ui|layout|render(ing)?|visual(ly)?|bildschirm|fenster|aussehen)\b',re.I)
-SCREEN_HINT=(' For visual work in desktop apps such as Roblox Studio or Blender, call the screen_capture tool through mcp_call'
-             ' (no target = the whole screen; target "roblox" or "blender" = only that window) as often as needed to see the current state'
-             ' before and after changes. To SEE a capture open its view_url with the Notion file viewer (viewFileUrl);'
+SCREEN_HINT=(' For visual work in desktop apps capture images ONLY with a tool that returns a view_url:'
+             ' Roblox Studio = roblox_call -> screen_capture {studio_id, capture_id, camera_position, look_at_position};'
+             ' anything else on the PC = screen_capture through mcp_call (no target = whole screen, or target/hwnd = one window).'
+             ' To SEE a capture open its view_url with the Notion file viewer (viewFileUrl) and show it in chat as an image;'
              ' never judge a picture you have not opened. Screen tools need no assignment token or code.')
-# Every coworker role may look at the screen; advisers and planners still only look.
-SCREEN_TOOLS_LINE=('\nScreen tools: screen_windows and screen_capture are available through mcp_call with no assignment token,'
-                   ' to check the current state when needed (open view_url with viewFileUrl to see a capture).')
+# Every coworker role may look at captures; advisers and planners still only look.
+SCREEN_TOOLS_LINE=('\nImages: only via a capture tool that returns a view_url (whole PC: screen_windows / screen_capture through mcp_call,'
+                   ' no assignment token; Roblox Studio: roblox_call -> screen_capture); open view_url with viewFileUrl to see it.')
 ADVISER_TOOLS_NOTE=' Use them only to look; this planning role has no write or shell rights.'
 
 

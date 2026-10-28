@@ -4,8 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from PIL import Image
+
+from notiontool import notion_upload
 
 from notiontool.screen_capture import MAX_PER_TASK, CaptureError, ScreenCapture, pick
 
@@ -57,12 +60,23 @@ class CaptureTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.store = Events(tmp.name)
         self.frames = [picture()]
+        self.uploads = []
+
+        def fake_publish(info, data, mime, name):
+            self.uploads.append(dict(data=data, mimeType=mime))
+            info['view_url'] = 'file://cap' + str(len(self.uploads))
+            return True
+        patcher = mock.patch.object(notion_upload, 'publish', side_effect=fake_publish)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.screen = ScreenCapture(self.store, lister=lambda: WINDOWS,
                                     grabber=lambda hwnd, restore=False: (self.frames[-1].copy(), 'print_window'))
 
     def test_capture_returns_an_image_and_logs_it_without_pixels(self):
-        result = self.screen.call('screen_capture', {'target': 'roblox', 'reason': 'check build'}, task_id='t1', run_id='r1', role='executor')
-        image = result.pop('_image')
+        result = self.screen.call('screen_capture', {'target': 'blender', 'reason': 'check build'}, task_id='t1', run_id='r1', role='executor')
+        self.assertNotIn('_image', result)
+        self.assertTrue(result['view_url'].startswith('file://cap'))
+        image = self.uploads[-1]
         self.assertEqual(image['mimeType'], 'image/jpeg')
         self.assertEqual(Image.open(io.BytesIO(base64.b64decode(image['data']))).size, (800, 600))
         self.assertTrue(result['changed'])
@@ -71,7 +85,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(list(Path(self.store.directory).rglob('*.png')), [])
         kind, run_id, fields = self.store.events[-1]
         self.assertEqual((kind, run_id, fields['task_id'], fields['reason'], fields['process']),
-                         ('capture_taken', 'r1', 't1', 'check build', 'RobloxStudioBeta.exe'))
+                         ('capture_taken', 'r1', 't1', 'check build', 'blender.exe'))
         self.assertLess(len(str(fields)), 2000)
 
     def test_unchanged_window_can_skip_the_image(self):
@@ -79,11 +93,11 @@ class CaptureTests(unittest.TestCase):
         second = self.screen.call('screen_capture', {'target': 'blender', 'only_if_changed': True})
         self.assertFalse(second['changed'])
         self.assertEqual(second['sha256'], first['sha256'])
-        self.assertNotIn('_image', second)
+        self.assertNotIn('view_url', second)
         self.frames.append(picture(bright_left=True))
         third = self.screen.call('screen_capture', {'target': 'blender', 'only_if_changed': True})
         self.assertTrue(third['changed'])
-        self.assertIn('_image', third)
+        self.assertIn('view_url', third)
         self.assertNotEqual(third['sha256'], first['sha256'])
 
     def test_without_target_the_whole_screen_is_captured(self):
@@ -93,7 +107,7 @@ class CaptureTests(unittest.TestCase):
                                screen_grabber=lambda: (picture(size=(2560, 1440)), 'screen'))
         result = screen.call('screen_capture', {})
         self.assertEqual((result['scope'], result['window']['process'], result['window_size']), ('screen', 'screen', [2560, 1440]))
-        self.assertIn('_image', result)
+        self.assertIn('view_url', result)
 
     def test_old_stored_captures_are_deleted_and_nothing_new_is_written(self):
         old = Path(self.store.directory) / 'captures' / '2026-10-10'
@@ -106,12 +120,18 @@ class CaptureTests(unittest.TestCase):
     def test_region_and_max_side_shape_the_returned_image(self):
         self.frames.append(picture(size=(3000, 2000)))
         result = self.screen.call('screen_capture', {'target': 'blender', 'max_side': 1000, 'format': 'png'})
-        self.assertEqual((result['_image']['mimeType'], result['image']['width']), ('image/png', 1000))
+        self.assertEqual((result['image']['mimeType'], result['image']['width']), ('image/png', 1000))
         self.assertIn(result['image']['height'], (666, 667))
         zoom = self.screen.call('screen_capture', {'target': 'blender', 'region': {'x': 100, 'y': 50, 'width': 300, 'height': 200}})
         self.assertEqual((zoom['width'], zoom['height'], zoom['region']), (300, 200, [100, 50, 400, 250]))
         with self.assertRaises(CaptureError):
             self.screen.call('screen_capture', {'target': 'blender', 'region': {'x': 5000, 'y': 0, 'width': 10, 'height': 10}})
+
+    def test_roblox_windows_are_refused_in_favour_of_roblox_call(self):
+        with self.assertRaisesRegex(CaptureError, 'roblox_call'):
+            self.screen.call('screen_capture', {'target': 'roblox'})
+        with self.assertRaisesRegex(CaptureError, 'roblox_call'):
+            self.screen.call('screen_capture', {'hwnd': 22})
 
     def test_per_task_limit_stops_runaway_loops(self):
         self.screen.counts['t9'] = MAX_PER_TASK
@@ -120,18 +140,26 @@ class CaptureTests(unittest.TestCase):
 
 
 class BridgeImageTests(unittest.TestCase):
-    def test_operator_capture_returns_mcp_image_content(self):
+    # Whole-PC capture (owner 28.10.2026): only ever a Notion view_url, never inline base64.
+    def test_operator_capture_returns_a_view_url_not_base64(self):
         from notiontool.bridge import Bridge
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(notion_upload, 'ACTIVE', True), \
+                mock.patch.object(notion_upload, 'upload', return_value={'view_url': 'file://cap'}):
             store = Events(tmp)
             bridge = Bridge(store, engine=None)
             bridge._screen = ScreenCapture(store, lister=lambda: WINDOWS, grabber=lambda hwnd, restore=False: (picture(), 'print_window'))
             reply = bridge.rpc({'id': 1, 'method': 'tools/call',
-                                'params': {'name': 'nt_screen_capture', 'arguments': {'target': 'roblox'}}}, operator=SimpleNamespace())
+                                'params': {'name': 'nt_screen_capture', 'arguments': {'target': 'blender'}}}, operator=SimpleNamespace())
         content = reply['result']['content']
-        self.assertEqual([c['type'] for c in content], ['text', 'image'])
-        self.assertNotIn('_image', content[0]['text'])
-        self.assertEqual(content[1]['mimeType'], 'image/jpeg')
+        self.assertEqual([c['type'] for c in content], ['text'])
+        self.assertIn('file://cap', content[0]['text'])
+
+    def test_failed_upload_is_an_error_instead_of_base64(self):
+        screen = ScreenCapture(None, lister=lambda: WINDOWS, grabber=lambda hwnd, restore=False: (picture(), 'print_window'))
+        with mock.patch.object(notion_upload, 'ACTIVE', False):
+            with self.assertRaisesRegex(CaptureError, 'upload'):
+                screen.call('screen_capture', {'target': 'blender'})
 
     def test_workers_get_the_screen_tools_unless_switched_off(self):
         from notiontool.bridge import Bridge

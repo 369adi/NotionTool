@@ -13,7 +13,7 @@
  * to STEP_CAP so the freeze cannot come back.
  */
 (function () {
-  var VERSION = 14;
+  var VERSION = 15;
   var BASE_TURNS = 5;      // v6: default view = last 5 user messages with their answers
   var BASE_MAX = 400;      // v6: but never more than this many steps by default (freeze guard)
   var STEP_CAP = 30;
@@ -28,12 +28,17 @@
   var ANCHOR_MS = 1500;    // how long the scroll position is held after a load
   var HOLD_MAX_MS = 4000;  // v10: Notion needs up to ~2 s to show the older messages (measured live)
   var SEND_MS = 4000;      // v11: after a sent message a jump to the top is undone for this long
+  var DONE_MS = 8000;      // v15: after an answer ended (or the shown steps changed) an unasked jump to the top is undone
 
   var live = window.__ntTSLive = window.__ntTSLive || {};
   var expanded = {};       // threadId -> scroller element
   var gesture = { up: 0, down: 0, drag: 0, move: 0 };
   var lastSend = 0;        // v11: time a new user message appeared in any chat
   var wasBottom = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var lastTop = typeof WeakMap === 'function' ? new WeakMap() : null;  // v15: last scroll position per scroller
+  var lastChange = 0;      // v15: time the shown steps of any chat changed
+  var lastDone = 0;        // v15: time an answer ended (Notion's inference lease went off)
+  var leaseOn = {};        // v15: threadId -> true while the agent answers
   var lastLoad = 0;
   var lastLen = {};        // v8: threadId -> store count seen last time
   var memo = {};           // v8: threadId -> last capped array (stable identity)
@@ -343,6 +348,24 @@
     b.style.display = 'block';
   }
 
+  // v15: true when the user did not wheel, key, click or drag in the last GESTURE_MS.
+  function noGesture(now) {
+    return now - gesture.up > GESTURE_MS && now - gesture.down > GESTURE_MS &&
+      now - gesture.drag > GESTURE_MS && now - gesture.move > GESTURE_MS;
+  }
+  // v15: notes when an answer ends (Notion's own inference-lease flag, same source as donesound).
+  function leases(now) {
+    now = now || Date.now();
+    for (var id in live) {
+      var ts = live[id], f = ts && ts.getIsInferenceLeaseActive, on = false;
+      if (typeof f !== 'function') continue;
+      try { on = !!(f.__orig ? f.__orig.call(ts) : f.call(ts)); } catch (e) { on = false; }
+      if (on) leaseOn[id] = true;
+      else if (leaseOn[id]) { delete leaseOn[id]; lastDone = now; }
+    }
+    return lastDone;
+  }
+
   function onScroll(e) {
     if (window.__ntStepExpV !== VERSION || window.__ntStepCapOff) return;
     var el = e && e.target;
@@ -359,7 +382,18 @@
         window.__ntSendFix = (window.__ntSendFix || 0) + 1;
         return;
       }
+      // v15: when an answer ends Notion re-mounts the message list and the scroller lands at the top (user report
+      // 2026-10-28). Without a user gesture that jump is undone: back to the bottom, or to the old place.
+      var doneWin = now - Math.max(lastChange, lastDone) < DONE_MS;
+      var prevTop = lastTop ? lastTop.get(el) : null;
+      if (!sendWin && doneWin && el.scrollTop < TOP_PX && prevTop != null && prevTop > TOP_PX * 2 &&
+          el.scrollHeight - el.clientHeight > 600 && noGesture(now) && now - lastLoad > HOLD_MAX_MS + 1000) {
+        el.scrollTop = wasBottom.get(el) ? el.scrollHeight : prevTop;
+        window.__ntDoneFix = (window.__ntDoneFix || 0) + 1;
+        return;
+      }
       if (!sendWin) wasBottom.set(el, el.scrollHeight - el.clientHeight - el.scrollTop < 120);
+      if (lastTop) lastTop.set(el, el.scrollTop);
     }
     // v8: while older messages are loading Notion briefly re-mounts the list (height drops ~900 px, measured), the
     // scroller clamps to its bottom and the button press counted as a gesture -> this reset sent you to the bottom.
@@ -378,8 +412,8 @@
 
   function bind() {
     window.__ntStepExpV = VERSION;
-    if (typeof document === 'undefined' || window.__ntStepExpBound11) return;
-    window.__ntStepExpBound11 = true;
+    if (typeof document === 'undefined' || window.__ntStepExpBound15) return;
+    window.__ntStepExpBound15 = true;
     window.__ntStepCap = {};  // drop the fixed 30-step caps of v3-v5; the 5-message default applies
     try {  // the v3/v4 builds had no button; drop a stale one if a part reinstalls
       var old = document.querySelectorAll('[data-nt-stepcap-more]');
@@ -400,6 +434,7 @@
     setInterval(function () {
       if (window.__ntStepExpV !== VERSION) return;
       sweep();
+      leases();
       if (btnEl && btnEl.isConnected === false) updateButton(null);  // chat closed or switched
     }, 1000);
   }
@@ -407,7 +442,8 @@
   window.__ntStepExp = {
     nextCap: nextCap, nextCapFor: nextCapFor, capOf: capOf, baseCap: baseCap, shouldOffer: shouldOffer, updateButton: updateButton, threadForEl: threadForEl, expand: expand, reset: reset, sweep: sweep,
     onScroll: onScroll, gesture: gesture, expanded: expanded, version: VERSION,
-    _resetCooldown: function () { lastLoad = 0; }
+    _resetCooldown: function () { lastLoad = 0; },
+    noGesture: noGesture, leases: leases, _setChange: function (t) { lastChange = t; }
   };
 
   function install() {
@@ -449,6 +485,7 @@
       // v8: same array while nothing changed, so Notion does not re-render the whole list on every update.
       var m = memo[id];
       if (m && m.len === len && m.cap === cap && m.last === all[len - 1] && m.first === all[0]) return m.out;
+      lastChange = Date.now();  // v15: the shown steps changed (new step, answer end, re-mount)
       var out = capStores(all, cap);
       memo[id] = { len: len, cap: cap, last: all[len - 1], first: all[0], out: out };
       return out;

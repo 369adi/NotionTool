@@ -44,6 +44,9 @@ if ($Rebuild -and $Mode -eq 'exe') {
 if ($LASTEXITCODE -ne 0) { L 'abort: an old instance is still alive or a harness port is busy'; exit 1 }
 # Rule I50 (user 2026-10-21): a restart is a FULL restart - also close the NotionTool Notion window,
 # otherwise injected window code stays old. app_autostart opens a fresh window with the new build.
+# Restart freeze (user 2026-10-28 05:20): store the open chat, scroll position and chat box text up to the
+# last letter right before the window closes or reloads; the new window opens exactly there again.
+$f = & $py "$root\work\freeze_window.py" 2>&1; L "freeze: $f"
 if (-not $KeepWindow) { $w = & $py "$root\work\stop_window.py" 2>&1; L "window: $w" }
 if ($Rebuild -and $Mode -eq 'exe') {
     Copy-Item "$root\dist\NotionTool.exe" "$root\work\NotionTool.exe.bak" -Force

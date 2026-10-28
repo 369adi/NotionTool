@@ -56,7 +56,7 @@ _PROPS = {
 SCREEN_TOOLS = {
     'screen_windows': ('List open desktop app windows (hwnd, title, process, size); screen_capture can target one of them', {}),
     'screen_capture': ('Capture the whole screen (all monitors) and return the image; pass target or hwnd to capture only '
-                       'one app window (for example Roblox Studio or Blender). No assignment token or code is needed. '
+                       'one app window (for example Blender). NOT for Roblox: use roblox_call -> screen_capture instead. No assignment token or code is needed. '
                        'Use it as often as needed to check what you are building. To SEE the image open the returned '
                        'view_url with the Notion file viewer (viewFileUrl).', _PROPS),
 }
@@ -68,6 +68,10 @@ SCREEN_OPERATOR_TOOLS = [
      'inputSchema': {'type': 'object', 'properties': _PROPS}},
 ]
 SCREEN_OPERATOR_NAMES = {t['name'] for t in SCREEN_OPERATOR_TOOLS}
+
+
+ROBLOX_ONLY = ('Roblox screenshots are disabled here. Use roblox_call -> screen_capture {studio_id, capture_id, '
+               'camera_position, look_at_position}, then open the returned view_url with viewFileUrl.')
 
 
 class CaptureError(ValueError):
@@ -407,7 +411,11 @@ class ScreenCapture:
                 if self.counts.get(task_id, 0) >= MAX_PER_TASK:
                     raise CaptureError(f'Capture limit of {MAX_PER_TASK} per task reached')
         self._purge()
+        if 'roblox' in str(args.get('target', '')).lower():
+            raise CaptureError(ROBLOX_ONLY)
         window = pick(self.lister(), args.get('target', ''), args.get('hwnd') or 0) if (args.get('target') or args.get('hwnd')) else None
+        if window is not None and 'roblox' in (str(window.get('process', '')) + ' ' + str(window.get('title', ''))).lower():
+            raise CaptureError(ROBLOX_ONLY)
         if window is None:
             window = dict(hwnd=0, title='Whole screen', process='screen')
             image, method = self.screen_grabber()
@@ -442,8 +450,11 @@ class ScreenCapture:
             info['note'] = 'Unchanged since the previous capture of the same screen or window; no image attached'
         info['ms'] = round((time.monotonic() - started) * 1000)
         self._log(info, args.get('reason', ''), task_id, run_id, role)
+        # Only method (owner 28.10.2026): the image goes to Notion and comes back as view_url, like
+        # roblox_call -> screen_capture. Never fall back to inline base64 (it arrives as text).
         if part and not notion_upload.publish(info, part['data'], part['mimeType'], window['process'] or 'capture'):
-            info['_image'] = {'data': part['data'], 'mimeType': part['mimeType']}
+            raise CaptureError('Capture upload to Notion failed (' + str(info.get('view_error') or 'upload is off')
+                               + '); no image returned. Fix the Notion upload and capture again.')
         return info
 
     def _log(self, info, reason, task_id, run_id, role):

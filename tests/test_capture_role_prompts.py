@@ -4,8 +4,8 @@ from notiontool import bridge, plain_protocol
 from notiontool.plain_protocol import prompt
 
 TOKEN = 'tok-ROLE-123'
-LINE = 'screen_windows and screen_capture are available through mcp_call with no assignment token'
-CHECK = 'to check the current state when needed'
+LINE = 'Images: only via a capture tool that returns a view_url'
+CHECK = 'open view_url with viewFileUrl'
 NO_RIGHTS = 'no write or shell rights'
 
 

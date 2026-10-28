@@ -85,6 +85,26 @@ r.bounded = X.nextCapFor(new Sparse('d', 1000, 100000), 30);
 r.dense = X.nextCapFor(new ThreadStore('e', 1000), 30);
 window.__ntStepCapOff = true;
 r.offLen = a.getMessageStores().length;
+window.__ntStepCapOff = false;
+function Big() { var e = new El('a', [95]); e.scrollHeight = 3000; e.clientHeight = 600; return e; }
+var elD = Big(); X._setChange(0);
+elD.scrollTop = 2400; X.onScroll({ target: elD });
+X._setChange(Date.now()); elD.scrollTop = 0; X.onScroll({ target: elD });
+r.doneFixBottom = elD.scrollTop; r.doneFixCount = window.__ntDoneFix || 0;
+var elM = Big(); X._setChange(0);
+elM.scrollTop = 1200; X.onScroll({ target: elM });
+X._setChange(Date.now()); elM.scrollTop = 0; X.onScroll({ target: elM });
+r.doneFixMiddle = elM.scrollTop;
+var elG = Big(); X._setChange(0);
+elG.scrollTop = 1200; X.onScroll({ target: elG });
+X._setChange(Date.now()); X.gesture.up = Date.now(); elG.scrollTop = 0; X.onScroll({ target: elG });
+r.userTop = elG.scrollTop; X.gesture.up = 0;
+var elO = Big(); X._setChange(0);
+elO.scrollTop = 1200; X.onScroll({ target: elO }); elO.scrollTop = 0; X.onScroll({ target: elO });
+r.noChangeTop = elO.scrollTop;
+var ls = new ThreadStore('l', 5); ls.lease = true; ls.getIsInferenceLeaseActive = function () { return this.lease; };
+window.__ntTSLive.l = ls; X.leases(1); ls.lease = false; r.leaseDone = X.leases(5000) === 5000;
+window.__ntStepCapOff = true;
 console.log(JSON.stringify(r));
 '''
 
@@ -105,7 +125,16 @@ class StepCapExpandTest(unittest.TestCase):
 
     def test_active_v14(self):
         self.assertEqual(self.r['state'], 'active')
-        self.assertEqual(self.r['version'], 14)
+        self.assertEqual(self.r['version'], 15)
+
+    def test_answer_end_jump_undone_v15(self):
+        r = self.r
+        self.assertEqual(r['doneFixBottom'], 3000)  # was at the bottom -> back to the bottom
+        self.assertEqual(r['doneFixMiddle'], 1200)  # was reading in the middle -> back to that place
+        self.assertGreaterEqual(r['doneFixCount'], 1)
+        self.assertEqual(r['userTop'], 0)           # the user scrolled up himself -> kept
+        self.assertEqual(r['noChangeTop'], 0)       # no answer end / change -> nothing undone
+        self.assertTrue(r['leaseDone'])
 
     def test_default_last_five_messages(self):
         r = self.r

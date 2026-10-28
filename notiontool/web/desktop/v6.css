@@ -369,10 +369,11 @@ html.nt-v6-on .layout-chat .notion-code-block .token.class-name { color: #7fb1e6
 
 /* ---- composer: #070e1b card, border #111a2b, no glow; Attach / Commands / Delegate; send 58x29 -- */
 html.nt-v6-on .nt-desk-composer {
-  background: #070e1b !important; border: 1px solid #111a2b !important; border-radius: 11px !important;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; outline: 0 !important;
+  background: var(--nt-raised, #16161d) !important; border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.08)) !important; border-radius: 16px !important;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3) !important; outline: 0 !important;
 }
-html.nt-v6-on .nt-desk-composer:focus-within { border-color: #16223a !important; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; }
+/* old purple composer is back (user 2026-10-28 03:44): purple-to-cyan border and soft purple glow while typing */
+html.nt-v6-on .nt-desk-composer:focus-within { border-color: transparent !important; background: linear-gradient(var(--nt-raised, #16161d), var(--nt-raised, #16161d)) padding-box, linear-gradient(135deg, var(--nt-accent-1, #8b5cf6), var(--nt-accent-2, #22d3ee)) border-box !important; box-shadow: 0 0 0 3px var(--nt-accent-glow, rgba(139, 92, 246, 0.18)), 0 14px 40px rgba(0, 0, 0, 0.45) !important; }
 /* dictation (user 2026-10-27): Notion's own mic button stays in the composer */
 html.nt-v6-on [data-nt-v6="mic"] { opacity: 1 !important; pointer-events: auto !important; visibility: visible !important; color: #aeb8dc !important; border-radius: 7px !important; }
 html.nt-v6-on [data-nt-v6="mic"]:hover { background: rgba(120, 140, 200, 0.1) !important; color: var(--v6-text) !important; }
@@ -437,13 +438,13 @@ html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer,
 html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer:focus-within,
 html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer,
 html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within {
-  background: #070e1b !important; border: 1px solid #111a2b !important; border-radius: 11px !important;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35) !important; max-width: none !important;
+  background: var(--nt-raised, #16161d) !important; border: 1px solid var(--nt-border, rgba(255, 255, 255, 0.08)) !important; border-radius: 16px !important;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3) !important; max-width: none !important;
 }
 html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer:focus-within,
-html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within { border-color: #16223a !important; }
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within { border-color: transparent !important; background: linear-gradient(var(--nt-raised, #16161d), var(--nt-raised, #16161d)) padding-box, linear-gradient(135deg, var(--nt-accent-1, #8b5cf6), var(--nt-accent-2, #22d3ee)) border-box !important; box-shadow: 0 0 0 3px var(--nt-accent-glow, rgba(139, 92, 246, 0.18)), 0 14px 40px rgba(0, 0, 0, 0.45) !important; }
 /* the mockup has no "NotionTool" label on the composer border */
-html.nt-v6-on .nt-desk-composer-empty::after { content: none !important; display: none !important; }
+/* the old composer keeps its small "NotionTool" label on the border (chrome.css) */
 html.nt-v6-on.nt-theme:not(.nt-desk-off) div:has(> div > .nt-desk-composer),
 html.nt-v6-on body div:has(> div > .nt-desk-composer) { max-width: 872px !important; transition: none !important; }
 /* ---- user review 22:43 (screenshot vs mockup 010922) ---------------------------------------------- */
@@ -748,3 +749,141 @@ html.nt-v6-rz-drag .nt-v6-sb, html.nt-v6-rz-drag .nt-v6-hd, html.nt-v6-rz-drag .
 .nt-v6-list.arch .nt-v6-row .nt-v6-t1 { font-size: 13px; }
 .nt-v6-main .nt-v6-t1 { font-size: 14px; line-height: 18px; }
 .nt-v6-sep { margin-top: 10px; }
+
+/* ---- round 15 (user 2026-10-28 03:55): calm old user bubble, clearer answers ------------------------ */
+/* user bubble: dark raised card with a faint purple edge instead of the bright purple-blue gradient */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) [data-agent-chat-user-step-id] div[data-nt-v6="ububble"][data-nt-v6="ububble"][data-nt-v6="ububble"],
+html.nt-v6-on [data-nt-v6="ububble"][data-nt-v6="ububble"] {
+  background: var(--nt-raised, #16161d) !important; color: #e8e8ee !important;
+  border: 1px solid rgba(139, 92, 246, 0.35) !important; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28) !important;
+}
+/* answer colours (turquoise bold, grey text) were removed again (user 2026-10-28 04:03) */
+/* ---- round 16 (user 2026-10-28 04:02): focus on the chat - slim header, wider chat and composer ---- */
+html.nt-v6-on .nt-v6-toprow { min-height: 46px !important; height: 46px !important; }
+html.nt-v6-on .nt-v6-hd { padding-right: 14px; gap: 10px; }
+html.nt-v6-on .nt-v6-ttl { top: 0; }
+html.nt-v6-on .nt-v6-ttl b { font-size: 14.5px; line-height: 18px; }
+html.nt-v6-on .nt-v6-ttl span { display: none !important; }
+html.nt-v6-on .nt-v6-stat { top: 0; height: 32px; min-width: 0; width: auto; border-radius: 9px; }
+html.nt-v6-on .nt-v6-si { font-size: 11px; }
+html.nt-v6-on .layout-chat div[style*="max-width: 798px"][style*="padding-inline: 52px"] { max-width: 1120px !important; }
+html.nt-v6-on div:has(> div > .nt-desk-composer),
+html.nt-v6-on.nt-theme:not(.nt-desk-off) div:has(> div > .nt-desk-composer),
+html.nt-v6-on body div:has(> div > .nt-desk-composer) { max-width: 1114px !important; }
+
+/* user 2026-10-28 04:06: nothing of Notion's own sidebar may show next to the panel (dots, titles) */
+html.nt-v6-on .notion-sidebar-container { overflow: hidden !important; }
+html.nt-v6-on .notion-sidebar-container * { visibility: hidden !important; }
+
+/* ---- round 17 (user 2026-10-28 04:18): no left rail - its tabs are a small icon row on top of the chat panel, like Notion ---- */
+html.nt-v6-on { --nt-rail-w: 0px !important; }
+html.nt-v6-on.nt-shell-on .notion-app-inner { margin-left: 0 !important; width: 100% !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail {
+  top: 9px !important; left: 16px !important; bottom: auto !important; right: auto !important;
+  width: auto !important; height: 32px !important; min-height: 0 !important; padding: 0 !important; gap: 0 !important;
+  flex-direction: row !important; align-items: center !important; overflow: visible !important;
+  background: transparent !important; border: 0 !important; box-shadow: none !important; z-index: 130 !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-rail-logo, html.nt-v6-on.nt-shell-on nav.nt-rail .nt-rail-status { display: none !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tabs {
+  flex-direction: row !important; align-items: center !important; gap: 2px !important; padding: 0 !important; margin: 0 !important; width: auto !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab {
+  position: relative !important; width: 32px !important; height: 30px !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important;
+  display: flex !important; flex-direction: row !important; justify-content: center !important; align-items: center !important;
+  border-radius: 7px !important; border: 0 !important; box-shadow: none !important; background: transparent !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab::before, html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab::after { display: none !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab:hover { background: rgba(255, 255, 255, 0.07) !important; color: #eef2f9 !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab.nt-shell-tab-active,
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab.nt-shell-tab-active:hover {
+  background: rgba(129, 82, 238, 0.24) !important; color: #fff !important; box-shadow: none !important; border: 0 !important;
+}
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab-label { display: none !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab-icon { display: flex !important; margin: 0 !important; color: inherit !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab svg { width: 18px !important; height: 18px !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-v6-badge, html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab-badge {
+  top: 0 !important; right: 0 !important; min-width: 13px !important; height: 13px !important; padding: 0 2px !important;
+  font-size: 8.5px !important; line-height: 13px !important; box-shadow: none !important;
+}
+html.nt-v6-on .nt-v6-sb { padding-top: 48px !important; }
+html.nt-v6-on.nt-shell-view-open:has(.nt-desk-stab) .nt-shell-layer { left: var(--nt-v6-sbw, 260px) !important; }
+
+/* ---- round 18 (user 2026-10-28 04:33): calm and clean - no counter on Live, no loud gradients or glows, composer in the panel colors ---- */
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-v6-badge, html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab-badge { display: none !important; }
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab.nt-shell-tab-active,
+html.nt-v6-on.nt-shell-on nav.nt-rail .nt-shell-tab.nt-shell-tab-active:hover { background: rgba(255, 255, 255, 0.09) !important; color: #f1f4f9 !important; }
+/* New chat: quiet button instead of the purple-to-cyan bar */
+html.nt-v6-on .nt-v6-new {
+  background: #121a28 !important; border: 1px solid #1f2a3c !important; color: #dce3ee !important; box-shadow: none !important;
+  height: 34px !important; margin-bottom: 14px !important; font-weight: 500 !important; filter: none !important;
+}
+html.nt-v6-on .nt-v6-new:hover { background: #18212f !important; border-color: #2a374c !important; color: #fff !important; }
+/* open chat card: flat, thin border, no purple glow */
+html.nt-v6-on .nt-v6-main, html.nt-v6-on .nt-v6-main.run {
+  background: #0f1624 !important; border: 1px solid #1d2738 !important; border-left-width: 1px !important; box-shadow: none !important;
+}
+/* panel: one flat surface */
+html.nt-v6-on .nt-v6-sb-in { background: #070c16 !important; border-color: #121a27 !important; }
+/* status dots without neon glow; thinking tag in grey */
+html.nt-v6-on .nt-v6-dot { box-shadow: none !important; }
+html.nt-v6-on .nt-v6-livetag { color: #95a1b8 !important; }
+/* resizer and Stop: neutral */
+html.nt-v6-on .nt-v6-rz:hover::after, html.nt-v6-on .nt-v6-rz.drag::after { background: rgba(160, 175, 200, 0.45) !important; box-shadow: none !important; }
+html.nt-v6-on .nt-v6-stop:not(.off) > span { background: #2a1820 !important; color: #e2a3b0 !important; }
+/* composer: same dark blue as the panel, thin border, focus = slightly lighter border (no gradient, no glow) */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer.nt-desk-composer,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer.nt-desk-composer {
+  background: #0b111c !important; border: 1px solid #1b2433 !important; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35) !important;
+}
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within,
+html.nt-v6-on .nt-desk-composer.nt-desk-composer.nt-desk-composer.nt-desk-composer:focus-within {
+  background: #0b111c !important; border: 1px solid #2c3a52 !important; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35) !important;
+}
+/* send: solid calm button */
+html.nt-v6-on [data-nt-v6="send"][data-nt-v6="send"] { background: #2a3550 !important; box-shadow: none !important; }
+html.nt-v6-on [data-nt-v6="send"][data-nt-v6="send"]:hover { background: #34425f !important; }
+/* ---- round 18b (user 2026-10-28 04:39 / 04:41): tool steps and "Model is working" calm and compact ---- */
+html.nt-v6-on [data-nt-v6="tool"][data-nt-v6="tool"] {
+  min-height: 30px !important; padding: 0 24px 0 50px !important;
+  background: linear-gradient(#141b28, #141b28) 6.1px 0 / 1px 100% no-repeat !important;
+}
+html.nt-v6-on [data-nt-v6="tool"][data-nt-v6="tool"]:hover { background-color: rgba(255, 255, 255, 0.03) !important; }
+html.nt-v6-on [data-nt-v6="tool"][data-nt-v6="tool"]::before {
+  left: 26px !important; width: 14px !important; height: 14px !important; margin-top: -7px !important; box-shadow: none !important;
+  background: rgba(255, 255, 255, 0.05) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237f8aa0' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12.5l4.5 4.5L19 7.5'/></svg>") center / 9px 9px no-repeat !important;
+}
+html.nt-v6-on [data-nt-v6="tool"][data-nt-v6="tool"] * { font-size: 11.5px !important; color: #98a3b7 !important; }
+html.nt-v6-on [data-nt-v6="tool"][data-nt-v6="tool"]:hover * { color: #cdd4df !important; }
+html.nt-v6-on [data-nt-v6="tool"][data-nt-v6="tool"]::after { color: #5d687d !important; font-size: 10.3px !important; right: 24px !important; }
+html.nt-v6-on [data-nt-v6="steps"][data-nt-v6="steps"][data-nt-v6="steps"] {
+  min-height: 30px !important; padding: 0 24px 0 50px !important;
+  background: linear-gradient(#141b28, #141b28) 6.1px 0 / 1px 100% no-repeat !important;
+}
+html.nt-v6-on [data-nt-v6="steps"][data-nt-v6="steps"][data-nt-v6="steps"] .nt-desk-steps { font-size: 11.5px !important; color: #6f7a90 !important; }
+/* "N tool steps": plain text line instead of a pill */
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head::before {
+  height: 24px !important; line-height: 24px !important; padding: 0 8px !important; border-radius: 6px !important;
+  background: transparent !important; border: 0 !important; color: #737e94 !important; font-size: 11.5px !important;
+}
+html.nt-v6-on.nt-theme:not(.nt-desk-off) .layout-chat .nt-desk-toolgroup-head:hover::before { background: rgba(255, 255, 255, 0.04) !important; color: #c3cbd8 !important; }
+/* "Model is working": small grey line, thin grey spinner */
+html.nt-v6-on .nt-v6-fwork.nt-v6-fwork { margin: 8px 0 4px 26px !important; gap: 8px !important; color: #7d889e !important; font: 500 11.5px/1.3 var(--v6-font) !important; }
+html.nt-v6-on .nt-v6-fwork.nt-v6-fwork i { width: 10px !important; height: 10px !important; border: 1.5px solid #1c2433 !important; border-top-color: #8e9ab0 !important; }
+
+/* ---- round 19 (user 2026-10-28 05:02): Notion never shows through ---------------------------------------
+   In a chat (html.nt-v6-mask, set by v6.js) Notion's app paints nothing by default. visibility is inherited
+   and a child can turn it back on, so a re-mounted Notion row, a chat switch, a window resize or a panel that is
+   placed one tick late shows the app background instead of Notion. Only these parts paint: our own nodes, the
+   composer, Notion's menus, dialogs, tooltips and alerts, and Notion's chat area while the own feed is off. */
+html.nt-v6-on.nt-v6-mask, html.nt-v6-on.nt-v6-mask body { background: var(--v6-bg) !important; }
+html.nt-v6-on.nt-v6-mask #notion-app { visibility: hidden !important; }
+html.nt-v6-on.nt-v6-mask #notion-app [data-nt-desk-own],
+html.nt-v6-on.nt-v6-mask #notion-app .nt-rail,
+html.nt-v6-on.nt-v6-mask #notion-app .nt-desk-composer,
+html.nt-v6-on.nt-v6-mask #notion-app .notion-overlay-container,
+html.nt-v6-on.nt-v6-mask #notion-app .notion-peek-renderer,
+html.nt-v6-on.nt-v6-mask #notion-app [role="dialog"],
+html.nt-v6-on.nt-v6-mask #notion-app [role="tooltip"],
+html.nt-v6-on.nt-v6-mask #notion-app [role="alert"],
+html.nt-v6-on.nt-v6-mask:not(.nt-v6-feed-on) #notion-app .layout-chat { visibility: visible; }

@@ -22,9 +22,14 @@ CSS = (
     'body *{background-color:transparent !important;border-color:transparent !important;'
     'box-shadow:none !important}'
     '[role="button"],[role="tab"]{opacity:0 !important;pointer-events:none !important}'
+    # user 2026-10-28 04:41: Notion's bar was still visible - every element of the bar is invisible now
+    # (layout and the window drag area stay; the native window buttons are drawn by Electron)
+    'body>*,body>*>*{opacity:0 !important}'
+    'button,a,[draggable="true"]{pointer-events:none !important}'
 )
 RETRIES = 15
 RETRY_S = 2.0
+KEEP_S = 5.0  # keep-alive: the skin is checked again every few seconds (the bar can come back after a reload)
 
 
 def skin_source(css=CSS):
@@ -72,11 +77,40 @@ def apply(http_get, connect, port, holder=None):
         return dict(ok=False, reason=str(exc)[:200])
 
 
-def start(app, *, retries=RETRIES, interval=RETRY_S, sleep=time.sleep, thread=True):
+def refresh(holder):
+    """Re-run the (idempotent) skin script on the kept session. False when there is no live session."""
+    session = holder.get('session') if holder is not None else None
+    if session is None:
+        return False
+    try:
+        session.send('Runtime.evaluate', {'expression': skin_source()})
+        return True
+    except Exception:  # noqa: BLE001 - socket gone: the keep-alive connects again
+        try:
+            session.close()
+        except Exception:  # noqa: BLE001
+            pass
+        holder['session'] = None
+        return False
+
+
+def keep_alive(http_get, connect, port, holder, *, interval=KEEP_S, sleep=time.sleep, rounds=None):
+    """Every few seconds: refresh the skin, or connect again when the session or the target is gone
+    (user 2026-10-28 04:41: the Notion bar showed again). rounds=None runs until holder['stop']."""
+    n = 0
+    while not holder.get('stop') and (rounds is None or n < rounds):
+        n += 1
+        sleep(interval)
+        if not refresh(holder):
+            holder['result'] = dict(apply(http_get, connect, port, holder), attempt='keep')
+
+
+def start(app, *, retries=RETRIES, interval=RETRY_S, sleep=time.sleep, thread=True, keep=None):
     """Apply the skin for a DesktopApp, retrying while the tab bar target is not there yet.
-    Runs in a daemon thread unless thread=False (tests). Returns the holder dict
-    ({'result': ..., 'session': ...})."""
+    Runs in a daemon thread unless thread=False (tests). keep (default: same as thread) keeps
+    checking the skin afterwards. Returns the holder dict ({'result': ..., 'session': ...})."""
     holder = {'result': None, 'session': None}
+    keep = thread if keep is None else keep
     http_get, connect, port = getattr(app, '_http_get', None), getattr(app, '_connect', None), getattr(app, 'port', None)
     if not callable(http_get) or not callable(connect) or not isinstance(port, int):
         holder['result'] = dict(ok=False, reason='no desktop app')
@@ -87,8 +121,10 @@ def start(app, *, retries=RETRIES, interval=RETRY_S, sleep=time.sleep, thread=Tr
             result = apply(http_get, connect, port, holder)
             holder['result'] = dict(result, attempt=attempt + 1)
             if result.get('ok'):
-                return
+                break
             sleep(interval)
+        if keep:
+            keep_alive(http_get, connect, port, holder, sleep=sleep)
 
     if thread:
         threading.Thread(target=run, name='nt-tabbar-skin', daemon=True).start()

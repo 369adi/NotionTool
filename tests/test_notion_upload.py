@@ -9,7 +9,7 @@ from unittest import mock
 from PIL import Image
 
 from notiontool import notion_upload, rea
-from notiontool.screen_capture import ScreenCapture
+from notiontool.screen_capture import CaptureError, ScreenCapture
 
 THREAD = '00000000-0000-4000-8000-000000000001'
 SPACE = '00000000-0000-4000-8000-000000000002'
@@ -126,7 +126,7 @@ class CaptureUploadTests(unittest.TestCase):
         self.addCleanup(setattr, notion_upload, 'ACTIVE', notion_upload.ACTIVE)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        windows = [dict(hwnd=22, title='Place1 - Roblox Studio', process='RobloxStudioBeta.exe', pid=2, width=1920,
+        windows = [dict(hwnd=33, title='Blender [ship.blend]', process='blender.exe', pid=3, width=1920,
                         height=1040, minimized=False, foreground=False)]
         self.screen = ScreenCapture(Events(tmp.name), lister=lambda: windows,
                                     grabber=lambda hwnd, restore=False: (Image.new('RGB', (800, 600), (40, 90, 160)), 'print_window'))
@@ -134,20 +134,21 @@ class CaptureUploadTests(unittest.TestCase):
     def test_uploaded_capture_carries_view_url_instead_of_base64(self):
         notion_upload.ACTIVE = True
         with mock.patch.object(notion_upload, 'upload', return_value={'view_url': 'file://cap'}) as up:
-            result = self.screen.call('screen_capture', {'target': 'roblox'})
+            result = self.screen.call('screen_capture', {'target': 'blender'})
         self.assertNotIn('_image', result)
         self.assertEqual(result['view_url'], 'file://cap')
         self.assertIn('viewFileUrl', result['view_hint'])
-        self.assertIn('robloxstudiobeta-exe', up.call_args[0][2])
+        self.assertIn('blender-exe', up.call_args[0][2])
 
-    def test_capture_keeps_the_image_when_upload_is_off_or_fails(self):
+    def test_capture_is_an_error_when_upload_is_off_or_fails(self):
+        # Only method (owner 28.10.2026): view_url or an error, never inline base64.
         notion_upload.ACTIVE = False
-        self.assertIn('_image', self.screen.call('screen_capture', {'target': 'roblox'}))
+        with self.assertRaisesRegex(CaptureError, 'upload is off'):
+            self.screen.call('screen_capture', {'target': 'blender'})
         notion_upload.ACTIVE = True
         with mock.patch.object(notion_upload, 'upload', side_effect=RuntimeError('down')):
-            result = self.screen.call('screen_capture', {'target': 'roblox'})
-        self.assertIn('_image', result)
-        self.assertEqual(result['view_error'], 'down')
+            with self.assertRaisesRegex(CaptureError, 'down'):
+                self.screen.call('screen_capture', {'target': 'blender'})
 
 
 class McpImageTests(unittest.TestCase):

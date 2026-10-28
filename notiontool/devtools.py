@@ -37,8 +37,8 @@ _PS_CMD = re.compile(r'\b(?:powershell|pwsh)(?:\.exe)?\b.*?(?<![\w-])-(?:c|comma
 
 # Opening an image/video in a desktop app pops up the Photos app on the owner PC (User 2026-10-23).
 IMAGE_OPEN_BLOCKED = ('Blocked: never open images/videos in a desktop app (Photos pops up on the owner PC). '
-                      'Check renders inside Blender (bpy.data.images pixel stats) or with nt_screen_capture '
-                      'of the Blender window instead.')
+                      'Check renders inside Blender (bpy.data.images pixel stats) or upload them so they return a view_url '
+                      'and open that with viewFileUrl instead.')
 _IMG_OPEN = re.compile(r'\b(?:Start-Process|saps|Invoke-Item|ii|start|explorer(?:\.exe)?|mspaint(?:\.exe)?)\b'
                        r'[^;|\n]*\.(?:png|jpe?g|webp|bmp|gif|tiff?|exr|mp4)\b', re.I)
 

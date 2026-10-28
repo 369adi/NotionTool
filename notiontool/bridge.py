@@ -284,7 +284,8 @@ class Bridge:
         return bool(self.store.settings().get('mcp_browser_access', False))
 
     def screen_access(self):
-        # Window capture is read-only and on by default; Settings can switch it off.
+        # Whole-PC capture is read-only and on by default (owner 28.10.2026). It only ever returns a
+        # Notion view_url (same method as roblox_call -> screen_capture), never inline base64.
         return bool(self.store.settings().get('screen_capture', True))
 
     def screen(self):

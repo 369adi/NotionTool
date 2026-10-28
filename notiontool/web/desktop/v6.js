@@ -729,18 +729,29 @@
     // Own frame (user 26.10. 03:31): the sidebar is NotionTool's, with its own width and resize handle.
     // Notion's sidebar box only reserves that width and stays invisible behind it.
     var wk = null, lastWk = '';
-    var SBW_KEY = 'nt-v6-sbw2', SBW_MIN = 260, SBW_MAX = 520, sbw = 320, rz = null, rzDrag = null, rzRaf = 0;
+    // user 2026-10-28 04:02: the chat is the focus - narrower panel by default (new key, so the old 320 is not reused)
+    // 260 is the narrowest width Notion's own sidebar box accepts; below it Notion showed through next to the panel
+    var SBW_KEY = 'nt-v6-sbw3', SBW_MIN = 260, SBW_MAX = 520, sbw = 260, rz = null, rzDrag = null, rzRaf = 0;
     try { var sbv = parseInt(localStorage.getItem(SBW_KEY), 10); if (sbv >= SBW_MIN && sbv <= SBW_MAX) sbw = sbv; } catch (e) { /* ignore */ }
     function railRight() {
-      var n = document.querySelector('nav.nt-rail'), r = n && n.getBoundingClientRect();
-      return r && r.width ? Math.round(r.right) : 66;
+      // user 2026-10-28 04:18: the rail is a small icon row on top of the panel now (like Notion), Notion is not pushed right
+      return 0;
     }
     function applySbw() {
       if (rzDrag) return;  // user 2026-10-27 21:05: Notion re-laid out behind the panel while dragging; apply on release
       var v = sbw + 'px';
       if (root.style.getPropertyValue('--nt-v6-sbw') !== v) root.style.setProperty('--nt-v6-sbw', v);
     }
-    function sbRect() { applySbw(); return { left: railRight(), top: 0, width: sbw, height: window.innerHeight }; }
+    // user 2026-10-28 04:06: the panel always covers Notion's whole sidebar box, also when Notion keeps it wider than sbw
+    function sbRect() {
+      applySbw();
+      var left = railRight(), w = sbw;
+      try {
+        var sc = document.querySelector('.notion-sidebar-container'), scR = sc && sc.getBoundingClientRect();
+        if (scR && scR.width) { var need = Math.round(scR.right) - left; if (need > w && need < w + 240) w = need; }
+      } catch (e) { /* ignore */ }
+      return { left: left, top: 0, width: w, height: window.innerHeight };
+    }
     function placeRz(r) {
       if (!rz || !rz.isConnected) {
         rz = document.createElement('div');
@@ -814,9 +825,23 @@
       if (sc.classList.contains('fb') !== below) sc.classList.toggle('fb', below);
     }
 
+    // round 19 (user 2026-10-28 05:02: Notion showed through on chat switch, window move and start): in a chat
+    // Notion's app paints nothing by default (v6.css html.nt-v6-mask); only our nodes, the composer, menus and
+    // the chat area paint. The boot cover of the desktop bootstrap goes once Notion's own layout is there.
+    function maskSync() {
+      var chat = document.querySelector('.layout-chat');
+      var on = !!(chat || currentThread());
+      if (root.classList.contains('nt-v6-mask') !== on) root.classList.toggle('nt-v6-mask', on);
+      if (typeof window.__ntBootCoverOff === 'function' && (chat || document.querySelector('.layout-content,.notion-frame'))) {
+        var off = window.__ntBootCoverOff; window.__ntBootCoverOff = null; off();
+      }
+    }
+
     function render() {
       if (stopped || !document.body) return;
       if (!root.classList.contains(CLS_ON)) root.classList.add(CLS_ON);
+      resumeTick();
+      maskSync();
       ensureNodes();
       var now = Date.now();
       if (now - agesAt > AGES_MS) loadAges();
@@ -943,6 +968,36 @@
     // re-mounts its list (voice recording cancelled) the mirrored turns stay for up to FEED_GRACE_MS.
     var fdDirty = new Set(), fdAll = true, fdFullAt = 0, fdGone = 0, fdThread = '', fdScr = null, fdScrAt = 0, fdPlaced = '', fdRo = null;
     var FEED_GRACE_MS = 6000, FEED_FULL_MS = 3000;
+    // user 2026-10-28 04:19: own chats stay loaded - the last turns of the last chats are kept, so a switch shows them
+    // at once while Notion loads the thread. 04:24: only the last 5 messages per chat, never the whole history.
+    // Coworker chats are not kept.
+    var fdCache = new Map(), fdSnap = null, fdSnapAt = 0, fdTitle = '', FD_CACHE_MAX = 8, FD_KEEP_TURNS = 5, FD_SNAP_MS = 15000;
+    function feedStash() {
+      if (!fdIn || !fdThread || fdSnap || COWORKER_RE.test(fdTitle)) return;
+      var keep = [];
+      for (var c = fdIn.firstChild; c; c = c.nextSibling) if (c !== fdWork && c.nodeType === 1 && c.hasAttribute('data-nt-v6-turn')) keep.push(c);
+      keep = keep.slice(-FD_KEEP_TURNS);
+      if (!keep.length) return;
+      for (var i = 0; i < keep.length; i++) keep[i].__ntOrig = null;  // do not hold Notion's old nodes in memory
+      fdCache.delete(fdThread); fdCache.set(fdThread, keep);
+      while (fdCache.size > FD_CACHE_MAX) fdCache.delete(fdCache.keys().next().value);
+    }
+    function feedSnapShow(host, th) {
+      var keep = fdCache.get(th);
+      if (!keep || !keep.length) return false;
+      feedEnsure(host);
+      fdIn.textContent = '';
+      for (var i = 0; i < keep.length; i++) fdIn.appendChild(keep[i]);
+      fdSnap = keep; fdSnapAt = Date.now(); fdThread = th; fdStick = true;
+      root.classList.add('nt-v6-feed-on');
+      feedPlace(); fdSc.scrollTop = fdSc.scrollHeight;
+      return true;
+    }
+    function feedSnapDrop() {
+      if (!fdSnap) return;
+      for (var i = 0; i < fdSnap.length; i++) if (!fdSnap[i].__ntOrig && fdSnap[i].parentNode) fdSnap[i].parentNode.removeChild(fdSnap[i]);
+      fdSnap = null;
+    }
     var FD_SEL = '[role="button"],button,a,[aria-expanded]';
     function feedList() {
       var lc = document.querySelector('.layout-content');
@@ -1088,6 +1143,7 @@
       fdObs.observe(list, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['aria-expanded', 'data-nt-v6-dur', 'data-nt-v6', 'class', 'data-nt-tl2'] });
     }
     function feedOff() {
+      feedStash(); fdSnap = null;
       if (fdObs) { fdObs.disconnect(); fdObs = null; }
       if (fdQ) { clearTimeout(fdQ); fdQ = 0; }
       if (fdList) { fdList.removeAttribute('data-nt-v6-src'); fdList = null; }
@@ -1118,11 +1174,20 @@
       var off = false;
       try { off = localStorage.getItem('nt-v6-feed') === '0'; } catch (e) { /* ignore */ }
       var list = off ? null : feedList(), host = document.querySelector('.layout-chat'), th = currentThread();
-      if (!list || !host || !document.querySelector('.nt-v6-hd')) {
+      var hdOn = !!document.querySelector('.nt-v6-hd');
+      if (th && fdThread && th !== fdThread) {  // switched chat: keep the old chat's last turns, show the new chat's at once
+        feedStash(); fdSnap = null; fdGone = 0;
+        fdMap = new Map(); if (fdIn) fdIn.textContent = ''; fdWork = null; fdStick = true; fdAll = true; fdThread = th;
+        if (!off && host && hdOn) feedSnapShow(host, th);
+      }
+      if (!list || !host || !hdOn) {
         if (!off && fd && host && fd.parentNode === host && fdMap.size && th === fdThread) {
           if (!fdGone) fdGone = Date.now();
           if (Date.now() - fdGone < FEED_GRACE_MS) return;  // Notion is re-mounting the list: keep the mirror
         }
+        // Notion still loads the chat: show its kept last turns meanwhile
+        if (!off && host && hdOn && th && th === fdThread && !fdMap.size &&
+            (fdSnap ? (Date.now() - fdSnapAt < FD_SNAP_MS || (fdCache.delete(th), false)) : feedSnapShow(host, th))) return;
         if (fd || fdList) feedOff();
         return;
       }
@@ -1134,11 +1199,17 @@
         }
         if (fdList) fdList.removeAttribute('data-nt-v6-src');
         fdList = list; list.setAttribute('data-nt-v6-src', '1');
-        fdMap = new Map(); fdIn.textContent = ''; fdWork = null; fdStick = true; fdAll = true; fdScr = null; fdScrAt = 0;
+        fdMap = new Map(); if (!fdSnap) fdIn.textContent = ''; fdWork = null; fdStick = true; fdAll = true; fdScr = null; fdScrAt = 0;
         feedObserve(list);
       }
       fdThread = th;
       var now = Date.now(), full = fdAll || now - fdFullAt > FEED_FULL_MS;
+      if (fdSnap) {  // the kept turns stay until Notion has painted this chat's own rows
+        var pv = 0;
+        for (var q = 0; q < list.children.length && pv < 2; q++) if (!list.children[q].hasAttribute('data-nt-desk-own') && list.children[q].getClientRects().length) pv++;
+        if (pv < Math.min(fdSnap.length, 2) && now - fdSnapAt < FD_SNAP_MS) { feedPlace(); return; }
+        feedSnapDrop();
+      }
       var kids = list.children, prev = null, seen = new Set(), changed = false, vis = 0;
       for (var i = 0; i < kids.length; i++) {
         var n = kids[i];
@@ -1146,11 +1217,12 @@
         vis++;
         var e = fdMap.get(n);
         if (!e || full || fdDirty.has(n)) {  // only changed rows are serialized (was: every row, every sync)
-          var sig = n.innerHTML.length + ':' + n.textContent.length;
+          var cs = n.textContent.length + ':' + n.getElementsByTagName('*').length;  // user 04:41 (switch lagged): cheap check first
+          var sig = e && !fdDirty.has(n) && e.cs === cs ? e.sig : n.innerHTML.length + ':' + cs;  // full pass: unchanged rows are not serialized again
           if (!e || e.sig !== sig) {
             var c = feedClone(n);
             if (e && e.c.parentNode) e.c.parentNode.replaceChild(c, e.c);
-            e = { sig: sig, c: c }; fdMap.set(n, e); changed = true;
+            e = { sig: sig, cs: cs, c: c }; fdMap.set(n, e); changed = true;
           }
         }
         var want = prev ? prev.nextSibling : fdIn.firstChild;
@@ -1173,6 +1245,7 @@
       if (fdOlder.style.display !== od) fdOlder.style.display = od;
       var moved = feedPlace();
       if (fdStick && (changed || moved)) fdSc.scrollTop = fdSc.scrollHeight;
+      fdTitle = currentTitle();  // feedStash skips coworker chats by this title
     }
 
     // New chat (user 2026-10-27 21:05): overlay.js asks v6 to open the chat it just created.
@@ -1195,6 +1268,7 @@
       }
       try { feedSync(); } catch (e) { try { feedOff(); } catch (x) { /* ignore */ } }
       try { placeScrollBtn(); } catch (e) { /* ignore */ }
+      try { draftTick(); } catch (e) { /* ignore */ }
       try { render(); } catch (e) {
         if (!errLogged) { errLogged = true; try { console.warn('[NotionTool v6]', e); } catch (x) { /* ignore */ } }
       }
@@ -1321,7 +1395,7 @@
     // Header label = what the request pin really sends (user 2026-10-27: the Roblox chat showed "Maximum" while
     // data/model_pin.log sent xhigh). Truth order: the backend pick (chat_effort_get, enforced by the pin), then
     // the locally remembered pick; both shown as one canonical label.
-    var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' };
+    var EFFORT_LABEL = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'xHigh', max: 'Max' };
     var effortBackend = {}, effortAskAt = {};
     function effortLabel(v) { var l = effortLevel(v); return EFFORT_LABEL[l] || cap(v); }
     function askEffort(tid) {
@@ -1349,27 +1423,28 @@
       return m ? cap(m[1]) : '';
     }
     function onEffortPick(e) {
+      // round 19 (user 2026-10-28 05:02: the chat was on xHigh, the header said High and the pin sent high):
+      // the level comes from the clicked menu row itself and is stored at once. The old delayed read of
+      // Notion's button label (400 ms later) missed picks, so the backend kept the old level.
       var it = e.target && e.target.closest ? e.target.closest('[role^="menuitem"],[role="option"]') : null;
-      if (!it || !it.closest('.notion-overlay-container [role="dialog"]') || !EFFORT_RE.test(text(it))) return;
-      var tid = currentThread();
-      if (!tid) return;
-      setTimeout(function () {
-        var lvl = nativeEffort();
-        if (!lvl || currentThread() !== tid) return;
-        try { localStorage.setItem('nt-effort-pick:' + tid, lvl); } catch (err) { /* ignore */ }
-        // The pick is also stored on the backend and enforced by the request pin, so Notion's own
-        // reset to 'medium' after a chat switch can never override the user's choice.
-        try {
-          if (ctx && typeof ctx.call === 'function') {
-            ctx.call('chat_effort_pick', { thread_id: tid, effort: effortLevel(lvl) }).then(function () {
-              var lv = effortLevel(lvl);
-              if (EFFORT_LABEL[lv]) effortBackend[tid] = lv;
-              if (!stopped) tick();
-            }, function () {});
-          }
-        } catch (err) { /* ignore */ }
-        if (!stopped) tick();
-      }, 400);
+      var box = it && it.closest('.notion-overlay-container');
+      if (!box || !EFFORT_RE.test(text(it))) return;
+      var menu = it.closest('[role="menu"],[role="dialog"],[role="listbox"]') || box;
+      if (!/\beffort\b/i.test(text(menu)) && !/\beffort\b/i.test(text(box))) return;
+      var tid = currentThread(), lv = effortLevel(text(it));
+      if (!tid || !EFFORT_LABEL[lv]) return;
+      try { localStorage.setItem('nt-effort-pick:' + tid, lv); } catch (err) { /* ignore */ }
+      effortBackend[tid] = lv; effortAskAt[tid] = Date.now();
+      // The pick is also stored on the backend and enforced by the request pin, so Notion's own
+      // reset to 'medium' after a chat switch can never override the user's choice.
+      try {
+        if (ctx && typeof ctx.call === 'function') {
+          Promise.resolve(ctx.call('chat_effort_pick', { thread_id: tid, effort: lv })).then(function () {
+            if (!stopped) tick();
+          }, function () { effortAskAt[tid] = 0; delete effortBackend[tid]; if (!stopped) tick(); });
+        }
+      } catch (err) { /* ignore */ }
+      if (!stopped) tick();
     }
     var pillDownOpen = false;
     function onPillDown(e) {
@@ -1456,6 +1531,133 @@
       }
     }
 
+    // ---- chat drafts (user 2026-10-28 04:49): the text in the chat box survives every restart, per chat,
+    // up to the last typed letter. Saved right after each input locally and in data/desktop_drafts.json
+    // (draft_save); after a restart or a chat switch an empty chat box gets its draft back, cursor at the end.
+    // A draft is only cleared by the user (sending or deleting the text), never by Notion rebuilding the box.
+    var DRAFT_LS = 'nt-v6-draft:', draftThread = null, draftLast = {}, draftWait = {}, draftShown = {}, draftSent = {}, draftLen = {}, draftT = 0;
+    function draftEd() { var c = document.querySelector('.nt-desk-composer'); return c ? c.querySelector('[contenteditable="true"]') : null; }
+    function draftText(ed) { return ed ? String(ed.innerText || '').replace(/\u200b/g, '').replace(/\n$/, '') : ''; }
+    function draftLocal(t) { try { var v = JSON.parse(localStorage.getItem(DRAFT_LS + t) || 'null'); return v && typeof v.text === 'string' ? v : null; } catch (e) { return null; } }
+    function draftSave() {
+      if (draftT) { clearTimeout(draftT); draftT = 0; }
+      var t = currentThread(), ed = draftEd();
+      if (!t || !ed || draftWait[t]) return;
+      var s = draftText(ed);
+      if (draftLast[t] === s) return;
+      draftLast[t] = s; draftShown[t] = 0;
+      try { if (s) localStorage.setItem(DRAFT_LS + t, JSON.stringify({ text: s, ts: Date.now() })); else localStorage.removeItem(DRAFT_LS + t); } catch (e) { /* ignore */ }
+      if (ctx && typeof ctx.call === 'function') ctx.call('draft_save', { thread: t, text: s }).catch(function () { /* the local copy stays */ });
+    }
+    function draftSoon() { if (!draftT) draftT = setTimeout(draftSave, 120); }
+    function draftIn(e) { var n = e && e.target; return !!(n && n.closest && n.closest('.nt-desk-composer')); }
+    function draftKeep() {  // the local copy right at the keystroke; the host copy follows within 120 ms
+      var t = currentThread(), ed = draftEd();
+      if (!t || !ed || draftWait[t]) return;
+      var s = draftText(ed);
+      try { if (s) localStorage.setItem(DRAFT_LS + t, JSON.stringify({ text: s, ts: Date.now() })); } catch (e) { /* ignore */ }
+    }
+    function onDraftInput(e) { if (draftIn(e)) { draftKeep(); draftSoon(); } }
+    function onDraftKey(e) { if (draftIn(e) && e.key === 'Enter' && !e.shiftKey && !e.isComposing) { var t = currentThread(); if (t) draftSent[t] = true; } }
+    function onDraftClick(e) { var n = e && e.target; if (n && n.closest && n.closest('[data-nt-v6="send"]')) { var t = currentThread(); if (t) draftSent[t] = true; } }
+    function draftPut(ed, value) {
+      try {
+        ed.focus();
+        var sel = window.getSelection(), r = document.createRange();
+        r.selectNodeContents(ed); r.collapse(false); sel.removeAllRanges(); sel.addRange(r);
+        var lines = String(value).split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          if (i) document.execCommand('insertLineBreak');
+          if (lines[i]) document.execCommand('insertText', false, lines[i]);
+        }
+      } catch (e) { /* ignore */ }
+    }
+    function draftFetch(t) {
+      var local = draftLocal(t);
+      function done(host) {
+        draftWait[t] = 0;
+        var pick = host && Number(host.ts || 0) >= Number((local && local.ts) || 0) ? host : local;
+        var ed = draftEd();
+        if (currentThread() !== t || !ed) return;
+        var cur = draftText(ed);
+        if (cur || !pick || !pick.text) { draftLast[t] = cur; return; }
+        draftLast[t] = pick.text; draftShown[t] = 1;
+        draftPut(ed, pick.text);
+      }
+      if (ctx && typeof ctx.call === 'function') ctx.call('draft_load', { thread: t }).then(done, function () { done(null); });
+      else done(null);
+    }
+    function draftTick() {
+      var t = currentThread();
+      if (t !== draftThread) { draftThread = t; if (t) draftWait[t] = 1; }
+      if (!t) return;
+      var ed = draftEd();
+      if (!ed) return;
+      if (draftWait[t] === 1) { draftWait[t] = 2; draftFetch(t); return; }
+      if (draftWait[t]) return;
+      var raw = String(ed.textContent || '').replace(/\u200b/g, '');
+      if (raw.trim()) { if (raw.length !== draftLen[t]) { draftLen[t] = raw.length; draftSoon(); } return; }  // also dictation
+      draftLen[t] = 0;
+      if (draftSent[t]) { draftSent[t] = false; draftSave(); return; }  // sent: the draft is gone
+      // Notion rebuilt the chat box right after a restore (no user input since): put the draft back
+      if (draftShown[t] && draftShown[t] < 4 && draftLast[t]) { draftShown[t]++; draftPut(ed, draftLast[t]); }
+    }
+    document.addEventListener('input', onDraftInput, true);
+    document.addEventListener('keydown', onDraftKey, true);
+    document.addEventListener('click', onDraftClick, true);
+    window.addEventListener('pagehide', draftSave);
+    function draftOff() {
+      if (draftT) draftSave();
+      document.removeEventListener('input', onDraftInput, true);
+      document.removeEventListener('keydown', onDraftKey, true);
+      document.removeEventListener('click', onDraftClick, true);
+      window.removeEventListener('pagehide', draftSave);
+      unfreeze();
+      if (window.__ntDeskFreeze === freezeState) { window.__ntDeskFreeze = null; window.__ntDeskUnfreeze = null; }
+    }
+
+    // ---- restart freeze + resume (user 2026-10-28 05:20): right before a restart closes the window,
+    // work/freeze_window.py takes the exact state - open chat, scroll position, chat box text up to the last
+    // letter - and the box turns read-only, so nothing typed after that moment can get lost. The new window
+    // opens the same chat (desktop_shell resume_url) and gets the scroll position back here (resume_take).
+    var resumeWant = null, freezeEd = null, freezeT = 0;
+    function freezeState() {
+      var t = currentThread(), ed = draftEd();
+      var out = { url: String(location.href), thread: t || '', text: null, fromBottom: 0 };
+      if (draftT) { clearTimeout(draftT); draftT = 0; }
+      if (t && ed && !draftWait[t]) out.text = draftText(ed);  // draft still loading: the stored one stays
+      if (ed) {
+        try { ed.setAttribute('contenteditable', 'false'); ed.blur(); } catch (e) { /* ignore */ }
+        freezeEd = ed;
+        if (freezeT) clearTimeout(freezeT);
+        freezeT = setTimeout(unfreeze, 20000);  // safety net only: the window was not closed after all
+      }
+      var sc = fdSc && fdSc.isConnected ? fdSc : feedScr();
+      if (sc) out.fromBottom = Math.max(0, Math.round(sc.scrollHeight - sc.scrollTop - sc.clientHeight));
+      return out;
+    }
+    function unfreeze() {
+      if (freezeT) { clearTimeout(freezeT); freezeT = 0; }
+      if (freezeEd) { try { freezeEd.setAttribute('contenteditable', 'true'); } catch (e) { /* ignore */ } freezeEd = null; }
+    }
+    window.__ntDeskFreeze = freezeState;
+    window.__ntDeskUnfreeze = unfreeze;
+    if (ctx && typeof ctx.call === 'function') {
+      Promise.resolve(ctx.call('resume_take', {})).then(function (r) {
+        if (r && r.thread && Number(r.from_bottom) > 40) resumeWant = { thread: String(r.thread).replace(/-/g, ''), fromBottom: Number(r.from_bottom) };
+      }, function () { /* no resume */ });
+    }
+    function resumeTick() {
+      if (!resumeWant) return;
+      var t = String(currentThread() || '').replace(/-/g, '');
+      if (t && t !== resumeWant.thread) { resumeWant = null; return; }
+      if (!fdSc || !fdSc.isConnected || !fdIn || !fdIn.children.length || !root.classList.contains('nt-v6-feed-on')) return;
+      var top = fdSc.scrollHeight - fdSc.clientHeight - resumeWant.fromBottom;
+      resumeWant = null;
+      fdStick = false;
+      fdSc.scrollTop = Math.max(0, top);
+    }
+
     if (ctx && typeof ctx.onState === 'function') {
       offState = ctx.onState(function (s) { state = obj(s); });
     }
@@ -1477,6 +1679,7 @@
       if (rz) { rz.remove(); rz = null; }
       if (wk) { wk.remove(); wk = null; }
       feedOff();
+      try { draftOff(); } catch (x) { /* ignore */ }
       try { delete window.__ntV6OpenThread; } catch (x) { /* ignore */ }
       root.style.removeProperty('--nt-v6-sbw');
       document.removeEventListener('pointerdown', onEffortPick, true);
@@ -1485,6 +1688,7 @@
       var rowEl = document.querySelector('.' + CLS_TOPROW);
       if (rowEl) rowEl.classList.remove(CLS_TOPROW);
       root.classList.remove(CLS_ON);
+      root.classList.remove('nt-v6-mask');
     }
     return { stop: stop };
   };

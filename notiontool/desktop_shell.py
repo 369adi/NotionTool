@@ -51,7 +51,7 @@ DESK_ACTIONS = tuple(notion_shell.ACTIONS) + ('new_welcome_chat', 'settings_sche
                                               'chat_context_switch', 'chat_ages', 'chat_age_switch',
                                               'chat_thread_age', 'live_answer', 'account_status', 'account_sign_in',
                                               'account_sign_out', 'account_select', 'account_setup', 'account_space', 'backup_status', 'backup_now',
-                                              'chat_effort_pick', 'chat_effort_get', 'dictate',
+                                              'chat_effort_pick', 'chat_effort_get', 'dictate', 'draft_save', 'draft_load', 'resume_take',
                                               'usage_report', 'patch_status', 'app_restart', 'app_restart_status',
                                               'app_health', 'notion_connections', 'notion_connection_permissions') + PROJECT_ACTIONS
 # RBX fix: one age check (Notion thread created_time) for ANY chat, also chats NotionTool did not create.
@@ -84,6 +84,33 @@ _BOOT_HEAD = '''(function(){
   window.__ntDeskParts = window.__ntDeskMounted;
   var css = '''
 _BOOT_BODY = r''';
+  // Boot cover (user 2026-10-28 05:02: Notion showed while NotionTool started or reloaded): from the first
+  // paint Notion's app stays invisible until v6 has its layout (v6.js maskSync then drops the cover for good).
+  // Fail-safe only: if v6 never comes up (overlay broken or switched off) the cover goes after 30 s, so the
+  // window is never left blank.
+  (function () {
+    var off = false;
+    try { off = localStorage.getItem('ntDeskOff') === '1'; } catch (e) {}
+    if (off || document.getElementById('nt-boot-cover')) return;
+    var cover = document.createElement('style');
+    cover.id = 'nt-boot-cover';
+    cover.textContent = '#notion-app{visibility:hidden!important}html,body{background:#050a18!important}';
+    function put() {
+      if (cover.isConnected) return true;
+      var r = document.head || document.documentElement;
+      if (!r) return false;
+      r.appendChild(cover);
+      return true;
+    }
+    window.__ntBootCoverOff = function () {
+      document.removeEventListener('readystatechange', put);
+      if (cover.parentNode) cover.parentNode.removeChild(cover);
+    };
+    if (!put()) document.addEventListener('readystatechange', put);
+    setTimeout(function () {
+      if (typeof window.__ntBootCoverOff === 'function') { var f = window.__ntBootCoverOff; window.__ntBootCoverOff = null; f(); }
+    }, 30000);
+  })();
   function addStyle() {
     var old = document.getElementById('nt-desk-style');
     if (old) {
@@ -231,7 +258,7 @@ function () {
     for (var i = 0; i < kids.length; i++) if (foreign(kids[i])) return false;
     return true;
   }
-  var style = document.getElementById('nt-desk-style');
+  var bootCover = document.getElementById('nt-boot-cover'); if (bootCover) bootCover.remove(); var style = document.getElementById('nt-desk-style');
   if (style) drop(style);
   Array.prototype.slice.call(document.querySelectorAll('*')).forEach(function (node) {
     if (node.isConnected === false || !ours(node)) return;
@@ -395,6 +422,114 @@ def save_app_settings(changes, data_dir=None):
     tmp.write_text(json.dumps(values, indent=2, sort_keys=True), encoding='utf-8')
     os.replace(tmp, path)
     return values
+
+
+# ---- chat drafts (user 2026-10-28 04:49) -------------------------------------
+# What the user typed in a chat box survives every restart, up to the last letter. The overlay (v6.js)
+# sends the chat box text per chat right after each input; an empty text is kept as a dated tombstone so
+# a sent or deleted draft never comes back from an older local copy.
+DRAFTS_FILE = 'desktop_drafts.json'
+DRAFT_MAX_CHARS = 100000
+DRAFT_MAX_CHATS = 60
+_drafts_lock = threading.Lock()
+
+
+def _draft_thread(args):
+    args = args if isinstance(args, dict) else {}
+    return re.sub(r'[^0-9A-Za-z-]', '', str(args.get('thread') or ''))[:64]
+
+
+def _read_drafts(data_dir=None):
+    try:
+        stored = json.loads((Path(data_dir or DATA_DIR) / DRAFTS_FILE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in stored.items() if isinstance(v, dict)} if isinstance(stored, dict) else {}
+
+
+def save_draft(args, data_dir=None, now=time.time):
+    thread = _draft_thread(args)
+    if not thread:
+        raise ValueError('No chat given')
+    text = str((args or {}).get('text') or '')[:DRAFT_MAX_CHARS]
+    with _drafts_lock:
+        drafts = _read_drafts(data_dir)
+        drafts[thread] = dict(text=text, ts=int(now() * 1000))
+        if len(drafts) > DRAFT_MAX_CHATS:
+            for old in sorted(drafts, key=lambda k: drafts[k].get('ts') or 0)[:len(drafts) - DRAFT_MAX_CHATS]:
+                drafts.pop(old, None)
+        path = Path(data_dir or DATA_DIR) / DRAFTS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(drafts, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, path)
+    return dict(saved=bool(text))
+
+
+def load_draft(args, data_dir=None):
+    entry = _read_drafts(data_dir).get(_draft_thread(args)) or {}
+    return dict(text=str(entry.get('text') or ''), ts=int(entry.get('ts') or 0))
+
+
+# ---- restart resume (user 2026-10-28 05:20) -----------------------------------
+# Right before a restart closes the window, work/freeze_window.py stores the open chat, the scroll position
+# and the chat box text (exact, up to the last letter; the text goes into the drafts above). The new window
+# opens that chat again (resume_url) and v6.js asks once for the scroll position (take_resume).
+RESUME_FILE = 'desktop_resume.json'
+
+
+def _resume_url(url):
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url or ''))
+    except ValueError:
+        return ''
+    host = (parts.hostname or '').lower()
+    ok = host in ('notion.so', 'notion.com') or host.endswith('.notion.so') or host.endswith('.notion.com')
+    return str(url)[:2000] if parts.scheme == 'https' and ok else ''
+
+
+def save_resume(state, data_dir=None, now=time.time):
+    state = state if isinstance(state, dict) else {}
+    try:
+        from_bottom = max(0, int(round(float(state.get('fromBottom') or 0))))
+    except (TypeError, ValueError):
+        from_bottom = 0
+    entry = dict(url=_resume_url(state.get('url')), thread=_draft_thread(state), from_bottom=from_bottom,
+                 ts=int(now() * 1000))
+    path = Path(data_dir or DATA_DIR) / RESUME_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(entry), encoding='utf-8')
+    os.replace(tmp, path)
+    return entry
+
+
+def read_resume(data_dir=None):
+    try:
+        entry = json.loads((Path(data_dir or DATA_DIR) / RESUME_FILE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    return entry if isinstance(entry, dict) else {}
+
+
+def resume_url(data_dir=None):
+    """The chat the window showed right before the last restart, or '' (then the default chat opens)."""
+    return _resume_url(read_resume(data_dir).get('url'))
+
+
+def take_resume(args=None, data_dir=None):
+    """Scroll position for the chat that was open before the restart. Used once, then the file is gone."""
+    entry = read_resume(data_dir)
+    try:
+        (Path(data_dir or DATA_DIR) / RESUME_FILE).unlink()
+    except OSError:
+        pass
+    try:
+        from_bottom = max(0, int(entry.get('from_bottom') or 0))
+    except (TypeError, ValueError):
+        from_bottom = 0
+    return dict(thread=str(entry.get('thread') or ''), from_bottom=from_bottom)
 
 
 # ---- state ------------------------------------------------------------------
@@ -1089,7 +1224,10 @@ def desktop_handlers(server, data_dir=None, sleep=time.sleep, clock=time.monoton
                     app_chat_promote=app_chat_promote, chat_context_switch=chat_context_switch,
                     chat_ages=chat_ages, chat_age_switch=chat_age_switch, chat_thread_age=chat_thread_age,
                     live_answer=live_answer, chat_effort_pick=chat_effort_pick,
-                    chat_effort_get=chat_effort_get, dictate=dictate)
+                    chat_effort_get=chat_effort_get, dictate=dictate,
+                    draft_save=lambda args: save_draft(args, data_dir),
+                    draft_load=lambda args: load_draft(args, data_dir),
+                    resume_take=lambda args: take_resume(args, data_dir))
     handlers.update(state=state, runs=lambda args: state(args)['runs'], new_welcome_chat=new_welcome_chat,
                     settings_schema=settings_schema, app_settings_get=app_settings_get,
                     app_settings_set=app_settings_set, main_switch_start=main_switch_start,
@@ -1479,7 +1617,7 @@ class DesktopController:
             account = selected_account(self.server.store) or ''
             app = self._make_app()
             shell = DesktopShell(app, account, desktop_handlers(self.server, self.data_dir),
-                                 secrets=notion_shell.shell_secrets(self.server))
+                                 secrets=notion_shell.shell_secrets(self.server), url=resume_url(self.data_dir))
             self.shell = shell
             # The Store Notion swallows notion:// links, so 'Continue in desktop app' can never reach this
             # window. window_login.py catches 'Continue in browser' and moves the session in via DevTools.
